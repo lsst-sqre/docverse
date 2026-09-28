@@ -183,7 +183,8 @@ Docverse while keeper-sync mirrors LTD (PRD #713):
   `publish_edition`, and the CDN publish.
 - **`build_content_copied`'s `ltd_lag_seconds`** (float seconds) is the
   copy's end minus the same `date_rebuilt`: the copy half. It is taken
-  when the copy ends, whether it succeeded or failed.
+  when the copy ends, whether it succeeded or failed, and is set for the
+  same copies whose publish sets `ltd_lag`.
 
 Subtracting the copy half from the whole leaves the queue wait and the
 CDN publish. Neither event names the edition or the build, which would
@@ -193,16 +194,26 @@ compare the two distributions over the same organization and window
 events.
 
 **When `ltd_lag` is set.** Only on a publish that a keeper-sync visit
-enqueued after importing a fresh LTD rebuild of the edition: the job's
-payload then carries the rebuild's `ltd_date_rebuilt`, and
-`publish_edition` subtracts it at its success terminal. A semver
-aggregate edition (`15`, `15.2`) that the same visit moved reports its
-release's lag, because the release's rebuild is what moved it. A
-build-level copy retry happens inside the window and counts toward it.
+enqueued after importing a fresh LTD rebuild of an edition Docverse
+already mirrors, meaning an earlier visit imported the edition and it
+already served a build, so LTD rebuilt it while keeper-sync was
+watching. The job's payload then carries the rebuild's
+`ltd_date_rebuilt`, and `publish_edition` subtracts it at its success
+terminal. A semver aggregate edition (`15`, `15.2`) that the same visit
+moved reports its release's lag, because the release's rebuild is what
+moved it. A build-level copy retry happens inside the window and counts
+toward it. It is the rebuild-to-CDN delay for known editions, which is
+what a sync-lag dashboard means.
 
 **When it is null.** Whenever there is no fresh rebuild to measure
 from:
 
+- an edition's first import, including a retry of a first import whose
+  copy failed. Its `date_rebuilt` is whenever LTD last rebuilt the
+  edition, before Docverse mirrored it: years ago, for most of what a
+  backfill run imports. The time since then is the rebuild's age, not a
+  sync lag, and `build_content_copied`'s `ltd_lag_seconds` is null for
+  the same copy;
 - publishes from a client build's fan-out, a rollback, or the reconcile
   loop;
 - keeper-sync's self-heal publish of an edition or aggregate whose
@@ -220,10 +231,11 @@ from:
 tier crons that poll LTD between runs enqueue their publishes without a
 run, so those publishes read `trigger=build` although they carry an
 `ltd_lag`. Keeper-sync's self-heal publishes, conversely, can read
-`trigger=keeper_sync` with no lag. The presence of `ltd_lag` is the
-marker of a publish that measured one, and an aggregate over `ltd_lag`
-already sees only those; adding `"trigger" = 'keeper_sync'` narrows it
-to backfill runs.
+`trigger=keeper_sync` with no lag, and so do a backfill run's first
+imports. The presence of `ltd_lag` is the marker of a publish that
+measured one, and an aggregate over `ltd_lag` already sees only those;
+adding `"trigger" = 'keeper_sync'` narrows it to the editions a backfill
+run found already mirrored and rebuilt since.
 
 **Negative values are data.** Neither field is clamped. LTD's clock and
 Docverse's disagree by some amount, and a lag shorter than that skew
@@ -322,7 +334,7 @@ read these events across a sync campaign.
 | `exhausted_object_count` | integer | field | Objects whose upload ran out of its whole retry budget. |
 | `build_retry_used` | boolean | field | Whether the build-level retry re-ran the copy. |
 | `succeeded` | boolean | field | Whether the copy, after any build-level retry, stored every object. Not named `success`, so not a tag. |
-| `ltd_lag_seconds` | float or null | field | Seconds from LTD's `date_rebuilt` for the edition to the copy's end: the copy half of `ltd_lag`. Null when LTD reports no `date_rebuilt`; negative under clock skew. See [Measuring lag behind LTD Keeper](#measuring-lag-behind-ltd-keeper). |
+| `ltd_lag_seconds` | float or null | field | Seconds from LTD's `date_rebuilt` for the edition to the copy's end: the copy half of `ltd_lag`, set when the copy is a rebuild of an edition Docverse already mirrors. Null on the edition's first import and when LTD reports no `date_rebuilt`; negative under clock skew. See [Measuring lag behind LTD Keeper](#measuring-lag-behind-ltd-keeper). |
 
 ### `edition_published`
 
@@ -338,7 +350,7 @@ from the `publish_edition` worker's success terminal only.
 | `edition_kind` | enum | tag | The edition's kind: `main`, `release`, `draft`, `major`, `minor`, or `alternate`. |
 | `trigger` | enum | tag | What drove the publish: `build` (a client build's fan-out, and keeper-sync's tier crons), `keeper_sync` (a keeper-sync run), `rollback`, or `reconcile` (the `edition_reconcile` loop re-driving a lost publish). |
 | `elapsed` | duration | field | Time the worker spent on the publish. |
-| `ltd_lag` | duration or null | field | Time from LTD's `date_rebuilt` for the edition to this publish's success, set when a keeper-sync visit imported a fresh rebuild. See [Measuring lag behind LTD Keeper](#measuring-lag-behind-ltd-keeper) for when it is null and why not to filter on `trigger`. |
+| `ltd_lag` | duration or null | field | Time from LTD's `date_rebuilt` for the edition to this publish's success, set when a keeper-sync visit imported a fresh rebuild of an edition Docverse already mirrors; null on the edition's first import. See [Measuring lag behind LTD Keeper](#measuring-lag-behind-ltd-keeper) for when else it is null and why not to filter on `trigger`. |
 
 ### `dashboard_built`
 

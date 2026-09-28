@@ -883,45 +883,216 @@ async def test_fresh_import_stamps_the_edition_with_ltd_dates(
     ) > datetime.fromisoformat(restamps[0]["date_updated"])
 
 
+def _rebuild_ltd_main(
+    mock_discovery: respx.Router,
+    source_objects: dict[str, bytes],
+    *,
+    date_rebuilt: datetime | None,
+) -> None:
+    """Rebuild LTD's ``main`` edition onto a newly uploaded build, ``43``.
+
+    LTD rebuilds an edition by pointing it at a new build, so the next
+    sync sees a different LTD build, new content, and the edition's new
+    ``date_rebuilt``. ``respx`` replaces a route with an identical
+    pattern, so these win over :func:`_seed_ltd`'s. The content lands in
+    ``source_objects``, the dict the service's LTD source reads from.
+    """
+    edition = _load("edition_main_git_refs.json")
+    edition["build_url"] = f"{LTD_BASE}/builds/43"
+    edition["date_rebuilt"] = (
+        None if date_rebuilt is None else date_rebuilt.isoformat()
+    )
+    build = _load("build.json")
+    build["self_url"] = f"{LTD_BASE}/builds/43"
+    build["slug"] = "43"
+    build["bucket_root_dir"] = "pipelines/builds/43"
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(200, json=edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=build)
+    )
+    source_objects["pipelines/builds/43/index.html"] = b"<html>v2</html>"
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "date_rebuilt",
-    [datetime(2026, 4, 30, 18, 30, tzinfo=UTC), None],
-    ids=["rebuilt", "never-rebuilt"],
-)
-async def test_sync_edition_outcome_carries_ltd_date_rebuilt(
+async def test_first_import_measures_no_ltd_lag(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
-    date_rebuilt: datetime | None,
 ) -> None:
-    """The outcome reports the ``date_rebuilt`` LTD gave this visit.
+    """Importing an edition for the first time reports no sync lag.
 
-    The worker forwards it into the publish payload so the
-    ``edition_published`` event can measure how long the rebuild took to
-    reach the CDN (PRD #713). An LTD edition that reports no
-    ``date_rebuilt`` has nothing to measure from and reports ``None``.
+    LTD's ``date_rebuilt`` for an edition Docverse has never mirrored is
+    whenever LTD last rebuilt it — years ago, for a backfill — so the
+    time since it says how old the rebuild is, not how long Docverse
+    took to follow it. Neither the outcome, which the worker forwards
+    into the publish payload, nor the copy report carries it.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session)
-    edition_main = _load("edition_main_git_refs.json")
-    edition_main["date_rebuilt"] = (
-        None if date_rebuilt is None else date_rebuilt.isoformat()
-    )
-    _seed_ltd(mock_discovery, edition_main=edition_main)
-
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
     service = _build_service(
         db_session,
         http_client,
         MockObjectStore(),
         {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        on_build_copied=on_build_copied,
     )
+
     result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
 
-    assert [o.ltd_date_rebuilt for o in result.edition_outcomes] == [
-        date_rebuilt
-    ]
-    assert result.edition_outcomes[0].build_outcome is not None
+    [outcome] = result.edition_outcomes
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is False
+    assert outcome.ltd_date_rebuilt is None
+    assert [report.ltd_lag_seconds for report in reports] == [None]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rebuilt_ago",
+    [timedelta(minutes=1), None],
+    ids=["rebuilt", "never-rebuilt"],
+)
+async def test_rebuild_of_a_mirrored_edition_measures_ltd_lag(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    rebuilt_ago: timedelta | None,
+) -> None:
+    """A rebuild of an edition Docverse already mirrors reports its lag.
+
+    LTD rebuilt ``main`` onto a new build after an earlier visit had
+    imported it, so the time since LTD's ``date_rebuilt`` is how long
+    Docverse took to follow. The outcome carries that ``date_rebuilt``
+    for the worker to forward into the publish payload, and the copy
+    report measures from it: at least ``duration_seconds``, and no more
+    than the time since the rebuild once the sync has returned. An LTD
+    edition that reports no ``date_rebuilt`` has nothing to measure
+    from.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        source_objects,
+        on_build_copied=on_build_copied,
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    date_rebuilt = (
+        None if rebuilt_ago is None else datetime.now(tz=UTC) - rebuilt_ago
+    )
+    _rebuild_ltd_main(
+        mock_discovery, source_objects, date_rebuilt=date_rebuilt
+    )
+    reports.clear()
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    finished = datetime.now(tz=UTC)
+
+    [outcome] = result.edition_outcomes
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is False
+    assert outcome.ltd_date_rebuilt == date_rebuilt
+    [report] = reports
+    if date_rebuilt is None:
+        assert report.ltd_lag_seconds is None
+    else:
+        assert report.ltd_lag_seconds is not None
+        assert report.duration_seconds <= report.ltd_lag_seconds
+        assert (
+            report.ltd_lag_seconds <= (finished - date_rebuilt).total_seconds()
+        )
+
+
+@pytest.mark.asyncio
+async def test_short_circuited_visit_measures_no_ltd_lag(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A visit whose build short-circuited reports no sync lag.
+
+    LTD's ``date_rebuilt`` is unchanged, so the rebuild is one an earlier
+    visit imported; the time since it keeps growing on every poll and
+    measures nothing Docverse did.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        on_build_copied=on_build_copied,
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    reports.clear()
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    [outcome] = result.edition_outcomes
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is True
+    assert outcome.ltd_date_rebuilt is None
+    assert reports == []
+
+
+@pytest.mark.asyncio
+async def test_retried_first_import_measures_no_ltd_lag(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first import that failed and is retried is still a first import.
+
+    The failed visit recorded the edition's state row before its copy
+    failed, so the row alone would pass the retry off as a rebuild of a
+    mirrored edition and report the age of LTD's old rebuild. The
+    edition never received a build, which is what keeps the retry from
+    measuring a lag, on the outcome and on the copy report alike.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-lag-retried-import")
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        ScriptedUploadStore(
+            {
+                "index.html": [
+                    httpx.ConnectTimeout("first"),
+                    httpx.ConnectTimeout("second"),
+                ]
+            }
+        ),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        on_build_copied=on_build_copied,
+    )
+    _record_copy_retry_sleeps(monkeypatch, db_session)
+    monkeypatch.setattr(sentry_sdk, "capture_exception", lambda _exc: None)
+    with pytest.raises(KeeperSyncSystemicFailureError):
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    reports.clear()
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    [outcome] = result.edition_outcomes
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is False
+    assert outcome.ltd_date_rebuilt is None
+    assert [report.ltd_lag_seconds for report in reports] == [None]
 
 
 @pytest.mark.asyncio
@@ -4445,60 +4616,6 @@ async def test_sync_build_reports_the_copy_and_its_retried_objects(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "rebuilt_ago",
-    [timedelta(minutes=1), None],
-    ids=["rebuilt", "never-rebuilt"],
-)
-async def test_sync_build_reports_the_copy_lag_behind_ltd(
-    db_session: AsyncSession,
-    http_client: httpx.AsyncClient,
-    mock_discovery: respx.Router,
-    rebuilt_ago: timedelta | None,
-) -> None:
-    """The report says how far behind LTD's rebuild the copy finished.
-
-    It is the copy's completion time minus the edition's
-    ``date_rebuilt``, so it spans the copy itself and everything the
-    visit did before it: at least ``duration_seconds``, and no more than
-    the time since the rebuild once the sync has returned. An LTD edition
-    that reports no ``date_rebuilt`` has nothing to measure from.
-    """
-    async with db_session.begin():
-        org_id = await _seed_org(db_session, slug="ks-copy-report-lag")
-    date_rebuilt = (
-        None if rebuilt_ago is None else datetime.now(tz=UTC) - rebuilt_ago
-    )
-    edition_main = _load("edition_main_git_refs.json")
-    edition_main["date_rebuilt"] = (
-        None if date_rebuilt is None else date_rebuilt.isoformat()
-    )
-    _seed_ltd(mock_discovery, edition_main=edition_main)
-    reports, on_build_copied = _record_copy_reports()
-    service = _build_service(
-        db_session,
-        http_client,
-        MockObjectStore(),
-        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
-        on_build_copied=on_build_copied,
-    )
-
-    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
-    finished = datetime.now(tz=UTC)
-
-    assert len(reports) == 1
-    report = reports[0]
-    if date_rebuilt is None:
-        assert report.ltd_lag_seconds is None
-    else:
-        assert report.ltd_lag_seconds is not None
-        assert report.duration_seconds <= report.ltd_lag_seconds
-        assert (
-            report.ltd_lag_seconds <= (finished - date_rebuilt).total_seconds()
-        )
-
-
-@pytest.mark.asyncio
 async def test_sync_build_reports_a_rerun_copy_as_one_copy(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
@@ -4508,22 +4625,33 @@ async def test_sync_build_reports_a_rerun_copy_as_one_copy(
     """A copy the build-level retry recovered is still one report.
 
     It says the retry was used and keeps the first pass's exhausted
-    upload — that object is the outage the retry rode out.
+    upload — that object is the outage the retry rode out. The copy is
+    a rebuild of an edition Docverse already mirrors, so it measures a
+    lag too, and the re-run falls inside it.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, slug="ks-copy-report-rerun")
 
     _seed_ltd(mock_discovery)
+    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
     reports, on_build_copied = _record_copy_reports()
     service = _build_service(
         db_session,
         http_client,
-        ScriptedUploadStore({"index.html": [httpx.ConnectTimeout("")]}),
-        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        # The first import's upload lands; the rebuild's first pass fails.
+        ScriptedUploadStore({"index.html": [1, httpx.ConnectTimeout("")]}),
+        source_objects,
         copy_retry_delay_seconds=7.0,
         on_build_copied=on_build_copied,
     )
     _record_copy_retry_sleeps(monkeypatch, db_session)
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    _rebuild_ltd_main(
+        mock_discovery,
+        source_objects,
+        date_rebuilt=datetime.now(tz=UTC) - timedelta(minutes=1),
+    )
+    reports.clear()
 
     result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
 
@@ -4551,30 +4679,43 @@ async def test_sync_build_reports_a_copy_that_failed_both_passes(
 
     Each pass's exhausted upload is counted, and the report goes out
     before the failure reaches ``sync_edition``'s accounting — here the
-    project's only edition, so the sync then fails as a whole.
+    project's only edition, so the sync then fails as a whole. The copy
+    is a rebuild of an edition Docverse already mirrors, so the report
+    still measures how far behind LTD it gave up.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, slug="ks-copy-report-failed")
 
     _seed_ltd(mock_discovery)
+    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
     reports, on_build_copied = _record_copy_reports()
     service = _build_service(
         db_session,
         http_client,
         ScriptedUploadStore(
             {
+                # The first import's upload lands; both of the rebuild's
+                # passes fail.
                 "index.html": [
+                    1,
                     httpx.ConnectTimeout("first"),
                     httpx.ConnectTimeout("second"),
                 ]
             }
         ),
-        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        source_objects,
         copy_retry_delay_seconds=7.0,
         on_build_copied=on_build_copied,
     )
     _record_copy_retry_sleeps(monkeypatch, db_session)
     monkeypatch.setattr(sentry_sdk, "capture_exception", lambda _exc: None)
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    _rebuild_ltd_main(
+        mock_discovery,
+        source_objects,
+        date_rebuilt=datetime.now(tz=UTC) - timedelta(minutes=1),
+    )
+    reports.clear()
 
     with pytest.raises(KeeperSyncSystemicFailureError):
         await service.sync_project(org_id=org_id, ltd_slug="pipelines")

@@ -378,9 +378,11 @@ class BuildCopyReport:
     """Seconds from LTD's ``date_rebuilt`` for the edition to the copy's end.
 
     Measured when the copy finished, successfully or not, so a
-    build-level re-run falls inside it. ``None`` when LTD reports no
-    ``date_rebuilt``. Not clamped: a rebuild stamped ahead of Docverse's
-    clock gives a negative value.
+    build-level re-run falls inside it. Only a rebuild of an edition
+    Docverse already mirrors measures one (see
+    :func:`_measures_sync_lag`): ``None`` on the edition's first import,
+    and when LTD reports no ``date_rebuilt``. Not clamped: a rebuild
+    stamped ahead of Docverse's clock gives a negative value.
     """
 
 
@@ -583,6 +585,35 @@ def _date_rebuilt_marker_retracted(state: KeeperSyncState) -> bool:
     )
 
 
+def _measures_sync_lag(
+    edition_state: KeeperSyncState | None, edition: Edition
+) -> bool:
+    """Report whether importing LTD's build now measures a sync lag.
+
+    ``now - date_rebuilt`` is how long Docverse took to follow LTD's
+    rebuild only when Docverse was already mirroring the edition when
+    LTD rebuilt it. Both halves of "already mirroring" are read before
+    this visit writes anything:
+
+    * **An edition state row from an earlier visit.** It is keyed on
+      the LTD edition id, which survives rebuilds. The *build* row does
+      not: LTD rebuilds an edition by pointing it at a newly uploaded
+      build, so every rebuild brings a build id no row has seen yet. A
+      first import has no edition row either — nor does an adopted
+      native edition's first keeper-sync import — and its
+      ``date_rebuilt`` is whenever LTD last rebuilt the edition: years
+      ago, on a backfill.
+    * **A current build on the Docverse edition.** A first import whose
+      copy failed still wrote the state row, so the next visit's retry
+      would otherwise pass for a rebuild. It never repointed the
+      edition, so the edition has no build yet.
+
+    Takes *edition* as ``sync_edition`` holds it before ``sync_build``
+    runs, when ``current_build_id`` is still the pre-visit pointer.
+    """
+    return edition_state is not None and edition.current_build_id is not None
+
+
 @dataclass(frozen=True)
 class AggregateEditionOutcome:
     """One semver aggregate edition the backfill created or advanced.
@@ -658,17 +689,24 @@ class EditionSyncOutcome:
     """
 
     ltd_date_rebuilt: datetime | None = None
-    """The ``date_rebuilt`` LTD Keeper reported for the edition this visit.
+    """LTD's ``date_rebuilt`` for the edition, when this visit measured lag.
 
-    When the visit imported a fresh build (``build_outcome`` not
-    short-circuited), the worker forwards it into the
+    Set only when the visit imported a fresh build (``build_outcome``
+    not short-circuited) for an edition Docverse already mirrored — see
+    :func:`_measures_sync_lag` — so the time since it is how long LTD's
+    rebuild took to reach Docverse. The worker forwards it as-is into the
     ``publish_edition`` payloads it enqueues from this outcome, the
     edition's own and those of the semver aggregates its release moved,
-    so the ``edition_published``
-    event can report how long LTD's rebuild took to reach the CDN
-    (``ltd_lag``, PRD #713). ``None`` when LTD reports no
-    ``date_rebuilt`` for the edition, and on a tombstone short-circuit,
-    which enqueues no publish to measure.
+    and the ``edition_published`` event reports ``ltd_lag`` from it (PRD
+    #713); the copy's ``BuildCopyReport.ltd_lag_seconds`` is measured
+    from the same value.
+
+    ``None`` on a first import, whose ``date_rebuilt`` dates a rebuild
+    from before Docverse mirrored the edition (years old, on a
+    backfill); on a short-circuited build, whose rebuild an earlier visit
+    imported; on a tombstone short-circuit or a build-less edition; and
+    when LTD reports no ``date_rebuilt``. This field is the single
+    decision: consumers forward it without re-deriving freshness.
     """
 
     @property
@@ -1520,6 +1558,14 @@ class KeeperSyncService:
             kind_derivation=kind_derivation,
         )
 
+        # Decided once, here, while ``edition`` still carries its
+        # pre-visit build: both lag fields read it, the copy report's
+        # through ``sync_build`` and the outcome's below.
+        ltd_lag_since = (
+            ltd_edition.date_rebuilt
+            if _measures_sync_lag(edition_state, edition)
+            else None
+        )
         build_outcome: BuildSyncOutcome | None = None
         aggregate_outcomes: tuple[AggregateEditionOutcome, ...] = ()
         if ltd_edition.build_url is not None:
@@ -1530,6 +1576,7 @@ class KeeperSyncService:
                 edition=edition,
                 ltd_edition=ltd_edition,
                 ltd_build=ltd_build_for_mapping,
+                ltd_lag_since=ltd_lag_since,
             )
             if (
                 build_outcome.docverse_build_id is not None
@@ -1618,7 +1665,14 @@ class KeeperSyncService:
             short_circuited=False,
             aggregate_outcomes=aggregate_outcomes,
             dates_restamped=dates_restamped,
-            ltd_date_rebuilt=ltd_edition.date_rebuilt,
+            # A short-circuited build imported nothing this visit, so
+            # there is no lag to report however known the edition is.
+            ltd_date_rebuilt=(
+                ltd_lag_since
+                if build_outcome is not None
+                and not build_outcome.short_circuited
+                else None
+            ),
         )
 
     async def _stamp_ltd_clock(
@@ -2323,6 +2377,7 @@ class KeeperSyncService:
         ltd_edition: LtdEdition,
         ltd_build: LtdBuild | None = None,
         org_slug: str | None = None,
+        ltd_lag_since: datetime | None = None,
     ) -> BuildSyncOutcome:
         """Sync the LTD edition's current build into Docverse.
 
@@ -2334,6 +2389,12 @@ class KeeperSyncService:
         the build (e.g. ``sync_edition`` does so for ``manual`` editions
         to derive the tracking pair). Skipping the refetch saves a round
         trip to LTD.
+
+        ``ltd_lag_since`` is the LTD ``date_rebuilt`` a copy's
+        :class:`BuildCopyReport` measures ``ltd_lag_seconds`` from, or
+        ``None`` for no lag. ``sync_edition`` sets it only for a rebuild
+        of an edition Docverse already mirrors (see
+        :func:`_measures_sync_lag`), so this method never decides it.
 
         The bucket prefix the content is read from is resolved once, by
         :meth:`_resolve_build_source`, and that one prefix feeds both the
@@ -2476,7 +2537,7 @@ class KeeperSyncService:
             source_prefix=source.prefix,
             dest_prefix=new_build.storage_prefix,
             project_slug=project.slug,
-            ltd_date_rebuilt=ltd_edition.date_rebuilt,
+            ltd_date_rebuilt=ltd_lag_since,
             logger=self._logger.bind(
                 ltd_build_id=ltd_build.ltd_id,
                 edition_slug=edition.slug,
@@ -2607,7 +2668,8 @@ class KeeperSyncService:
         neither landed nor failed on its own account.
 
         ``ltd_date_rebuilt`` is the LTD edition's ``date_rebuilt``, which
-        the report measures its ``ltd_lag_seconds`` from.
+        the report measures its ``ltd_lag_seconds`` from, or ``None`` when
+        this import measures no lag (``sync_build``'s ``ltd_lag_since``).
         """
         started = monotonic()
         passes: list[CopyTally] = []

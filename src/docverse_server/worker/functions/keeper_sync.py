@@ -1086,9 +1086,11 @@ async def _enqueue_publish_for_synced_edition(
     a tombstoned ``keeper_sync_state`` row whose ``docverse_id`` is
     ``NULL`` short-circuited before the edition was ever imported.
 
-    The payload carries the outcome's ``ltd_date_rebuilt``, so the
-    publish's ``edition_published`` event reports how long LTD's rebuild
-    took to reach the CDN (``ltd_lag``).
+    The payload carries the outcome's ``ltd_date_rebuilt`` as it stands,
+    so the publish's ``edition_published`` event reports how long LTD's
+    rebuild took to reach the CDN (``ltd_lag``). Whether this visit
+    measured a lag at all is the service's call, not this callback's:
+    see :attr:`EditionSyncOutcome.ltd_date_rebuilt`.
 
     Returns whether a publish was enqueued, which is what tells the
     callback that this edition's dashboard refresh is already on its
@@ -1171,24 +1173,20 @@ async def _enqueue_publish_for_aggregates(
     — is recovered from persistent state by
     :func:`_self_heal_unpublished_aggregates`.
 
-    When this visit imported a fresh release build, each payload
-    carries the release edition's ``ltd_date_rebuilt``: the aggregate
-    moved because that release was rebuilt, so its ``edition_published``
-    event reports the release's ``ltd_lag``. Behind a short-circuited
-    build the rebuild is one an earlier visit imported, so the time
-    since it is no sync lag and the payloads leave it out, as the
-    self-heal publishes do.
+    Each payload carries the release edition's ``ltd_date_rebuilt`` as
+    the outcome reports it: the aggregate moved because that release was
+    rebuilt, so its ``edition_published`` event reports the release's
+    ``ltd_lag``. The service leaves it ``None`` wherever the visit
+    measured no lag — a first import, or a short-circuited build whose
+    rebuild an earlier visit imported — so those payloads leave it out,
+    as the self-heal publishes do. See
+    :attr:`EditionSyncOutcome.ltd_date_rebuilt`.
 
     Returns whether any aggregate publish was enqueued; like the
     edition's own, each one cascades a ``dashboard_build``.
     """
     if not outcome.aggregate_outcomes:
         return False
-    fresh_rebuild = (
-        outcome.build_outcome is not None
-        and not outcome.build_outcome.short_circuited
-    )
-    ltd_date_rebuilt = outcome.ltd_date_rebuilt if fresh_rebuild else None
     edition_store = factory.create_edition_store()
     history_store = factory.create_edition_build_history_store()
     queue_backend = factory.create_queue_backend()
@@ -1208,7 +1206,7 @@ async def _enqueue_publish_for_aggregates(
             build_id=aggregate.docverse_build_id,
             build_public_id=aggregate.docverse_build_public_id,
             keeper_sync_run_id=run_id,
-            ltd_date_rebuilt=ltd_date_rebuilt,
+            ltd_date_rebuilt=outcome.ltd_date_rebuilt,
         )
         logger.info(
             "Enqueued publish_edition for synced build",

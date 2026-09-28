@@ -171,19 +171,21 @@ class EditionPublishedEvent(DocverseEventBase):
     """How long LTD's rebuild of this edition took to reach the CDN.
 
     The publish's success time minus the ``date_rebuilt`` LTD Keeper
-    reported for the edition, set only when a fresh keeper-sync visit
-    imported that rebuild and enqueued this publish (``trigger`` is
-    ``keeper_sync``). A semver aggregate (``15``, ``15.2``) the same
-    visit moved reports its release's lag, because that release's
-    rebuild is what moved it. A build-level copy retry happens inside
-    the window and counts toward it.
+    reported for the edition, set only when a keeper-sync visit imported
+    that rebuild of an edition Docverse already mirrored and enqueued
+    this publish. A semver aggregate (``15``, ``15.2``) the same visit
+    moved reports its release's lag, because that release's rebuild is
+    what moved it. A build-level copy retry happens inside the window
+    and counts toward it.
 
-    ``None`` whenever there is no LTD rebuild to measure from: the
-    build fan-out, rollback, and reconcile publishes, keeper-sync's
-    self-heal of an edition whose publish was lost, publish jobs
-    enqueued before this field existed, and LTD editions that report no
-    ``date_rebuilt``. Never clamped: clock skew between LTD and Docverse
-    shows up as a negative value rather than hiding as zero.
+    ``None`` whenever there is no LTD rebuild to measure from: an
+    edition's first import, whose ``date_rebuilt`` predates Docverse
+    mirroring it; the build fan-out, rollback, and reconcile publishes;
+    keeper-sync's self-heal of an edition whose publish was lost;
+    publish jobs enqueued before this field existed; and LTD editions
+    that report no ``date_rebuilt``. Never clamped: clock skew between
+    LTD and Docverse shows up as a negative value rather than hiding as
+    zero.
     """
 
 
@@ -398,9 +400,11 @@ class BuildContentCopiedEvent(DocverseEventBase):
     leaves the queue wait and the CDN publish. A float in seconds, like
     ``duration_seconds``, so the two read in the same unit.
 
-    ``None`` when LTD reports no ``date_rebuilt`` for the edition. Never
-    clamped: clock skew between LTD and Docverse shows up as a negative
-    value rather than hiding as zero.
+    ``None`` on the edition's first import, whose ``date_rebuilt``
+    predates Docverse mirroring it, and when LTD reports no
+    ``date_rebuilt`` for the edition. Never clamped: clock skew between
+    LTD and Docverse shows up as a negative value rather than hiding as
+    zero.
     """
 
 
