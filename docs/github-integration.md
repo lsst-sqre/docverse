@@ -425,7 +425,7 @@ the line to count. The rule's other lines say why it did what it did.
 | `Kept __main on a build at least as new` | info | `edition_id`, `github_ref`, `build_id`, `current_build_id` |
 | `Applied repository default branch` | info | `column_changed`, `main_rewritten`, `main_rewritten_from`, `drafts_retired`, `repointed_build_id` |
 | `Resolved project GitHub metadata` | info | `github_installation_id`, `github_owner_id`, `github_repo_id`, `github_default_branch`, `default_branch_changed`, `main_rewritten` |
-| `Skipping default branch: project binding changed during resolve` | info | — |
+| `Recorded GitHub ids but skipped default branch: project rebound or deleted after the ids were committed` | info | `github_installation_id`, `github_owner_id`, `github_repo_id`, `github_default_branch` |
 | `Git ref audit: GitHub repository metadata fetch failed, skipping default branch for this pass` | warning | `owner`, `repo`, `installation_id`, `error`, `error_type` |
 | `Git ref audit: default branch convergence failed, skipping project for this pass` | warning | `error`, `error_type` |
 | `Git ref audit completed for org` | info | `had_failures`, `default_branch_updates`, `main_rewrites`, `default_branch_errors` |
@@ -442,6 +442,19 @@ rule committed and only the hand-off of its `publish_edition` job to
 the queue failed, the project counts toward the other two as well, and
 the job's row is left for the reapers' orphan sweep, as after any failed
 hand-off.
+
+The resolve commits the numeric ids and then applies the branch in a
+second transaction, re-reading the binding in between. When a `PATCH`
+has moved the project to another repository (or deleted it) in that
+window, the ids are already committed but the old repository's branch
+is not recorded against the new binding: the job logs
+`Recorded GitHub ids but skipped default branch` with the ids it wrote
+and returns `metadata_only`, rather than the `skipped` of a resolve
+that wrote nothing, and the rebind's own resolve records the new
+repository's branch. A `repository.renamed` or
+`repository.transferred` delivery in the same window is not a rebind:
+it keeps the repository id the resolve just committed, so the branch
+is recorded and the job returns `completed`.
 
 A `repository.edited` delivery that matched any project ends with
 `Processed repository.edited default branch change`, which counts the

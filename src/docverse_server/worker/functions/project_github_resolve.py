@@ -37,6 +37,7 @@ from arq import Retry
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse_server.domain.project import Project
 from docverse_server.factory import Factory
 from docverse_server.metrics import (
     DocverseEvents,
@@ -178,14 +179,18 @@ async def project_github_resolve(
     Returns
     -------
     str
-        ``"completed"`` on a successful resolve, ``"skipped"`` when the
-        project has no GitHub binding (or has been deleted, or was
-        rebound while GitHub answered), ``"not_installed"`` when the
-        GitHub App is not installed on the repository (an expected,
-        operator-recoverable state — the ids stay NULL and the
-        ``installation`` webhook backfills them once the App is
-        installed), or ``"failed"`` when GitHub returned a genuine error
-        or the columns could not be written.
+        ``"completed"`` on a successful resolve; ``"skipped"`` when
+        nothing was written because the project has no GitHub binding
+        (or has been deleted, or was rebound while GitHub answered);
+        ``"metadata_only"`` when the ids were committed but the project
+        was rebound or deleted before the default branch could be
+        applied (the rebind's own resolve records the new repository's
+        branch); ``"not_installed"`` when the GitHub App is not
+        installed on the repository (an expected, operator-recoverable
+        state — the ids stay NULL and the ``installation`` webhook
+        backfills them once the App is installed); or ``"failed"`` when
+        GitHub returned a genuine error or the columns could not be
+        written.
 
     Raises
     ------
@@ -297,16 +302,24 @@ async def project_github_resolve(
             project_id=project_id,
             owner=owner,
             repo=repo,
+            repo_id=metadata.repo_id,
             default_branch=metadata.default_branch,
             previous_default_branch=previous_default_branch,
             logger=logger,
         )
         if outcome is None:
+            # Unlike the pre-commit skip above, the ids *are* in the
+            # row's history, so the outcome and the line say what was
+            # written as well as what was not.
             logger.info(
-                "Skipping default branch: project binding changed during "
-                "resolve"
+                "Recorded GitHub ids but skipped default branch: project "
+                "rebound or deleted after the ids were committed",
+                github_installation_id=metadata.installation_id,
+                github_owner_id=metadata.owner_id,
+                github_repo_id=metadata.repo_id,
+                github_default_branch=metadata.default_branch,
             )
-            return "skipped"
+            return "metadata_only"
 
         logger.info(
             "Resolved project GitHub metadata",
@@ -331,6 +344,7 @@ async def _apply_default_branch(
     project_id: int,
     owner: str,
     repo: str,
+    repo_id: int,
     default_branch: str,
     previous_default_branch: str | None,
     logger: structlog.stdlib.BoundLogger,
@@ -356,19 +370,19 @@ async def _apply_default_branch(
     row while waiting on it (advisory lock, then rows). The binding is
     re-read first so a project rebound between the two transactions
     does not record the old repository's branch; the rebind enqueued
-    its own resolve.
+    its own resolve. See :func:`_still_bound` for what counts as the
+    same binding.
 
     Returns
     -------
     DefaultBranchOutcome or None
         What the service changed, or ``None`` when the project is gone
-        or no longer bound to ``owner/repo``.
+        or no longer bound to the repository the resolve read.
     """
     async with session.begin():
         project = await factory.create_project_store().get_by_id(project_id)
-        if project is None or (project.github_owner, project.github_repo) != (
-            owner,
-            repo,
+        if project is None or not _still_bound(
+            project, owner=owner, repo=repo, repo_id=repo_id
         ):
             return None
         outcome = await factory.create_default_branch_service().apply(
@@ -402,3 +416,43 @@ async def _apply_default_branch(
         project_slug=project.slug,
     )
     return outcome
+
+
+def _still_bound(
+    project: Project, *, owner: str, repo: str, repo_id: int
+) -> bool:
+    """Report whether a re-read project is bound to the resolved repo.
+
+    The numeric repository id is the identity: the resolve committed
+    ``repo_id`` a moment earlier, and ``repository.renamed`` /
+    ``repository.transferred`` match the row on it and keep it while
+    they rewrite ``github_owner`` / ``github_repo``. A row still holding
+    ``repo_id`` is therefore the same repository under whatever name it
+    has now, and its default branch is the one GitHub just reported —
+    comparing names would mistake that rename for a rebind and drop the
+    branch.
+
+    A ``PATCH`` rebind clears the id, so only a row without one falls
+    back to comparing names; a row holding a *different* id was rebound
+    and already re-resolved.
+
+    Parameters
+    ----------
+    project
+        The project as re-read in the default-branch transaction.
+    owner
+        The owner login the resolve read the repository under.
+    repo
+        The repository name the resolve read it under.
+    repo_id
+        The numeric repository id the resolve committed.
+
+    Returns
+    -------
+    bool
+        `True` when the default branch the resolve read describes the
+        repository the project is bound to now.
+    """
+    if project.github_repo_id is not None:
+        return project.github_repo_id == repo_id
+    return (project.github_owner, project.github_repo) == (owner, repo)

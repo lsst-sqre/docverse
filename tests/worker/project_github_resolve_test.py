@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import httpx
 import pytest
@@ -25,6 +27,7 @@ from docverse.models import (
     EditionKind,
     OrganizationCreate,
     ProjectCreate,
+    ProjectUpdate,
     TrackingMode,
 )
 from docverse.models.projects import ProjectGitHubBindingCreate
@@ -39,6 +42,8 @@ from docverse_server.metrics import (
     MetricsEditionKind,
     build_event_manager,
 )
+from docverse_server.services.default_branch import DefaultBranchOutcome
+from docverse_server.services.project import ProjectService
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
@@ -51,6 +56,15 @@ from tests.conftest import seed_org_with_admin
 from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
 from tests.worker.conftest import make_worker_ctx
+
+_RESOLVE_MODULE = importlib.import_module(
+    "docverse_server.worker.functions.project_github_resolve"
+)
+"""The resolve worker's module.
+
+``docverse_server.worker.functions`` re-exports the function under the
+module's own name, so attribute access reaches the function instead.
+"""
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -989,3 +1003,174 @@ async def test_project_github_resolve_rebound_mid_resolve_records_nothing(
 
     assert result == "skipped"
     assert await _fetch_project_default_branch(project_id) is None
+
+
+def _interleave_after_ids_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    write: Callable[[], Awaitable[None]],
+) -> None:
+    """Run ``write`` after the resolve commits the ids, before the branch.
+
+    The resolve commits the three ``github_*_id`` columns and then
+    applies the default branch in a second transaction; ``write`` lands
+    in the window between the two, as a webhook or a ``PATCH`` handled
+    concurrently would.
+    """
+    apply_default_branch: Callable[
+        ..., Awaitable[DefaultBranchOutcome | None]
+    ] = _RESOLVE_MODULE._apply_default_branch
+
+    async def interleaved(**kwargs: Any) -> DefaultBranchOutcome | None:
+        await write()
+        return await apply_default_branch(**kwargs)
+
+    monkeypatch.setattr(_RESOLVE_MODULE, "_apply_default_branch", interleaved)
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_rename_after_ids_commit_records_branch(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rename landing between the two commits still records the branch.
+
+    ``repository.renamed`` matches the project on the ``github_repo_id``
+    this resolve just committed and keeps it, so the row still describes
+    the repository GitHub answered for, under its new name. The default
+    branch belongs to that same repository and is recorded.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+
+    async def rename() -> None:
+        async for session in db_session_dependency():
+            async with session.begin():
+                renamed = await ProjectStore(
+                    session=session, logger=_logger()
+                ).rename_repo_by_repo_id(
+                    github_repo_id=12345, new_repo="renamed"
+                )
+            assert renamed == [project_id]
+
+    _interleave_after_ids_commit(monkeypatch, rename)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert result == "completed"
+    assert await _fetch_project_github_ids(project_id) == (
+        "acme",
+        "renamed",
+        111,
+        12345,
+        42,
+    )
+    assert await _fetch_project_default_branch(project_id) == "master"
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_rebind_after_ids_commit_is_metadata_only(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``PATCH`` rebind between the two commits skips only the branch.
+
+    The ids were already committed for the old repository when the
+    ``PATCH`` moved the binding (clearing them, as a rebind does), so the
+    old repository's default branch is not recorded against the new
+    binding. The job says so with its own outcome and log line rather
+    than the pre-commit ``"skipped"``, which wrote nothing.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(
+            db_session, org_slug="pgr-window-rebind"
+        )
+        await db_session.commit()
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+
+    async def rebind() -> None:
+        async for session in db_session_dependency():
+            async with session.begin():
+                await ProjectService(
+                    store=ProjectStore(session=session, logger=_logger()),
+                    org_store=OrganizationStore(
+                        session=session, logger=_logger()
+                    ),
+                    edition_store=EditionStore(
+                        session=session, logger=_logger()
+                    ),
+                    logger=_logger(),
+                ).update(
+                    org_slug="pgr-window-rebind",
+                    slug="pgr-proj",
+                    data=ProjectUpdate(
+                        github=ProjectGitHubBindingCreate(
+                            owner="acme", repo="moved"
+                        )
+                    ),
+                )
+
+    _interleave_after_ids_commit(monkeypatch, rebind)
+
+    with capture_logs() as captured:
+        async with httpx.AsyncClient() as http_client:
+            ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+            result = await project_github_resolve(
+                ctx, {"project_id": project_id}
+            )
+
+    assert result == "metadata_only"
+    assert await _fetch_project_github_ids(project_id) == (
+        "acme",
+        "moved",
+        None,
+        None,
+        None,
+    )
+    assert await _fetch_project_default_branch(project_id) is None
+    messages = [entry["event"] for entry in captured]
+    assert (
+        "Skipping persist: project binding changed during resolve"
+        not in messages
+    )
+    [skip_log] = [
+        entry for entry in captured if entry["event"] == _METADATA_ONLY_MESSAGE
+    ]
+    assert skip_log["log_level"] == "info"
+    assert (
+        skip_log["github_installation_id"],
+        skip_log["github_owner_id"],
+        skip_log["github_repo_id"],
+        skip_log["github_default_branch"],
+    ) == (42, 111, 12345, "master")
+
+
+_METADATA_ONLY_MESSAGE = (
+    "Recorded GitHub ids but skipped default branch: project rebound or "
+    "deleted after the ids were committed"
+)
