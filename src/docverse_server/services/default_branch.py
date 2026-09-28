@@ -280,7 +280,8 @@ class DefaultBranchService:
             What reported it, for the logs.
         old_default_branch
             The branch that was the default before, when the trigger
-            knows it (the webhook's ``changes.default_branch.from``).
+            knows it (the webhook's ``changes.default_branch.from``, or
+            for the resolve the branch a rebind cleared from the column).
             ``__main`` tracking exactly this ref is taken as tracking a
             ref that is gone.
         live_refs

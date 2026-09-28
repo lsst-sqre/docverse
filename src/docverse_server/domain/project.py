@@ -103,7 +103,8 @@ class Project(BaseModel):
         default=None,
         description=(
             "The repository's default branch as GitHub last reported"
-            " it, captured by the resolve worker. ``None`` until"
+            " it, captured by the resolve worker and cleared when a"
+            " PATCH unbinds or rebinds the project. ``None`` until"
             " learned; consumers fall back to ``main``."
         ),
     )

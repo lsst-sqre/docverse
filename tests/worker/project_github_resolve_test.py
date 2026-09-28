@@ -792,8 +792,16 @@ async def _resolve_with(
     project_id: int,
     events: DocverseEvents,
     arq_queue: MockArqQueue,
+    previous_default_branch: str | None = None,
 ) -> str:
-    """Run one resolve with metrics and the arq queue observable."""
+    """Run one resolve with metrics and the arq queue observable.
+
+    ``previous_default_branch`` lands in the payload as a ``PATCH``
+    rebind puts it there.
+    """
+    payload: dict[str, object] = {"project_id": project_id}
+    if previous_default_branch is not None:
+        payload["previous_default_branch"] = previous_default_branch
     async with httpx.AsyncClient() as http_client:
         ctx = make_worker_ctx(
             http_client=http_client,
@@ -803,28 +811,37 @@ async def _resolve_with(
             github_webhook_secret=SecretStr("webhook-secret"),
             events=events,
         )
-        return await project_github_resolve(ctx, {"project_id": project_id})
+        return await project_github_resolve(ctx, payload)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_default_branch", "previous_default_branch"),
+    [(None, "master"), ("master", None)],
+    ids=["rebind-payload", "stored-column"],
+)
 async def test_project_github_resolve_rewrites_main_on_the_old_branch(
     app: None,
     db_session: AsyncSession,
     mock_github: GitHubMock,
+    stored_default_branch: str | None,
+    previous_default_branch: str | None,
 ) -> None:
     """A resolve learning a new branch moves ``__main`` off the old one.
 
-    The column's previous value (``master``) is the old default branch,
-    so a ``__main`` still tracking it is rewritten onto ``main``, the
-    ``main`` draft is retired, and ``__main`` is repointed and
-    announced exactly as the webhook would (PRD #721).
+    The old default branch (``master``) comes from the payload after a
+    ``PATCH`` rebind, which cleared the column, and otherwise from the
+    column's previous value. Either way a ``__main`` still tracking it
+    is rewritten onto ``main``, the ``main`` draft is retired, and
+    ``__main`` is repointed and announced exactly as the webhook would
+    (PRD #721).
     """
     manager, events = await build_event_manager(Configuration())
     arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
     seeded = await _seed_converging_project(
         db_session,
         org_slug="pgr-rewrite",
-        stored_default_branch="master",
+        stored_default_branch=stored_default_branch,
         main_ref="master",
     )
     mock_github.seed_installation(
@@ -840,6 +857,7 @@ async def test_project_github_resolve_rewrites_main_on_the_old_branch(
             project_id=seeded.project_id,
             events=events,
             arq_queue=arq_queue,
+            previous_default_branch=previous_default_branch,
         )
 
     assert result == "completed"

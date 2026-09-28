@@ -108,7 +108,10 @@ Docverse therefore records each bound project's default branch in
 through the API — GitHub is the source of truth — and it reads `null`
 until Docverse has learned it, which every consumer treats as `main`.
 Recording a new value moves the project's `date_updated`; an unchanged
-one does not.
+one does not. A `PATCH` that unbinds the project (`github: null`, or a
+non-GitHub `source_url`) or binds it to another repository clears the
+column along with the numeric ids, so it never describes a repository
+the project is no longer bound to.
 
 ### Three triggers, one rule
 
@@ -119,7 +122,7 @@ exists:
 | Trigger | When it runs | Its evidence that `__main`'s ref is gone |
 | --- | --- | --- |
 | `webhook` | A `repository.edited` delivery whose `changes` carry `default_branch` | `changes.default_branch.from`: the branch that just stopped being the default |
-| `resolve` | `project_github_resolve`, after a project is created with a `github` binding or a `PATCH` names one | The branch the column held before, if any — a project rebound to a repository with a different default |
+| `resolve` | `project_github_resolve`, after a project is created with a `github` binding or a `PATCH` names one | The old repository's default branch, for a project rebound to another repository: the `PATCH` clears the column, so the job's payload carries the value it held as `previous_default_branch`. Without one, the column's current value, if any |
 | `audit` | The daily `git_ref_audit`, at 05:17 UTC | The live branch and tag names it fetched for the project |
 
 All three hand the branch to one rule, `DefaultBranchService.apply`,
@@ -194,8 +197,8 @@ rule has no metrics event of its own.
   `alternate_name`: neither ever matches alongside `__main`.
 - A build still processing: step 4 repoints only at completed builds,
   and edition tracking advances `__main` when the build completes.
-- A project with no GitHub binding: its column stays `null` and every
-  consumer keeps the `main` fallback.
+- A project with no GitHub binding: unbinding clears its column, it
+  stays `null`, and every consumer keeps the `main` fallback.
 
 ### `lsst_doc` editions
 

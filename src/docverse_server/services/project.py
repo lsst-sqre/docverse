@@ -36,7 +36,7 @@ def patch_changes_github_binding(data: ProjectUpdate) -> bool:
     supplying a non-null ``source_url``, which the validator guarantees
     is non-GitHub and which therefore clears the binding. Every other
     PATCH — a retitle, new lifecycle rules, an explicit
-    ``source_url: null`` on a bound project — leaves all five
+    ``source_url: null`` on a bound project — leaves all six
     ``github_*`` columns exactly as they were.
 
     The handler uses this to decide whether a PATCH is worth a
@@ -115,15 +115,26 @@ class ProjectService:
         touches it also reconciles the cosmetic ``source_url`` column:
 
         * ``github`` set → write ``github_owner``/``github_repo``, clear
-          the three opportunistically-captured numeric columns so they
-          re-resolve against the new repo, **and null ``source_url``** so
-          a project that was previously non-GitHub does not keep a stale
-          free-form URL alongside its new binding.
-        * ``github: null`` → clear all five github_* columns; the binding
+          the three opportunistically-captured numeric columns and
+          ``github_default_branch`` so they re-resolve against the new
+          repo, **and null ``source_url``** so a project that was
+          previously non-GitHub does not keep a stale free-form URL
+          alongside its new binding.
+        * ``github: null`` → clear all six github_* columns; the binding
           is gone and the derived URL falls back to ``source_url``.
         * neither, but a non-null ``source_url`` (guaranteed non-GitHub
-          by the validator) → clear all five github_* columns so the
+          by the validator) → clear all six github_* columns so the
           project flips to the non-GitHub URL.
+
+        ``github_default_branch`` describes the repository the project
+        was bound to, so it goes with the binding (PRD #721). Nothing
+        re-learns it for an unbound project — the resolve and the audit
+        visit only bound ones — so leaving it would keep the old
+        repository's branch steering ``__main`` forever, and a rebound
+        project would report repo A's branch as repo B's until a resolve
+        of B succeeded. The value it held is not lost on a rebind:
+        :meth:`update` returns it, and the resolve job carries it as the
+        evidence that ``__main``'s old ref is gone.
         * otherwise → no github_* / source_url overrides; the
           ``exclude_unset`` model dump in the store handles a plain
           ``source_url: null`` clear on its own. This is the case
@@ -138,6 +149,7 @@ class ProjectService:
             "github_owner_id": None,
             "github_repo_id": None,
             "github_installation_id": None,
+            "github_default_branch": None,
         }
         if "github" in data.model_fields_set:
             if data.github is None:
@@ -148,6 +160,7 @@ class ProjectService:
                 "github_owner_id": None,
                 "github_repo_id": None,
                 "github_installation_id": None,
+                "github_default_branch": None,
                 "source_url": None,
             }
         # A non-null ``source_url``, guaranteed non-GitHub by the
@@ -305,8 +318,21 @@ class ProjectService:
 
     async def update(
         self, *, org_slug: str, slug: str, data: ProjectUpdate
-    ) -> tuple[Organization, Project]:
+    ) -> tuple[Organization, Project, str | None]:
         """Update a project.
+
+        Returns
+        -------
+        tuple
+            The organization, the updated project, and the
+            ``github_default_branch`` the project held before this PATCH
+            rewrote its binding — ``None`` when the PATCH left the
+            binding alone, or the column was not yet learned. A binding
+            change clears the column (see
+            :meth:`_resolve_github_for_update`), so this is the only
+            record of the old repository's default branch left for the
+            resolve job, which needs it to move a ``__main`` still
+            tracking that branch (PRD #721).
 
         Raises
         ------
@@ -315,6 +341,11 @@ class ProjectService:
         """
         org = await self._resolve_org(org_slug)
         extra_updates = self._resolve_github_for_update(data)
+        previous_default_branch = None
+        if extra_updates:
+            existing = await self._store.get_by_slug(org_id=org.id, slug=slug)
+            if existing is not None:
+                previous_default_branch = existing.github_default_branch
         project = await self._store.update(
             org_id=org.id,
             slug=slug,
@@ -325,7 +356,7 @@ class ProjectService:
             msg = f"Project {slug!r} not found"
             raise NotFoundError(msg)
         self._logger.info("Updated project", slug=slug, org=org_slug)
-        return org, project
+        return org, project, previous_default_branch
 
     async def soft_delete(
         self, *, org_slug: str, slug: str

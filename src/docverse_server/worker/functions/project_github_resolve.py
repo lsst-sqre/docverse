@@ -160,9 +160,10 @@ async def project_github_resolve(
     Writes the three ``github_*_id`` columns, then applies the
     repository's default branch through ``DefaultBranchService``
     (PRD #721), which records ``github_default_branch`` and converges a
-    ``__main`` still tracking the branch the column held before. Each
-    write is a no-op when GitHub reports what the row already holds, so
-    a re-resolve leaves the project's clock alone.
+    ``__main`` still tracking the previous default branch — the one a
+    ``PATCH`` rebind cleared, carried in the payload, or else the one
+    the column held. Each write is a no-op when GitHub reports what the
+    row already holds, so a re-resolve leaves the project's clock alone.
 
     Parameters
     ----------
@@ -170,7 +171,9 @@ async def project_github_resolve(
         arq worker context (``factory_builder``, ``http_client``,
         ``arq_queue``, and arq's own ``job_try``).
     payload
-        Job payload with ``project_id``.
+        Job payload with ``project_id`` and, after a ``PATCH`` rebind of
+        a project whose default branch was known, the
+        ``previous_default_branch`` the rebind cleared.
 
     Returns
     -------
@@ -194,6 +197,9 @@ async def project_github_resolve(
         recorded exactly as it was before retries existed.
     """
     project_id: int = payload["project_id"]
+    previous_default_branch: str | None = payload.get(
+        "previous_default_branch"
+    )
     logger = structlog.get_logger(
         "docverse_server.worker.project_github_resolve"
     ).bind(project_id=project_id)
@@ -292,6 +298,7 @@ async def project_github_resolve(
             owner=owner,
             repo=repo,
             default_branch=metadata.default_branch,
+            previous_default_branch=previous_default_branch,
             logger=logger,
         )
         if outcome is None:
@@ -325,20 +332,23 @@ async def _apply_default_branch(
     owner: str,
     repo: str,
     default_branch: str,
+    previous_default_branch: str | None,
     logger: structlog.stdlib.BoundLogger,
 ) -> DefaultBranchOutcome | None:
     """Converge the project on the default branch the resolve read.
 
     Routes the write through
     :class:`~docverse_server.services.default_branch.DefaultBranchService`
-    (PRD #721) with ``old_default_branch`` set to the column's previous
-    value and no live ref set. A first resolve (``NULL`` column) therefore
-    only seeds the column, while a binding moved to a repository with a
-    different default branch rewrites a ``__main`` still tracking the
-    branch recorded for the old one. A rewritten ``__main`` is announced
-    as a ``PATCH`` of it would be: its ``publish_edition`` job is handed
-    to arq, then one ``edition_lifecycle`` ``update`` event and one
-    ``dashboard_build``.
+    (PRD #721) with no live ref set and ``old_default_branch`` set to
+    ``previous_default_branch`` — the branch a ``PATCH`` rebind cleared
+    from the column, carried in the job payload — or, without one, the
+    column's current value. A first resolve (no previous branch, ``NULL``
+    column) therefore only seeds the column, while a binding moved to a
+    repository with a different default branch rewrites a ``__main``
+    still tracking the branch recorded for the old one. A rewritten
+    ``__main`` is announced as a ``PATCH`` of it would be: its
+    ``publish_edition`` job is handed to arq, then one
+    ``edition_lifecycle`` ``update`` event and one ``dashboard_build``.
 
     Runs in its own transaction after the ids commit, because the
     service takes ``__main``'s ``EDITION_UPDATE`` advisory lock before
@@ -365,7 +375,9 @@ async def _apply_default_branch(
             project=project,
             default_branch=default_branch,
             trigger=DefaultBranchTrigger.resolve,
-            old_default_branch=project.github_default_branch,
+            old_default_branch=(
+                previous_default_branch or project.github_default_branch
+            ),
         )
         org = await factory.create_org_store().get_by_id(project.org_id)
         await session.commit()

@@ -23,6 +23,7 @@ from docverse_server.domain.base32id import (
     serialize_base32_id,
     validate_base32_id,
 )
+from docverse_server.domain.project import Project as DomainProject
 from docverse_server.domain.slug import VersionRule, parse_slug_rewrite_rules
 from docverse_server.factory import Factory
 from docverse_server.metrics import (
@@ -1474,6 +1475,133 @@ async def test_patch_project_sets_github_binding_drops_source_url(
     assert data["source_url"] == "https://github.com/lsst/add-gh"
 
 
+async def _set_github_default_branch(slug: str, value: str) -> None:
+    """Record a project's default branch the way a resolve would.
+
+    Stands in for the triggers that learn it from GitHub (PRD #721),
+    all of which land it through
+    :meth:`~docverse_server.storage.project_store.ProjectStore
+    .set_github_default_branch`.
+    """
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_id = (
+                await session.execute(
+                    select(SqlProject.id).where(SqlProject.slug == slug)
+                )
+            ).scalar_one()
+            store = ProjectStore(session=session, logger=logger)
+            await store.set_github_default_branch(
+                project_id=project_id, value=value
+            )
+            await session.commit()
+        break
+
+
+async def _load_project(slug: str) -> DomainProject:
+    """Read one live project's domain representation by slug."""
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_id = (
+                await session.execute(
+                    select(SqlProject.id).where(SqlProject.slug == slug)
+                )
+            ).scalar_one()
+            project = await ProjectStore(
+                session=session, logger=logger
+            ).get_by_id(project_id)
+        assert project is not None
+        return project
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"github": None},
+        {"github": None, "source_url": "https://gitlab.com/lsst/unbind"},
+        {"source_url": "https://gitlab.com/lsst/unbind"},
+    ],
+    ids=["github-null", "github-null-and-source-url", "source-url"],
+)
+async def test_patch_project_unbinding_clears_github_default_branch(
+    client: AsyncClient, body: dict[str, str | None]
+) -> None:
+    """Unbinding a project forgets its repository's default branch.
+
+    Nothing learns a default branch for an unbound project — the resolve
+    skips it and the audit only visits bound ones — so a column the
+    PATCH left behind would steer ``__main`` and ``lsst_doc`` matching
+    off a repository the project no longer has, forever. Clearing it
+    puts the project back on the ``main`` fallback (review of PR #730).
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "unbind",
+            "title": "Unbind",
+            "github": {"owner": "lsst", "repo": "unbind"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    await _set_github_default_branch("unbind", "master")
+
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/unbind",
+        json=body,
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["github"] is None
+    project = await _load_project("unbind")
+    assert project.github_default_branch is None
+    assert project.effective_default_branch == "main"
+
+
+@pytest.mark.asyncio
+async def test_patch_project_rebinding_clears_github_default_branch(
+    client: AsyncClient,
+) -> None:
+    """Rebinding a project forgets the old repository's default branch.
+
+    The column describes the repository the project was bound to, so a
+    PATCH onto another one clears it along with the numeric ids: the API
+    reports ``default_branch: null`` rather than repo A's branch as repo
+    B's, and consumers fall back to ``main`` until the resolve reads repo
+    B (review of PR #730).
+    """
+    await _setup(client)
+    await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "rebind",
+            "title": "Rebind",
+            "github": {"owner": "lsst", "repo": "rebind-a"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    await _set_github_default_branch("rebind", "master")
+
+    response = await client.patch(
+        "/docverse/orgs/proj-org/projects/rebind",
+        json={"github": {"owner": "lsst", "repo": "rebind-b"}},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+
+    assert response.status_code == 200
+    binding = response.json()["github"]
+    assert (binding["repo"], binding["default_branch"]) == ("rebind-b", None)
+    project = await _load_project("rebind")
+    assert project.github_default_branch is None
+    assert project.effective_default_branch == "main"
+
+
 @pytest.mark.asyncio
 async def test_patch_project_source_url_null_leaves_github_intact(
     client: AsyncClient,
@@ -1593,19 +1721,7 @@ async def test_get_project_shows_github_default_branch(
     assert response.status_code == 200
     assert response.json()["github"]["default_branch"] is None
 
-    logger = structlog.get_logger("docverse")
-    async for session in db_session_dependency():
-        async with session.begin():
-            result = await session.execute(
-                select(SqlProject.id).where(SqlProject.slug == "gh-branch")
-            )
-            project_id = result.scalar_one()
-            store = ProjectStore(session=session, logger=logger)
-            await store.set_github_default_branch(
-                project_id=project_id, value="master"
-            )
-            await session.commit()
-        break
+    await _set_github_default_branch("gh-branch", "master")
 
     response = await client.get(
         "/docverse/orgs/proj-org/projects/gh-branch",

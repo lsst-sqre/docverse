@@ -13,7 +13,7 @@ worker queue stays signal-only.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import sentry_sdk
 import structlog
@@ -34,6 +34,7 @@ async def try_enqueue_project_github_resolve_by_id(
     session: AsyncSession,
     logger: structlog.stdlib.BoundLogger,
     project_id: int,
+    previous_default_branch: str | None = None,
 ) -> None:
     """Enqueue one ``project_github_resolve`` job in its own transaction.
 
@@ -46,6 +47,14 @@ async def try_enqueue_project_github_resolve_by_id(
     ``github_owner`` / ``github_repo``): the worker would just return
     ``"skipped"`` after a single DB read, and avoiding the enqueue
     keeps the queue signal-only.
+
+    ``previous_default_branch`` is the ``github_default_branch`` a
+    ``PATCH`` rebind cleared (PRD #721). When given, the payload carries
+    it and the worker hands it to ``DefaultBranchService`` as the old
+    default branch, so a ``__main`` still tracking the old repository's
+    default is rewritten onto the new one's. Without it — a create, or a
+    rebind of a project whose branch was never learned — the payload is
+    ``project_id`` alone.
     """
     try:
         async with session.begin():
@@ -57,13 +66,16 @@ async def try_enqueue_project_github_resolve_by_id(
                 or project.github_repo is None
             ):
                 return
+            payload: dict[str, Any] = {"project_id": project_id}
+            if previous_default_branch is not None:
+                payload["previous_default_branch"] = previous_default_branch
             queue_backend = factory.create_queue_backend()
             # Route onto the dedicated maintenance pool (PRD #419): the
             # resolve's installation-id lookup is opportunistic and must
             # not contend with the default pool's live publishing flow.
             await queue_backend.enqueue(
                 "project_github_resolve",
-                {"project_id": project_id},
+                payload,
                 queue_name=MAINTENANCE_QUEUE_NAME,
             )
             await session.commit()
