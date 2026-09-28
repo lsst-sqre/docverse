@@ -504,7 +504,23 @@ the proactive lifecycle pass (see
 [Lifecycle rules read the same clock](#lifecycle-rules-read-the-same-clock))
 both read it, so they cannot disagree.
 
-Three refinements decide *which* rows are stamped:
+Four refinements decide *which* rows are stamped:
+
+- **Only editions still serving the build keeper-sync imported.**
+  Keeper-sync owns an edition's clock only while the edition's current
+  build is the Docverse build its LTD edition maps to. A project cut
+  over to publishing directly to Docverse, but not yet excluded from
+  keeper-sync scope, stops publishing to LTD, so its LTD editions
+  freeze. When a native upload repoints one of its editions, the next
+  visit finds LTD unchanged, short-circuits without moving the pointer
+  back, and then leaves the edition's clock alone — along with the
+  build and aggregates it would have stamped with it. The edition keeps
+  the `date_updated` its native build gave it, instead of being dragged
+  back to LTD's frozen `date_rebuilt` on every poll. This is what makes
+  the cutover assumption — a repo publishes to LTD or to Docverse,
+  never both — safe however late the project leaves keeper-sync scope.
+  An LTD edition with no build has nothing to compare and is stamped as
+  usual.
 
 - **The build is the edition's current one.** The stamp writes the
   Docverse build the edition's LTD build maps to, and only ever moves

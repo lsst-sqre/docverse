@@ -803,9 +803,14 @@ class KeeperSyncService:
 
         The same key the native path takes in
         ``EditionTrackingService._set_current_build_locked`` and in the
-        ``publish_edition`` worker, so a project mid-migration —
-        publishing natively while keeper-sync still polls — cannot
-        interleave two pointer writes on one edition.
+        ``publish_edition`` worker, so a project mid-migration — cut
+        over to publishing natively but not yet excluded from
+        keeper-sync scope, so keeper-sync still polls it — cannot
+        interleave two pointer writes on one edition. The lock covers
+        the pointer only. The edition's clock is kept apart by rule
+        instead: once a native build has replaced the one keeper-sync
+        imported, :meth:`_stamp_ltd_clock` stops stamping the edition,
+        and LTD's dates no longer apply to it.
 
         Acquisition follows the DM-54693 convention established by
         ``build_processing`` and ``publish_edition``: resolve the key
@@ -1620,6 +1625,24 @@ class KeeperSyncService:
         ``track_build`` takes the same rows for a native upload of the
         release's tag.
 
+        Keeper-sync owns the clock only of an edition still serving the
+        build it imported. When the edition row's ``current_build_id``
+        is not the Docverse build *build_outcome* mapped this LTD
+        edition to, the edition has moved on to a native build: a
+        project cut over to publishing directly to Docverse but still in
+        keeper-sync scope, whose frozen LTD edition makes ``sync_build``
+        short-circuit on "state matches LTD" and leave the native
+        pointer alone. That edition keeps its own clock, so nothing is
+        written — build and aggregates included — and the stamp reports
+        ``False``. This is what makes the cutover assumption (a repo
+        publishes to LTD or to Docverse, never both) safe however late
+        the project is excluded from keeper-sync scope. The comparison
+        reads the row fresh inside the stamp's transaction, not
+        *edition*, which was loaded before ``sync_build`` ran and misses
+        its repoint, and any native one since. A build-less LTD edition
+        (*build_outcome* ``None``) has no build to compare and is
+        stamped as before.
+
         Each stamp is a compare-and-set, so a visit whose rows already
         match writes nothing and reports ``False``. An edition
         soft-deleted mid-visit is left alone, build and aggregates
@@ -1644,6 +1667,23 @@ class KeeperSyncService:
             async with self._session.begin():
                 current = await self._edition_store.get_by_id(edition.id)
                 if current is None:
+                    return False
+                if (
+                    build_outcome is not None
+                    and current.current_build_id
+                    != build_outcome.docverse_build_id
+                ):
+                    self._logger.debug(
+                        "Edition moved off its LTD build; leaving its clock",
+                        edition_id=edition.id,
+                        edition_slug=current.slug,
+                        project_id=current.project_id,
+                        ltd_edition_id=ltd_edition.ltd_id,
+                        current_build_id=current.current_build_id,
+                        ltd_build_docverse_id=(
+                            build_outcome.docverse_build_id
+                        ),
+                    )
                     return False
                 if build_outcome is not None:
                     restamped_aggregates = await self._stamp_aggregate_clocks(

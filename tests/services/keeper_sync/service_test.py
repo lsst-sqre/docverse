@@ -1271,6 +1271,79 @@ async def test_steady_state_visit_writes_no_clock(
         )
 
 
+@pytest.mark.asyncio
+async def test_native_repoint_keeps_the_edition_clock(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An edition that moved on to a native build keeps its own clock.
+
+    A project cut over to publishing directly to Docverse, but not yet
+    dropped from keeper-sync scope: a native upload repoints the
+    keeper-created ``__main``, while LTD, no longer published to, keeps
+    reporting the build keeper-sync imported. The next visit
+    short-circuits in ``sync_build`` ("state matches LTD") and leaves
+    the native pointer alone, so the clock stamp has to leave the
+    edition alone too — not drag ``date_updated`` back to LTD's frozen
+    ``date_rebuilt`` on every poll.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+    ltd_edition = LtdEdition.model_validate(
+        _load("edition_main_git_refs.json")
+    )
+    assert ltd_edition.date_rebuilt is not None
+    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    project_id = first.docverse_project_id
+    assert project_id is not None
+    edition_id = first.edition_outcomes[0].docverse_edition_id
+    assert edition_id is not None
+
+    # The native upload's repoint moves ``date_updated`` to its own now.
+    native_build_id = await _seed_native_release_build(
+        db_session, project_id=project_id, git_ref="main"
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        await edition_store.set_current_build(
+            edition_id=edition_id,
+            build_id=native_build_id,
+            skip_date_guard=True,
+        )
+    async with db_session.begin():
+        native_clock = await _read_edition_clock(
+            db_session, project_id=project_id, slug=DEFAULT_EDITION_SLUG
+        )
+    assert native_clock[1] > ltd_edition.date_rebuilt
+
+    second = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    (outcome,) = second.edition_outcomes
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is True
+    assert outcome.build_outcome.docverse_build_id != native_build_id
+    assert outcome.dates_restamped is False
+    async with db_session.begin():
+        edition = await edition_store.get_by_id(edition_id)
+        assert edition is not None
+        assert edition.current_build_id == native_build_id
+        assert (
+            await _read_edition_clock(
+                db_session, project_id=project_id, slug=DEFAULT_EDITION_SLUG
+            )
+            == native_clock
+        )
+
+
 def test_restamped_edition_count_counts_restamped_outcomes() -> None:
     """The project's restamp count is per edition, not "did any move".
 
@@ -6646,6 +6719,96 @@ async def test_drifted_aggregate_clock_is_restamped_without_the_backfill(
                 db_session, project_id=project_id, slug=slug
             )
             assert date_updated == ltd_release.date_rebuilt
+
+
+@pytest.mark.asyncio
+async def test_native_repoint_leaves_the_imported_build_and_aggregates(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The build and aggregates stamped with a release stand down with it.
+
+    Once a native upload has moved the release edition off the build
+    keeper-sync imported, that build is no longer what the edition
+    serves, and neither it nor the ``15`` / ``15.2`` aggregates still on
+    it are re-dated from the release's visit. Both are drifted later
+    than LTD's dates here, where even the earlier-only build and
+    aggregate stamps would otherwise have moved them.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-clock-native")
+    project_id = await _seed_project(db_session, org_id=org_id)
+    release_payload = _version_edition_payload(slug="15.2.1", git_ref="15.2.1")
+    _seed_ltd_one_edition(mock_discovery, edition_payload=release_payload)
+    ltd_release = LtdEdition.model_validate(release_payload)
+    assert ltd_release.date_rebuilt is not None
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    (first_outcome,) = first.edition_outcomes
+    release_id = first_outcome.docverse_edition_id
+    assert release_id is not None
+    assert first_outcome.build_outcome is not None
+    keeper_build_id = first_outcome.build_outcome.docverse_build_id
+    assert keeper_build_id is not None
+    ltd_build_date = first_outcome.build_outcome.ltd_date_created
+
+    native_build_id = await _seed_native_release_build(
+        db_session, project_id=project_id, git_ref="15.2.1"
+    )
+    drift = datetime(2026, 9, 20, 8, 0, tzinfo=UTC)
+    assert drift > max(ltd_release.date_rebuilt, ltd_build_date)
+    async with db_session.begin():
+        await EditionStore(
+            session=db_session, logger=structlog.get_logger("test")
+        ).set_current_build(
+            edition_id=release_id,
+            build_id=native_build_id,
+            skip_date_guard=True,
+        )
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == keeper_build_id)
+            .values(date_created=drift, date_completed=drift)
+        )
+        await db_session.execute(
+            update(SqlEdition)
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.slug.in_(["15", "15.2"]),
+            )
+            .values(date_updated=drift)
+        )
+    async with db_session.begin():
+        build_version = await _read_row_version(
+            db_session, SqlBuild, keeper_build_id
+        )
+        aggregate_versions = await _read_aggregate_versions(
+            db_session, project_id=project_id
+        )
+
+    second = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    (outcome,) = second.edition_outcomes
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is True
+    assert outcome.build_outcome.docverse_build_id == keeper_build_id
+    assert outcome.dates_restamped is False
+    async with db_session.begin():
+        assert (
+            await _read_row_version(db_session, SqlBuild, keeper_build_id)
+            == build_version
+        )
+        assert (
+            await _read_aggregate_versions(db_session, project_id=project_id)
+            == aggregate_versions
+        )
 
 
 @pytest.mark.asyncio
