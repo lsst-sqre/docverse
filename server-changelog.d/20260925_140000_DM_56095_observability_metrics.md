@@ -11,6 +11,8 @@
 
 - A signed GitHub webhook delivery that gidgethub cannot parse (a content type other than JSON or a form, a body that does not decode, or a missing `X-GitHub-Event` or `X-GitHub-Delivery` header) is now answered `400 Bad Request` and recorded as `outcome=malformed`, instead of raising out of the handler as a `500`. `error` is left for failures while dispatching a delivery, so an alert on it is not set off by a caller's mistake. gidgethub checks the signature before parsing, so an unsigned request of any shape is still `401` and `invalid_signature`.
 
+- An LTD Keeper timestamp that arrives without a UTC offset (`date_created`, `date_rebuilt`, or `date_ended` on an edition or build) is now read as UTC, so it compares against Docverse's clocks instead of failing the edition's sync with a `TypeError`.
+
 ### Other changes
 
 - `docs/metrics.md` is a new catalog of every Sasquatch event Docverse publishes: its InfluxDB measurement (`lsst.square.metrics.events.docverse.<event>`), each field's type and meaning, which fields are tags under the Phalanx `influxTags` list and which events each tag applies to, the cardinality rule for choosing a tag, what `ltd_lag` and `ltd_lag_seconds` measure and when they are null, and example InfluxQL queries for sync lag, request volume, request latency, and webhook deliveries. It is linked from `docs/index.md`, from `build_content_copied` on the keeper-sync transport page, from the conditional GET section of the API conventions page, and from the README. `tests/docs_test.py` fails when an event `DocverseEvents.initialize` registers, or one of its fields, is missing from the page or typed or tagged differently there.

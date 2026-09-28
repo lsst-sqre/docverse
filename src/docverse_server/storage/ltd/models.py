@@ -7,10 +7,10 @@ ignored so a future LTD-side addition cannot break the sync.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 __all__ = [
     "LtdBuild",
@@ -86,6 +86,12 @@ class LtdEdition(BaseModel):
     tracked_refs: list[str] | None = None
     mode: str
 
+    @field_validator("date_created", "date_rebuilt", "date_ended")
+    @classmethod
+    def assume_utc(cls, value: datetime | None) -> datetime | None:
+        """Read a timestamp that arrived without an offset as UTC."""
+        return _assume_utc(value)
+
     @property
     def ltd_id(self) -> int:
         """Parse the integer LTD id from the trailing ``self_url`` segment."""
@@ -117,10 +123,30 @@ class LtdBuild(BaseModel):
     published_url: HttpUrl
     surrogate_key: str | None = None
 
+    @field_validator("date_created", "date_ended")
+    @classmethod
+    def assume_utc(cls, value: datetime | None) -> datetime | None:
+        """Read a timestamp that arrived without an offset as UTC."""
+        return _assume_utc(value)
+
     @property
     def ltd_id(self) -> int:
         """Parse the integer LTD id from the trailing ``self_url`` segment."""
         return _parse_trailing_id(str(self.self_url))
+
+
+def _assume_utc(value: datetime | None) -> datetime | None:
+    """Give a naive LTD timestamp the UTC zone it was serialised without.
+
+    LTD Keeper keeps its clocks in UTC and normally serialises them with
+    an offset. A value that arrives without one is the same instant in
+    UTC, and reading it that way keeps it comparable with Docverse's
+    aware clocks: a naive timestamp would otherwise raise ``TypeError``
+    wherever the sync engine compares or subtracts it.
+    """
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
 
 
 def _parse_trailing_id(url: str) -> int:

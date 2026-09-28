@@ -3069,13 +3069,12 @@ def _measure_ltd_lag_seconds(
     """Measure a build copy's ``ltd_lag_seconds``, or give ``None``.
 
     ``None`` when there is no ``ltd_date_rebuilt`` to measure from, and
-    also when it cannot be compared against Docverse's clock:
-    ``LtdEdition.date_rebuilt`` is not validated as timezone-aware, so an
-    LTD response without its trailing ``Z`` parses to a naive timestamp,
-    which an aware one cannot be subtracted from. The lag is a
-    metrics-only calculation, so that error is sent to Sentry and logged
-    rather than raised: it costs the report its lag, never the copy its
-    outcome.
+    also when it cannot be compared against Docverse's clock. An LTD
+    response cannot hand the service a naive timestamp
+    (:class:`~docverse_server.storage.ltd.LtdEdition` reads one as UTC),
+    but the lag is a metrics-only calculation, so a ``TypeError`` from
+    any other source of the value is sent to Sentry and logged rather
+    than raised: it costs the report its lag, never the copy its outcome.
     """
     if ltd_date_rebuilt is None:
         return None

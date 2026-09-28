@@ -89,6 +89,7 @@ from docverse_server.services.keeper_sync.service import (
     KeeperSyncContext,
     KeeperSyncService,
     ProjectSyncResult,
+    _measure_ltd_lag_seconds,
     _now,
     _retryable_transport_error,
 )
@@ -4816,58 +4817,25 @@ async def test_sync_build_isolates_a_raising_copy_report_hook(
     )
 
 
-@pytest.mark.asyncio
-async def test_sync_build_reports_no_lag_for_a_naive_date_rebuilt(
-    db_session: AsyncSession,
-    http_client: httpx.AsyncClient,
-    mock_discovery: respx.Router,
+def test_measure_ltd_lag_seconds_reports_none_when_incomparable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A ``date_rebuilt`` with no timezone cannot fail the copy it dates.
+    """An incomparable ``date_rebuilt`` costs the report only its lag.
 
-    ``LtdEdition.date_rebuilt`` is not validated as timezone-aware, so an
-    LTD response without its trailing ``Z`` parses to a naive timestamp,
-    which Docverse's aware clock cannot be subtracted from. The lag is a
-    metrics-only calculation: its error goes to Sentry and the log, the
-    report still goes out with no lag, and the copy lands.
+    ``LtdEdition`` reads a naive LTD timestamp as UTC, so an LTD response
+    cannot hand the copy one; the guard is for whatever else may supply
+    ``ltd_date_rebuilt`` (a future caller, a fixture). The lag is a
+    metrics-only calculation: its error goes to Sentry and the log, and
+    the caller gets no lag rather than an exception.
     """
-    async with db_session.begin():
-        org_id = await _seed_org(db_session, slug="ks-copy-report-naive")
-
-    _seed_ltd(mock_discovery)
-    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
-    reports, on_build_copied = _record_copy_reports()
-    service = _build_service(
-        db_session,
-        http_client,
-        MockObjectStore(),
-        source_objects,
-        on_build_copied=on_build_copied,
-    )
-    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
-    _rebuild_ltd_main(
-        mock_discovery,
-        source_objects,
-        date_rebuilt=(datetime.now(tz=UTC) - timedelta(minutes=1)).replace(
-            tzinfo=None
-        ),
-    )
-    reports.clear()
     captured: list[BaseException] = []
     monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+    naive = datetime.now(tz=UTC).replace(tzinfo=None)
 
     with structlog.testing.capture_logs() as logs:
-        result = await service.sync_project(
-            org_id=org_id, ltd_slug="pipelines"
-        )
+        lag = _measure_ltd_lag_seconds(naive, logger=structlog.get_logger())
 
-    assert result.edition_failures == ()
-    [outcome] = result.edition_outcomes
-    assert outcome.build_outcome is not None
-    assert outcome.build_outcome.short_circuited is False
-    [report] = reports
-    assert report.succeeded is True
-    assert report.ltd_lag_seconds is None
+    assert lag is None
     assert [type(exc) for exc in captured] == [TypeError]
     assert any(
         entry["event"] == "Could not measure LTD sync lag; reporting none"
@@ -4877,21 +4845,23 @@ async def test_sync_build_reports_no_lag_for_a_naive_date_rebuilt(
 
 
 @pytest.mark.asyncio
-async def test_failed_copy_with_a_naive_date_rebuilt_raises_its_own_error(
+async def test_failed_copy_report_error_cannot_replace_the_copy_error(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A naive ``date_rebuilt`` cannot replace a failed copy's own error.
+    """An error while reporting a failed copy leaves the copy's error in place.
 
     The failure report goes out while the copy's exception is being
-    handled, so a lag that raised there would reach ``sync_edition``'s
-    failure accounting in the copy's place. Here the copy's ``403`` is
-    what fails the edition, and the report still says the copy failed.
+    handled, so anything the report raised there would reach
+    ``sync_edition``'s failure accounting in the copy's place. Here the
+    lag measurement raises while the report is being built: the report
+    is dropped with its error sent to Sentry and the log, and the copy's
+    ``403`` is still what fails the edition.
     """
     async with db_session.begin():
-        org_id = await _seed_org(db_session, slug="ks-copy-report-naive-403")
+        org_id = await _seed_org(db_session, slug="ks-copy-report-broken")
 
     _seed_ltd(mock_discovery)
     source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
@@ -4909,20 +4879,37 @@ async def test_failed_copy_with_a_naive_date_rebuilt_raises_its_own_error(
     _rebuild_ltd_main(
         mock_discovery,
         source_objects,
-        date_rebuilt=(datetime.now(tz=UTC) - timedelta(minutes=1)).replace(
-            tzinfo=None
-        ),
+        date_rebuilt=datetime.now(tz=UTC) - timedelta(minutes=1),
     )
     reports.clear()
-    monkeypatch.setattr(sentry_sdk, "capture_exception", lambda _exc: None)
+    report_error = RuntimeError("the clock is broken")
 
-    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+    def _broken_lag(
+        ltd_date_rebuilt: datetime | None,
+        *,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> float | None:
+        raise report_error
+
+    monkeypatch.setattr(
+        service_module, "_measure_ltd_lag_seconds", _broken_lag
+    )
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    with (
+        structlog.testing.capture_logs() as logs,
+        pytest.raises(KeeperSyncSystemicFailureError) as exc_info,
+    ):
         await service.sync_project(org_id=org_id, ltd_slug="pipelines")
 
     assert exc_info.value.__cause__ is forbidden
-    [report] = reports
-    assert report.succeeded is False
-    assert report.ltd_lag_seconds is None
+    assert reports == []
+    assert report_error in captured
+    assert any(
+        entry["event"] == "on_build_copied callback raised; continuing"
+        for entry in logs
+    )
 
 
 @pytest.mark.asyncio
