@@ -7,6 +7,7 @@ from typing import Any
 
 import structlog
 
+from docverse_server.services.github_payload import coerce_int
 from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
 )
@@ -72,7 +73,7 @@ class InstallationEventProcessor:
         """Dispatch on the installation action."""
         action = payload.get("action")
         installation = payload.get("installation", {})
-        installation_id = _coerce_int(installation.get("id"))
+        installation_id = coerce_int(installation.get("id"))
 
         if installation_id is None or not isinstance(action, str):
             self._logger.warning(
@@ -166,7 +167,7 @@ class InstallationEventProcessor:
         """
         action = payload.get("action")
         installation = payload.get("installation", {})
-        installation_id = _coerce_int(installation.get("id"))
+        installation_id = coerce_int(installation.get("id"))
 
         if installation_id is None or not isinstance(action, str):
             self._logger.warning(
@@ -217,7 +218,7 @@ class InstallationEventProcessor:
         """
         account = installation.get("account") or {}
         owner = account.get("login")
-        owner_id = _coerce_int(account.get("id"))
+        owner_id = coerce_int(account.get("id"))
         if (
             not isinstance(owner, str)
             or owner_id is None
@@ -229,7 +230,7 @@ class InstallationEventProcessor:
         for repo in repos:
             if not isinstance(repo, Mapping):
                 continue
-            repo_id = _coerce_int(repo.get("id"))
+            repo_id = coerce_int(repo.get("id"))
             repo_name = repo.get("name") or _repo_name_from_full(
                 repo.get("full_name"), owner=owner
             )
@@ -261,11 +262,3 @@ def _repo_name_from_full(full_name: object, *, owner: str) -> str | None:
     if not full_name.lower().startswith(prefix.lower()):
         return None
     return full_name[len(prefix) :] or None
-
-
-def _coerce_int(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    return None

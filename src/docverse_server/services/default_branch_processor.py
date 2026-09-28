@@ -14,6 +14,7 @@ from docverse_server.services.default_branch import (
     DefaultBranchService,
     DefaultBranchTrigger,
 )
+from docverse_server.services.github_payload import repository_coordinates
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 
@@ -112,8 +113,11 @@ class DefaultBranchEventProcessor:
         Projects are found by ``repository.id``, with the
         ``(owner, name)`` fallback for projects whose numeric id is
         still unresolved — the same lookup the ``delete`` processor
-        uses (:meth:`ProjectStore.list_by_github_repo`). Read-only: the
-        caller wraps it in a transaction that needs no commit.
+        uses (:meth:`ProjectStore.list_by_github_repo`), over the same
+        reading of the ``repository`` block
+        (:func:`~docverse_server.services.github_payload.repository_coordinates`).
+        Read-only: the caller wraps it in a transaction that needs no
+        commit.
 
         Returns
         -------
@@ -133,9 +137,12 @@ class DefaultBranchEventProcessor:
         repo = payload.get("repository")
         if not isinstance(repo, Mapping):
             repo = {}
-        owner, repo_name, repo_id = _repository_coordinates(repo)
+        coordinates = repository_coordinates(repo)
+        owner, repo_name = coordinates.owner, coordinates.name
         logger = self._logger.bind(
-            github_owner=owner, github_repo=repo_name, github_repo_id=repo_id
+            github_owner=owner,
+            github_repo=repo_name,
+            github_repo_id=coordinates.repo_id,
         )
         if not isinstance(change, Mapping):
             logger.info(
@@ -163,7 +170,7 @@ class DefaultBranchEventProcessor:
             old_default_branch = None
 
         projects = await self._project_store.list_by_github_repo(
-            repo_id=repo_id, owner=owner, repo=repo_name
+            repo_id=coordinates.repo_id, owner=owner, repo=repo_name
         )
         targets: list[DefaultBranchTarget] = []
         org_slugs: dict[int, str] = {}
@@ -219,32 +226,3 @@ class DefaultBranchEventProcessor:
             project_slug=target.project.slug,
             outcome=outcome,
         )
-
-
-def _repository_coordinates(
-    repo: Mapping[str, Any],
-) -> tuple[str | None, str | None, int | None]:
-    """Read ``(owner, name, id)`` from a payload's ``repository`` block.
-
-    The owner comes from ``owner.login`` (``owner.name`` on older
-    payload shapes), falling back to ``full_name``; the id is accepted
-    only as a genuine ``int``, since ``isinstance(True, int)`` would
-    otherwise let a boolean through as a repository id.
-    """
-    full_name = repo.get("full_name")
-    fallback_owner = fallback_name = None
-    if isinstance(full_name, str) and "/" in full_name:
-        fallback_owner, fallback_name = full_name.split("/", 1)
-    owner_block = repo.get("owner")
-    if not isinstance(owner_block, Mapping):
-        owner_block = {}
-    owner = owner_block.get("login") or owner_block.get("name")
-    name = repo.get("name")
-    repo_id = repo.get("id")
-    return (
-        owner if isinstance(owner, str) else fallback_owner,
-        name if isinstance(name, str) else fallback_name,
-        repo_id
-        if isinstance(repo_id, int) and not isinstance(repo_id, bool)
-        else None,
-    )
