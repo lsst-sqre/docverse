@@ -2774,10 +2774,13 @@ class KeeperSyncService:
     ) -> None:
         """Hand ``on_build_copied`` the report for one build copy, if wired.
 
-        The hook is a side channel, so it may not decide the copy's fate:
-        whatever it raises is sent to Sentry and logged, and the copy's
-        own result or exception carries on as if it had not run — the
-        same isolation ``sync_project`` gives ``on_edition_synced``.
+        The report is a side channel, so it may not decide the copy's
+        fate: whatever building it or running the hook raises is sent to
+        Sentry and logged, and the copy's own result or exception carries
+        on as if it had not run — the same isolation ``sync_project``
+        gives ``on_edition_synced``. A lag that cannot be measured costs
+        only the lag (see :func:`_measure_ltd_lag_seconds`); the report
+        still goes out.
 
         Called as the copy ends, so this is where both clocks stop:
         ``duration_seconds`` on the monotonic clock from ``started``, and
@@ -2787,31 +2790,28 @@ class KeeperSyncService:
         if self._on_build_copied is None:
             return
         duration_seconds = monotonic() - started
-        ltd_lag_seconds = (
-            None
-            if ltd_date_rebuilt is None
-            else (_now() - ltd_date_rebuilt).total_seconds()
-        )
-        last = passes[-1]
-        report = BuildCopyReport(
-            project_slug=project_slug,
-            object_count=last.object_count,
-            total_size_bytes=last.total_size_bytes,
-            duration_seconds=duration_seconds,
-            peak_concurrent_copies=max(
-                tally.peak_concurrent_copies for tally in passes
-            ),
-            retried_object_count=sum(
-                tally.retried_object_count for tally in passes
-            ),
-            exhausted_object_count=sum(
-                tally.exhausted_object_count for tally in passes
-            ),
-            build_retry_used=len(passes) > 1,
-            succeeded=succeeded,
-            ltd_lag_seconds=ltd_lag_seconds,
-        )
         try:
+            last = passes[-1]
+            report = BuildCopyReport(
+                project_slug=project_slug,
+                object_count=last.object_count,
+                total_size_bytes=last.total_size_bytes,
+                duration_seconds=duration_seconds,
+                peak_concurrent_copies=max(
+                    tally.peak_concurrent_copies for tally in passes
+                ),
+                retried_object_count=sum(
+                    tally.retried_object_count for tally in passes
+                ),
+                exhausted_object_count=sum(
+                    tally.exhausted_object_count for tally in passes
+                ),
+                build_retry_used=len(passes) > 1,
+                succeeded=succeeded,
+                ltd_lag_seconds=_measure_ltd_lag_seconds(
+                    ltd_date_rebuilt, logger=logger
+                ),
+            )
             await self._on_build_copied(report)
         except Exception as exc:
             sentry_sdk.capture_exception(exc)
@@ -3059,6 +3059,35 @@ class KeeperSyncService:
 
 def _now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def _measure_ltd_lag_seconds(
+    ltd_date_rebuilt: datetime | None,
+    *,
+    logger: structlog.stdlib.BoundLogger,
+) -> float | None:
+    """Measure a build copy's ``ltd_lag_seconds``, or give ``None``.
+
+    ``None`` when there is no ``ltd_date_rebuilt`` to measure from, and
+    also when it cannot be compared against Docverse's clock:
+    ``LtdEdition.date_rebuilt`` is not validated as timezone-aware, so an
+    LTD response without its trailing ``Z`` parses to a naive timestamp,
+    which an aware one cannot be subtracted from. The lag is a
+    metrics-only calculation, so that error is sent to Sentry and logged
+    rather than raised: it costs the report its lag, never the copy its
+    outcome.
+    """
+    if ltd_date_rebuilt is None:
+        return None
+    try:
+        return (_now() - ltd_date_rebuilt).total_seconds()
+    except TypeError as exc:
+        sentry_sdk.capture_exception(exc)
+        logger.exception(
+            "Could not measure LTD sync lag; reporting none",
+            ltd_date_rebuilt=ltd_date_rebuilt.isoformat(),
+        )
+        return None
 
 
 async def _sleep(delay: float) -> None:

@@ -4817,6 +4817,115 @@ async def test_sync_build_isolates_a_raising_copy_report_hook(
 
 
 @pytest.mark.asyncio
+async def test_sync_build_reports_no_lag_for_a_naive_date_rebuilt(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``date_rebuilt`` with no timezone cannot fail the copy it dates.
+
+    ``LtdEdition.date_rebuilt`` is not validated as timezone-aware, so an
+    LTD response without its trailing ``Z`` parses to a naive timestamp,
+    which Docverse's aware clock cannot be subtracted from. The lag is a
+    metrics-only calculation: its error goes to Sentry and the log, the
+    report still goes out with no lag, and the copy lands.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-naive")
+
+    _seed_ltd(mock_discovery)
+    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        source_objects,
+        on_build_copied=on_build_copied,
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    _rebuild_ltd_main(
+        mock_discovery,
+        source_objects,
+        date_rebuilt=(datetime.now(tz=UTC) - timedelta(minutes=1)).replace(
+            tzinfo=None
+        ),
+    )
+    reports.clear()
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert result.edition_failures == ()
+    [outcome] = result.edition_outcomes
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is False
+    [report] = reports
+    assert report.succeeded is True
+    assert report.ltd_lag_seconds is None
+    assert [type(exc) for exc in captured] == [TypeError]
+    assert any(
+        entry["event"] == "Could not measure LTD sync lag; reporting none"
+        and entry["log_level"] == "error"
+        for entry in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_copy_with_a_naive_date_rebuilt_raises_its_own_error(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A naive ``date_rebuilt`` cannot replace a failed copy's own error.
+
+    The failure report goes out while the copy's exception is being
+    handled, so a lag that raised there would reach ``sync_edition``'s
+    failure accounting in the copy's place. Here the copy's ``403`` is
+    what fails the edition, and the report still says the copy failed.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-naive-403")
+
+    _seed_ltd(mock_discovery)
+    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
+    reports, on_build_copied = _record_copy_reports()
+    forbidden = _forbidden()
+    service = _build_service(
+        db_session,
+        http_client,
+        # The first import's upload lands; the rebuild's is refused.
+        ScriptedUploadStore({"index.html": [1, forbidden]}),
+        source_objects,
+        on_build_copied=on_build_copied,
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    _rebuild_ltd_main(
+        mock_discovery,
+        source_objects,
+        date_rebuilt=(datetime.now(tz=UTC) - timedelta(minutes=1)).replace(
+            tzinfo=None
+        ),
+    )
+    reports.clear()
+    monkeypatch.setattr(sentry_sdk, "capture_exception", lambda _exc: None)
+
+    with pytest.raises(KeeperSyncSystemicFailureError) as exc_info:
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert exc_info.value.__cause__ is forbidden
+    [report] = reports
+    assert report.succeeded is False
+    assert report.ltd_lag_seconds is None
+
+
+@pytest.mark.asyncio
 async def test_sync_edition_short_circuits_when_tombstoned(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
