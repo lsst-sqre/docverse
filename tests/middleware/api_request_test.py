@@ -20,7 +20,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
 from httpx import ASGITransport, AsyncClient
 from safir.metrics import MockEventPublisher
-from starlette.types import Receive, Scope, Send
+from starlette.types import Message, Receive, Scope, Send
 from structlog.testing import capture_logs
 
 from docverse_server.dependencies.context import (
@@ -30,6 +30,7 @@ from docverse_server.dependencies.context import (
 from docverse_server.metrics import (
     ApiRequestEvent,
     DocverseEvents,
+    HttpMethod,
     HttpStatusClass,
 )
 from docverse_server.middleware import ApiRequestMiddleware
@@ -474,3 +475,93 @@ async def test_non_http_scopes_pass_through(
     assert seen[0] is lifespan
     assert seen[1] is websocket
     assert publisher.published == []
+
+
+async def _send_raw(
+    app: ApiRequestMiddleware, *, method: str, path: str
+) -> list[Message]:
+    """Drive one request straight through the ASGI interface.
+
+    An HTTP client may refuse to put a junk token on the request line,
+    but an ASGI server hands the application whatever token the request
+    line carried, so the scope is where such a method is reproduced.
+    Returns the messages the application sent.
+    """
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "https",
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"example.com")],
+        "server": ("example.com", 443),
+        "client": ("127.0.0.1", 50000),
+    }
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_nonstandard_method_records_other(
+    mock_events: DocverseEvents,
+) -> None:
+    """A method token outside RFC 9110's set is recorded as ``OTHER``.
+
+    The ASGI server accepts any token on the request line, and the router
+    answers it ``405``; recording the token itself would let every
+    scanner mint a new ``method`` tag value.
+    """
+    app = _prefixed_app(lambda: mock_events)
+    publisher = mock_events.api_request
+    assert isinstance(publisher, MockEventPublisher)
+
+    sent = await _send_raw(app, method="FOOBAR", path="/docverse/orgs/rubin")
+
+    assert sent[0]["status"] == 405
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.method == "OTHER"
+    assert event.status_class == HttpStatusClass.client_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        *[
+            (method.value, method.value)
+            for method in HttpMethod
+            if method is not HttpMethod.other
+        ],
+        ("get", "GET"),
+        ("Patch", "PATCH"),
+    ],
+)
+async def test_standard_method_records_its_token(
+    mock_events: DocverseEvents, token: str, expected: str
+) -> None:
+    """Each of RFC 9110's methods is recorded as itself, upper-cased.
+
+    Only tokens outside that set collapse to ``OTHER``; a standard method
+    keeps its own tag value whatever case it arrived in and whatever the
+    router answered it with.
+    """
+    app = _prefixed_app(lambda: mock_events)
+    publisher = mock_events.api_request
+    assert isinstance(publisher, MockEventPublisher)
+
+    await _send_raw(app, method=token, path="/docverse/orgs/rubin")
+
+    assert [event.method for event in publisher.published] == [expected]

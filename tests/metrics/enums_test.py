@@ -16,6 +16,7 @@ from docverse.models import (
     RefDeletedRule,
 )
 from docverse_server.metrics import (
+    HttpMethod,
     HttpStatusClass,
     LifecycleActionTrigger,
     LifecycleReapAction,
@@ -48,6 +49,47 @@ def test_retention_expired_is_a_lifecycle_reap_action() -> None:
         RefDeletedRule().type,
     }
     assert LifecycleReapAction.retention_expired.value not in rule_types
+
+
+def test_http_method_values() -> None:
+    """The methods are RFC 9110's nine tokens plus one sentinel.
+
+    ``method`` is an InfluxDB tag on ``api_request``, so these values are
+    what a query quotes, and the closed list is what bounds the tag's
+    cardinality.
+    """
+    assert [member.value for member in HttpMethod] == [
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "DELETE",
+        "CONNECT",
+        "OPTIONS",
+        "TRACE",
+        "PATCH",
+        "OTHER",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("GET", HttpMethod.get),
+        ("get", HttpMethod.get),
+        ("Delete", HttpMethod.delete),
+        ("PATCH", HttpMethod.patch),
+        ("FOOBAR", HttpMethod.other),
+        ("PROPFIND", HttpMethod.other),
+        ("OTHER", HttpMethod.other),
+        ("", HttpMethod.other),
+    ],
+)
+def test_http_method_from_request_method(
+    token: str, expected: HttpMethod
+) -> None:
+    """A token maps to its RFC 9110 method, upper-cased, or else ``OTHER``."""
+    assert HttpMethod.from_request_method(token) is expected
 
 
 def test_http_status_class_values() -> None:

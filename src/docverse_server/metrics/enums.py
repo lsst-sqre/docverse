@@ -22,6 +22,7 @@ __all__ = [
     "ConditionalGetOutcome",
     "ConditionalGetPrecondition",
     "EditionPublishTrigger",
+    "HttpMethod",
     "HttpStatusClass",
     "LifecycleAction",
     "LifecycleActionTrigger",
@@ -294,6 +295,64 @@ class ConditionalGetPrecondition(StrEnum):
         rather than a silent schema break.
         """
         return cls(kind.value)
+
+
+class HttpMethod(StrEnum):
+    """The method of an HTTP request, as recorded on ``api_request``.
+
+    The nine methods RFC 9110 §9 defines, valued by their upper-case
+    tokens, plus :attr:`other` for any token outside them. ``method`` is
+    an InfluxDB tag, and the ASGI server accepts any RFC token on the
+    request line, so recording the token itself would let a scanner
+    sending ``FOOBAR /docverse/orgs`` mint a new tag value per request.
+    Mapping every token through this enum keeps the tag at ten values.
+    """
+
+    get = "GET"
+    """``GET``: read a resource."""
+
+    head = "HEAD"
+    """``HEAD``: read a resource's headers only."""
+
+    post = "POST"
+    """``POST``: create a resource or run an action."""
+
+    put = "PUT"
+    """``PUT``: replace a resource."""
+
+    delete = "DELETE"
+    """``DELETE``: remove a resource."""
+
+    connect = "CONNECT"
+    """``CONNECT``: open a tunnel, which the API never serves."""
+
+    options = "OPTIONS"
+    """``OPTIONS``: ask which methods a resource allows."""
+
+    trace = "TRACE"
+    """``TRACE``: echo the request back, which the API never serves."""
+
+    patch = "PATCH"
+    """``PATCH``: modify part of a resource."""
+
+    other = "OTHER"
+    """Any token outside RFC 9110's nine methods, such as ``PROPFIND``.
+
+    The router answers these with a ``405`` (or a ``404`` on a path no
+    route matches); they are still counted, all under this one value.
+    """
+
+    @classmethod
+    def from_request_method(cls, method: str) -> HttpMethod:
+        """Map a request's method token, upper-cased, to its member.
+
+        Any token that is not one of RFC 9110's nine methods maps to
+        :attr:`other`.
+        """
+        try:
+            return cls(method.upper())
+        except ValueError:
+            return cls.other
 
 
 class HttpStatusClass(StrEnum):

@@ -24,6 +24,7 @@ from .enums import (
     ConditionalGetOutcome,
     ConditionalGetPrecondition,
     EditionPublishTrigger,
+    HttpMethod,
     HttpStatusClass,
     LifecycleAction,
     LifecycleActionTrigger,
@@ -605,7 +606,18 @@ class ApiRequestEvent(EventPayload):
     """
 
     method: str
-    """The request's HTTP method, upper-case (``GET``, ``PATCH``)."""
+    """The request's HTTP method: an :class:`HttpMethod` value.
+
+    One of RFC 9110's nine methods, upper-case (``GET``, ``HEAD``,
+    ``POST``, ``PUT``, ``DELETE``, ``CONNECT``, ``OPTIONS``, ``TRACE``,
+    ``PATCH``), or the sentinel ``OTHER`` for any other token the request
+    line carried. The ASGI server accepts any token there, so recording
+    it verbatim would let a scanner mint a tag value per request; the
+    validator below keeps the vocabulary closed, which is what keeps this
+    tag's cardinality at ten. Carried as an Avro string rather than an
+    Avro enum, so a method added to the vocabulary later is a new value
+    rather than a change to the registered schema.
+    """
 
     route: str | None
     """The matched route template, without the application path prefix.
@@ -649,6 +661,17 @@ class ApiRequestEvent(EventPayload):
 
     project: str | None
     """Slug of the project the route addressed, if any."""
+
+    @field_validator("method")
+    @classmethod
+    def _validate_method(cls, value: str) -> str:
+        """Refuse a value that is not an :class:`HttpMethod`.
+
+        The emitter maps a non-standard token to ``OTHER`` with
+        :meth:`HttpMethod.from_request_method`; a raw token reaching the
+        payload is a bug in the emitter, not a new tag value.
+        """
+        return HttpMethod(value).value
 
     @field_validator("status_class")
     @classmethod

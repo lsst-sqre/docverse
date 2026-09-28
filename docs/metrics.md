@@ -155,6 +155,9 @@ The events are built so that the tag list above keeps to that rule:
   `/orgs/{org}/projects/{project}`, never the concrete path. A path no
   route matched records `route` as null rather than the path, so
   scanner noise adds request volume but no tag values.
+- `api_request`'s `method` is one of RFC 9110's nine methods or `OTHER`.
+  The server accepts any token on the request line, so a non-standard
+  one is recorded as `OTHER` rather than as itself.
 - `api_request` records whether the ingress authenticated a request
   (`authenticated`), never who made it.
 - `github_webhook_received` carries no delivery ID, and names an
@@ -448,6 +451,10 @@ events it does not require an organization, because most routes
   with a `404`, so it counts as `4xx` volume without adding a `route`
   tag value. The documentation pages FastAPI serves itself
   (`openapi.json`, `docs`, `redoc`) record no template either.
+- A method token outside RFC 9110's nine methods, such as `PROPFIND` or
+  a scanner's `FOOBAR`, records `method` as `OTHER`. FastAPI answers it
+  with a `405` (or a `404` on an unknown path), so it counts as `4xx`
+  volume without adding a `method` tag value.
 - An exception that escapes the application is recorded as a `500`
   (`5xx`) and re-raised unchanged, so the caller still receives the
   `500` and Sentry still captures it.
@@ -460,7 +467,7 @@ events it does not require an organization, because most routes
 
 | Field | Type | Stored as | Meaning |
 | --- | --- | --- | --- |
-| `method` | string | tag | The HTTP method, upper-case (`GET`, `PATCH`). |
+| `method` | string | tag | The HTTP method, upper-case: one of RFC 9110's `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`, or `PATCH`, or `OTHER` for any other token the request line carried. The payload refuses any other value. |
 | `route` | string or null | tag | The matched route template without the application's path prefix: `/orgs/{org}/projects/{project}` for a request to `/docverse/orgs/rubin/projects/sqr-000`. Null when no route template matched. |
 | `status_code` | integer | field | The HTTP status the response started with. |
 | `status_class` | string | tag | The class of `status_code`: `1xx`, `2xx`, `3xx`, `4xx`, or `5xx`. A string rather than an Avro enum, because enum symbols cannot begin with a digit; the payload refuses any other value. |

@@ -19,7 +19,12 @@ from starlette import status
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from ..metrics import ApiRequestEvent, DocverseEvents, HttpStatusClass
+from ..metrics import (
+    ApiRequestEvent,
+    DocverseEvents,
+    HttpMethod,
+    HttpStatusClass,
+)
 
 __all__ = ["ApiRequestMiddleware"]
 
@@ -45,7 +50,9 @@ class ApiRequestMiddleware:
     from the scope. Its fields are filled as follows.
 
     ``method``
-        The request method, upper-cased.
+        The request method, upper-cased, when it is one of RFC 9110's
+        nine methods; ``OTHER`` for any other token, which the router
+        answers ``405``. See :class:`~docverse_server.metrics.HttpMethod`.
     ``route``
         The template of the route the router matched, with
         ``path_prefix`` removed: ``/orgs/{org}/projects/{project}``,
@@ -80,7 +87,8 @@ class ApiRequestMiddleware:
     ``authenticated`` into InfluxDB tags, and each stays bounded only
     because it is a closed vocabulary or a template bounded by the size
     of the API; an unmatched path is counted, but with ``route=None``,
-    so scanner noise adds volume without adding a tag value.
+    and a non-standard method with ``method="OTHER"``, so scanner noise
+    adds volume without adding a tag value.
 
     Publishing is best-effort. The publish runs after the response has
     been handed to the server, and any exception it raises is logged and
@@ -165,7 +173,7 @@ class ApiRequestMiddleware:
         route = self._route_template(scope)
         try:
             payload = ApiRequestEvent(
-                method=scope["method"].upper(),
+                method=HttpMethod.from_request_method(scope["method"]),
                 route=route,
                 status_code=status_code,
                 status_class=HttpStatusClass.from_status_code(status_code),

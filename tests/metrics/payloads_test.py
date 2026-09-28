@@ -22,6 +22,7 @@ from docverse_server.metrics import (
     DocverseEventBase,
     EditionPublishedEvent,
     GitHubWebhookReceivedEvent,
+    HttpMethod,
     HttpStatusClass,
 )
 
@@ -168,9 +169,40 @@ def test_api_request_status_class_accepts_only_known_classes() -> None:
         _api_request(status_class="404")
 
 
-def _api_request(*, status_class: str) -> ApiRequestEvent:
+def test_api_request_method_is_an_avro_string() -> None:
+    """``method`` goes over the wire as a string, not an Avro enum.
+
+    Its values are :class:`~docverse_server.metrics.HttpMethod`'s, but
+    the Avro type stays an open string, so a method added to the
+    vocabulary later is a new value rather than a registered-schema
+    change.
+    """
+    fields = _avro_field_types(ApiRequestEvent)
+
+    assert fields["method"] == "string"
+
+
+def test_api_request_method_accepts_only_known_methods() -> None:
+    """A method outside :class:`HttpMethod` is refused.
+
+    ``method`` is an InfluxDB tag, so the payload itself keeps the
+    vocabulary closed: the emitter must map a non-standard token to
+    ``OTHER`` rather than record it.
+    """
+    assert _api_request(method=HttpMethod.patch).method == "PATCH"
+    assert _api_request(method=HttpMethod.other).method == "OTHER"
+
+    with pytest.raises(ValidationError):
+        _api_request(method="FOOBAR")
+
+
+def _api_request(
+    *,
+    status_class: str = HttpStatusClass.client_error,
+    method: str = HttpMethod.get,
+) -> ApiRequestEvent:
     return ApiRequestEvent(
-        method="GET",
+        method=method,
         route="/orgs/{org}",
         status_code=404,
         status_class=status_class,

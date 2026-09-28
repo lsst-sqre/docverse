@@ -57,6 +57,7 @@ from docverse_server.metrics import (
     ConditionalGetPrecondition,
     DocverseEvents,
     EditionReconcileCompletedEvent,
+    HttpMethod,
     HttpStatusClass,
 )
 from docverse_server.services.edition_reconcile import (
@@ -953,6 +954,17 @@ def test_metrics_page_names_every_status_class() -> None:
     """
     section = _event_section(_read(_METRICS_PAGE), "api_request")
     assert not _uncoded({value.value for value in HttpStatusClass}, section)
+
+
+def test_metrics_page_names_every_method() -> None:
+    """The ``api_request`` section names every ``method`` value.
+
+    ``method`` is a string in the Avro schema, so the enum check above
+    cannot see it either; its vocabulary is :class:`HttpMethod`, the nine
+    RFC 9110 methods and the ``OTHER`` sentinel a dashboard filters on.
+    """
+    section = _event_section(_read(_METRICS_PAGE), "api_request")
+    assert not _uncoded({value.value for value in HttpMethod}, section)
 
 
 def test_metrics_page_has_an_example_query_per_capability() -> None:
