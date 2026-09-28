@@ -229,8 +229,11 @@ delivery.
 - **Failures.** A project whose ref set cannot be fetched is skipped for
   the pass. One whose ref set was fetched but whose `GET /repos` failed
   keeps its `ref_deleted` reaping and waits a day for its default
-  branch. Either way the rest of the organization's pass carries on,
-  and its `git_ref_audit` queue job ends `completed_with_errors`.
+  branch. So does one whose rule raises — a CDN failure unpublishing a
+  retired draft, say, or a database error: its transaction rolls back
+  whole, so none of the rule's writes for it land, and the next tick
+  tries again. Either way the rest of the organization's pass carries
+  on, and its `git_ref_audit` queue job ends `completed_with_errors`.
 - **Order.** The rule runs in its own transaction per project, ahead of
   the pass's `ref_deleted` deletions. One organization-wide transaction
   would hold every earlier project's rows while waiting on a later
@@ -394,13 +397,21 @@ the line to count. The rule's other lines say why it did what it did.
 | `Resolved project GitHub metadata` | info | `github_installation_id`, `github_owner_id`, `github_repo_id`, `github_default_branch`, `default_branch_changed`, `main_rewritten` |
 | `Skipping default branch: project binding changed during resolve` | info | — |
 | `Git ref audit: GitHub repository metadata fetch failed, skipping default branch for this pass` | warning | `owner`, `repo`, `installation_id`, `error`, `error_type` |
-| `Git ref audit completed for org` | info | `had_failures`, `default_branch_updates`, `main_rewrites` |
+| `Git ref audit: default branch convergence failed, skipping project for this pass` | warning | `error`, `error_type` |
+| `Git ref audit completed for org` | info | `had_failures`, `default_branch_updates`, `main_rewrites`, `default_branch_errors` |
 
 `drafts_retired` counts the drafts step 3 retired; `main_rewritten_from`
-is the ref `__main` tracked before, or null when it was left alone. On
-the audit's summary line, `default_branch_updates` counts the projects
-whose column took a new value and `main_rewrites` the projects whose
-`__main` was rewritten, across the organization's pass.
+is the ref `__main` tracked before, or null when it was left alone. The
+audit's two warnings name the project they skipped with `project` and
+`project_id`. On the audit's summary line, `default_branch_updates`
+counts the projects whose column took a new value, `main_rewrites` the
+projects whose `__main` was rewritten, and `default_branch_errors` the
+projects whose convergence failed, across the organization's pass.
+Usually that failure is the rule raising and rolling back; when the
+rule committed and only the hand-off of its `publish_edition` job to
+the queue failed, the project counts toward the other two as well, and
+the job's row is left for the reapers' orphan sweep, as after any failed
+hand-off.
 
 ## Pinned `__main` editions are left for operators
 

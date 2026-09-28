@@ -23,7 +23,10 @@ A per-project fetch failure — of the ref set or of the default branch —
 is caught, logged with org/project/error, and the per-org pass
 continues with the next project — one
 rate-limited installation cannot block the audit for every other
-project. When at least one project failed, the queue-job row
+project. A project whose default-branch convergence raises is isolated
+the same way: its transaction rolls back, and the rest of the org's
+convergence and ``ref_deleted`` reaping still run. When at least one
+project failed, the queue-job row
 transitions to ``completed_with_errors`` and ``aggregate_activity``
 in the finaliser routes the parent run to ``partial_failure``;
 otherwise the row transitions to ``completed`` and the parent rolls
@@ -37,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,7 +61,10 @@ from docverse_server.metrics import (
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
-from docverse_server.services.default_branch import DefaultBranchTrigger
+from docverse_server.services.default_branch import (
+    DefaultBranchService,
+    DefaultBranchTrigger,
+)
 from docverse_server.services.git_ref_audit_finalisation import (
     maybe_finalise_git_ref_audit_run,
 )
@@ -82,13 +89,25 @@ class _AuditSummary:
     """What one org's pass did, for the queue-job row and the summary log."""
 
     had_failures: bool = False
-    """Whether any project's GitHub read failed this pass."""
+    """Whether any project's GitHub read or convergence failed this pass."""
 
     default_branch_updates: int = 0
     """Projects whose ``github_default_branch`` took a new value."""
 
     main_rewrites: int = 0
     """Projects whose ``__main`` was rewritten onto the default branch."""
+
+    default_branch_errors: int = 0
+    """Projects whose default-branch convergence failed this pass."""
+
+
+@dataclass(slots=True)
+class _ConvergenceTally:
+    """What the default-branch convergence did across one org's pass."""
+
+    default_branch_updates: int = 0
+    main_rewrites: int = 0
+    default_branch_errors: int = 0
 
 
 @dataclass(slots=True)
@@ -120,9 +139,9 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     Returns
     -------
     str
-        ``"completed"`` on a clean pass (every project's fetch
-        succeeded), ``"completed_with_errors"`` when at least one
-        project's fetch failed. Raises on hard failure after marking
+        ``"completed"`` on a clean pass (every project's fetch and
+        convergence succeeded), ``"completed_with_errors"`` when at
+        least one project's failed. Raises on hard failure after marking
         the queue job ``failed`` and rolling the parent run, mirroring
         ``lifecycle_eval``'s contract so arq logs the job as failed.
     """
@@ -193,6 +212,7 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             had_failures=summary.had_failures,
             default_branch_updates=summary.default_branch_updates,
             main_rewrites=summary.main_rewrites,
+            default_branch_errors=summary.default_branch_errors,
         )
         # Publish one lifecycle_action per reaped edition after the commit.
         # Best-effort: production runs raise_on_error=False so a metrics
@@ -230,11 +250,12 @@ async def _audit_org(
     re-evaluate from a consistent state.
 
     Returns the pass's :class:`_AuditSummary`; its ``had_failures`` is
-    ``True`` if at least one project's fetch failed
-    (``completed_with_errors`` for the parent queue-job row). Per-project
-    fetch failures never bubble out of this function — the audit's
-    failure-isolation contract is that one rate-limited installation
-    cannot block the audit for every other project.
+    ``True`` if at least one project's fetch or convergence failed
+    (``completed_with_errors`` for the parent queue-job row). Neither
+    kind of per-project failure bubbles out of this function — the
+    audit's failure-isolation contract is that one project, whether its
+    installation is rate-limited or its convergence raised, cannot
+    block the audit for every other project.
     """
     state = await _load_org_state(
         session=session, factory=factory, org_id=org_id
@@ -253,7 +274,7 @@ async def _audit_org(
         projects=projects,
         logger=logger,
     )
-    default_branch_updates, main_rewrites = await _converge_default_branches(
+    tally = await _converge_default_branches(
         session=session,
         factory=factory,
         projects=projects,
@@ -263,9 +284,10 @@ async def _audit_org(
         logger=logger,
     )
     summary = _AuditSummary(
-        had_failures=fetches.had_failures,
-        default_branch_updates=default_branch_updates,
-        main_rewrites=main_rewrites,
+        had_failures=fetches.had_failures or tally.default_branch_errors > 0,
+        default_branch_updates=tally.default_branch_updates,
+        main_rewrites=tally.main_rewrites,
+        default_branch_errors=tally.default_branch_errors,
     )
     refs_by_project = fetches.refs_by_project
 
@@ -399,7 +421,7 @@ async def _converge_default_branches(
     org_slug: str,
     events: DocverseEvents | None,
     logger: structlog.stdlib.BoundLogger,
-) -> tuple[int, int]:
+) -> _ConvergenceTally:
     """Apply each fetched default branch to its project (PRD #721).
 
     Hands each branch, with the live ref set as evidence, to
@@ -417,48 +439,106 @@ async def _converge_default_branches(
     ``__main`` gets what a ``PATCH`` of it would announce: one
     ``edition_lifecycle`` ``update`` event and one ``dashboard_build``.
 
-    Returns ``(default_branch_updates, main_rewrites)``, the counts for
-    the per-org summary log.
+    A project whose convergence raises — a CDN failure unpublishing a
+    retired draft, a lock or database error, a queue-backend outage on
+    the dispatch — is logged, counted, and skipped for this pass, like
+    a failed GitHub read in :func:`_fetch_per_project`: one project
+    cannot block the rest of the org's convergence, nor the
+    ``ref_deleted`` reaping that runs after it. A failure inside the
+    transaction leaves none of that project's writes behind, because
+    ``session.begin()`` rolls them back as the exception leaves it.
+
+    Returns the :class:`_ConvergenceTally` for the per-org summary log.
     """
     service = factory.create_default_branch_service()
-    default_branch_updates = 0
-    main_rewrites = 0
+    tally = _ConvergenceTally()
     for project in projects:
         default_branch = fetches.default_branches.get(project.id)
         ref_set = fetches.refs_by_project.get(project.id)
         if default_branch is None or ref_set is None:
             continue
-        async with session.begin():
-            outcome = await service.apply(
+        try:
+            await _converge_project(
+                session=session,
+                factory=factory,
+                service=service,
                 project=project,
                 default_branch=default_branch,
-                trigger=DefaultBranchTrigger.audit,
-                live_refs=ref_set.all,
+                ref_set=ref_set,
+                org_slug=org_slug,
+                events=events,
+                tally=tally,
+                logger=logger,
             )
-            await session.commit()
-        await factory.queue_dispatcher.dispatch()
-        if outcome.column_changed:
-            default_branch_updates += 1
-        if not outcome.main_rewritten:
-            continue
-        main_rewrites += 1
-        if events is not None:
-            await events.edition_lifecycle.publish(
-                EditionLifecycleEvent(
-                    organization=org_slug,
-                    project=project.slug,
-                    action=LifecycleAction.update,
-                    edition_kind=MetricsEditionKind.main,
-                )
+        except Exception as exc:
+            # A ``publish_edition`` the rule deferred before the failure
+            # names a row the rollback just removed; left pending, the
+            # next project's ``dispatch()`` would hand arq a job whose
+            # row no worker can find. After a failure inside
+            # ``dispatch()`` itself nothing is pending any more, and its
+            # committed rows are the orphan shape the reapers reclaim.
+            factory.queue_dispatcher.discard()
+            sentry_sdk.capture_exception(exc)
+            logger.bind(project=project.slug, project_id=project.id).warning(
+                "Git ref audit: default branch convergence failed, "
+                "skipping project for this pass",
+                error=str(exc),
+                error_type=type(exc).__name__,
             )
-        await try_enqueue_dashboard_build_by_slug(
-            factory=factory,
-            session=session,
-            logger=logger,
-            org_slug=org_slug,
-            project_slug=project.slug,
+            tally.default_branch_errors += 1
+    return tally
+
+
+async def _converge_project(
+    *,
+    session: AsyncSession,
+    factory: Factory,
+    service: DefaultBranchService,
+    project: Project,
+    default_branch: str,
+    ref_set: RepositoryRefSet,
+    org_slug: str,
+    events: DocverseEvents | None,
+    tally: _ConvergenceTally,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Apply one project's default branch, dispatch, and announce.
+
+    The outcome is tallied as soon as its transaction commits, so a
+    later failure dispatching or announcing it still reports the
+    column and rewrite that are durable.
+    """
+    async with session.begin():
+        outcome = await service.apply(
+            project=project,
+            default_branch=default_branch,
+            trigger=DefaultBranchTrigger.audit,
+            live_refs=ref_set.all,
         )
-    return default_branch_updates, main_rewrites
+        await session.commit()
+    if outcome.column_changed:
+        tally.default_branch_updates += 1
+    if outcome.main_rewritten:
+        tally.main_rewrites += 1
+    await factory.queue_dispatcher.dispatch()
+    if not outcome.main_rewritten:
+        return
+    if events is not None:
+        await events.edition_lifecycle.publish(
+            EditionLifecycleEvent(
+                organization=org_slug,
+                project=project.slug,
+                action=LifecycleAction.update,
+                edition_kind=MetricsEditionKind.main,
+            )
+        )
+    await try_enqueue_dashboard_build_by_slug(
+        factory=factory,
+        session=session,
+        logger=logger,
+        org_slug=org_slug,
+        project_slug=project.slug,
+    )
 
 
 def _evaluate_matches(

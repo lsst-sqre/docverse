@@ -10,7 +10,9 @@ the parent ``git_ref_audit_runs`` row.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 import pytest
@@ -61,6 +63,10 @@ from docverse_server.metrics import (
     MetricsEditionKind,
     build_event_manager,
 )
+from docverse_server.services.default_branch import (
+    DefaultBranchOutcome,
+    DefaultBranchService,
+)
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.git_ref_audit_run_store import GitRefAuditRunStore
@@ -73,7 +79,7 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.git_ref_audit import git_ref_audit
-from tests.support.arq_testing import count_jobs_by_name
+from tests.support.arq_testing import count_jobs_by_name, get_jobs_by_name
 from tests.support.github_mock import GitHubMock
 from tests.worker.conftest import make_worker_ctx
 
@@ -1639,7 +1645,297 @@ async def test_git_ref_audit_summary_counts_default_branch_work(
             if entry["event"] == "Git ref audit completed for org"
         ]
         summaries.append(
-            (summary["default_branch_updates"], summary["main_rewrites"])
+            (
+                summary["default_branch_updates"],
+                summary["main_rewrites"],
+                summary["default_branch_errors"],
+            )
         )
 
-    assert summaries == [(2, 1), (0, 0)]
+    assert summaries == [(2, 1, 0), (0, 0, 0)]
+
+
+@dataclass(frozen=True, slots=True)
+class _ConvergenceFailureOrg:
+    """An org whose middle project's default-branch convergence fails.
+
+    Three bound projects, ``conv-a`` / ``conv-b`` / ``conv-c`` in the
+    audit's slug order, each renamed ``master`` → ``main``: ``__main``
+    tracks ``master`` and serves a ``master`` build, a newer ``main``
+    build and a ``main`` draft exist, and the live set holds only
+    ``main``. ``conv-c`` also carries a draft on a deleted branch for
+    the pass's ``ref_deleted`` reaping.
+    """
+
+    org_id: int
+    org_slug: str
+    run_id: int
+    queue_job_id: int
+    project_ids: dict[str, int]
+    main_ids: dict[str, int]
+    master_builds: dict[str, int]
+    main_builds: dict[str, int]
+    draft_ids: dict[str, int]
+    gone_draft_id: int
+
+    @property
+    def failing_id(self) -> int:
+        return self.project_ids["conv-b"]
+
+
+async def _seed_convergence_failure_org(
+    db_session: AsyncSession, mock_github: GitHubMock, *, org_slug: str
+) -> _ConvergenceFailureOrg:
+    project_ids: dict[str, int] = {}
+    main_ids: dict[str, int] = {}
+    master_builds: dict[str, int] = {}
+    main_builds: dict[str, int] = {}
+    draft_ids: dict[str, int] = {}
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug=org_slug)
+        for offset, slug in enumerate(("conv-a", "conv-b", "conv-c")):
+            installation_id = mock_github.seed_installation(
+                "acme",
+                f"{org_slug}-{slug}",
+                installation_id=90 + offset,
+                owner_id=555,
+            )
+            project_id = await _seed_github_project(
+                db_session,
+                org_id=org_id,
+                slug=slug,
+                owner="acme",
+                repo=f"{org_slug}-{slug}",
+                installation_id=installation_id,
+            )
+            project_ids[slug] = project_id
+            main_ids[slug] = await _seed_main_edition(
+                db_session, project_id=project_id, git_ref="master"
+            )
+            master_builds[slug] = await _seed_completed_build(
+                db_session,
+                project_id=project_id,
+                project_slug=slug,
+                git_ref="master",
+                days=1,
+            )
+            await EditionStore(
+                session=db_session, logger=_logger()
+            ).set_current_build(
+                edition_id=main_ids[slug], build_id=master_builds[slug]
+            )
+            main_builds[slug] = await _seed_completed_build(
+                db_session,
+                project_id=project_id,
+                project_slug=slug,
+                git_ref="main",
+                days=2,
+            )
+            draft_ids[slug] = await _seed_draft_edition(
+                db_session, project_id=project_id, slug="main", git_ref="main"
+            )
+            _seed_refs(
+                mock_github.router,
+                owner="acme",
+                repo=f"{org_slug}-{slug}",
+                branches=["main"],
+                default_branch="main",
+            )
+        gone_draft_id = await _seed_draft_edition(
+            db_session,
+            project_id=project_ids["conv-c"],
+            slug="gone-branch",
+            git_ref="tickets/DM-gone",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    return _ConvergenceFailureOrg(
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        queue_job_id=queue_job_id,
+        project_ids=project_ids,
+        main_ids=main_ids,
+        master_builds=master_builds,
+        main_builds=main_builds,
+        draft_ids=draft_ids,
+        gone_draft_id=gone_draft_id,
+    )
+
+
+def _fail_convergence_after_apply(
+    monkeypatch: pytest.MonkeyPatch, *, project_id: int
+) -> None:
+    """Make one project's convergence raise once the rule has run.
+
+    The real rule runs first, so the failure lands after every write it
+    makes — column, rewrite, draft retirement, repoint, and the deferred
+    ``publish_edition`` — which is what the rollback has to undo.
+    """
+    apply = DefaultBranchService.apply
+
+    async def _apply_then_fail(
+        self: DefaultBranchService, *, project: Project, **kwargs: Any
+    ) -> DefaultBranchOutcome:
+        outcome = await apply(self, project=project, **kwargs)
+        if project.id == project_id:
+            msg = "convergence exploded"
+            raise RuntimeError(msg)
+        return outcome
+
+    monkeypatch.setattr(DefaultBranchService, "apply", _apply_then_fail)
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_isolates_a_default_branch_convergence_failure(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One project's failed convergence does not stop the org's pass.
+
+    The projects either side of it still converge, the pass's
+    ``ref_deleted`` reaping — which runs after convergence — still
+    soft-deletes the deleted branch's draft, and the queue job ends
+    ``completed_with_errors`` rather than ``failed``. The failure is
+    logged and counted on the summary line.
+    """
+    seeded = await _seed_convergence_failure_org(
+        db_session, mock_github, org_slug="gra-conv-isolate"
+    )
+    _fail_convergence_after_apply(monkeypatch, project_id=seeded.failing_id)
+
+    with capture_logs() as captured:
+        result = await _run_audit(
+            mock_github=mock_github,
+            org_id=seeded.org_id,
+            org_slug=seeded.org_slug,
+            run_id=seeded.run_id,
+            queue_job_id=seeded.queue_job_id,
+        )
+
+    assert result == "completed_with_errors"
+    for slug in ("conv-a", "conv-c"):
+        project = await _load_project(seeded.project_ids[slug])
+        assert project.github_default_branch == "main"
+        main = await _load_edition(seeded.main_ids[slug])
+        assert main is not None
+        assert main.tracking_params == {"git_ref": "main"}
+        assert main.current_build_id == seeded.main_builds[slug]
+    assert await _load_edition(seeded.gone_draft_id) is None
+    [failure_log] = [
+        entry
+        for entry in captured
+        if entry["event"]
+        == (
+            "Git ref audit: default branch convergence failed, "
+            "skipping project for this pass"
+        )
+    ]
+    assert failure_log["log_level"] == "warning"
+    assert failure_log["project"] == "conv-b"
+    assert failure_log["error"] == "convergence exploded"
+    assert failure_log["error_type"] == "RuntimeError"
+    [summary] = [
+        entry
+        for entry in captured
+        if entry["event"] == "Git ref audit completed for org"
+    ]
+    assert summary["had_failures"] is True
+    assert summary["default_branch_updates"] == 2
+    assert summary["main_rewrites"] == 2
+    assert summary["default_branch_errors"] == 1
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj = await QueueJobStore(session=session, logger=_logger()).get(
+                seeded.queue_job_id
+            )
+            assert qj is not None
+            assert qj.status == JobStatus.completed_with_errors
+            run = await GitRefAuditRunStore(
+                session=session, logger=_logger()
+            ).get(seeded.run_id)
+            assert run is not None
+            assert run.status is GitRefAuditRunStatus.partial_failure
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_rolls_back_a_failed_convergence(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A project whose convergence fails keeps none of the rule's writes.
+
+    The rule ran to completion before the failure, so each write it
+    made — the column, the ``__main`` rewrite and repoint, the retired
+    ``main`` draft — has to have been rolled back with the project's
+    transaction, leaving it exactly as the next tick will find it.
+    """
+    seeded = await _seed_convergence_failure_org(
+        db_session, mock_github, org_slug="gra-conv-rollback"
+    )
+    _fail_convergence_after_apply(monkeypatch, project_id=seeded.failing_id)
+
+    result = await _run_audit(
+        mock_github=mock_github,
+        org_id=seeded.org_id,
+        org_slug=seeded.org_slug,
+        run_id=seeded.run_id,
+        queue_job_id=seeded.queue_job_id,
+    )
+
+    assert result == "completed_with_errors"
+    project = await _load_project(seeded.failing_id)
+    assert project.github_default_branch is None
+    main = await _load_edition(seeded.main_ids["conv-b"])
+    assert main is not None
+    assert main.tracking_params == {"git_ref": "master"}
+    assert main.current_build_id == seeded.master_builds["conv-b"]
+    assert main.publish_status is not PublishStatus.pending
+    assert await _load_edition(seeded.draft_ids["conv-b"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_drops_a_failed_convergence_publish_job(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``publish_edition`` a failed convergence deferred never reaches arq.
+
+    The rule repointed the failing project's ``__main`` and deferred
+    its publish before the failure rolled the job's row back. Only the
+    two converged projects' publishes are handed to arq, each naming a
+    row that exists.
+    """
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_convergence_failure_org(
+        db_session, mock_github, org_slug="gra-conv-discard"
+    )
+    _fail_convergence_after_apply(monkeypatch, project_id=seeded.failing_id)
+
+    result = await _run_audit(
+        mock_github=mock_github,
+        org_id=seeded.org_id,
+        org_slug=seeded.org_slug,
+        run_id=seeded.run_id,
+        queue_job_id=seeded.queue_job_id,
+        arq_queue=arq_queue,
+    )
+
+    assert result == "completed_with_errors"
+    jobs = get_jobs_by_name(arq_queue, "publish_edition")
+    assert len(jobs) == 2
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = QueueJobStore(session=session, logger=_logger())
+            for job in jobs:
+                row = await store.get(job.kwargs["payload"]["queue_job_id"])
+                assert row is not None
+                assert row.backend_job_id == job.id

@@ -18,9 +18,11 @@ owns the commit and so a service cannot simply commit mid-method.
 
 Services call :meth:`QueueDispatcher.defer` while the handler's
 transaction is still open; the handler calls
-:meth:`QueueDispatcher.dispatch` once it has committed. One dispatcher
-is shared per :class:`~docverse_server.factory.Factory` (and therefore
-per request / per worker job), so a service and its caller reach the
+:meth:`QueueDispatcher.dispatch` once it has committed, or
+:meth:`QueueDispatcher.discard` when that transaction rolled back
+instead. One dispatcher is shared per
+:class:`~docverse_server.factory.Factory` (and therefore per request /
+per worker job), so a service and its caller reach the
 same pending list without threading it through return values.
 
 Skipping the ``dispatch`` call is a fail-safe rather than a wedge: the
@@ -148,6 +150,33 @@ class QueueDispatcher:
                 queue_name=queue_name,
             )
         )
+
+    def discard(self) -> tuple[PendingEnqueue, ...]:
+        """Forget everything deferred so far without enqueueing it.
+
+        Call this when the transaction that wrote the deferred rows
+        rolled back instead of committing. Those rows no longer exist,
+        so the next :meth:`dispatch` — say, for the next item of a loop
+        that commits one transaction per item — would otherwise hand
+        arq a job whose row the receiving worker can never find. The
+        rollback took the work with it, so dropping the enqueue loses
+        nothing.
+
+        Returns
+        -------
+        tuple of PendingEnqueue
+            The enqueues dropped, in deferral order. Empty when nothing
+            was deferred, which makes the call safe to make
+            unconditionally.
+        """
+        discarded, self._pending = tuple(self._pending), []
+        for item in discarded:
+            self._logger.debug(
+                "Discarded deferred queue job",
+                discarded_queue_job_id=item.queue_job_public_id,
+                job_type=item.job_type,
+            )
+        return discarded
 
     async def dispatch(self) -> list[QueueJob]:
         """Enqueue everything deferred so far, stamping each row.
