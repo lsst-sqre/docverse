@@ -563,8 +563,8 @@ nothing at all.
 **A stamp only ever moves an edition's clock earlier.** Each column
 becomes the earlier of its current value and LTD's. Every drift the
 stamp exists to undo — the import moment, a repoint, a kind
-convergence, a `publish_status` flip — moves `date_updated` to now,
-later than any LTD date, so the rule still corrects each one. An LTD
+convergence — moves `date_updated` to now, later than any LTD date, so
+the rule still corrects each one. An LTD
 rebuild still moves the clock forward: `sync_build`'s repoint onto the
 rebuilt content first moves `date_updated` to now, and the stamp then
 lowers it to the new `date_rebuilt`. A rebuild whose bytes are
@@ -594,11 +594,13 @@ follows the edition that rebuilt.
 
 The consequence is that **a Docverse-side write to a synced row drifts
 its clock for at most one visit.** A tracking refresh, a kind
-convergence, an operator's `PATCH` of the edition's title or
-`lifecycle_exempt`, and above all the `publish_status` flips of the
-edition's own publish all move `date_updated` to now; the project's
-next keeper-sync visit puts LTD's value back. A visit is any
-`keeper_sync_project` job for the project:
+convergence, and an operator's `PATCH` of the edition's title or
+`lifecycle_exempt` all move `date_updated` to now; the project's next
+keeper-sync visit puts LTD's value back. Publishing is not such a
+write: its `publish_status` flips leave `date_updated` alone, so a
+freshly imported edition's own publish, and the dashboard that publish
+renders, already carry LTD's dates, and the next visit writes nothing.
+A visit is any `keeper_sync_project` job for the project:
 
 - a run, `POST /orgs/{org}/keeper-sync/runs`;
 - a per-project refresh,
@@ -609,12 +611,6 @@ next keeper-sync visit puts LTD's value back. A visit is any
   `tier_main` revisits a project only when LTD rebuilds its `main`, so
   a project whose only LTD edition is `main` stays drifted until then,
   or until the next run.
-
-A **freshly imported** edition therefore restamps on two visits, not
-one. The import visit stamps it; the publish that visit enqueues flips
-`publish_status`, which moves `date_updated` to now; the next visit
-puts LTD's value back. It settles there — a third visit writes nothing.
-The same holds for a release's aggregates, whose publish flips theirs.
 
 A stamp that fails is logged, with a Sentry event, as
 `Edition clock stamp failed; edition sync still succeeded` and does not
@@ -725,13 +721,13 @@ LTD's values, so the backfill is simply a full org run:
 
 A **repeat run** is the check that the backfill converged: it reports
 `restamped_edition_count` of `0` for every project whose content did
-not move in between. A project the first run imported or republished
-reports its second-visit restamp once more (see
-[Every visit re-asserts the clock](#every-visit-re-asserts-the-clock))
-and `0` after that. The same applies to a wave: the run that imports it
-leaves each new edition one visit behind, so a second run straight
-after — or the tier crons over the following hours — is what settles
-the new dashboards.
+not move in between, including a project the first run imported or
+republished, because the publishes that run enqueued leave the clock
+alone (see
+[Every visit re-asserts the clock](#every-visit-re-asserts-the-clock)).
+The same applies to a wave: the run that imports it stamps each new
+edition, and the dashboard its publish renders already shows LTD's
+dates.
 
 To see exactly what moved, the stamp logs one info line per changed
 row:

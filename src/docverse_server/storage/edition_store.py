@@ -1040,16 +1040,41 @@ class EditionStore:
     async def set_publish_status(
         self, *, edition_id: int, status: PublishStatus
     ) -> None:
-        """Set the ``publish_status`` column on an edition row."""
+        """Set the ``publish_status`` column on an edition row.
+
+        Leaves ``date_updated`` where it was. A status flip moves no
+        content — the repoint that enqueued the publish already moved
+        the clock — so it must not read back as a change. That matters
+        most for a keeper-synced edition (PRD #706): its import visit
+        stamps LTD's dates last, and the publish that visit enqueues
+        then flips this column three times before the
+        ``dashboard_build`` it cascades renders the edition's clock.
+
+        Written as a core ``UPDATE`` that pins ``date_updated`` to its
+        own value, because only a column the statement names escapes
+        the ORM's ``onupdate=now()``, and ORM attribute assignment
+        cannot name one it does not change. See the note on
+        ``SqlDashboardGitHubTemplateBinding.date_updated`` for the
+        idiom.
+
+        Raises
+        ------
+        RuntimeError
+            If no edition row has *edition_id*.
+        """
         result = await self._session.execute(
-            select(SqlEdition).where(SqlEdition.id == edition_id)
+            update(SqlEdition)
+            .where(SqlEdition.id == edition_id)
+            .values(
+                publish_status=status.value,
+                # Pinned: publishing is not a content change.
+                date_updated=SqlEdition.date_updated,
+            )
+            .returning(SqlEdition.id)
         )
-        row = result.scalar_one_or_none()
-        if row is None:
+        if result.scalar_one_or_none() is None:
             msg = f"Edition id={edition_id} not found"
             raise RuntimeError(msg)
-        row.publish_status = status.value
-        await self._session.flush()
 
     async def set_alternate_name(
         self, *, edition_id: int, alternate_name: str
@@ -1080,9 +1105,10 @@ class EditionStore:
         ``onupdate=now()`` on ``date_updated`` from applying: that
         default fills only a column a statement leaves out. The
         converse is why the caller stamps *last* — every later ORM
-        write to the row (a repoint, a kind convergence, a
-        ``publish_status`` flip) leaves ``date_updated`` out and so
-        moves it back to now.
+        write to the row (a repoint, a kind convergence) leaves
+        ``date_updated`` out and so moves it back to now.
+        :meth:`set_publish_status` is the exception: it pins the column,
+        so the publish a visit enqueues does not undo its stamp.
 
         The stamp only ever moves a date *earlier*: each column becomes
         the ``LEAST`` of its current value and the given one, and ``>``
@@ -1099,15 +1125,14 @@ class EditionStore:
         column, and later visits write nothing.
 
         Earlier-only still undoes every drift the stamp exists for: the
-        import moment, a repoint, a kind convergence, and a
-        ``publish_status`` flip all move ``date_updated`` to now, later
-        than any LTD date. An LTD rebuild still moves the clock forward,
-        because ``sync_build``'s repoint onto the rebuilt content first
-        moves ``date_updated`` to now, and the rebuilding edition's
-        stamp then lowers it to the new ``date_rebuilt``. A rebuild
-        whose bytes converge onto the build the row already serves moves
-        no pointer, and so no clock: its content is no newer than
-        before.
+        import moment, a repoint, and a kind convergence all move
+        ``date_updated`` to now, later than any LTD date. An LTD
+        rebuild still moves the clock forward, because ``sync_build``'s
+        repoint onto the rebuilt content first moves ``date_updated`` to
+        now, and the rebuilding edition's stamp then lowers it to the
+        new ``date_rebuilt``. A rebuild whose bytes converge onto the
+        build the row already serves moves no pointer, and so no clock:
+        its content is no newer than before.
 
         ``projects.date_updated`` is deliberately left alone. The
         project clock means "the content behind this project moved" to

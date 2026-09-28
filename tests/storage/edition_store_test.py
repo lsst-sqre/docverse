@@ -3817,10 +3817,9 @@ async def test_set_sync_dates_is_undone_by_a_later_orm_write(
     """Any later ORM write to the row moves ``date_updated`` back to now.
 
     Pins why keeper-sync stamps in its *last* transaction of a visit:
-    the repoint, a kind convergence, and a ``publish_status`` flip all
-    go through the ORM, whose ``onupdate`` re-stamps ``date_updated``
-    with the transaction time. A stamp that ran before any of them
-    would not survive the visit.
+    the repoint and a kind convergence both go through the ORM, whose
+    ``onupdate`` re-stamps ``date_updated`` with the transaction time.
+    A stamp that ran before either would not survive the visit.
     """
     created = datetime(2016, 5, 6, tzinfo=UTC)
     updated = datetime(2020, 9, 10, tzinfo=UTC)
@@ -3840,8 +3839,8 @@ async def test_set_sync_dates_is_undone_by_a_later_orm_write(
         await db_session.commit()
 
     async with db_session.begin():
-        await edition_store.set_publish_status(
-            edition_id=edition_id, status=PublishStatus.published
+        await edition_store.update_kind(
+            edition_id=edition_id, kind=EditionKind.release
         )
         write_time = (
             await db_session.execute(select(func.now()))
@@ -3854,6 +3853,70 @@ async def test_set_sync_dates_is_undone_by_a_later_orm_write(
         )
     assert date_created == created
     assert date_updated == write_time
+
+
+@pytest.mark.asyncio
+async def test_set_publish_status_leaves_the_edition_clock(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A ``publish_status`` flip does not move ``date_updated``.
+
+    Publishing moves no content — the repoint that enqueued it already
+    did — so it must not read back as a change. A freshly keeper-synced
+    edition carries LTD's dates when its publish runs, and the
+    ``dashboard_build`` that publish cascades renders whatever clock the
+    row holds by then.
+    """
+    created = datetime(2016, 5, 6, tzinfo=UTC)
+    updated = datetime(2020, 9, 10, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="publishes",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "publishes"},
+        )
+        await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+
+    for status in (
+        PublishStatus.pending,
+        PublishStatus.publishing,
+        PublishStatus.published,
+    ):
+        async with db_session.begin():
+            await edition_store.set_publish_status(
+                edition_id=edition_id, status=status
+            )
+            await db_session.commit()
+
+    async with db_session.begin():
+        assert await _read_edition_clock(db_session, edition_id) == (
+            created,
+            updated,
+        )
+        edition = await edition_store.get_by_id(edition_id)
+    assert edition is not None
+    assert edition.publish_status == PublishStatus.published
+
+
+@pytest.mark.asyncio
+async def test_set_publish_status_missing_edition_raises(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Flipping the status of an edition that does not exist raises."""
+    async with db_session.begin():
+        with pytest.raises(RuntimeError, match="Edition id=999999 not found"):
+            await edition_store.set_publish_status(
+                edition_id=999999, status=PublishStatus.pending
+            )
 
 
 @pytest.mark.asyncio

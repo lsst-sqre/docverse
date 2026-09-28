@@ -82,6 +82,13 @@ class SqlEdition(Base):
         server_default=func.now(),
     )
 
+    # Every write that leaves this column out moves it to now through
+    # ``onupdate``. Two writers name it to stay out of that:
+    # ``EditionStore.set_sync_dates`` (keeper-sync's LTD clock, PRD
+    # #706) and ``EditionStore.set_publish_status``, which pins it
+    # because publishing moves no content. Both are core ``UPDATE``
+    # statements, since ORM attribute assignment cannot suppress
+    # ``onupdate``.
     date_updated: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

@@ -6915,10 +6915,9 @@ async def test_drifted_aggregate_clock_is_restamped_without_the_backfill(
     """A visit that skips the backfill still re-dates its aggregates.
 
     The backfill only reports an aggregate on the visit that moved it,
-    and that is not the row's last write: the worker then publishes the
-    aggregate, whose ``publish_status`` flips move ``date_updated`` back
-    to now, and an aggregate imported before PRD #706 carries its import
-    time. Every later visit skips the backfill on its marker, so the
+    but an aggregate imported before PRD #706 carries its import time,
+    and one a later Docverse-side write drifted carries that write's.
+    Every later visit skips the backfill on its marker, so the
     aggregates' clock has to be re-asserted from the release's own
     visit — the full-org-run backfill depends on it.
     """
@@ -6935,8 +6934,8 @@ async def test_drifted_aggregate_clock_is_restamped_without_the_backfill(
         db_session, http_client, MockObjectStore(), source_objects
     ).sync_project(org_id=org_id, ltd_slug="pipelines")
 
-    # What the aggregates' publish (or a pre-PRD import) leaves behind.
-    publish_time = datetime(2026, 9, 20, 8, 0, tzinfo=UTC)
+    # What a pre-PRD import (or a later Docverse-side write) leaves.
+    drift_time = datetime(2026, 9, 20, 8, 0, tzinfo=UTC)
     async with db_session.begin():
         await db_session.execute(
             update(SqlEdition)
@@ -6944,7 +6943,7 @@ async def test_drifted_aggregate_clock_is_restamped_without_the_backfill(
                 SqlEdition.project_id == project_id,
                 SqlEdition.slug.in_(["15", "15.2"]),
             )
-            .values(date_updated=publish_time)
+            .values(date_updated=drift_time)
         )
 
     service = _build_service(

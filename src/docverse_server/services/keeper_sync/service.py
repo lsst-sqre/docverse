@@ -725,9 +725,10 @@ class ProjectSyncResult:
         operator's read on the backfill: a full org run over projects
         imported before the clock stamp reports non-zero, and a repeat
         run reports zero once every edition carries LTD's clock. A
-        freshly imported edition also counts on the visit after its
-        publish, whose ``publish_status`` flips move ``date_updated``
-        back to now through the ORM ``onupdate`` for one poll.
+        freshly imported edition counts on its import visit only: the
+        publish that visit enqueues leaves ``date_updated`` alone (see
+        :meth:`EditionStore.set_publish_status`), so the next visit
+        finds nothing to restamp.
         """
         return sum(
             1 for outcome in self.edition_outcomes if outcome.dates_restamped
@@ -1795,13 +1796,12 @@ class KeeperSyncService:
 
         The aggregates are looked up by the slugs *git_ref* implies on
         every visit, not taken from the backfill's outcomes, which only
-        exist on the visit that moved the pointer. That visit is not
-        the last write the row sees: the worker's publish of the moved
-        aggregate flips its ``publish_status`` through the ORM, moving
-        ``date_updated`` back to now, and the next visit skips the
-        backfill on its marker. An aggregate imported before PRD #706
-        likewise never moves again. One ``SELECT`` of at most two named
-        slugs per release visit re-asserts the clock for both.
+        exist on the visit that moved the pointer. An aggregate imported
+        before PRD #706 carries its import time, and one a later
+        Docverse-side write drifted carries that write's, yet every
+        later visit skips the backfill on its marker, so neither would
+        ever be re-dated from the outcomes. One ``SELECT`` of at most
+        two named slugs per release visit re-asserts the clock for both.
 
         The stamp only ever moves an aggregate's ``date_updated``
         *earlier* — the rule :meth:`EditionStore.set_sync_dates` applies
@@ -1810,9 +1810,9 @@ class KeeperSyncService:
         no statement. Two releases in one series whose content converged
         onto one build both find the aggregate on "their" build, and
         stamping each verbatim would make them overwrite each other on
-        every poll. Every write the stamp exists to undo — a repoint, a
-        ``publish_status`` flip — moves the clock to now, later than
-        any LTD date, so the earlier-only rule still corrects each one.
+        every poll. Every write the stamp exists to undo — the import, a
+        repoint — moves the clock to now, later than any LTD date, so
+        the earlier-only rule still corrects each one.
 
         Returns
         -------
