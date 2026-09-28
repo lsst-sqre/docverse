@@ -96,13 +96,17 @@ class RecordingLockService(LockService):
 
 def install_recording_lock_service(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    trace: list[str] | None = None,
 ) -> list[LockEvent]:
     """Patch ``Factory.create_lock_service`` to return a recording spy.
 
     Returns a list that accumulates :class:`LockEvent` records as
     workers acquire and release advisory locks. All ``LockService``
     instances built by the patched factory share the same list so a
-    single end-to-end run produces one ordered event log.
+    single end-to-end run produces one ordered event log. ``trace``,
+    when given, is every spy's shared plain-string log (see
+    :class:`RecordingLockService`).
     """
     events: list[LockEvent] = []
 
@@ -111,6 +115,7 @@ def install_recording_lock_service(
             session=self._session,
             logger=self._logger,
             events=events,
+            trace=trace,
         )
 
     monkeypatch.setattr(Factory, "create_lock_service", _create)

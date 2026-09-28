@@ -8,6 +8,7 @@ from typing import Any
 
 import structlog
 
+from docverse_server.domain.project import Project
 from docverse_server.services.default_branch import (
     DefaultBranchOutcome,
     DefaultBranchService,
@@ -18,9 +19,34 @@ from docverse_server.storage.project_store import ProjectStore
 
 __all__ = [
     "DefaultBranchEventProcessor",
-    "DefaultBranchEventResult",
     "DefaultBranchProjectResult",
+    "DefaultBranchTarget",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class DefaultBranchTarget:
+    """One project a ``repository.edited`` delivery converges, and on what.
+
+    Returned by :meth:`DefaultBranchEventProcessor.resolve_targets` and
+    handed back, one at a time, to
+    :meth:`DefaultBranchEventProcessor.converge`. Carries the org slug
+    alongside the project because the repo-keyed project lookup can
+    span organizations and the handler's post-commit work is keyed on
+    both slugs.
+    """
+
+    org_slug: str
+    """Slug of the organization that owns :attr:`project`."""
+
+    project: Project
+    """The project bound to the edited repository."""
+
+    default_branch: str
+    """The repository's new default branch, ``repository.default_branch``."""
+
+    old_default_branch: str | None
+    """The branch it replaced, ``changes.default_branch.from``, if given."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,26 +55,12 @@ class DefaultBranchProjectResult:
 
     Carries the slugs alongside the outcome because the handler's
     post-commit work — the ``edition_lifecycle`` event and the
-    ``dashboard_build`` enqueue — is keyed on them, and the repo-keyed
-    project lookup can span organizations.
+    ``dashboard_build`` enqueue — is keyed on them.
     """
 
     org_slug: str
     project_slug: str
     outcome: DefaultBranchOutcome
-
-
-@dataclass(frozen=True, slots=True)
-class DefaultBranchEventResult:
-    """Outcome of one :meth:`DefaultBranchEventProcessor.process` call.
-
-    ``projects`` holds one entry per project the delivery was applied
-    to, in the order the repo lookup returned them; empty when the
-    delivery changed no default branch, was malformed, or names a
-    repository no project is bound to.
-    """
-
-    projects: tuple[DefaultBranchProjectResult, ...] = ()
 
 
 class DefaultBranchEventProcessor:
@@ -64,10 +76,19 @@ class DefaultBranchEventProcessor:
     needs to rewrite a ``__main`` still tracking it.
 
     Payload parsing is defensive, as in the other processors: a missing
-    or wrong-shape field logs and returns an empty result, so the
-    handler still answers 200 and GitHub does not redeliver a payload
-    that will never parse. The caller (the webhook handler) owns the
-    transaction.
+    or wrong-shape field logs and returns no targets, so the handler
+    still answers 200 and GitHub does not redeliver a payload that will
+    never parse.
+
+    The work is split in two so the caller (the webhook handler) can
+    own one transaction per project, as the daily ``git_ref_audit``
+    does: :meth:`resolve_targets` reads which projects the delivery
+    reaches, inside a short read transaction, and :meth:`converge`
+    applies the rule to one of them inside that project's own. The
+    rule holds that project's ``__main`` ``EDITION_UPDATE`` lock while
+    it writes, so a delivery-wide transaction would wait on each later
+    project's lock while holding every earlier project's uncommitted
+    rows.
     """
 
     def __init__(
@@ -83,15 +104,25 @@ class DefaultBranchEventProcessor:
         self._service = default_branch_service
         self._logger = logger
 
-    async def process(
+    async def resolve_targets(
         self, payload: Mapping[str, Any]
-    ) -> DefaultBranchEventResult:
-        """Converge every project backed by the edited repository.
+    ) -> list[DefaultBranchTarget]:
+        """Return every project a default-branch change converges.
 
         Projects are found by ``repository.id``, with the
         ``(owner, name)`` fallback for projects whose numeric id is
         still unresolved — the same lookup the ``delete`` processor
-        uses (:meth:`ProjectStore.list_by_github_repo`).
+        uses (:meth:`ProjectStore.list_by_github_repo`). Read-only: the
+        caller wraps it in a transaction that needs no commit.
+
+        Returns
+        -------
+        list of DefaultBranchTarget
+            One per project bound to the repository, in the order the
+            repository lookup returned them. Empty, after an info or
+            warning log saying why, when the edit changed something
+            other than the default branch, the payload is malformed, or
+            no project is bound to the repository.
         """
         changes = payload.get("changes")
         change = (
@@ -113,7 +144,7 @@ class DefaultBranchEventProcessor:
                     sorted(changes) if isinstance(changes, Mapping) else None
                 ),
             )
-            return DefaultBranchEventResult()
+            return []
 
         old_default_branch = change.get("from")
         new_default_branch = repo.get("default_branch")
@@ -127,52 +158,67 @@ class DefaultBranchEventProcessor:
                 "repository.edited payload missing default branch or repo",
                 new_default_branch=new_default_branch,
             )
-            return DefaultBranchEventResult()
+            return []
         if not isinstance(old_default_branch, str):
             old_default_branch = None
 
         projects = await self._project_store.list_by_github_repo(
             repo_id=repo_id, owner=owner, repo=repo_name
         )
-        if not projects:
-            logger.info(
-                "No projects match repository.edited",
-                old_default_branch=old_default_branch,
-                new_default_branch=new_default_branch,
-            )
-            return DefaultBranchEventResult()
-
-        results: list[DefaultBranchProjectResult] = []
+        targets: list[DefaultBranchTarget] = []
         org_slugs: dict[int, str] = {}
         for project in projects:
-            outcome = await self._service.apply(
-                project=project,
-                default_branch=new_default_branch,
-                trigger=DefaultBranchTrigger.webhook,
-                old_default_branch=old_default_branch,
-            )
             org_slug = org_slugs.get(project.org_id)
             if org_slug is None:
                 org = await self._org_store.get_by_id(project.org_id)
                 if org is None:
                     continue
                 org_slug = org_slugs[project.org_id] = org.slug
-            results.append(
-                DefaultBranchProjectResult(
+            targets.append(
+                DefaultBranchTarget(
                     org_slug=org_slug,
-                    project_slug=project.slug,
-                    outcome=outcome,
+                    project=project,
+                    default_branch=new_default_branch,
+                    old_default_branch=old_default_branch,
                 )
             )
+        if not targets:
+            logger.info(
+                "No projects match repository.edited",
+                old_default_branch=old_default_branch,
+                new_default_branch=new_default_branch,
+            )
+            return []
 
         logger.info(
-            "Processed repository.edited default branch change",
+            "Matched projects for repository.edited default branch change",
             old_default_branch=old_default_branch,
             new_default_branch=new_default_branch,
-            projects_matched=len(projects),
-            main_rewrites=sum(r.outcome.main_rewritten for r in results),
+            projects_matched=len(targets),
         )
-        return DefaultBranchEventResult(projects=tuple(results))
+        return targets
+
+    async def converge(
+        self, target: DefaultBranchTarget
+    ) -> DefaultBranchProjectResult:
+        """Apply the delivery's default branch to one project.
+
+        Runs :meth:`DefaultBranchService.apply` with the webhook's old
+        default branch as its evidence that ``__main``'s ref is gone.
+        The caller owns the transaction — one per target — and, once it
+        commits, the post-commit work the result calls for.
+        """
+        outcome = await self._service.apply(
+            project=target.project,
+            default_branch=target.default_branch,
+            trigger=DefaultBranchTrigger.webhook,
+            old_default_branch=target.old_default_branch,
+        )
+        return DefaultBranchProjectResult(
+            org_slug=target.org_slug,
+            project_slug=target.project.slug,
+            outcome=outcome,
+        )
 
 
 def _repository_coordinates(

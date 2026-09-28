@@ -146,6 +146,7 @@ payload handling and the one rule every trigger applies.
 
 _GITHUB_LOG_MODULES = (
     *_DEFAULT_BRANCH_LOG_MODULES,
+    "docverse_server.handlers.webhooks.github",
     "docverse_server.worker.functions.git_ref_audit",
     "docverse_server.worker.functions.project_github_resolve",
 )

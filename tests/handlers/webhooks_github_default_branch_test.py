@@ -21,7 +21,7 @@ import pytest
 import pytest_asyncio
 import structlog
 from fastapi import FastAPI
-from httpx import AsyncClient
+from httpx import AsyncClient, Response
 from pydantic import SecretStr
 from safir.arq import MockArqQueue
 from safir.dependencies.arq import arq_dependency
@@ -53,12 +53,18 @@ from docverse_server.metrics import (
     MetricsEditionKind,
     WebhookOutcome,
 )
+from docverse_server.services.default_branch import (
+    DefaultBranchOutcome,
+    DefaultBranchService,
+)
+from docverse_server.services.lock_service import LockKey
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
+from tests.support.lock_service_spy import install_recording_lock_service
 
 _WEBHOOK_PATH = "/docverse/webhooks/github"
 _WEBHOOK_SECRET = "test-webhook-secret"
@@ -95,6 +101,8 @@ async def github_app_enabled(
 
 
 class _Seeded(NamedTuple):
+    org_id: int
+    org_slug: str
     project_id: int
     main_id: int
 
@@ -151,7 +159,12 @@ async def _seed(
             ),
         )
         await db_session.commit()
-    return _Seeded(project_id=project.id, main_id=main.id)
+    return _Seeded(
+        org_id=org.id,
+        org_slug=org_slug,
+        project_id=project.id,
+        main_id=main.id,
+    )
 
 
 async def _seed_build(
@@ -261,12 +274,12 @@ def _edited_payload(
     }
 
 
-async def _post(client: AsyncClient, payload: dict[str, Any]) -> None:
+async def _send(client: AsyncClient, payload: dict[str, Any]) -> Response:
     body = json.dumps(payload).encode("utf-8")
     digest = hmac.new(
         _WEBHOOK_SECRET.encode("utf-8"), msg=body, digestmod=hashlib.sha256
     ).hexdigest()
-    response = await client.post(
+    return await client.post(
         _WEBHOOK_PATH,
         content=body,
         headers={
@@ -276,6 +289,10 @@ async def _post(client: AsyncClient, payload: dict[str, Any]) -> None:
             "X-Hub-Signature-256": f"sha256={digest}",
         },
     )
+
+
+async def _post(client: AsyncClient, payload: dict[str, Any]) -> None:
+    response = await _send(client, payload)
     assert response.status_code == 200
 
 
@@ -494,3 +511,218 @@ async def test_default_branch_change_without_the_new_branch_is_ignored(
     assert main is not None
     assert main.tracking_params == {"git_ref": "master"}
     assert _lifecycle_events() == []
+
+
+async def _seed_shared_repo(
+    db_session: AsyncSession, *org_slugs: str
+) -> dict[int, _Seeded]:
+    """Seed one project per org, all bound to ``acme/docs``, by project id.
+
+    Each ``__main`` tracks ``master`` and each project has a completed
+    ``main`` build for the rename to repoint it at.
+    """
+    seeded: dict[int, _Seeded] = {}
+    for org_slug in org_slugs:
+        project = await _seed(db_session, org_slug=org_slug)
+        await _seed_build(
+            db_session, project_id=project.project_id, git_ref="main", days=2
+        )
+        seeded[project.project_id] = project
+    return seeded
+
+
+def _main_lock_id(seeded: _Seeded) -> int:
+    """Return the id of the ``EDITION_UPDATE`` lock the rule takes."""
+    return LockKey.for_edition_update(
+        org_id=seeded.org_id,
+        project_id=seeded.project_id,
+        edition_id=seeded.main_id,
+    ).lock_id
+
+
+def _fail_convergence(
+    monkeypatch: pytest.MonkeyPatch, *, on_call: int
+) -> list[int]:
+    """Make the ``on_call``-th application of the rule raise.
+
+    The real rule runs first, so the failure lands after it wrote the
+    column, rewrote ``__main``, repointed it, and deferred its
+    ``publish_edition``: all of which that project's rollback has to
+    take back. Returns the ids of the projects the rule was applied to,
+    in the order the delivery reached them.
+    """
+    calls: list[int] = []
+    real_apply = DefaultBranchService.apply
+
+    async def _apply(
+        self: DefaultBranchService, **kwargs: Any
+    ) -> DefaultBranchOutcome:
+        calls.append(kwargs["project"].id)
+        outcome = await real_apply(self, **kwargs)
+        if len(calls) == on_call:
+            msg = "convergence failed"
+            raise RuntimeError(msg)
+        return outcome
+
+    monkeypatch.setattr(DefaultBranchService, "apply", _apply)
+    return calls
+
+
+async def _assert_converged(db_session: AsyncSession, seeded: _Seeded) -> None:
+    project = await _project(db_session, seeded.project_id)
+    assert project.github_default_branch == "main"
+    main = await _edition(db_session, seeded.main_id)
+    assert main is not None
+    assert main.tracking_params == {"git_ref": "main"}
+    assert main.current_build_id is not None
+
+
+async def _assert_untouched(db_session: AsyncSession, seeded: _Seeded) -> None:
+    project = await _project(db_session, seeded.project_id)
+    assert project.github_default_branch is None
+    main = await _edition(db_session, seeded.main_id)
+    assert main is not None
+    assert main.tracking_params == {"git_ref": "master"}
+    assert main.current_build_id is None
+
+
+@pytest.mark.asyncio
+async def test_default_branch_rename_converges_every_bound_project(
+    client: AsyncClient,
+    github_app_enabled: None,
+    db_session: AsyncSession,
+) -> None:
+    """One delivery converges each project the repository backs.
+
+    The repo-keyed lookup spans organizations, and each project gets
+    its own rewrite, repoint, publish, dashboard rebuild, and ``update``
+    event.
+    """
+    seeded = await _seed_shared_repo(db_session, "db-multi-a", "db-multi-b")
+
+    await _post(client, _edited_payload())
+
+    for project in seeded.values():
+        await _assert_converged(db_session, project)
+    assert sorted(e.organization for e in _lifecycle_events()) == [
+        "db-multi-a",
+        "db-multi-b",
+    ]
+    assert _arq_count("publish_edition") == 2
+    assert _arq_count("dashboard_build") == 2
+    [received] = _received_events()
+    assert received.outcome is WebhookOutcome.dispatched
+    assert received.jobs_enqueued == 4
+
+
+@pytest.mark.asyncio
+async def test_default_branch_commits_each_project_before_the_next_lock(
+    client: AsyncClient,
+    github_app_enabled: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A project's convergence commits before the next project's lock.
+
+    The rule holds ``__main``'s ``EDITION_UPDATE`` lock while it writes.
+    Waiting on the second project's lock inside a delivery-wide
+    transaction would hold the first project's uncommitted rows the
+    whole time: the shape the audit avoids with one transaction per
+    project, and the one this delivery must avoid too.
+    """
+    seeded = await _seed_shared_repo(db_session, "db-lock-a", "db-lock-b")
+    enters = {
+        f"enter:{_main_lock_id(project)}": f"exit:{_main_lock_id(project)}"
+        for project in seeded.values()
+    }
+    trace: list[str] = []
+    install_recording_lock_service(monkeypatch, trace=trace)
+    real_commit = AsyncSession.commit
+
+    async def _traced_commit(self: AsyncSession) -> None:
+        await real_commit(self)
+        trace.append("commit")
+
+    monkeypatch.setattr(AsyncSession, "commit", _traced_commit)
+
+    await _post(client, _edited_payload())
+
+    first_enter, second_enter = (
+        i for i, entry in enumerate(trace) if entry in enters
+    )
+    first_exit = trace.index(enters[trace[first_enter]])
+    assert first_exit < second_enter
+    assert "commit" in trace[first_exit:second_enter]
+
+
+@pytest.mark.asyncio
+async def test_default_branch_failure_keeps_earlier_projects_converged(
+    client: AsyncClient,
+    github_app_enabled: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A project whose convergence raises does not undo the ones before it.
+
+    Its own writes roll back with its transaction, and the delivery
+    still fails — the exception escapes, and its metrics event reads
+    ``error`` — so it shows as failed for GitHub's redelivery, which is
+    inert for the project already converged. In this ASGI-transport rig
+    the uncaught exception bubbles up through ``httpx`` rather than
+    becoming a ``500``, hence ``pytest.raises``.
+    """
+    seeded = await _seed_shared_repo(db_session, "db-fail-a", "db-fail-b")
+    calls = _fail_convergence(monkeypatch, on_call=2)
+
+    with pytest.raises(RuntimeError, match="convergence failed"):
+        await _send(client, _edited_payload())
+
+    converged, failed = (seeded[project_id] for project_id in calls)
+    await _assert_converged(db_session, converged)
+    await _assert_untouched(db_session, failed)
+    assert await _job_kinds(db_session) == [
+        JobKind.publish_edition,
+        JobKind.dashboard_build,
+    ]
+    assert _arq_count("publish_edition") == 1
+    assert _arq_count("dashboard_build") == 1
+    [event] = _lifecycle_events()
+    assert event.organization == converged.org_slug
+    [received] = _received_events()
+    assert received.outcome is WebhookOutcome.error
+    assert received.jobs_enqueued == 2
+
+
+@pytest.mark.asyncio
+async def test_default_branch_failure_does_not_block_later_projects(
+    client: AsyncClient,
+    github_app_enabled: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The projects after a failing one still converge.
+
+    The failure leaves the ``publish_edition`` it deferred naming a row
+    its rollback removed. That enqueue is dropped, not handed to arq
+    with the next project's: exactly one ``publish_edition`` reaches
+    the queue, for the project that converged.
+    """
+    seeded = await _seed_shared_repo(db_session, "db-skip-a", "db-skip-b")
+    calls = _fail_convergence(monkeypatch, on_call=1)
+
+    with pytest.raises(RuntimeError, match="convergence failed"):
+        await _send(client, _edited_payload())
+
+    failed, converged = (seeded[project_id] for project_id in calls)
+    await _assert_untouched(db_session, failed)
+    await _assert_converged(db_session, converged)
+    assert await _job_kinds(db_session) == [
+        JobKind.publish_edition,
+        JobKind.dashboard_build,
+    ]
+    assert _arq_count("publish_edition") == 1
+    [event] = _lifecycle_events()
+    assert event.organization == converged.org_slug
+    [received] = _received_events()
+    assert received.outcome is WebhookOutcome.error
+    assert received.jobs_enqueued == 2

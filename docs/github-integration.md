@@ -29,7 +29,9 @@ dispatches on the event type and its `action`. It answers:
   so GitHub never retries a delivery Docverse chose to ignore;
 - `500` when a handler raises. Each handler does its database work in
   one transaction, so a delivery that fails partway through that work
-  leaves nothing half-done.
+  leaves nothing half-done — except `repository.edited`, which works
+  project by project (see
+  [A default-branch delivery that fails](#a-default-branch-delivery-that-fails)).
 
 Every delivery, whatever became of it, publishes one
 `github_webhook_received` event; see the
@@ -41,7 +43,7 @@ Every delivery, whatever became of it, publishes one
 | `delete` | For a deleted branch or tag, soft-deletes and unpublishes every live, non-exempt `draft` edition tracking it, on every project bound to the repository, then enqueues one `dashboard_build` per affected project. Release editions and `__main` are never swept. |
 | `repository.renamed` | Rewrites the repository name on bound projects and on dashboard-template bindings and templates, matched by `repository.id` — and, for a template binding that has never synced, by its old name. |
 | `repository.transferred` | Rewrites the owner, owner id, and name on the same rows, matched by `repository.id` only. |
-| `repository.edited` | When `changes` carries `default_branch`, applies the new default branch to every project bound to the repository: see [The default branch](#the-default-branch). Any other edit — description, homepage, topics — is logged and ignored. |
+| `repository.edited` | When `changes` carries `default_branch`, applies the new default branch to every project bound to the repository, each in a transaction of its own: see [The default branch](#the-default-branch). Any other edit — description, homepage, topics — is logged and ignored. |
 | `organization.renamed` | Rewrites the owner login on dashboard-template bindings and templates. Project rows are not rewritten: a project's `github.owner` keeps the old login. |
 | `installation.created` | Records the installation, owner, and repository ids on every project bound to a repository the installation covers. |
 | `installation.deleted` | Marks every dashboard-template binding under the installation failed, with `installation_deleted`. |
@@ -67,6 +69,27 @@ is fixed, redeliver it from the App's *Advanced* settings tab (*Recent
 Deliveries*). A default-branch change whose delivery was lost is
 converged by the next `git_ref_audit` tick anyway (see
 [The audit is the backfill](#the-audit-is-the-backfill)).
+
+### A default-branch delivery that fails
+
+A `repository.edited` delivery reads the projects bound to the
+repository first, then converges each one in its own transaction,
+committing it before the next project's turn. That is the audit's
+shape, and for the same reason: the rule holds each project's `__main`
+lock while it writes, and one delivery-wide transaction would wait on a
+later project's lock while still holding every earlier project's
+uncommitted rows.
+
+So a failure does not roll the whole delivery back. A project whose
+convergence raises — a CDN failure unpublishing a retired draft, say —
+loses only its own writes, and the projects after it still converge.
+Once every project has had its turn, the delivery answers `500` with
+the first failure, which is what Sentry records, and its
+`github_webhook_received` event reads `error`, with `jobs_enqueued`
+counting the jobs the converged projects enqueued. Redelivering it
+retries the failed projects and is inert for the ones that converged:
+their column already matches and their `__main` already tracks the
+branch.
 
 ## The default branch
 
@@ -361,7 +384,9 @@ Notes:
 The rule binds these fields onto every line it writes, and the
 `repository.edited` processor binds the repository's onto every line it
 writes. A worker's own context rides along as well — `org` and
-`git_ref_audit_run_id` on an audit's lines, for example.
+`git_ref_audit_run_id` on an audit's lines, for example — and the
+webhook handler's own two lines, which the processor does not write,
+carry the delivery's `github_event` and `github_delivery_id` instead.
 
 | Field | Bound by | Meaning |
 | --- | --- | --- |
@@ -382,7 +407,9 @@ the line to count. The rule's other lines say why it did what it did.
 
 | Message | Level | Fields |
 | --- | --- | --- |
-| `Processed repository.edited default branch change` | info | `old_default_branch`, `new_default_branch`, `projects_matched`, `main_rewrites` |
+| `Matched projects for repository.edited default branch change` | info | `old_default_branch`, `new_default_branch`, `projects_matched` |
+| `Default branch convergence failed for a project` | warning | `org`, `project`, `project_id`, `error`, `error_type` |
+| `Processed repository.edited default branch change` | info | `projects_converged`, `projects_failed`, `main_rewrites` |
 | `Ignoring repository.edited without a default branch change` | info | `changed_fields` |
 | `No projects match repository.edited` | info | `old_default_branch`, `new_default_branch` |
 | `repository.edited payload missing default branch or repo` | warning | `new_default_branch` |
@@ -412,6 +439,15 @@ rule committed and only the hand-off of its `publish_edition` job to
 the queue failed, the project counts toward the other two as well, and
 the job's row is left for the reapers' orphan sweep, as after any failed
 hand-off.
+
+A `repository.edited` delivery that matched any project ends with
+`Processed repository.edited default branch change`, which counts the
+same way per delivery: `projects_converged` the projects whose
+transaction committed, `main_rewrites` those among them whose `__main`
+was rewritten, and `projects_failed` the projects that raised, each of
+which also logged `Default branch convergence failed for a project`. A
+project whose rule committed but whose post-commit hand-off failed
+counts as both converged and failed.
 
 ## Pinned `__main` editions are left for operators
 

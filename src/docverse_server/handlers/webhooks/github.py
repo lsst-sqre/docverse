@@ -9,6 +9,7 @@ from datetime import timedelta
 from typing import Annotated, Any
 
 import gidgethub
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from gidgethub import sansio
 from gidgethub.routing import Router as GidgethubRouter
@@ -35,6 +36,8 @@ from docverse_server.services.dashboard_templates import (
 )
 from docverse_server.services.default_branch_processor import (
     DefaultBranchEventProcessor,
+    DefaultBranchProjectResult,
+    DefaultBranchTarget,
 )
 from docverse_server.services.ref_deleted_processor import (
     RefDeletedWebhookProcessor,
@@ -162,44 +165,119 @@ async def _handle_repository_edited(
 
     Only an edit that changes the default branch does anything; the
     processor logs and ignores the rest (description, topics, ...).
-    Shaped like :func:`_handle_delete`: the convergence — column write,
-    ``__main`` rewrite, draft retire, repoint — runs in one transaction
-    so a failure mid-way (a CDN ``unpublish`` refusal, say) rolls the
-    whole delivery back for GitHub to redeliver. After the commit the
-    deferred ``publish_edition`` jobs are handed to arq, then each
-    project whose ``__main`` was rewritten gets what a ``PATCH`` of the
-    edition would have announced: one ``edition_lifecycle`` ``update``
-    event and one ``dashboard_build``, the latter in its own
-    transaction so an enqueue failure cannot undo the convergence.
-    Every publish job and every dashboard build actually enqueued is
-    counted on ``report``.
+
+    Shaped like the daily ``git_ref_audit``'s convergence rather than
+    :func:`_handle_delete`: the projects the delivery reaches are read
+    in one short transaction, then each is converged — column write,
+    ``__main`` rewrite, draft retire, repoint — in a transaction of its
+    own. The rule holds the project's ``__main`` ``EDITION_UPDATE`` lock
+    while it writes, so one delivery-wide transaction would wait on each
+    later project's lock while still holding every earlier project's
+    uncommitted rows. See :func:`_converge_default_branch_target` for
+    what follows each commit.
+
+    A project whose convergence raises — a CDN ``unpublish`` refusal,
+    say — rolls back only its own writes and does not stop the projects
+    after it; the projects converged before it stay converged. Once
+    every project has had its turn, the first such exception is
+    re-raised, so the delivery answers ``500`` and records ``error`` for
+    GitHub's redelivery, which is inert for the projects that did
+    converge. Every publish job and every dashboard build actually
+    enqueued is counted on ``report``, failures or not.
     """
     async with context.session.begin():
-        result = await default_branch.process(event.data)
-        await context.session.commit()
-    await context.factory.queue_dispatcher.dispatch()
-    for affected in result.projects:
-        outcome = affected.outcome
-        if outcome.repointed_build_id is not None:
-            report.jobs_enqueued += 1
-        if not outcome.main_rewritten:
-            continue
-        await context.events.edition_lifecycle.publish(
-            EditionLifecycleEvent(
-                organization=affected.org_slug,
-                project=affected.project_slug,
-                action=LifecycleAction.update,
-                edition_kind=MetricsEditionKind.main,
+        targets = await default_branch.resolve_targets(event.data)
+    if not targets:
+        return
+    results: list[DefaultBranchProjectResult] = []
+    failure: Exception | None = None
+    failed = 0
+    for target in targets:
+        try:
+            await _converge_default_branch_target(
+                target,
+                default_branch=default_branch,
+                context=context,
+                report=report,
+                results=results,
             )
+        except Exception as exc:
+            # A ``publish_edition`` the rule deferred before the failure
+            # names a row the rollback just removed; left pending, the
+            # next project's ``dispatch()`` would hand arq a job whose
+            # row no worker can find.
+            context.factory.queue_dispatcher.discard()
+            context.logger.warning(
+                "Default branch convergence failed for a project",
+                org=target.org_slug,
+                project=target.project.slug,
+                project_id=target.project.id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            failed += 1
+            if failure is None:
+                failure = exc
+            else:
+                # Only the first is re-raised to reach Sentry as the
+                # delivery's 500.
+                sentry_sdk.capture_exception(exc)
+    context.logger.info(
+        "Processed repository.edited default branch change",
+        projects_converged=len(results),
+        projects_failed=failed,
+        main_rewrites=sum(r.outcome.main_rewritten for r in results),
+    )
+    if failure is not None:
+        raise failure
+
+
+async def _converge_default_branch_target(
+    target: DefaultBranchTarget,
+    *,
+    default_branch: DefaultBranchEventProcessor,
+    context: RequestContext,
+    report: WebhookDeliveryReport,
+    results: list[DefaultBranchProjectResult],
+) -> None:
+    """Converge one project in its own transaction, then announce it.
+
+    After the commit the deferred ``publish_edition`` job is handed to
+    arq, and a rewritten ``__main`` gets what a ``PATCH`` of the edition
+    would have announced: one ``edition_lifecycle`` ``update`` event and
+    one ``dashboard_build``, the latter in its own transaction so an
+    enqueue failure cannot undo the convergence.
+
+    The result is appended to ``results`` as soon as the transaction
+    commits, so a later failure dispatching or announcing it still
+    counts the rewrite that is durable.
+    """
+    async with context.session.begin():
+        result = await default_branch.converge(target)
+        await context.session.commit()
+    results.append(result)
+    await context.factory.queue_dispatcher.dispatch()
+    outcome = result.outcome
+    if outcome.repointed_build_id is not None:
+        report.jobs_enqueued += 1
+    if not outcome.main_rewritten:
+        return
+    await context.events.edition_lifecycle.publish(
+        EditionLifecycleEvent(
+            organization=result.org_slug,
+            project=result.project_slug,
+            action=LifecycleAction.update,
+            edition_kind=MetricsEditionKind.main,
         )
-        if await try_enqueue_dashboard_build_by_slug(
-            factory=context.factory,
-            session=context.session,
-            logger=context.logger,
-            org_slug=affected.org_slug,
-            project_slug=affected.project_slug,
-        ):
-            report.jobs_enqueued += 1
+    )
+    if await try_enqueue_dashboard_build_by_slug(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        org_slug=result.org_slug,
+        project_slug=result.project_slug,
+    ):
+        report.jobs_enqueued += 1
 
 
 @_event_router.register("organization", action="renamed")
