@@ -39,18 +39,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse_server.domain.project import Project
 from docverse_server.factory import Factory
-from docverse_server.metrics import (
-    DocverseEvents,
-    EditionLifecycleEvent,
-    LifecycleAction,
-    MetricsEditionKind,
-)
-from docverse_server.services.dashboard.enqueue import (
-    try_enqueue_dashboard_build_by_slug,
-)
 from docverse_server.services.default_branch import (
     DefaultBranchOutcome,
     DefaultBranchTrigger,
+)
+from docverse_server.services.default_branch_announce import (
+    announce_main_rewrite,
 )
 from docverse_server.storage._http_retry import (
     RETRYABLE_STATUS_CODES,
@@ -391,9 +385,10 @@ async def _apply_default_branch(
     audit as the backstop. A later resolve spends no requests on the
     ref set: the column's previous value is its evidence.
 
-    A rewritten ``__main`` is announced as a ``PATCH`` of it would be:
-    its ``publish_edition`` job is handed to arq, then one
-    ``edition_lifecycle`` ``update`` event and one ``dashboard_build``.
+    After the commit the deferred ``publish_edition`` job is handed to
+    arq, and a rewritten ``__main`` is announced as a ``PATCH`` of it
+    would be, through
+    :func:`~docverse_server.services.default_branch_announce.announce_main_rewrite`.
 
     Runs in its own transaction after the ids commit, because the
     service takes ``__main``'s ``EDITION_UPDATE`` advisory lock before
@@ -445,25 +440,16 @@ async def _apply_default_branch(
         org = await factory.create_org_store().get_by_id(project.org_id)
         await session.commit()
     await factory.queue_dispatcher.dispatch()
-    if not outcome.main_rewritten or org is None:
-        return outcome
-    events: DocverseEvents | None = ctx.get("events")
-    if events is not None:
-        await events.edition_lifecycle.publish(
-            EditionLifecycleEvent(
-                organization=org.slug,
-                project=project.slug,
-                action=LifecycleAction.update,
-                edition_kind=MetricsEditionKind.main,
-            )
+    if org is not None:
+        await announce_main_rewrite(
+            factory=factory,
+            session=session,
+            events=ctx.get("events"),
+            logger=logger,
+            org_slug=org.slug,
+            project_slug=project.slug,
+            outcome=outcome,
         )
-    await try_enqueue_dashboard_build_by_slug(
-        factory=factory,
-        session=session,
-        logger=logger,
-        org_slug=org.slug,
-        project_slug=project.slug,
-    )
     return outcome
 
 

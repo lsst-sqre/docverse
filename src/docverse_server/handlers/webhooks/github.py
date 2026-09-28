@@ -19,13 +19,7 @@ from docverse_server.dependencies.context import (
     context_dependency,
 )
 from docverse_server.factory import WebhookDispatch
-from docverse_server.metrics import (
-    EditionLifecycleEvent,
-    GitHubWebhookReceivedEvent,
-    LifecycleAction,
-    MetricsEditionKind,
-    WebhookOutcome,
-)
+from docverse_server.metrics import GitHubWebhookReceivedEvent, WebhookOutcome
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
@@ -33,6 +27,9 @@ from docverse_server.services.dashboard_templates import (
     InstallationEventProcessor,
     PushEventProcessor,
     RenameEventProcessor,
+)
+from docverse_server.services.default_branch_announce import (
+    announce_main_rewrite,
 )
 from docverse_server.services.default_branch_processor import (
     DefaultBranchEventProcessor,
@@ -243,10 +240,11 @@ async def _converge_default_branch_target(
     """Converge one project in its own transaction, then announce it.
 
     After the commit the deferred ``publish_edition`` job is handed to
-    arq, and a rewritten ``__main`` gets what a ``PATCH`` of the edition
-    would have announced: one ``edition_lifecycle`` ``update`` event and
-    one ``dashboard_build``, the latter in its own transaction so an
-    enqueue failure cannot undo the convergence.
+    arq, and a rewritten ``__main`` is announced as a ``PATCH`` of the
+    edition would be, through
+    :func:`~docverse_server.services.default_branch_announce.announce_main_rewrite`.
+    The repoint's ``publish_edition`` and the announcement's
+    ``dashboard_build`` are both counted on ``report``.
 
     The result is appended to ``results`` as soon as the transaction
     commits, so a later failure dispatching or announcing it still
@@ -257,25 +255,16 @@ async def _converge_default_branch_target(
         await context.session.commit()
     results.append(result)
     await context.factory.queue_dispatcher.dispatch()
-    outcome = result.outcome
-    if outcome.repointed_build_id is not None:
+    if result.outcome.repointed_build_id is not None:
         report.jobs_enqueued += 1
-    if not outcome.main_rewritten:
-        return
-    await context.events.edition_lifecycle.publish(
-        EditionLifecycleEvent(
-            organization=result.org_slug,
-            project=result.project_slug,
-            action=LifecycleAction.update,
-            edition_kind=MetricsEditionKind.main,
-        )
-    )
-    if await try_enqueue_dashboard_build_by_slug(
+    if await announce_main_rewrite(
         factory=context.factory,
         session=context.session,
+        events=context.events,
         logger=context.logger,
         org_slug=result.org_slug,
         project_slug=result.project_slug,
+        outcome=result.outcome,
     ):
         report.jobs_enqueued += 1
 

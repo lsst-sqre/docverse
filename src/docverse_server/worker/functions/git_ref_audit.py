@@ -51,12 +51,9 @@ from docverse_server.domain.project import Project
 from docverse_server.factory import Factory
 from docverse_server.metrics import (
     DocverseEvents,
-    EditionLifecycleEvent,
-    LifecycleAction,
     LifecycleActionEvent,
     LifecycleActionTrigger,
     LifecycleReapAction,
-    MetricsEditionKind,
 )
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
@@ -64,6 +61,9 @@ from docverse_server.services.dashboard.enqueue import (
 from docverse_server.services.default_branch import (
     DefaultBranchService,
     DefaultBranchTrigger,
+)
+from docverse_server.services.default_branch_announce import (
+    announce_main_rewrite,
 )
 from docverse_server.services.git_ref_audit_finalisation import (
     maybe_finalise_git_ref_audit_run,
@@ -436,8 +436,8 @@ async def _converge_default_branches(
     org-wide transaction would keep every earlier project's rows locked
     while waiting on a later project's lock. After each commit the
     deferred ``publish_edition`` job is handed to arq, and a rewritten
-    ``__main`` gets what a ``PATCH`` of it would announce: one
-    ``edition_lifecycle`` ``update`` event and one ``dashboard_build``.
+    ``__main`` is announced as a ``PATCH`` of it would be, through
+    :func:`~docverse_server.services.default_branch_announce.announce_main_rewrite`.
 
     A project whose convergence raises — a CDN failure unpublishing a
     retired draft, a lock or database error, a queue-backend outage on
@@ -521,23 +521,14 @@ async def _converge_project(
     if outcome.main_rewritten:
         tally.main_rewrites += 1
     await factory.queue_dispatcher.dispatch()
-    if not outcome.main_rewritten:
-        return
-    if events is not None:
-        await events.edition_lifecycle.publish(
-            EditionLifecycleEvent(
-                organization=org_slug,
-                project=project.slug,
-                action=LifecycleAction.update,
-                edition_kind=MetricsEditionKind.main,
-            )
-        )
-    await try_enqueue_dashboard_build_by_slug(
+    await announce_main_rewrite(
         factory=factory,
         session=session,
+        events=events,
         logger=logger,
         org_slug=org_slug,
         project_slug=project.slug,
+        outcome=outcome,
     )
 
 

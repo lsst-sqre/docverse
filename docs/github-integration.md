@@ -578,6 +578,9 @@ it the fix for a synced project whose old branch still exists; see
   endpoint and its event router.
 - `src/docverse_server/services/default_branch.py` — the rule every
   trigger applies.
+- `src/docverse_server/services/default_branch_announce.py` — the
+  `edition_lifecycle` event and `dashboard_build` every trigger sends
+  after a `__main` rewrite commits.
 - `src/docverse_server/services/default_branch_processor.py` — the
   `repository.edited` processor.
 - `src/docverse_server/services/ref_deleted_processor.py` and
