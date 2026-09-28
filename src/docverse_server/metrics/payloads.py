@@ -3,9 +3,10 @@
 Almost every payload derives from :class:`DocverseEventBase`, which
 carries the two dimensions every Docverse metric is sliced by —
 ``organization`` and ``project``. The exceptions are
-:class:`ApiRequestEvent` and :class:`GitHubWebhookReceivedEvent`, which
-usually address no organization and so carry both as optional fields of
-their own. Payloads are
+:class:`ApiRequestEvent`, which usually addresses no organization and
+so carries both as optional fields of its own, and
+:class:`GitHubWebhookReceivedEvent`, which is never resolved to one and
+carries neither. Payloads are
 deliberately **scalar-only** (the Avro/InfluxDB backing store rejects
 nested structures; see
 :meth:`safir.metrics.EventPayload.validate_structure`), and durations are
@@ -694,7 +695,10 @@ class GitHubWebhookReceivedEvent(EventPayload):
     :class:`~safir.metrics.EventPayload` directly rather than
     :class:`DocverseEventBase`: a delivery is recorded before it is
     resolved to any organization, and an unsigned or unconfigured one
-    never can be.
+    never can be. Unlike :class:`ApiRequestEvent` it carries no
+    ``organization`` or ``project`` at all, since no delivery is
+    resolved to one; an emission that does resolve them can add both as
+    nullable fields, a backward-compatible schema change.
 
     The event never carries the delivery ID or any other per-delivery
     identifier.
@@ -733,14 +737,3 @@ class GitHubWebhookReceivedEvent(EventPayload):
     ``installation``) and for a delivery whose signature did not verify,
     whose payload is not trusted.
     """
-
-    organization: str | None
-    """Reserved: always ``None``.
-
-    Kept so that a later emission which resolves the delivery to the
-    organization it affects is an additive change rather than a schema
-    break.
-    """
-
-    project: str | None
-    """Reserved: always ``None``, for the same reason as ``organization``."""

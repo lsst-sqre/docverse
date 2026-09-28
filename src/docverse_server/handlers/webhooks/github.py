@@ -394,8 +394,6 @@ async def _record_delivery(
                 jobs_enqueued=jobs_enqueued,
                 elapsed=timedelta(seconds=time.monotonic() - started),
                 github_repository=github_repository,
-                organization=None,
-                project=None,
             )
         )
     except Exception:

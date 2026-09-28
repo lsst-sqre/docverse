@@ -229,9 +229,10 @@ def test_github_webhook_received_fields() -> None:
     """``github_webhook_received`` carries a delivery's type and outcome.
 
     ``event_type`` and ``github_repository`` are nullable because not
-    every delivery names them, and ``organization``/``project`` are
-    reserved as nullable so a later binding-aware emission is additive;
-    every other field is always present.
+    every delivery names them; every other field is always present.
+    There is no ``organization`` or ``project``: no delivery is resolved
+    to one, and adding either as a nullable field once one is would be a
+    backward-compatible schema change, so there is nothing to reserve.
     """
     fields = _avro_field_types(GitHubWebhookReceivedEvent)
 
@@ -241,15 +242,8 @@ def test_github_webhook_received_fields() -> None:
         "jobs_enqueued",
         "elapsed",
         "github_repository",
-        "organization",
-        "project",
     ]
-    for nullable in (
-        "event_type",
-        "github_repository",
-        "organization",
-        "project",
-    ):
+    for nullable in ("event_type", "github_repository"):
         assert isinstance(fields[nullable], list)
         assert "null" in fields[nullable]
     for required in ("outcome", "jobs_enqueued", "elapsed"):

@@ -233,6 +233,33 @@ def _field_cells(section: str, field: str) -> list[str] | None:
     return None
 
 
+def _documented_fields(section: str) -> list[str]:
+    """Names in the first cell of a catalog section's field table.
+
+    Only the table headed ``| Field | Type | Stored as |``, so a section's
+    other tables, such as ``github_webhook_received``'s outcomes, are not
+    mistaken for fields.
+    """
+    lines = section.splitlines()
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("| Field | Type | Stored as |")
+        ),
+        None,
+    )
+    assert start is not None, "the section has no field table"
+    names: list[str] = []
+    for line in lines[start + 2 :]:
+        if not line.startswith("|"):
+            break
+        match = re.match(r"\| `([^`]+)` \|", line)
+        assert match is not None, f"field row names no field: {line!r}"
+        names.append(match.group(1))
+    return names
+
+
 def _enum_of(annotation: object) -> type[StrEnum] | None:
     """Return the metrics enum a payload field is typed with, if any."""
     for candidate in (annotation, *get_args(annotation)):
@@ -866,6 +893,26 @@ async def test_metrics_page_types_every_event_field() -> None:
 
 
 @pytest.mark.asyncio
+async def test_metrics_page_documents_no_field_an_event_lacks() -> None:
+    """Every row of an event's field table is a field the payload carries.
+
+    The converse of the check above: a field dropped from a payload has
+    to leave its table too, or a dashboard author goes looking for a
+    column no point will ever have.
+    """
+    page = _read(_METRICS_PAGE)
+    stale: list[str] = []
+    for name, payload in (await _registered_events()).items():
+        section = _event_section(page, name)
+        stale.extend(
+            f"{name}.{field}"
+            for field in _documented_fields(section)
+            if field not in payload.model_fields
+        )
+    assert not stale
+
+
+@pytest.mark.asyncio
 async def test_metrics_page_marks_the_phalanx_tags() -> None:
     """Each field's Stored-as cell agrees with the quoted tag list.
 
@@ -901,6 +948,8 @@ async def test_metrics_page_says_which_events_each_tag_applies_to() -> None:
     A tag name applies to every event carrying a field of that name,
     which is easy to forget when adding one: this table is where the
     page spells that out, so it is checked against the payloads here.
+    The cell either lists the events, or says ``every event`` and may
+    name the ones ``except`` it.
     """
     page = _read(_METRICS_PAGE)
     section = _section(page, "Tags")
@@ -915,10 +964,14 @@ async def test_metrics_page_says_which_events_each_tag_applies_to() -> None:
         }
         if cells is None:
             wrong.append(tag)
-        elif cells[1] == "every event":
-            if carriers != set(events):
+            continue
+        named = set(re.findall(r"`([^`]+)`", cells[1]))
+        if cells[1] == "every event" or cells[1].startswith(
+            "every event except "
+        ):
+            if carriers != set(events) - named:
                 wrong.append(tag)
-        elif set(re.findall(r"`([^`]+)`", cells[1])) != carriers:
+        elif named != carriers:
             wrong.append(tag)
     assert not wrong
 

@@ -552,8 +552,6 @@ async def test_signed_delete_records_dashboard_builds_enqueued(
     assert event.event_type == "delete"
     assert event.jobs_enqueued == enqueued
     assert event.github_repository == "acme/docs"
-    assert event.organization is None
-    assert event.project is None
 
 
 async def _enqueue_active_dashboard_build(*, org_slug: str, slug: str) -> None:

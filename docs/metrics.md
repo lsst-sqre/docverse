@@ -114,8 +114,8 @@ because it will become one. The list tags these events today:
 
 | Tag | Events it tags | Added by |
 | --- | --- | --- |
-| `organization` | every event | SQR-112 |
-| `project` | every event | SQR-112 |
+| `organization` | every event except `github_webhook_received` | SQR-112 |
+| `project` | every event except `github_webhook_received` | SQR-112 |
 | `action` | `project_lifecycle`, `edition_lifecycle`, `membership_changed`, `lifecycle_action` | SQR-112 |
 | `edition_kind` | `edition_published`, `edition_lifecycle` | SQR-112 |
 | `trigger` | `edition_published`, `lifecycle_action` | SQR-112 |
@@ -250,7 +250,8 @@ run of negative values is a clock problem, not a fast sync.
 Every event `DocverseEvents.initialize` registers, with the flow that
 emits it. "Scope" says which of `organization` and `project` the event
 fills: project-scoped events carry both; org-scoped events leave
-`project` null.
+`project` null; `api_request` fills each only when its route names one;
+and `github_webhook_received` has neither field.
 
 | Event | Emitted by | Scope |
 | --- | --- | --- |
@@ -491,9 +492,10 @@ The API received one GitHub webhook delivery at
 `POST /docverse/webhooks/github`. Published once per delivery, whatever
 became of it, just before the handler returns or raises. It records
 what `api_request` cannot: the GitHub event type, and whether Docverse
-acted on the delivery. Like `api_request` it does not require an
-organization, because a delivery is recorded before it is resolved to
-one. Publishing is best-effort, as for `api_request`.
+acted on the delivery. It is the one event with no `organization` or
+`project` field, because a delivery is recorded before it is resolved
+to either; slice it by `github_repository` instead. Publishing is
+best-effort, as for `api_request`.
 
 | Outcome | Response | When |
 | --- | --- | --- |
@@ -511,8 +513,6 @@ one. Publishing is best-effort, as for `api_request`.
 | `jobs_enqueued` | integer | field | Background jobs the delivery's callbacks enqueued: the `dashboard_sync` jobs a `push` enqueues, or the `dashboard_build` jobs a `delete` enqueues. Zero for other event types and for a delivery that was not dispatched; on `error`, the jobs enqueued before the failure. |
 | `elapsed` | duration | field | Time from the handler receiving the delivery to its outcome. |
 | `github_repository` | string or null | tag | The signed payload's `repository.full_name` (`owner/repo`). Null for events that name no repository (`ping`, `installation`) and for a delivery that was not both verified and parsed. |
-| `organization` | string or null | tag | Reserved; always null. Kept so that resolving a delivery to its organization later is an additive change. |
-| `project` | string or null | tag | Reserved; always null, like `organization`. |
 
 ### `keeper_sync_run_completed`
 
@@ -711,6 +711,7 @@ carry no `event_type`, so they group under an empty one.
   or its section does not name its measurement;
 - a payload field is missing from its event's table, or the field's
   Type cell does not match its annotation;
+- an event's table has a row for a field its payload does not carry;
 - a Stored-as cell disagrees with the tag list above, or the list names
   a field no event carries;
 - the Tags table misstates which events a tag applies to;

@@ -87,15 +87,12 @@ def _received_events() -> list[GitHubWebhookReceivedEvent]:
     return list(publisher.published)
 
 
-def _assert_unattributed(event: GitHubWebhookReceivedEvent) -> None:
-    """Assert the invariants every recorded delivery shares today.
+def _assert_timed(event: GitHubWebhookReceivedEvent) -> None:
+    """Assert that a recorded delivery measured its ``elapsed`` time.
 
-    ``elapsed`` is measured on every path, and the reserved
-    ``organization`` and ``project`` are not yet resolved on any.
+    ``elapsed`` is measured on every path, whatever the outcome.
     """
     assert event.elapsed > timedelta(0)
-    assert event.organization is None
-    assert event.project is None
 
 
 def _push_payload(
@@ -500,7 +497,7 @@ async def test_unconfigured_delivery_records_not_configured(
     assert event.event_type is None
     assert event.jobs_enqueued == 0
     assert event.github_repository is None
-    _assert_unattributed(event)
+    _assert_timed(event)
 
 
 @pytest.mark.asyncio
@@ -535,7 +532,7 @@ async def test_bad_signature_records_invalid_signature(
     assert event.event_type is None
     assert event.jobs_enqueued == 0
     assert event.github_repository is None
-    _assert_unattributed(event)
+    _assert_timed(event)
 
 
 @pytest.mark.asyncio
@@ -569,7 +566,7 @@ async def test_unsubscribed_event_records_ignored(
     assert event.event_type == "ping"
     assert event.jobs_enqueued == 0
     assert event.github_repository is None
-    _assert_unattributed(event)
+    _assert_timed(event)
 
 
 @pytest.mark.asyncio
@@ -612,7 +609,7 @@ async def test_bound_push_records_dispatched_with_jobs_enqueued(
     assert event.event_type == "push"
     assert event.jobs_enqueued == enqueued
     assert event.github_repository == "acme/templates"
-    _assert_unattributed(event)
+    _assert_timed(event)
 
 
 @pytest.mark.asyncio
@@ -703,7 +700,7 @@ async def test_failing_callback_records_error(
     assert event.event_type == "push"
     assert event.jobs_enqueued == 0
     assert event.github_repository == "acme/templates"
-    _assert_unattributed(event)
+    _assert_timed(event)
 
 
 _SIGNED_JSON_HEADERS = {
@@ -777,7 +774,7 @@ async def test_unparseable_signed_delivery_records_malformed(
     assert event.event_type is None
     assert event.jobs_enqueued == 0
     assert event.github_repository is None
-    _assert_unattributed(event)
+    _assert_timed(event)
 
 
 @pytest.mark.asyncio
