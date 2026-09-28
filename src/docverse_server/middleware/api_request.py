@@ -63,14 +63,21 @@ class ApiRequestMiddleware:
         serves itself (``openapi.json``, ``docs``, ``redoc``), whose
         plain Starlette routes record no template.
     ``status_code`` and ``status_class``
-        The status of the ``http.response.start`` message. When an
-        exception escapes the application instead, ``500`` and ``5xx``:
-        the response Starlette's server-error layer, outside this
-        middleware, sends for it.
+        The status of the ``http.response.start`` message, which is the
+        status the caller received. That holds even when an exception
+        escapes the application after the response started (a streaming
+        body that raises midway): the caller has the status line and a
+        truncated body, and nothing can replace a started response, so
+        the event records the sent status and the middleware logs a
+        warning (``API response failed after it started``) as the
+        signal that the body was cut short. When an exception escapes
+        before any response starts, ``500`` and ``5xx``: the response
+        Starlette's server-error layer, outside this middleware, sends
+        for it.
     ``duration``
         Time on the monotonic clock from the request reaching this
-        middleware to its response starting, or to the exception
-        escaping.
+        middleware to its response starting, or, when an exception
+        escapes before any response starts, to the exception escaping.
     ``authenticated``
         Whether Gafaelfawr's ingress set ``X-Auth-Request-User``. Only
         the header's presence is recorded, never the username in it.
@@ -95,7 +102,7 @@ class ApiRequestMiddleware:
     swallowed, so a metrics outage can never change or fail a response.
     An exception raised by the application is recorded and then
     re-raised unchanged, so Starlette's server-error handling, Sentry's
-    capture, and the ``500`` the caller receives are all untouched.
+    capture, and the response the caller receives are all untouched.
 
     This middleware must run inside
     :class:`~safir.middleware.x_forwarded.XForwardedMiddleware`, which
@@ -149,12 +156,18 @@ class ApiRequestMiddleware:
         try:
             await self._app(scope, receive, send_and_time)
         except Exception:
-            if duration is None:
+            if status_code is None or duration is None:
+                # Nothing has gone out yet, so Starlette's server-error
+                # layer outside this middleware answers the 500.
+                status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
                 duration = timedelta(seconds=time.monotonic() - started)
+            else:
+                # The caller already has the status line, and a started
+                # response cannot be replaced: record what was sent, and
+                # flag the truncated body the event cannot show.
+                self._log_failed_after_start(scope, status_code=status_code)
             await self._publish(
-                scope,
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                duration=duration,
+                scope, status_code=status_code, duration=duration
             )
             raise
 
@@ -195,6 +208,24 @@ class ApiRequestMiddleware:
                 route=route,
                 status_code=status_code,
             )
+
+    def _log_failed_after_start(
+        self, scope: Scope, *, status_code: int
+    ) -> None:
+        """Warn that a response failed after its status line went out.
+
+        Its event records the status the caller received, which a
+        dashboard cannot tell from a response that completed; this line
+        is the signal that the body was cut short. The exception itself
+        is logged by the server and captured by Sentry once it has been
+        re-raised.
+        """
+        logger = structlog.get_logger("docverse")
+        logger.warning(
+            "API response failed after it started",
+            route=self._route_template(scope),
+            status_code=status_code,
+        )
 
     def _route_template(self, scope: Scope) -> str | None:
         """Return the matched route's template without the path prefix.

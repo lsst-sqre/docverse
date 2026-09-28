@@ -11,13 +11,14 @@ a handler exception escaping to the server-error layer.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, MutableMapping
 from datetime import timedelta
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from httpx import ASGITransport, AsyncClient
 from safir.metrics import MockEventPublisher
 from starlette.types import Message, Receive, Scope, Send
@@ -34,6 +35,7 @@ from docverse_server.metrics import (
     HttpStatusClass,
 )
 from docverse_server.middleware import ApiRequestMiddleware
+from docverse_server.middleware import api_request as api_request_module
 from tests.conftest import seed_org_with_admin
 
 
@@ -306,19 +308,35 @@ def _failing_app(
     *,
     error: Exception,
     reached: list[Exception],
+    after_start: Callable[[], None] | None = None,
 ) -> FastAPI:
     """Build an app whose one route raises ``error`` unhandled.
 
     The middleware is installed with ``add_middleware``, as ``main.py``
     does, so it sits inside Starlette's ``ServerErrorMiddleware`` exactly
     as in a deployment. That outer layer's handler appends every
-    exception it receives to ``reached`` before answering ``500``.
+    exception it receives to ``reached``, and answers ``500`` when no
+    response has started yet.
+
+    By default the handler raises before any response starts. With
+    ``after_start``, it instead answers ``200`` with a streaming body
+    that sends one chunk, calls ``after_start``, and then raises, so the
+    exception escapes after ``http.response.start`` has gone out.
     """
     app = FastAPI()
 
     @app.get("/orgs/{org}")
-    async def get_org(org: str) -> dict[str, str]:
-        raise error
+    async def get_org(org: str) -> Response:
+        if after_start is None:
+            raise error
+        hook = after_start
+
+        async def body() -> AsyncIterator[bytes]:
+            yield b"partial"
+            hook()
+            raise error
+
+        return StreamingResponse(body(), media_type="text/plain")
 
     async def server_error(request: Request, exc: Exception) -> Response:
         reached.append(exc)
@@ -332,16 +350,16 @@ def _failing_app(
 
 
 @pytest.mark.asyncio
-async def test_handler_exception_records_5xx_and_propagates(
+async def test_exception_before_response_start_records_5xx_and_propagates(
     mock_events: DocverseEvents,
 ) -> None:
-    """An unhandled exception is recorded as a ``500`` and then re-raised.
+    """An exception before any response starts is recorded as a ``500``.
 
-    The exception escapes before any response starts, so the middleware
-    records the ``500`` the server-error layer is about to send, then
-    re-raises the very same exception: the error handler, Sentry's
-    capture, and the caller's ``500`` are exactly what they would be
-    without the middleware.
+    No status line has gone out, so the middleware records the ``500``
+    the server-error layer is about to send, then re-raises the very
+    same exception: the error handler, Sentry's capture, and the
+    caller's ``500`` are exactly what they would be without the
+    middleware.
     """
     error = _HandlerFailureError("handler failed")
     reached: list[Exception] = []
@@ -364,6 +382,131 @@ async def test_handler_exception_records_5xx_and_propagates(
     assert event.status_code == 500
     assert event.status_class == HttpStatusClass.server_error
     assert event.organization == "rubin"
+
+
+def _above_debug(
+    captured: list[MutableMapping[str, Any]],
+) -> list[MutableMapping[str, Any]]:
+    """Drop debug entries, such as the mock publisher's own log lines."""
+    return [entry for entry in captured if entry["log_level"] != "debug"]
+
+
+class _FakeClock:
+    """A monotonic clock the test advances by hand."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.mark.asyncio
+async def test_exception_after_response_start_records_sent_status(
+    mock_events: DocverseEvents,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception escaping mid-body records the response that started.
+
+    The caller has already received the ``200`` status line (with a
+    truncated body), and the server-error layer cannot replace a started
+    response, so recording a ``500`` would count a server error no
+    client ever saw. The event keeps the status and the time to that
+    status line, while the exception still propagates unchanged.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(api_request_module, "time", clock)
+
+    def advance_clock() -> None:
+        clock.now += 60.0
+
+    error = _HandlerFailureError("body failed")
+    reached: list[Exception] = []
+    app = _failing_app(
+        lambda: mock_events,
+        error=error,
+        reached=reached,
+        after_start=advance_clock,
+    )
+    publisher = mock_events.api_request
+    assert isinstance(publisher, MockEventPublisher)
+
+    async with AsyncClient(
+        base_url="https://example.com/",
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+    ) as client:
+        response = await client.get("/orgs/rubin")
+
+    assert response.status_code == 200
+    assert len(reached) == 1
+    assert reached[0] is error
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.route == "/orgs/{org}"
+    assert event.status_code == 200
+    assert event.status_class == HttpStatusClass.successful
+    assert event.duration == timedelta(0)
+
+
+@pytest.mark.asyncio
+async def test_exception_after_response_start_logs_truncated_response(
+    mock_events: DocverseEvents,
+) -> None:
+    """A response that failed mid-body is flagged in its own log line.
+
+    The event records the status the caller received, so it looks like
+    any other ``200``; the warning is what tells an operator that this
+    one's body was cut short. It names the route and status but, like
+    the event, never the concrete path.
+    """
+    error = _HandlerFailureError("body failed")
+    reached: list[Exception] = []
+    app = _failing_app(
+        lambda: mock_events,
+        error=error,
+        reached=reached,
+        after_start=lambda: None,
+    )
+
+    with capture_logs() as captured:
+        async with AsyncClient(
+            base_url="https://example.com/",
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+        ) as client:
+            await client.get("/orgs/rubin")
+
+    assert _above_debug(captured) == [
+        {
+            "event": "API response failed after it started",
+            "log_level": "warning",
+            "route": "/orgs/{org}",
+            "status_code": 200,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_exception_before_response_start_logs_nothing(
+    mock_events: DocverseEvents,
+) -> None:
+    """An exception before any response starts adds no log line.
+
+    The server-error layer answers ``500`` and the event records it, so
+    there is no truncated response to flag.
+    """
+    error = _HandlerFailureError("handler failed")
+    reached: list[Exception] = []
+    app = _failing_app(lambda: mock_events, error=error, reached=reached)
+
+    with capture_logs() as captured:
+        async with AsyncClient(
+            base_url="https://example.com/",
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+        ) as client:
+            response = await client.get("/orgs/rubin")
+
+    assert response.status_code == 500
+    assert _above_debug(captured) == []
 
 
 @pytest.mark.asyncio

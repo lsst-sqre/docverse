@@ -455,9 +455,16 @@ events it does not require an organization, because most routes
   a scanner's `FOOBAR`, records `method` as `OTHER`. FastAPI answers it
   with a `405` (or a `404` on an unknown path), so it counts as `4xx`
   volume without adding a `method` tag value.
-- An exception that escapes the application is recorded as a `500`
-  (`5xx`) and re-raised unchanged, so the caller still receives the
-  `500` and Sentry still captures it.
+- An exception that escapes the application before its response
+  starts is recorded as a `500` (`5xx`) and re-raised unchanged, so the
+  caller still receives the `500` and Sentry still captures it.
+- An exception that escapes after the response started (a streaming
+  body that raises midway) is recorded with the status the response
+  started with, because the caller already received that status line
+  and nothing can replace it. The exception is re-raised unchanged, and
+  the middleware logs a warning, `API response failed after it
+  started`, with the `route` and `status_code`, since the event alone
+  cannot tell a truncated body from a complete one.
 - Publishing is best-effort. A publish that fails is logged (`Failed to
   publish api_request metrics event`) and swallowed, so a metrics
   outage never changes or fails a response.
@@ -471,7 +478,7 @@ events it does not require an organization, because most routes
 | `route` | string or null | tag | The matched route template without the application's path prefix: `/orgs/{org}/projects/{project}` for a request to `/docverse/orgs/rubin/projects/sqr-000`. Null when no route template matched. |
 | `status_code` | integer | field | The HTTP status the response started with. |
 | `status_class` | string | tag | The class of `status_code`: `1xx`, `2xx`, `3xx`, `4xx`, or `5xx`. A string rather than an Avro enum, because enum symbols cannot begin with a digit; the payload refuses any other value. |
-| `duration` | duration | field | Seconds from the request reaching the API to its response starting, on the monotonic clock. It excludes streaming the body. |
+| `duration` | duration | field | Seconds from the request reaching the API to its response starting, on the monotonic clock. It excludes streaming the body. When an exception escapes before any response starts, it runs to the exception instead. |
 | `authenticated` | boolean | tag | Whether Gafaelfawr's ingress set `X-Auth-Request-User`: true for a known user, false for anonymous traffic such as webhook deliveries. Only the header's presence is recorded, never the username in it. |
 | `organization` | string or null | tag | The route's `org` path parameter, if it declares one. |
 | `project` | string or null | tag | The route's `project` path parameter, if it declares one. |
