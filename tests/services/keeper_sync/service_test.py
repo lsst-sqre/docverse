@@ -21,6 +21,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,8 @@ from docverse_server.exceptions import (
     InvalidBuildStateError,
     KeeperSyncSystemicFailureError,
 )
+from docverse_server.factory import Factory
+from docverse_server.services.default_branch import DuplicateDraftRetirer
 from docverse_server.services.keeper_sync import service as service_module
 from docverse_server.services.keeper_sync.copier import (
     BuildContentCopier,
@@ -125,7 +128,7 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.worker.functions.build_processing import _process_build
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
-from tests.support.lock_service_spy import RecordingLockService
+from tests.support.lock_service_spy import LockEvent, RecordingLockService
 from tests.support.objectstore import ScriptedUploadStore
 from tests.support.rowlocks import (
     LOCK_WAIT_TIMEOUT,
@@ -228,6 +231,7 @@ def _build_service(
     wrap_copy: Callable[[CopyCallable], CopyCallable] | None = None,
     copy_retry_delay_seconds: float | None = None,
     on_build_copied: BuildCopiedCallback | None = None,
+    draft_retirer: DuplicateDraftRetirer | None = None,
 ) -> KeeperSyncService:
     """Construct a real ``KeeperSyncService`` against the test DB.
 
@@ -251,7 +255,9 @@ def _build_service(
     (see :func:`_flaky_copy`). ``copy_retry_delay_seconds`` overrides
     the service's default wait before re-running a failed copy.
     ``on_build_copied`` receives one report per build copy (see
-    :func:`_record_copy_reports`).
+    :func:`_record_copy_reports`). ``draft_retirer`` retires the drafts
+    duplicating a ``__main`` keeper-sync moves onto the default branch
+    (see :func:`_build_draft_retirer`).
     """
     logger = structlog.get_logger("test")
     org_store = OrganizationStore(session=session, logger=logger)
@@ -321,6 +327,35 @@ def _build_service(
             else DEFAULT_COPY_RETRY_DELAY_SECONDS
         ),
         on_build_copied=on_build_copied,
+        draft_retirer=draft_retirer,
+    )
+
+
+@dataclass
+class _RecordingUnpublisher:
+    """Records ``unpublish`` calls in place of the CDN publisher."""
+
+    calls: list[tuple[int, str, str]] = field(default_factory=list)
+
+    async def unpublish(
+        self, *, org_id: int, project_slug: str, edition_slug: str
+    ) -> None:
+        self.calls.append((org_id, project_slug, edition_slug))
+
+
+def _build_draft_retirer(
+    session: AsyncSession, unpublisher: _RecordingUnpublisher
+) -> DuplicateDraftRetirer:
+    """Build the production draft retirer around a recording unpublisher."""
+    factory = Factory(
+        session=session,
+        logger=structlog.get_logger("test"),
+        default_queue_name="docverse:queue",
+    )
+    return DuplicateDraftRetirer(
+        edition_store=factory.create_edition_store(),
+        edition_service=factory.create_edition_service(),
+        publishing_service=unpublisher,  # type: ignore[arg-type]
     )
 
 
@@ -8518,6 +8553,381 @@ async def test_sync_edition_without_live_refs_keeps_ltd_tracking(
 
     main = await _read_main_edition(db_session, project_id=project.id)
     assert main.tracking_params == {"git_ref": "master"}
+
+
+async def _rewrite_main_elsewhere(
+    session: AsyncSession, *, project_id: int, git_ref: str
+) -> None:
+    """Stand in for another trigger rewriting ``__main``'s tracked ref.
+
+    The ``repository.edited`` webhook, the resolve, and the audit all
+    converge ``__main`` through ``DefaultBranchService``, which writes
+    exactly this.
+    """
+    edition_store = EditionStore(
+        session=session, logger=structlog.get_logger("test")
+    )
+    async with session.begin():
+        main = await edition_store.get_by_slug(
+            project_id=project_id, slug=DEFAULT_EDITION_SLUG
+        )
+        assert main is not None
+        await edition_store.update_tracking(
+            edition_id=main.id,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": git_ref},
+        )
+
+
+@pytest.mark.parametrize(
+    "live_refs",
+    [
+        pytest.param(None, id="live-refs-unavailable"),
+        pytest.param(frozenset({"main", "master"}), id="old-branch-kept"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_sync_edition_keeps_a_converged_main_on_the_default_branch(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    live_refs: frozenset[str] | None,
+) -> None:
+    """A ``__main`` another trigger converged is not reverted to LTD's ref.
+
+    The webhook rewrote ``__main`` to ``main`` (the column is ``main``),
+    but LTD still says ``master``. Neither a visit with no live ref set
+    nor one where ``master`` was kept alive is evidence against what the
+    webhook recorded, and the audit would never move ``__main`` back off
+    a live ``master`` — so keeper-sync keeps it on ``main`` and says so.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-default-branch-conv")
+    ltd_main = _seed_ltd_main_tracking_master(mock_discovery)
+    service = _build_service(
+        db_session, http_client, MockObjectStore(), _RENAMED_SOURCE_OBJECTS
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+    await _rewrite_main_elsewhere(
+        db_session, project_id=project.id, git_ref="main"
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        await service.sync_edition(
+            org_id=org_id,
+            project=project,
+            ltd_edition=ltd_main,
+            live_refs=live_refs,
+        )
+
+    main = await _read_main_edition(db_session, project_id=project.id)
+    assert main.tracking_mode == TrackingMode.git_ref
+    assert main.tracking_params == {"git_ref": "main"}
+    derivations = [
+        log
+        for log in logs
+        if log["event"] == "Derived keeper-sync edition tracking and kind"
+    ]
+    assert [log["tracking_source"] for log in derivations] == ["converged"]
+
+
+_MAIN_DRAFT_LTD_ID = 900
+"""LTD id of the synced ``main`` draft :func:`_seed_main_draft` seeds."""
+
+
+async def _seed_main_draft(
+    session: AsyncSession, *, org_id: int, project_id: int
+) -> int:
+    """Seed the ``main`` draft a rename leaves beside ``__main``.
+
+    Builds on the new default branch match no ``__main`` still tracking
+    ``master``, so tracking auto-creates this draft for them. It carries
+    a ``keeper_sync_state`` row so a test can read the tombstone reason
+    its retirement records.
+    """
+    logger = structlog.get_logger("test")
+    edition_store = EditionStore(session=session, logger=logger)
+    state_store = KeeperSyncStateStore(session=session, logger=logger)
+    async with session.begin():
+        draft = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="main",
+                title="main",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+            ),
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=_MAIN_DRAFT_LTD_ID,
+            ltd_slug="main-draft",
+            docverse_id=draft.id,
+        )
+    return draft.id
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_moving_main_retires_the_duplicate_draft(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Keeper-sync's own move onto the default branch retires the draft.
+
+    With ``master`` gone from the live set, the visit itself moves
+    ``__main`` from ``master`` to ``main`` (``default_branch``). The
+    ``main`` draft would then match every push alongside ``__main``, so
+    it is retired the way ``DefaultBranchService`` retires it after its
+    own rewrite: soft-deleted as a lifecycle delete and unpublished.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-default-branch-retire")
+    ltd_main = _seed_ltd_main_tracking_master(mock_discovery)
+    unpublisher = _RecordingUnpublisher()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        _RENAMED_SOURCE_OBJECTS,
+        draft_retirer=_build_draft_retirer(db_session, unpublisher),
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+    draft_id = await _seed_main_draft(
+        db_session, org_id=org_id, project_id=project.id
+    )
+
+    await service.sync_edition(
+        org_id=org_id,
+        project=project,
+        ltd_edition=ltd_main,
+        live_refs=frozenset({"main"}),
+    )
+
+    main = await _read_main_edition(db_session, project_id=project.id)
+    assert main.tracking_params == {"git_ref": "main"}
+    assert unpublisher.calls == [(org_id, "pipelines", "main")]
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        assert await edition_store.get_by_id(draft_id) is None
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=_MAIN_DRAFT_LTD_ID,
+            include_tombstoned=True,
+        )
+    assert state is not None
+    assert state.tombstone_reason == TombstoneReason.lifecycle_delete.value
+
+
+def _trace_tracking_writes(
+    monkeypatch: pytest.MonkeyPatch, trace: list[str]
+) -> None:
+    """Record each ``update_tracking`` call into *trace*.
+
+    Interleaved with a :class:`RecordingLockService`'s ``enter:`` /
+    ``exit:`` entries on the same list, so a test can tell which locks
+    were held around a tracking write.
+    """
+    original = EditionStore.update_tracking
+
+    async def _traced(
+        self: EditionStore,
+        *,
+        edition_id: int,
+        tracking_mode: TrackingMode,
+        tracking_params: dict[str, Any],
+    ) -> None:
+        trace.append(f"update_tracking:{edition_id}")
+        await original(
+            self,
+            edition_id=edition_id,
+            tracking_mode=tracking_mode,
+            tracking_params=tracking_params,
+        )
+
+    monkeypatch.setattr(EditionStore, "update_tracking", _traced)
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_writes_main_tracking_under_its_lock(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tracking write on ``__main`` holds the edition's ``EDITION_UPDATE``.
+
+    The key ``DefaultBranchService`` holds for its rewrite, so a
+    keeper-sync visit and the ``repository.edited`` webhook cannot
+    interleave their writes of ``__main``'s tracked ref.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-default-branch-lock")
+    ltd_main = _seed_ltd_main_tracking_master(mock_discovery)
+    trace: list[str] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        _RENAMED_SOURCE_OBJECTS,
+        lock_service=RecordingLockService(
+            session=db_session,
+            logger=structlog.get_logger("test"),
+            events=[],
+            trace=trace,
+        ),
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+    main = await _read_main_edition(db_session, project_id=project.id)
+    trace.clear()
+    _trace_tracking_writes(monkeypatch, trace)
+
+    await service.sync_edition(
+        org_id=org_id,
+        project=project,
+        ltd_edition=ltd_main,
+        live_refs=frozenset({"main"}),
+    )
+
+    lock_id = LockKey.for_edition_update(
+        org_id=org_id, project_id=project.id, edition_id=main.id
+    ).lock_id
+    write = trace.index(f"update_tracking:{main.id}")
+    assert f"enter:{lock_id}" in trace[:write], (
+        "__main tracking write ran with no EDITION_UPDATE lock held"
+    )
+    assert f"exit:{lock_id}" in trace[write + 1 :], (
+        "EDITION_UPDATE lock released before the __main tracking write"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_respects_a_rewrite_landing_while_it_waits(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The tracking is re-derived from ``__main`` as the lock finds it.
+
+    An operator pinned ``__main`` to ``docs``, so this visit sets out to
+    realign it with LTD's ``master``. The webhook wins the race for the
+    lock and converges ``__main`` on ``main``; inside the lock the visit
+    sees that, and keeps ``main`` rather than overwrite it with the
+    ``master`` it derived before the wait.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-default-branch-race")
+    ltd_main = _seed_ltd_main_tracking_master(mock_discovery)
+    await _build_service(
+        db_session, http_client, MockObjectStore(), _RENAMED_SOURCE_OBJECTS
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+    await _rewrite_main_elsewhere(
+        db_session, project_id=project.id, git_ref="docs"
+    )
+
+    async def webhook_wins(_key: LockKey) -> None:
+        await _rewrite_main_elsewhere(
+            db_session, project_id=project.id, git_ref="main"
+        )
+
+    lock_service = _CompetingWriterLockService(
+        session=db_session,
+        logger=structlog.get_logger("test"),
+        on_acquire=webhook_wins,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        _RENAMED_SOURCE_OBJECTS,
+        lock_service=lock_service,
+    )
+
+    await service.sync_edition(
+        org_id=org_id, project=project, ltd_edition=ltd_main, live_refs=None
+    )
+
+    main = await _read_main_edition(db_session, project_id=project.id)
+    assert main.tracking_params == {"git_ref": "main"}
+    assert lock_service.acquired == [
+        LockKey.for_edition_update(
+            org_id=org_id, project_id=project.id, edition_id=main.id
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_edition_leaves_matching_main_tracking_unwritten(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A visit whose derivation already matches writes nothing.
+
+    ``__main`` tracks LTD's ``master`` after the first sync, and with no
+    live ref set the next visit maps ``master`` again, so it has nothing
+    to realign: no tracking write, and no lock taken to make one.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-default-branch-noop")
+    ltd_main = _seed_ltd_main_tracking_master(mock_discovery)
+    events: list[LockEvent] = []
+    trace: list[str] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        _RENAMED_SOURCE_OBJECTS,
+        lock_service=RecordingLockService(
+            session=db_session,
+            logger=structlog.get_logger("test"),
+            events=events,
+            trace=trace,
+        ),
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert result.docverse_project_id is not None
+    main = await _read_main_edition(
+        db_session, project_id=result.docverse_project_id
+    )
+    assert main.tracking_params == {"git_ref": "master"}
+    events.clear()
+    trace.clear()
+    _trace_tracking_writes(monkeypatch, trace)
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+
+    await service.sync_edition(
+        org_id=org_id, project=project, ltd_edition=ltd_main, live_refs=None
+    )
+
+    assert f"update_tracking:{main.id}" not in trace
+    main_key = LockKey.for_edition_update(
+        org_id=org_id, project_id=project.id, edition_id=main.id
+    )
+    assert main_key not in {event.lock_key for event in events}
 
 
 def _build_ref_aware_service(

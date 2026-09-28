@@ -14,6 +14,12 @@ evidence it has that ``__main``'s own ref is gone, and the service
 records the branch, rewrites ``__main`` only when that evidence holds,
 retires the draft the old tracking let accumulate, and repoints
 ``__main`` at the new branch's newest build.
+
+Keeper-sync, which realigns a synced ``__main`` with LTD Keeper on
+every visit, is the fourth writer of ``__main``'s tracking. It applies
+the same "ref gone" test in its own mapper and, when that moves
+``__main`` onto the default branch, retires the duplicate drafts
+through the same :class:`DuplicateDraftRetirer`.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ __all__ = [
     "DefaultBranchOutcome",
     "DefaultBranchService",
     "DefaultBranchTrigger",
+    "DuplicateDraftRetirer",
 ]
 
 
@@ -109,6 +116,82 @@ class DefaultBranchOutcome:
         return self.rewritten_from is not None
 
 
+class DuplicateDraftRetirer:
+    """Retire the ``draft`` editions duplicating ``__main`` on a ref.
+
+    Once ``__main`` tracks a ref, a ``draft`` tracking the same ref —
+    the one edition tracking auto-created while ``__main`` ignored the
+    branch — would match every push alongside it. Both writers that move
+    ``__main`` onto a project's default branch retire those drafts
+    through here: :class:`DefaultBranchService` after its guarded
+    rewrite, and keeper-sync when its own mapping moves a synced
+    ``__main`` there.
+
+    The caller owns the transaction and holds ``__main``'s
+    ``EDITION_UPDATE`` lock around the rewrite this follows.
+    """
+
+    def __init__(
+        self,
+        *,
+        edition_store: EditionStore,
+        edition_service: EditionService,
+        publishing_service: EditionPublishingService,
+    ) -> None:
+        self._edition_store = edition_store
+        self._edition_service = edition_service
+        self._publishing_service = publishing_service
+
+    async def retire(
+        self,
+        *,
+        project: Project,
+        ref: str,
+        logger: structlog.stdlib.BoundLogger,
+    ) -> tuple[int, ...]:
+        """Soft-delete and unpublish the drafts duplicating ``__main``.
+
+        The ``RefDeletedWebhookProcessor`` recipe, over the same
+        candidate set (live, non-exempt ``draft`` editions tracking
+        ``ref``) narrowed to plain ``git_ref`` mode: a deployment-scoped
+        ``alternate_git_ref`` draft never matches a build alongside
+        ``__main``, so it is not a duplicate. ``unpublish`` runs inside
+        the caller's transaction, as it does there, so a CDN failure
+        rolls the whole convergence back and the trigger retries it.
+
+        Returns the ids of the editions retired, in candidate order.
+        """
+        candidates = await self._edition_store.list_draft_editions_by_git_ref(
+            project_id=project.id, git_ref=ref
+        )
+        retired: list[int] = []
+        for edition in candidates:
+            if edition.tracking_mode is not TrackingMode.git_ref:
+                continue
+            deleted = await self._edition_service.soft_delete(
+                org_id=project.org_id,
+                project_id=project.id,
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+                reason=TombstoneReason.lifecycle_delete,
+            )
+            if not deleted:
+                continue
+            await self._publishing_service.unpublish(
+                org_id=project.org_id,
+                project_slug=project.slug,
+                edition_slug=edition.slug,
+            )
+            retired.append(edition.id)
+            logger.info(
+                "Retired draft duplicating __main",
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+                github_ref=ref,
+            )
+        return tuple(retired)
+
+
 class DefaultBranchService:
     """Apply a repository's default branch to its project.
 
@@ -135,7 +218,11 @@ class DefaultBranchService:
         self._edition_store = edition_store
         self._build_store = build_store
         self._edition_service = edition_service
-        self._publishing_service = publishing_service
+        self._draft_retirer = DuplicateDraftRetirer(
+            edition_store=edition_store,
+            edition_service=edition_service,
+            publishing_service=publishing_service,
+        )
         self._lock_service = lock_service
         self._logger = logger
 
@@ -170,7 +257,8 @@ class DefaultBranchService:
         3. After a rewrite, soft-delete and unpublish every ``draft``
            ``git_ref`` edition tracking ``default_branch`` — the one
            tracking auto-created while ``__main`` ignored the branch —
-           so the two do not both match the next push.
+           so the two do not both match the next push — see
+           :class:`DuplicateDraftRetirer`.
         4. After a rewrite, repoint ``__main`` at the branch's newest
            completed build under the ordinary stale-build guard, which
            records the history row, marks the publish pending, defers a
@@ -239,7 +327,7 @@ class DefaultBranchService:
                 outcome = DefaultBranchOutcome(
                     column_changed=column_changed,
                     rewritten_from=rewritten_from,
-                    drafts_retired=await self._retire_drafts(
+                    drafts_retired=await self._draft_retirer.retire(
                         project=project, ref=default_branch, logger=logger
                     ),
                     repointed_build_id=await self._repoint_main(
@@ -325,53 +413,6 @@ class DefaultBranchService:
             main_rewritten_from=current_ref,
         )
         return current_ref
-
-    async def _retire_drafts(
-        self,
-        *,
-        project: Project,
-        ref: str,
-        logger: structlog.stdlib.BoundLogger,
-    ) -> tuple[int, ...]:
-        """Soft-delete and unpublish the drafts duplicating ``__main``.
-
-        The ``RefDeletedWebhookProcessor`` recipe, over the same
-        candidate set (live, non-exempt ``draft`` editions tracking
-        ``ref``) narrowed to plain ``git_ref`` mode: a deployment-scoped
-        ``alternate_git_ref`` draft never matches a build alongside
-        ``__main``, so it is not a duplicate. ``unpublish`` runs inside
-        the caller's transaction, as it does there, so a CDN failure
-        rolls the whole convergence back and the delivery is retried.
-        """
-        candidates = await self._edition_store.list_draft_editions_by_git_ref(
-            project_id=project.id, git_ref=ref
-        )
-        retired: list[int] = []
-        for edition in candidates:
-            if edition.tracking_mode is not TrackingMode.git_ref:
-                continue
-            deleted = await self._edition_service.soft_delete(
-                org_id=project.org_id,
-                project_id=project.id,
-                edition_id=edition.id,
-                edition_slug=edition.slug,
-                reason=TombstoneReason.lifecycle_delete,
-            )
-            if not deleted:
-                continue
-            await self._publishing_service.unpublish(
-                org_id=project.org_id,
-                project_slug=project.slug,
-                edition_slug=edition.slug,
-            )
-            retired.append(edition.id)
-            logger.info(
-                "Retired draft duplicating __main",
-                edition_id=edition.id,
-                edition_slug=edition.slug,
-                github_ref=ref,
-            )
-        return tuple(retired)
 
     async def _repoint_main(
         self,

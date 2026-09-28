@@ -12,7 +12,7 @@ mode (PRD #275 "Out of scope") and is collapsed onto a pinned
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -28,6 +28,7 @@ from docverse_server.storage.ltd import LtdBuild, LtdEdition, LtdEditionMode
 
 __all__ = [
     "LTD_MAIN_SLUG",
+    "CurrentTracking",
     "EditionKindDerivation",
     "KindDerivationSource",
     "TrackingDerivationSource",
@@ -46,6 +47,13 @@ LTD_MAIN_SLUG = "main"
 
 DOCVERSE_MAIN_SLUG = "__main"
 """Docverse slug for a project's auto-created default edition."""
+
+type CurrentTracking = tuple[TrackingMode, Mapping[str, Any] | None]
+"""A Docverse edition's ``(tracking_mode, tracking_params)`` as stored.
+
+The shape :func:`map_edition_tracking` returns, except that a stored
+``tracking_params`` may be ``NULL``.
+"""
 
 #: Path segment LTD writes build uploads under, between the product slug
 #: and the build slug: ``<product>/builds/<build-slug>/``.
@@ -83,9 +91,10 @@ class KindDerivationSource(StrEnum):
 class TrackingDerivationSource(StrEnum):
     """Which arm of :func:`map_edition_tracking` produced a tracking pair.
 
-    Observability only, like :class:`KindDerivationSource`: keeper-sync
-    logs it so an operator can tell a ``__main`` that follows the
-    project's default branch from one that mirrors LTD verbatim.
+    Keeper-sync logs it so an operator can tell a ``__main`` that
+    follows the project's default branch from one that mirrors LTD
+    verbatim, and retires the drafts duplicating ``__main`` only on the
+    ``default_branch`` arm, the one visit that moves it there.
     """
 
     ltd = "ltd"
@@ -94,7 +103,18 @@ class TrackingDerivationSource(StrEnum):
     default_branch = "default_branch"
     """LTD's ``main`` edition names a gone ref; the default branch won.
 
-    See :func:`derive_tracking_source` for the rule.
+    The visit moves ``__main`` onto the default branch. See
+    :func:`derive_tracking_source` for the rule.
+    """
+
+    converged = "converged"
+    """``__main`` already tracks the recorded default branch; LTD's ref
+    is not applied.
+
+    Another trigger — the ``repository.edited`` webhook, the resolve, or
+    the audit — or an earlier visit already moved it there, and
+    keeper-sync respects that whatever the live ref set says. See
+    :func:`derive_tracking_source` for the rule.
     """
 
 
@@ -299,6 +319,7 @@ def derive_tracking_source(
     *,
     default_branch: str | None,
     live_refs: frozenset[str] | None,
+    current_tracking: CurrentTracking | None = None,
 ) -> TrackingDerivationSource:
     """Decide whether an LTD edition's tracking follows the default branch.
 
@@ -307,32 +328,52 @@ def derive_tracking_source(
     with LTD on every visit, so mirroring LTD verbatim would revert the
     ``__main`` that
     :class:`~docverse_server.services.default_branch.DefaultBranchService`
-    just converged (PRD #721). The default branch therefore wins, by the
-    same "ref gone" rule that service applies, when all of these hold:
+    just converged (PRD #721). Only LTD's ``main`` edition (the one that
+    becomes ``__main``) in ``git_refs`` mode, with the project's
+    ``github_default_branch`` known (*default_branch* not ``None``) and
+    different from LTD's tracked ref, is ever a candidate —
+    ``lsst_doc`` carries no ref to rewrite and ``manual`` is pinned to
+    its published build. For that edition, in order:
 
-    - the edition is LTD's ``main`` (the one that becomes ``__main``)
-      in ``git_refs`` mode — ``lsst_doc`` carries no ref to rewrite and
-      ``manual`` is pinned to its published build;
-    - the project's ``github_default_branch`` is known (*default_branch*
-      is not ``None``) and differs from LTD's tracked ref;
-    - *live_refs* was actually fetched and LTD's tracked ref is not in
-      it.
+    1. ``converged`` when *current_tracking* — ``__main``'s tracking as
+       Docverse stores it — is ``git_ref`` mode on exactly
+       *default_branch*. Another trigger (or an earlier visit) already
+       moved it there, so LTD's stale ref is not applied, whatever
+       *live_refs* says: an absent live set is no evidence the old
+       branch still exists, and an old branch kept alive is one the
+       audit would never move ``__main`` back off.
+    2. ``default_branch`` when *live_refs* was actually fetched and
+       LTD's tracked ref is not in it — the same "ref gone" rule that
+       service applies. The visit moves ``__main`` onto the default
+       branch.
 
-    Everything else keeps LTD's value: a tracked ref that still exists
-    is deliberate non-default tracking, and a ``None`` *live_refs* — no
-    binding, an unconfigured fetcher, or a failed GitHub round-trip —
-    is no evidence the ref is gone.
+    Everything else keeps LTD's value (``ltd``): a tracked ref that
+    still exists is deliberate non-default tracking, and a ``None``
+    *live_refs* — no binding, an unconfigured fetcher, or a failed
+    GitHub round-trip — is no evidence the ref is gone.
     """
     tracked_ref = _divergent_ltd_main_ref(
         edition, default_branch=default_branch
     )
-    if (
-        tracked_ref is not None
-        and live_refs is not None
-        and tracked_ref not in live_refs
-    ):
+    if tracked_ref is None:
+        return TrackingDerivationSource.ltd
+    if _tracks_ref(current_tracking, default_branch):
+        return TrackingDerivationSource.converged
+    if live_refs is not None and tracked_ref not in live_refs:
         return TrackingDerivationSource.default_branch
     return TrackingDerivationSource.ltd
+
+
+def _tracks_ref(tracking: CurrentTracking | None, ref: str | None) -> bool:
+    """Whether a stored tracking pair is ``git_ref`` mode on exactly *ref*."""
+    if tracking is None or ref is None:
+        return False
+    mode, params = tracking
+    return (
+        mode is TrackingMode.git_ref
+        and params is not None
+        and params.get("git_ref") == ref
+    )
 
 
 def tracking_reads_live_refs(
@@ -385,6 +426,7 @@ def map_edition_tracking(
     build: LtdBuild | None = None,
     default_branch: str | None = None,
     live_refs: frozenset[str] | None = None,
+    current_tracking: CurrentTracking | None = None,
 ) -> tuple[TrackingMode, dict[str, Any]]:
     """Map an LTD edition's tracking mode onto Docverse's tracking pair.
 
@@ -398,11 +440,13 @@ def map_edition_tracking(
     is preserved by the caller in ``keeper_sync_state.annotations`` for
     reversibility — this mapper just emits the tracking pair.
 
-    ``default_branch`` (the project's ``github_default_branch``) and
-    ``live_refs`` (the repository's live ref set, when it was fetched)
-    only ever change LTD's ``main`` edition in ``git_refs`` mode: when
-    its tracked ref is gone, the pair tracks the default branch instead
-    — see :func:`derive_tracking_source`. Both default to ``None``,
+    ``default_branch`` (the project's ``github_default_branch``),
+    ``live_refs`` (the repository's live ref set, when it was fetched),
+    and ``current_tracking`` (``__main``'s tracking as Docverse stores
+    it) only ever change LTD's ``main`` edition in ``git_refs`` mode:
+    when ``__main`` already tracks the default branch, or LTD's tracked
+    ref is gone, the pair tracks the default branch instead — see
+    :func:`derive_tracking_source`. All three default to ``None``,
     which maps every edition exactly as LTD reports it.
 
     Raises
@@ -431,7 +475,10 @@ def map_edition_tracking(
 
     if ltd_mode is LtdEditionMode.git_refs:
         return _map_git_refs(
-            edition, default_branch=default_branch, live_refs=live_refs
+            edition,
+            default_branch=default_branch,
+            live_refs=live_refs,
+            current_tracking=current_tracking,
         )
     mapped = _VERSION_MODE_TABLE.get(ltd_mode)
     if mapped is not None:
@@ -451,6 +498,7 @@ def _map_git_refs(
     *,
     default_branch: str | None,
     live_refs: frozenset[str] | None,
+    current_tracking: CurrentTracking | None,
 ) -> tuple[TrackingMode, dict[str, Any]]:
     if not edition.tracked_refs:
         msg = (
@@ -459,12 +507,12 @@ def _map_git_refs(
         )
         raise ValueError(msg)
     source = derive_tracking_source(
-        edition, default_branch=default_branch, live_refs=live_refs
+        edition,
+        default_branch=default_branch,
+        live_refs=live_refs,
+        current_tracking=current_tracking,
     )
-    if (
-        source is TrackingDerivationSource.default_branch
-        and default_branch is not None
-    ):
+    if source is not TrackingDerivationSource.ltd and default_branch:
         return TrackingMode.git_ref, {"git_ref": default_branch}
     return TrackingMode.git_ref, {"git_ref": edition.tracked_refs[0]}
 

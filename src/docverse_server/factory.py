@@ -33,7 +33,10 @@ from .services.dashboard_templates import (
     RenameEventProcessor,
     TemplateResolver,
 )
-from .services.default_branch import DefaultBranchService
+from .services.default_branch import (
+    DefaultBranchService,
+    DuplicateDraftRetirer,
+)
 from .services.default_branch_processor import DefaultBranchEventProcessor
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
@@ -769,6 +772,19 @@ class Factory:
             logger=self._logger,
         )
 
+    def create_duplicate_draft_retirer(self) -> DuplicateDraftRetirer:
+        """Create the retirer of drafts duplicating a converged ``__main``.
+
+        Keeper-sync's, for the visits whose own mapping moves a synced
+        ``__main`` onto the default branch. ``DefaultBranchService``
+        builds its own from the collaborators it already holds.
+        """
+        return DuplicateDraftRetirer(
+            edition_store=self.create_edition_store(),
+            edition_service=self.create_edition_service(),
+            publishing_service=self.create_edition_publishing_service(),
+        )
+
     def create_edition_publishing_service(self) -> EditionPublishingService:
         """Create an EditionPublishingService."""
         return EditionPublishingService(
@@ -1268,6 +1284,10 @@ class Factory:
         ``on_build_copied`` is handed one report per build-content copy;
         the keeper-sync worker passes a hook that publishes it as a
         ``BuildContentCopiedEvent``.
+
+        Also wires a :class:`DuplicateDraftRetirer`, so a visit that moves
+        a synced ``__main`` onto the project's default branch retires the
+        ``draft`` tracking that branch, as the default-branch rule does.
         """
         ltd_client = self.create_ltd_client(base_url=ltd_base_url)
 
@@ -1329,6 +1349,7 @@ class Factory:
             lock_service=self.create_lock_service(),
             copy_retry_delay_seconds=self._keeper_sync_copy_retry_delay_seconds,
             on_build_copied=on_build_copied,
+            draft_retirer=self.create_duplicate_draft_retirer(),
         )
 
 

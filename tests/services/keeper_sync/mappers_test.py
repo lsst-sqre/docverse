@@ -491,6 +491,63 @@ class TestMainFollowsDefaultBranch:
         assert mode == TrackingMode.git_ref
         assert params == {"git_ref": "master"}
 
+    @pytest.mark.parametrize(
+        "live_refs",
+        [
+            pytest.param(None, id="live-refs-unavailable"),
+            pytest.param(frozenset({"main", "master"}), id="ref-still-live"),
+        ],
+    )
+    def test_converged_main_keeps_the_default_branch(
+        self, live_refs: frozenset[str] | None
+    ) -> None:
+        """A ``__main`` already on the default branch is not reverted.
+
+        Once the webhook, the resolve, or the audit has moved ``__main``
+        onto the recorded default branch, LTD's stale ref is not applied
+        — even with no live set to judge it by, and even when the old
+        branch was kept alive, which the audit would never move
+        ``__main`` back off.
+        """
+        edition = _edition(slug="main", tracked_refs=["master"])
+        mode, params = map_edition_tracking(
+            edition,
+            default_branch="main",
+            live_refs=live_refs,
+            current_tracking=(TrackingMode.git_ref, {"git_ref": "main"}),
+        )
+        assert mode == TrackingMode.git_ref
+        assert params == {"git_ref": "main"}
+
+    @pytest.mark.parametrize(
+        "current_tracking",
+        [
+            pytest.param(
+                (TrackingMode.git_ref, {"git_ref": "master"}), id="on-ltd-ref"
+            ),
+            pytest.param(
+                (TrackingMode.git_ref, {"git_ref": "docs"}), id="pinned"
+            ),
+            pytest.param((TrackingMode.lsst_doc, None), id="lsst_doc"),
+        ],
+    )
+    def test_main_off_the_default_branch_follows_ltd(
+        self, current_tracking: tuple[TrackingMode, dict[str, Any] | None]
+    ) -> None:
+        """Only a ``__main`` tracking the default branch itself is kept.
+
+        Any other current tracking is LTD's to realign, by the usual
+        "ref gone" rule — here ``master`` is still live, so LTD wins.
+        """
+        edition = _edition(slug="main", tracked_refs=["master"])
+        _, params = map_edition_tracking(
+            edition,
+            default_branch="main",
+            live_refs=frozenset({"main", "master"}),
+            current_tracking=current_tracking,
+        )
+        assert params == {"git_ref": "master"}
+
     def test_non_main_editions_keep_their_gone_ref(self) -> None:
         """Only ``__main`` follows the default branch.
 
@@ -556,6 +613,42 @@ class TestDeriveTrackingSource:
             edition, default_branch="main", live_refs=frozenset({"main"})
         )
         assert source == TrackingDerivationSource.default_branch
+
+    @pytest.mark.parametrize(
+        "live_refs",
+        [
+            pytest.param(None, id="live-refs-unavailable"),
+            pytest.param(frozenset({"main", "master"}), id="ref-still-live"),
+            pytest.param(frozenset({"main"}), id="ref-gone"),
+        ],
+    )
+    def test_main_on_the_default_branch_is_the_converged_arm(
+        self, live_refs: frozenset[str] | None
+    ) -> None:
+        """``__main`` already tracking the default branch is ``converged``.
+
+        Checked ahead of the "ref gone" arm, so ``default_branch`` is
+        reserved for a visit that actually moves ``__main``.
+        """
+        edition = _edition(slug="main", tracked_refs=["master"])
+        source = derive_tracking_source(
+            edition,
+            default_branch="main",
+            live_refs=live_refs,
+            current_tracking=(TrackingMode.git_ref, {"git_ref": "main"}),
+        )
+        assert source == TrackingDerivationSource.converged
+
+    def test_converged_needs_a_known_default_branch(self) -> None:
+        """With a ``NULL`` column there is no default branch to keep."""
+        edition = _edition(slug="main", tracked_refs=["master"])
+        source = derive_tracking_source(
+            edition,
+            default_branch=None,
+            live_refs=None,
+            current_tracking=(TrackingMode.git_ref, {"git_ref": "main"}),
+        )
+        assert source == TrackingDerivationSource.ltd
 
     def test_standing_ltd_ref_is_the_ltd_arm(self) -> None:
         edition = _edition(slug="main", tracked_refs=["master"])

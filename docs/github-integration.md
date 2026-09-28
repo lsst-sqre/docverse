@@ -251,21 +251,49 @@ A keeper-synced project's `__main` mirrors LTD Keeper's `main` edition,
 and keeper-sync realigns its tracking with LTD on every visit. LTD never
 hears about a default-branch rename, so its `main` edition goes on
 naming the old branch. Mirrored verbatim, every sync visit would undo
-what the webhook or the audit converged.
+what the webhook, the resolve, or the audit converged — and where the
+old branch was kept alive, nothing would ever converge it again, since
+the audit never moves `__main` off a branch that still exists.
 
-Keeper-sync therefore applies the same "ref gone" test when it maps
-LTD's `main` edition in `git_refs` mode, and tracks the project's
-default branch instead of LTD's ref when all of these hold:
+Keeper-sync is the one trigger that defers to the others. When it maps
+LTD's `main` edition in `git_refs` mode, and the column is known — not
+`null` — and differs from LTD's ref, it reads `__main`'s tracking as
+Docverse stores it and decides, in order:
 
-- the column is known — not `null` — and differs from LTD's ref;
-- this visit fetched the repository's live ref set;
-- LTD's ref is not in it.
+1. **`__main` already tracks the default branch.** `__main` is in
+   `git_ref` mode on exactly the column's branch — another trigger, or
+   an earlier visit, put it there. It stays, whatever the live ref set
+   says, and LTD's ref is not applied.
+2. **LTD's ref is gone.** This visit fetched the repository's live ref
+   set and LTD's ref is not in it — the rule's own "ref gone" test.
+   `__main` moves onto the default branch.
 
 Otherwise LTD's value stands. A ref that still exists is deliberate
 non-default tracking, a `null` column has nothing to follow, and a ref
 fetch that failed — or a project with no binding — is no evidence that
-the ref is gone. A visit whose fetch failed therefore maps LTD's ref
-for that visit, and the next visit with a live set converges again.
+the ref is gone. A `__main` still tracking LTD's ref after a failed
+fetch keeps it for that visit, and the next visit with a live set
+converges it; a `__main` already on the default branch is not moved
+back by a failed fetch.
+
+When a visit moves `__main` onto the default branch itself (case 2), it
+also retires the duplicate drafts, as step 3 of the rule does after a
+rewrite: every live, non-exempt `draft` in `git_ref` mode tracking that
+branch is soft-deleted and unpublished. A synced draft's
+`keeper_sync_state` row is tombstoned with reason `lifecycle_delete`, so
+later visits skip its LTD edition. Unlike the rule, a keeper-sync visit
+does not repoint `__main` (which build it serves stays LTD's), publish
+an `edition_lifecycle` event, or enqueue a `dashboard_build`; the `/v/`
+dashboard drops the retired draft at the project's next publish.
+
+A visit writes `__main`'s tracking only when it changes, and then under
+`__main`'s `EDITION_UPDATE` lock — the lock the rule holds for its
+rewrite — re-reading `__main` inside the lock, so a rewrite that landed
+while the visit waited is kept rather than overwritten. A visit that
+changes it logs `Realigned keeper-synced __main tracking` with
+`previous_git_ref`, `git_ref`, `tracking_source`, and `drafts_retired`;
+its `Retired draft duplicating __main` lines carry `trigger`
+`keeper_sync`.
 
 The live set is fetched at most once per visit and shared with the
 proactive lifecycle pass. A project with neither a `ref_deleted` nor a
@@ -275,13 +303,24 @@ differs from a known default branch.
 LTD's own view is kept: `annotations.ltd_tracked_refs` on the edition's
 `keeper_sync_state` row still records what LTD said. Which way a visit
 went is on the debug line
-`Derived keeper-sync edition tracking and kind`: `tracking_source` is
-`ltd` or `default_branch`, alongside `ltd_tracked_refs` and the
-resulting `git_ref`.
+`Derived keeper-sync edition tracking and kind`, alongside
+`ltd_tracked_refs` and the resulting `git_ref`. Its `tracking_source`
+is one of:
+
+| `tracking_source` | Meaning |
+| --- | --- |
+| `ltd` | LTD's tracking, mapped mode for mode |
+| `converged` | `__main` already tracks the default branch; LTD's ref is not applied |
+| `default_branch` | LTD's ref is gone; the visit moves `__main` onto the default branch |
 
 This governs only the ref a synced `__main` tracks. Which build it
 serves is still keeper-sync's business, and follows LTD's `main`
-edition.
+edition. While `__main` tracks the default branch, a change to the ref
+LTD's `main` edition tracks is not applied either. To have a synced
+`__main` follow some other ref, set that ref in LTD and `PATCH` `__main`
+to the same ref (see
+[Pinned `__main` editions](#pinned-__main-editions-are-left-for-operators));
+from then on it agrees with LTD, and keeper-sync mirrors LTD as before.
 
 ## Configuration
 
@@ -323,7 +362,7 @@ writes. A worker's own context rides along as well — `org` and
 
 | Field | Bound by | Meaning |
 | --- | --- | --- |
-| `trigger` | the rule | `webhook`, `resolve`, or `audit` |
+| `trigger` | the rule | `webhook`, `resolve`, or `audit`; `keeper_sync` on the draft retirements a keeper-sync visit makes (see [Keeper-synced projects](#keeper-synced-projects)) |
 | `project_id` | the rule | The project's internal id |
 | `project_slug` | the rule | The project's slug |
 | `old_default_branch` | the rule | The old default the trigger named: the webhook's `changes.default_branch.from`, or the column's previous value on a resolve. Null on the audit, whose evidence is the live ref set instead. |
@@ -406,11 +445,14 @@ of this: the `delete` delivery retires its drafts, and the next audit
 tick finds `__main`'s ref gone and applies the whole rule — rewrite,
 retire, repoint.
 
-A keeper-synced `__main` keeps a hand-set tracking only while it agrees
-with LTD or LTD's ref is gone: keeper-sync realigns `__main` with LTD's
-`main` edition on every visit, so a `PATCH` away from a ref LTD tracks
-and that still exists is undone at the next visit. Fix those in LTD, or
-delete the old branch.
+A keeper-synced `__main` keeps a hand-set tracking only when it agrees
+with LTD or tracks the project's recorded default branch
+(`github.default_branch`): keeper-sync realigns `__main` with LTD's
+`main` edition on every visit, so a `PATCH` to any other ref is undone
+at the next visit. A `PATCH` onto the default branch sticks, which makes
+it the fix for a synced project whose old branch still exists; see
+[Keeper-synced projects](#keeper-synced-projects). To pin a synced
+`__main` to another ref, set that ref in LTD as well.
 
 ## What the integration deliberately does not do
 

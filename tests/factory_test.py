@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse.models import CredentialProvider, OrganizationCreate
 from docverse_server.factory import Factory
 from docverse_server.services.credential_encryptor import CredentialEncryptor
+from docverse_server.services.default_branch import DuplicateDraftRetirer
 from docverse_server.services.keeper_sync.copier import (
     DEFAULT_COPY_CONCURRENCY,
 )
@@ -383,6 +384,30 @@ async def test_keeper_sync_service_copy_retry_delay_defaults(
     assert service.copy_retry_delay_seconds == (
         DEFAULT_COPY_RETRY_DELAY_SECONDS
     )
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_service_retires_duplicate_drafts(
+    db_session: AsyncSession,
+) -> None:
+    """The sync service is wired to retire drafts duplicating ``__main``.
+
+    When a visit's own mapping moves a synced ``__main`` onto the
+    default branch, the ``draft`` tracking that branch has to go, as it
+    does after the webhook's rewrite (PRD #721); without a retirer the
+    worker's service would silently leave it matching every push.
+    """
+    async with httpx.AsyncClient() as http_client:
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            http_client=http_client,
+            default_queue_name="docverse:queue",
+        )
+        service = factory.create_keeper_sync_service(
+            org_id=1, service_label="r2"
+        )
+    assert isinstance(service._draft_retirer, DuplicateDraftRetirer)
 
 
 @pytest.mark.asyncio

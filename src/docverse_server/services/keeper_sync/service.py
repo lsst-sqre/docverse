@@ -81,6 +81,7 @@ from docverse_server.exceptions import (
     NotFoundError,
     format_ltd_edition_slugs,
 )
+from docverse_server.services.default_branch import DuplicateDraftRetirer
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
 )
@@ -124,6 +125,7 @@ from docverse_server.storage.project_store import ProjectStore
 from .copier import CopyResult, CopyTally
 from .mappers import (
     EditionKindDerivation,
+    TrackingDerivationSource,
     derive_edition_dates,
     derive_edition_kind,
     derive_edition_slug,
@@ -538,6 +540,74 @@ class _LiveRefsCache:
     """The live ref names, or ``None`` when none are known."""
 
 
+def _carries_tracking(
+    edition: Edition,
+    *,
+    tracking_mode: TrackingMode,
+    tracking_params: dict[str, Any],
+) -> bool:
+    """Whether *edition* already carries a tracking pair.
+
+    A stored ``NULL`` ``tracking_params`` reads as ``{}``, the params the
+    mapper gives every mode that carries none, so an ``lsst_doc`` edition
+    created with ``NULL`` is not rewritten on every visit.
+    """
+    return (
+        edition.tracking_mode == tracking_mode
+        and (edition.tracking_params or {}) == tracking_params
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _DerivedTracking:
+    """One LTD edition's Docverse tracking pair, plus its provenance."""
+
+    mode: TrackingMode
+    params: dict[str, Any]
+    source: TrackingDerivationSource
+
+    def matches(self, edition: Edition) -> bool:
+        """Whether *edition* already carries this tracking pair."""
+        return _carries_tracking(
+            edition, tracking_mode=self.mode, tracking_params=self.params
+        )
+
+
+def _derive_tracking(
+    ltd_edition: LtdEdition,
+    *,
+    ltd_build: LtdBuild | None,
+    default_branch: str | None,
+    live_refs: frozenset[str] | None,
+    current: Edition | None,
+) -> _DerivedTracking:
+    """Map an LTD edition's tracking, recording which arm produced it.
+
+    *current* is the Docverse edition the pair is for, as it stands
+    now; only ``__main``'s is ever consulted (see
+    :func:`~docverse_server.services.keeper_sync.mappers.derive_tracking_source`).
+    """
+    current_tracking = (
+        None
+        if current is None
+        else (current.tracking_mode, current.tracking_params)
+    )
+    mode, params = map_edition_tracking(
+        ltd_edition,
+        build=ltd_build,
+        default_branch=default_branch,
+        live_refs=live_refs,
+        current_tracking=current_tracking,
+    )
+    source = derive_tracking_source(
+        ltd_edition,
+        default_branch=default_branch,
+        live_refs=live_refs,
+        current_tracking=current_tracking,
+    )
+    return _DerivedTracking(mode=mode, params=params, source=source)
+
+
 #: Kinds a *different* derivation owns, which the per-LTD-edition
 #: derivation must therefore never overwrite. ``derive_edition_kind``
 #: only ever answers ``main``/``release``/``draft``; the semver aggregate
@@ -852,6 +922,7 @@ class KeeperSyncService:
         lock_service: LockService | None = None,
         copy_retry_delay_seconds: float = DEFAULT_COPY_RETRY_DELAY_SECONDS,
         on_build_copied: BuildCopiedCallback | None = None,
+        draft_retirer: DuplicateDraftRetirer | None = None,
     ) -> None:
         self._session = session
         self._org_store = context.org_store
@@ -871,6 +942,7 @@ class KeeperSyncService:
         self._lock_service = lock_service
         self._copy_retry_delay_seconds = copy_retry_delay_seconds
         self._on_build_copied = on_build_copied
+        self._draft_retirer = draft_retirer
 
     @property
     def copy_retry_delay_seconds(self) -> float:
@@ -1525,10 +1597,13 @@ class KeeperSyncService:
         ``live_refs`` is the repository's live ref set when
         :meth:`sync_project` fetched one. With the project's
         ``github_default_branch``, it lets LTD's ``main`` edition follow
-        a default-branch rename LTD never heard of rather than revert
-        the ``__main`` the webhook converged (PRD #721) — see
+        a default-branch rename LTD never heard of (PRD #721) — see
         :func:`~docverse_server.services.keeper_sync.mappers.derive_tracking_source`.
-        ``None`` maps every edition exactly as LTD reports it.
+        ``None`` is no evidence either way: a ``__main`` another trigger
+        already converged on the default branch stays there, and every
+        other edition maps exactly as LTD reports it. ``__main``'s
+        tracking is written under its ``EDITION_UPDATE`` lock — see
+        :meth:`_converge_main_tracking`.
 
         ``autocreation`` is the project's resolved edition-autocreation
         config, which gates the semver aggregate backfill;
@@ -1581,23 +1656,34 @@ class KeeperSyncService:
                 str(ltd_edition.build_url)
             )
 
-        tracking_mode, tracking_params = map_edition_tracking(
-            ltd_edition,
-            build=ltd_build_for_mapping,
-            default_branch=project.github_default_branch,
-            live_refs=live_refs,
-        )
-        tracking_source = derive_tracking_source(
-            ltd_edition,
-            default_branch=project.github_default_branch,
-            live_refs=live_refs,
-        )
+        docverse_slug = derive_edition_slug(ltd_edition.slug)
+        if docverse_slug == DEFAULT_EDITION_SLUG:
+            # Written here, under the edition's lock, rather than by
+            # ``_ensure_edition`` inside the transaction below: this
+            # service takes an advisory lock only with no transaction
+            # open (see ``_edition_update_lock``).
+            tracking = await self._converge_main_tracking(
+                org_id=org_id,
+                project=project,
+                ltd_edition=ltd_edition,
+                ltd_build=ltd_build_for_mapping,
+                live_refs=live_refs,
+            )
+        else:
+            tracking = _derive_tracking(
+                ltd_edition,
+                ltd_build=ltd_build_for_mapping,
+                default_branch=project.github_default_branch,
+                live_refs=live_refs,
+                current=None,
+            )
+        tracking_mode, tracking_params = tracking.mode, tracking.params
+        tracking_source = tracking.source
         kind_derivation = derive_edition_kind(
             ltd_edition,
             git_ref=tracking_params.get("git_ref"),
             rules=rewrite_rules,
         )
-        docverse_slug = derive_edition_slug(ltd_edition.slug)
         self._logger.debug(
             "Derived keeper-sync edition tracking and kind",
             ltd_edition_id=ltd_edition.ltd_id,
@@ -2314,6 +2400,9 @@ class KeeperSyncService:
     ) -> Edition:
         """Look up or create an edition and realign its tracking columns.
 
+        ``__main`` is looked up only: its tracking has already been
+        realigned, under its lock, by :meth:`_converge_main_tracking`.
+
         ``kind_derivation`` seeds a newly created edition's kind
         outright. Existing rows — matched by slug, adopted by
         ``git_ref``, or handed back by a ``create_internal`` that lost
@@ -2326,13 +2415,15 @@ class KeeperSyncService:
         edition = await self._edition_store.get_by_slug(
             project_id=project_id, slug=docverse_slug
         )
-        if edition is None and docverse_slug == DEFAULT_EDITION_SLUG:
-            msg = (
-                f"Default edition {DEFAULT_EDITION_SLUG!r} missing for "
-                f"project_id={project_id}; project creation should have"
-                " auto-created it"
-            )
-            raise RuntimeError(msg)
+        if docverse_slug == DEFAULT_EDITION_SLUG:
+            if edition is None:
+                msg = (
+                    f"Default edition {DEFAULT_EDITION_SLUG!r} missing for "
+                    f"project_id={project_id}; project creation should have"
+                    " auto-created it"
+                )
+                raise RuntimeError(msg)
+            return edition
         if edition is None:
             # PRD #409: native auto-creation and keeper-sync derive an
             # edition's slug from a branch differently, so the same
@@ -2399,12 +2490,124 @@ class KeeperSyncService:
         tracking_mode: TrackingMode,
         tracking_params: dict[str, Any],
     ) -> None:
-        """Realign an existing edition's tracking columns with LTD."""
+        """Realign an existing edition's tracking columns with LTD.
+
+        Writes nothing when the edition already carries the pair.
+        """
+        if _carries_tracking(
+            edition,
+            tracking_mode=tracking_mode,
+            tracking_params=tracking_params,
+        ):
+            return
         await self._edition_store.update_tracking(
             edition_id=edition.id,
             tracking_mode=tracking_mode,
             tracking_params=tracking_params,
         )
+
+    async def _converge_main_tracking(
+        self,
+        *,
+        org_id: int,
+        project: Project,
+        ltd_edition: LtdEdition,
+        ltd_build: LtdBuild | None,
+        live_refs: frozenset[str] | None,
+    ) -> _DerivedTracking:
+        """Derive ``__main``'s tracking from LTD and write it, locked.
+
+        ``__main``'s tracking has four writers: this visit and the
+        webhook, resolve, and audit triggers of
+        :class:`~docverse_server.services.default_branch.DefaultBranchService`.
+        The derivation reads ``__main`` as it stands, so a ``__main``
+        another trigger already moved onto the recorded default branch
+        stays there (``converged``) instead of reverting to LTD's stale
+        ref.
+
+        Shaped like :meth:`_refresh_kind`: a lock-free pre-check, then
+        the write under the edition's ``EDITION_UPDATE`` lock — the key
+        ``DefaultBranchService`` holds for its rewrite — with the row
+        re-read and the tracking re-derived inside it, so a trigger
+        that converged ``__main`` while this visit waited is respected
+        rather than overwritten. A visit whose derivation already
+        matches writes nothing and takes no lock.
+
+        When the write moves ``__main`` onto the default branch
+        (``default_branch``), the ``draft`` editions tracking that
+        branch are retired in the same transaction, as
+        ``DefaultBranchService`` does after its own rewrite — see
+        :class:`~docverse_server.services.default_branch.DuplicateDraftRetirer`.
+        Direct unit-test constructions without a retirer skip that step.
+
+        Returns the derived tracking, which is ``__main``'s tracking
+        after the call. A project with no ``__main`` gets the derivation
+        back unwritten, and :meth:`_ensure_edition` reports it.
+        """
+        default_branch = project.github_default_branch
+        async with self._session.begin():
+            main = await self._edition_store.get_by_slug(
+                project_id=project.id, slug=DEFAULT_EDITION_SLUG
+            )
+        tracking = _derive_tracking(
+            ltd_edition,
+            ltd_build=ltd_build,
+            default_branch=default_branch,
+            live_refs=live_refs,
+            current=main,
+        )
+        if main is None or tracking.matches(main):
+            return tracking
+        async with (
+            self._edition_update_lock(
+                org_id=org_id, project_id=project.id, edition_id=main.id
+            ),
+            self._session.begin(),
+        ):
+            current = await self._edition_store.get_by_id(main.id)
+            if current is None:
+                return tracking
+            tracking = _derive_tracking(
+                ltd_edition,
+                ltd_build=ltd_build,
+                default_branch=default_branch,
+                live_refs=live_refs,
+                current=current,
+            )
+            if tracking.matches(current):
+                return tracking
+            await self._edition_store.update_tracking(
+                edition_id=current.id,
+                tracking_mode=tracking.mode,
+                tracking_params=tracking.params,
+            )
+            drafts_retired: tuple[int, ...] = ()
+            if (
+                tracking.source is TrackingDerivationSource.default_branch
+                and self._draft_retirer is not None
+            ):
+                drafts_retired = await self._draft_retirer.retire(
+                    project=project,
+                    ref=tracking.params["git_ref"],
+                    logger=self._logger.bind(
+                        trigger="keeper_sync",
+                        project_id=project.id,
+                        project_slug=project.slug,
+                    ),
+                )
+        self._logger.info(
+            "Realigned keeper-synced __main tracking",
+            project_id=project.id,
+            edition_id=current.id,
+            previous_tracking_mode=current.tracking_mode.value,
+            previous_git_ref=(current.tracking_params or {}).get("git_ref"),
+            tracking_mode=tracking.mode.value,
+            git_ref=tracking.params.get("git_ref"),
+            tracking_source=tracking.source.value,
+            default_branch=default_branch,
+            drafts_retired=len(drafts_retired),
+        )
+        return tracking
 
     async def _refresh_kind(
         self,
