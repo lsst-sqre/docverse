@@ -401,9 +401,11 @@ class WebhookOutcome(StrEnum):
 
     Recorded on ``github_webhook_received``, one per delivery, so the
     stream answers both "how many deliveries arrive?" and "how many of
-    them did anything?". The members follow the order a delivery is
-    decided in: the app must be configured, the signature must verify,
-    and a subscribed event type is then dispatched to its callbacks.
+    them did anything?". A delivery is decided in this order: the app
+    must be configured, the signature must verify, the delivery must
+    parse, and a subscribed event type is then dispatched to its
+    callbacks. The members are not in that order: a new one is appended,
+    so every existing symbol keeps its index in the Avro enum.
     """
 
     dispatched = "dispatched"
@@ -424,4 +426,19 @@ class WebhookOutcome(StrEnum):
     """This deployment has no GitHub App configured (``404``)."""
 
     error = "error"
-    """The delivery raised while being parsed or dispatched (``500``)."""
+    """The delivery raised unexpectedly (``500``).
+
+    Almost always a callback failing while dispatching a verified
+    delivery. A delivery that verifies but cannot be parsed is
+    :attr:`malformed` instead, so an alert on this outcome is not set
+    off by a caller's mistake.
+    """
+
+    malformed = "malformed"
+    """Signed, but gidgethub cannot parse the delivery (``400``).
+
+    Its content type is neither JSON nor a form, its body does not
+    decode, or it lacks the ``X-GitHub-Event`` or ``X-GitHub-Delivery``
+    header. gidgethub verifies the signature before parsing, so an
+    unsigned request is :attr:`invalid_signature`, not this.
+    """

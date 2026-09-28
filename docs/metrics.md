@@ -500,16 +500,17 @@ one. Publishing is best-effort, as for `api_request`.
 | `dispatched` | 200 | The event type is subscribed, and every callback ran. |
 | `ignored` | 200 | The delivery is signed, but no callback subscribes to its event type, such as the `ping` GitHub sends when a webhook is set up. |
 | `invalid_signature` | 401 | The delivery is unsigned, or its HMAC does not verify. |
+| `malformed` | 400 | The signature verifies, but gidgethub cannot parse the delivery: its content type is neither JSON nor a form, its body does not decode, or it lacks the `X-GitHub-Event` or `X-GitHub-Delivery` header. gidgethub checks the signature first, so an unsigned request of any shape is `invalid_signature` instead. |
 | `not_configured` | 404 | This deployment has no GitHub App configured. |
-| `error` | 500 | The delivery raised while being parsed or dispatched. The exception is re-raised unchanged, so Sentry still captures it. |
+| `error` | 500 | The delivery raised unexpectedly, almost always because a callback failed while dispatching it. The exception is re-raised unchanged, so Sentry still captures it. A caller's unparseable delivery is `malformed`, so it does not set off an alert on `error`. |
 
 | Field | Type | Stored as | Meaning |
 | --- | --- | --- | --- |
-| `event_type` | string or null | tag | GitHub's `X-GitHub-Event` header, such as `push` or `ping`. Null for a delivery whose signature was not verified (`not_configured`, `invalid_signature`, or an `error` while parsing), because the header is caller-supplied. |
-| `outcome` | enum | tag | What became of the delivery: `dispatched`, `ignored`, `invalid_signature`, `not_configured`, or `error`. |
+| `event_type` | string or null | tag | GitHub's `X-GitHub-Event` header, such as `push` or `ping`. Null for a delivery that was not both verified and parsed (`not_configured`, `invalid_signature`, or `malformed`), because the header is caller-supplied. |
+| `outcome` | enum | tag | What became of the delivery: `dispatched`, `ignored`, `invalid_signature`, `malformed`, `not_configured`, or `error`. |
 | `jobs_enqueued` | integer | field | Background jobs the delivery's callbacks enqueued: the `dashboard_sync` jobs a `push` enqueues, or the `dashboard_build` jobs a `delete` enqueues. Zero for other event types and for a delivery that was not dispatched; on `error`, the jobs enqueued before the failure. |
 | `elapsed` | duration | field | Time from the handler receiving the delivery to its outcome. |
-| `github_repository` | string or null | tag | The signed payload's `repository.full_name` (`owner/repo`). Null for events that name no repository (`ping`, `installation`) and for an unverified delivery. |
+| `github_repository` | string or null | tag | The signed payload's `repository.full_name` (`owner/repo`). Null for events that name no repository (`ping`, `installation`) and for a delivery that was not both verified and parsed. |
 | `organization` | string or null | tag | Reserved; always null. Kept so that resolving a delivery to its organization later is an additive change. |
 | `project` | string or null | tag | Reserved; always null, like `organization`. |
 
@@ -677,8 +678,8 @@ WHERE time > now() - 24h
 GROUP BY time(1h), "event_type", "outcome"
 ```
 
-`invalid_signature` and `not_configured` deliveries carry no
-`event_type`, so they group under an empty one.
+`invalid_signature`, `malformed`, and `not_configured` deliveries
+carry no `event_type`, so they group under an empty one.
 
 ## Changing the catalog
 
@@ -691,6 +692,12 @@ GROUP BY time(1h), "event_type", "outcome"
   gained `ltd_lag_seconds`. Every consumer reads the topic through the
   event's registered Avro schema, so renaming, retyping, or removing a
   field breaks them.
+- **A new enum value** is appended to its enum, as `WebhookOutcome`
+  gained `malformed`. Adding a symbol is a backward-compatible Avro
+  change, and every message names the registered schema it was written
+  with, so a consumer decodes the new value without needing an enum
+  default. Appending rather than inserting keeps every existing symbol
+  at its index.
 - **A new tag** is a Phalanx change to `influxTags`, released alongside
   the Docverse change that needs it and copied into the list above. It
   must follow the [cardinality rule](#cardinality-rule), and it tags
@@ -709,6 +716,8 @@ GROUP BY time(1h), "event_type", "outcome"
 - the Tags table misstates which events a tag applies to;
 - a value an enum field (or `status_class`) can carry is not named in
   its event's section;
+- a `github_webhook_received` outcome has no row in its outcome table,
+  or the row names no response status;
 - one of the four example queries is missing;
 - `index.md`, the transport page's metrics-event section, or the API
   conventions page's conditional GET section stops linking here.

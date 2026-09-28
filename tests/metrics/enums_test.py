@@ -143,7 +143,9 @@ def test_webhook_outcome_values() -> None:
 
     ``outcome`` is an InfluxDB tag on ``github_webhook_received``, so
     these values are what a query's ``GROUP BY`` and ``WHERE`` clauses
-    quote, and renaming one is a schema break for every dashboard.
+    quote, and renaming one is a schema break for every dashboard. A new
+    outcome is appended, so every existing symbol keeps its index in the
+    Avro enum.
     """
     assert [member.value for member in WebhookOutcome] == [
         "dispatched",
@@ -151,4 +153,5 @@ def test_webhook_outcome_values() -> None:
         "invalid_signature",
         "not_configured",
         "error",
+        "malformed",
     ]

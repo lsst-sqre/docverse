@@ -59,6 +59,7 @@ from docverse_server.metrics import (
     EditionReconcileCompletedEvent,
     HttpMethod,
     HttpStatusClass,
+    WebhookOutcome,
 )
 from docverse_server.services.edition_reconcile import (
     EditionReconcileOutcome,
@@ -954,6 +955,24 @@ def test_metrics_page_names_every_status_class() -> None:
     """
     section = _event_section(_read(_METRICS_PAGE), "api_request")
     assert not _uncoded({value.value for value in HttpStatusClass}, section)
+
+
+def test_metrics_page_tables_every_webhook_outcome() -> None:
+    """Each webhook outcome has a row naming the status it answers with.
+
+    Naming an outcome somewhere in the section is not enough: the
+    outcome table is where an operator reads whether an outcome is
+    GitHub's doing, a caller's mistake, or Docverse failing, and the
+    response status on its row is what tells those apart.
+    """
+    section = _event_section(_read(_METRICS_PAGE), "github_webhook_received")
+    untabled = [
+        outcome.value
+        for outcome in WebhookOutcome
+        if (cells := _field_cells(section, outcome.value)) is None
+        or re.fullmatch(r"[1-5]\d\d", cells[1]) is None
+    ]
+    assert not untabled
 
 
 def test_metrics_page_names_every_method() -> None:

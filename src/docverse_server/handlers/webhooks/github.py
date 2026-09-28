@@ -48,15 +48,29 @@ not the Docverse REST API.
 class WebhookDeliveryReport:
     """What one delivery's callbacks did, for its metrics event.
 
-    gidgethub's :meth:`~gidgethub.routing.Router.dispatch` returns
-    nothing, so the handler passes one of these to every callback as the
-    ``report`` keyword and reads it back once dispatch finishes. Only the
-    callbacks that enqueue jobs write to it; the rest absorb it through
-    their ``**_unused``.
+    A gidgethub callback returns nothing, so the handler passes one of
+    these to every callback as the ``report`` keyword and reads it back
+    once the callbacks finish. Only the callbacks that enqueue jobs write
+    to it; the rest absorb it through their ``**_unused``.
     """
 
     jobs_enqueued: int = 0
     """How many background jobs the callbacks enqueued."""
+
+
+_UNPARSEABLE_DELIVERY_ERRORS = (gidgethub.BadRequest, LookupError, ValueError)
+"""What ``sansio.Event.from_http`` raises for a delivery it cannot parse.
+
+gidgethub verifies the signature first, so only a signed delivery gets
+this far. It then raises ``gidgethub.BadRequest`` for a content type
+that is neither JSON nor a form, or a body that does not decode;
+``KeyError`` (a ``LookupError``) for a missing ``X-GitHub-Event`` or
+``X-GitHub-Delivery`` header; and a bare ``LookupError`` for a charset
+Python has no codec for. ``ValueError`` covers a decode failure that
+escapes gidgethub's own wrapping. The handler answers each with a
+``400``, recorded as :attr:`WebhookOutcome.malformed
+<docverse_server.metrics.WebhookOutcome.malformed>`.
+"""
 
 
 _event_router = GidgethubRouter()
@@ -229,11 +243,12 @@ async def post_github_webhook(
     that would page operators on every GitHub redelivery attempt.
 
     Returns ``401`` when the request is unsigned or the HMAC does
-    not match the configured webhook secret. A signed delivery that
-    ``gidgethub`` cannot parse (a content type other than JSON or a
-    form, or a missing ``X-GitHub-Event``) raises out of the handler.
+    not match the configured webhook secret. Returns ``400`` for a
+    signed delivery that ``gidgethub`` cannot parse (a content type
+    other than JSON or a form, a body that does not decode, or a
+    missing ``X-GitHub-Event`` or ``X-GitHub-Delivery``).
 
-    Returns ``200`` for all signed deliveries — including event
+    Returns ``200`` for every other signed delivery — including event
     types this app does not subscribe to — so GitHub's redelivery
     machinery does not retry deliveries we have intentionally
     chosen not to act on.
@@ -241,9 +256,11 @@ async def post_github_webhook(
     Every delivery publishes exactly one ``github_webhook_received``
     metrics event recording its
     :class:`~docverse_server.metrics.WebhookOutcome`, just before the
-    handler returns or raises; an exception raised while parsing or
-    dispatching is recorded as ``error`` and then re-raised unchanged,
-    so the ``500`` and Sentry's capture of it are unaffected.
+    handler returns or raises. An unparseable delivery is recorded as
+    ``malformed``, so a caller's mistake never counts as ``error``. Any
+    other exception, such as a callback failing, is recorded as
+    ``error`` and then re-raised unchanged, so the ``500`` and Sentry's
+    capture of it are unaffected.
     """
     started = time.monotonic()
     try:
@@ -272,6 +289,14 @@ async def post_github_webhook(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid webhook signature",
         ) from exc
+    except _UNPARSEABLE_DELIVERY_ERRORS as exc:
+        await _record_delivery(
+            context, started=started, outcome=WebhookOutcome.malformed
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed webhook delivery",
+        ) from exc
     except Exception:
         await _record_delivery(
             context, started=started, outcome=WebhookOutcome.error
@@ -283,7 +308,10 @@ async def post_github_webhook(
     )
     github_repository = _repository_full_name(event.data)
 
-    if not _event_router.fetch(event):
+    # Match once and run the callbacks found here, rather than handing the
+    # event to Router.dispatch, which would match it all over again.
+    callbacks = _event_router.fetch(event)
+    if not callbacks:
         await _record_delivery(
             context,
             started=started,
@@ -295,15 +323,16 @@ async def post_github_webhook(
 
     report = WebhookDeliveryReport()
     try:
-        await _event_router.dispatch(
-            event,
-            push=dispatch.push,
-            rename=dispatch.rename,
-            installation=dispatch.installation,
-            ref_deleted=dispatch.ref_deleted,
-            context=context,
-            report=report,
-        )
+        for callback in callbacks:
+            await callback(
+                event,
+                push=dispatch.push,
+                rename=dispatch.rename,
+                installation=dispatch.installation,
+                ref_deleted=dispatch.ref_deleted,
+                context=context,
+                report=report,
+            )
     except Exception:
         await _record_delivery(
             context,

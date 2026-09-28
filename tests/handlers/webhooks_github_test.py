@@ -9,11 +9,11 @@ from collections.abc import AsyncIterator, Mapping
 from datetime import timedelta
 from typing import Any
 
-import gidgethub
 import pytest
 import pytest_asyncio
 import structlog
 from fastapi import FastAPI
+from gidgethub import sansio
 from httpx import AsyncClient
 from pydantic import SecretStr
 from safir.arq import MockArqQueue
@@ -23,6 +23,7 @@ from safir.metrics import MockEventPublisher
 
 from docverse.models import OrganizationCreate
 from docverse_server.dependencies.context import context_dependency
+from docverse_server.handlers.webhooks import github as github_webhooks
 from docverse_server.metrics import GitHubWebhookReceivedEvent, WebhookOutcome
 from docverse_server.services.dashboard_templates import PushEventProcessor
 from docverse_server.storage.dashboard_templates.github import (
@@ -615,6 +616,51 @@ async def test_bound_push_records_dispatched_with_jobs_enqueued(
 
 
 @pytest.mark.asyncio
+async def test_dispatched_delivery_matches_its_callbacks_once(
+    client: AsyncClient,
+    github_app_enabled: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dispatched delivery is matched against the router exactly once.
+
+    The handler matches the event to tell a subscribed delivery from an
+    ignored one, then runs the callbacks that match found, rather than
+    handing the event to ``Router.dispatch`` to be matched a second time.
+    """
+    event_router = github_webhooks._event_router
+    fetch = event_router.fetch
+    matched: list[str] = []
+
+    def _counting_fetch(event: sansio.Event) -> frozenset[Any]:
+        matched.append(event.event)
+        return fetch(event)
+
+    monkeypatch.setattr(event_router, "fetch", _counting_fetch)
+    await _seed_binding(root_path="/")
+    body = json.dumps(
+        _push_payload(changed_files=["templates/blue/dashboard.html.jinja"])
+    ).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000017",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+
+    assert response.status_code == 200
+    assert matched == ["push"]
+    events = _received_events()
+    assert len(events) == 1
+    assert events[0].outcome == WebhookOutcome.dispatched
+    assert events[0].jobs_enqueued == 1
+
+
+@pytest.mark.asyncio
 async def test_failing_callback_records_error(
     client: AsyncClient,
     github_app_enabled: None,
@@ -660,39 +706,101 @@ async def test_failing_callback_records_error(
     _assert_unattributed(event)
 
 
+_SIGNED_JSON_HEADERS = {
+    "Content-Type": "application/json",
+    "X-GitHub-Event": "push",
+    "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000015",
+}
+"""The headers of a well-formed push delivery, less its signature."""
+
+
 @pytest.mark.asyncio
-async def test_unparseable_delivery_records_error(
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param(
+            {**_SIGNED_JSON_HEADERS, "Content-Type": "text/plain"},
+            id="content-type-neither-json-nor-form",
+        ),
+        pytest.param(
+            {
+                **_SIGNED_JSON_HEADERS,
+                "Content-Type": "application/json; charset=no-such-codec",
+            },
+            id="unknown-charset",
+        ),
+        pytest.param(
+            {
+                key: value
+                for key, value in _SIGNED_JSON_HEADERS.items()
+                if key != "X-GitHub-Event"
+            },
+            id="missing-x-github-event",
+        ),
+        pytest.param(
+            {
+                key: value
+                for key, value in _SIGNED_JSON_HEADERS.items()
+                if key != "X-GitHub-Delivery"
+            },
+            id="missing-x-github-delivery",
+        ),
+    ],
+)
+async def test_unparseable_signed_delivery_records_malformed(
     client: AsyncClient,
     github_app_enabled: None,
+    headers: dict[str, str],
 ) -> None:
-    """A signed delivery gidgethub cannot parse is one ``error`` event.
+    """A signed delivery gidgethub cannot parse is one ``malformed`` event.
 
-    A content type other than JSON or a form is refused by gidgethub
-    after the signature verifies. The exception still escapes as before;
-    with no event parsed, the event names no event type or repository.
+    The caller's mistake is answered 400 rather than raised as a 500, so
+    it does not land under ``error``, which an operator alerts on. With
+    no event parsed, the event names no event type or repository.
     """
     body = json.dumps(_push_payload()).encode("utf-8")
 
-    with pytest.raises(gidgethub.BadRequest):
-        await client.post(
-            _WEBHOOK_PATH,
-            content=body,
-            headers={
-                "Content-Type": "text/plain",
-                "X-GitHub-Event": "push",
-                "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000015",
-                "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
-            },
-        )
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            **headers,
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
 
+    assert response.status_code == 400
     events = _received_events()
     assert len(events) == 1
     event = events[0]
-    assert event.outcome == WebhookOutcome.error
+    assert event.outcome == WebhookOutcome.malformed
     assert event.event_type is None
     assert event.jobs_enqueued == 0
     assert event.github_repository is None
     _assert_unattributed(event)
+
+
+@pytest.mark.asyncio
+async def test_unsigned_unparseable_delivery_records_invalid_signature(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """An unsigned request of any shape is ``invalid_signature``.
+
+    gidgethub checks the signature before it parses anything, so a
+    scanner posting a form or plain text without a signature is refused
+    401, never counted as ``malformed``.
+    """
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=b"x=1",
+        headers={"Content-Type": "text/plain"},
+    )
+
+    assert response.status_code == 401
+    events = _received_events()
+    assert len(events) == 1
+    assert events[0].outcome == WebhookOutcome.invalid_signature
 
 
 @pytest.mark.asyncio
