@@ -138,6 +138,39 @@ def test_binding_response_carries_status_and_app_url() -> None:
     assert binding.app_url == "https://github.com/apps/docverse"
 
 
+def test_binding_response_default_branch_defaults_none() -> None:
+    """``default_branch`` is ``None`` until Docverse learns it."""
+    binding = ProjectGitHubBinding(
+        owner="lsst",
+        repo="docverse",
+        installation_status=InstallationStatus.not_installed,
+    )
+    assert binding.default_branch is None
+
+
+def test_binding_response_parses_default_branch() -> None:
+    """``default_branch`` parses from an API response body."""
+    binding = ProjectGitHubBinding.model_validate(
+        {
+            "owner": "lsst",
+            "repo": "docverse",
+            "installation_id": 42,
+            "installation_status": "installed",
+            "app_url": None,
+            "default_branch": "master",
+        }
+    )
+    assert binding.default_branch == "master"
+
+
+def test_binding_create_rejects_default_branch() -> None:
+    """GitHub owns the default branch, so a create cannot supply it."""
+    with pytest.raises(ValidationError):
+        ProjectGitHubBindingCreate.model_validate(
+            {"owner": "lsst", "repo": "docverse", "default_branch": "main"}
+        )
+
+
 def test_project_create_accepts_github_without_source_url() -> None:
     proj = ProjectCreate(
         slug="docs",

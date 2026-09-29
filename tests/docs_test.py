@@ -17,42 +17,73 @@ kind actually has.
 
 from __future__ import annotations
 
+import ast
 import importlib
+import inspect
+import re
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, fields
+from datetime import timedelta
+from enum import StrEnum
 from pathlib import Path
+from types import NoneType
 from typing import get_args, get_type_hints
+from unittest.mock import AsyncMock, Mock
 
-from fastapi import params
+import pytest
+from fastapi import APIRouter, params
 from fastapi.routing import APIRoute
+from safir.metrics import EventManager, EventPayload
 
-from docverse.models import KeeperSyncConfig, KeeperSyncScopePreview
+from docverse.models import (
+    DraftInactivityRule,
+    EditionUpdate,
+    KeeperSyncConfig,
+    KeeperSyncScopePreview,
+    ProjectGitHubBinding,
+    ProjectGitHubBindingCreate,
+)
 from docverse.models.keeper_sync import (
     _MAX_SLUG_PATTERN_LENGTH,
     _MAX_SLUG_PATTERNS,
 )
 from docverse_server.config import Configuration
 from docverse_server.domain.edition_reconcile import ReconcileReason, _Skip
+from docverse_server.handlers.orgs.editions import router as editions_router
 from docverse_server.handlers.orgs.keeper_sync import (
     router as keeper_sync_router,
 )
 from docverse_server.handlers.orgs.projects import get_project, get_projects
+from docverse_server.handlers.webhooks.github import _event_router
 from docverse_server.metrics import (
     BuildContentCopiedEvent,
     ConditionalGetEndpoint,
     ConditionalGetEvent,
     ConditionalGetOutcome,
     ConditionalGetPrecondition,
+    DocverseEvents,
     EditionReconcileCompletedEvent,
+    HttpMethod,
+    HttpStatusClass,
+    WebhookOutcome,
 )
+from docverse_server.services.default_branch import DefaultBranchTrigger
 from docverse_server.services.edition_reconcile import (
     EditionReconcileOutcome,
     _ApplySkip,
+)
+from docverse_server.services.keeper_sync import (
+    EditionSyncOutcome,
+    ProjectSyncResult,
+    TrackingDerivationSource,
 )
 from docverse_server.storage._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
     RETRYABLE_TRANSPORT_ERRORS,
     backoff_for_attempt,
 )
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.ltd import RETRYABLE_SOURCE_TRANSPORT_ERRORS
 from docverse_server.storage.pagination import ProjectSortOrder
 from docverse_server.worker.functions.edition_reconcile import (
@@ -79,8 +110,69 @@ _SCOPE_PAGE = "keeper-sync-scope.md"
 _TRANSPORT_PAGE = "keeper-sync-transport.md"
 """Operations page for keeper-sync transport resilience (PRD #685)."""
 
+_TIMESTAMPS_SECTION = "Timestamps mirror LTD"
+"""Scope-page section on keeper-sync's LTD clock stamp (PRD #706)."""
+
 _TRANSPORT_KNOB_PREFIXES = ("keeper_sync_upload_", "keeper_sync_copy_retry_")
 """Name prefixes of the settings that shape a build copy's retries."""
+
+_METRICS_PAGE = "metrics.md"
+"""Catalog of every Sasquatch metrics event Docverse publishes (PRD #713)."""
+
+_METRICS_TOPIC = "lsst.square.metrics.events.docverse"
+"""Kafka topic of every Docverse event, and its measurements' prefix.
+
+Safir names the topic ``lsst.square.metrics.events.<application>`` and
+each event's Avro schema ``<topic>.<event>``, which Telegraf writes as the
+InfluxDB measurement name; ``METRICS_APPLICATION`` is ``docverse`` in
+every deployment.
+"""
+
+_GITHUB_PAGE = "github-integration.md"
+"""Operations page for the GitHub App integration (PRD #721)."""
+
+_GITHUB_KNOB_PREFIXES = ("github_", "git_ref_audit")
+"""Name prefixes of the settings the GitHub integration page tabulates."""
+
+_DEFAULT_BRANCH_LOG_MODULES = (
+    "docverse_server.services.default_branch",
+    "docverse_server.services.default_branch_processor",
+)
+"""Modules the GitHub page documents every log line of.
+
+Together they *are* the default-branch convergence: the webhook's
+payload handling and the one rule every trigger applies.
+"""
+
+_GITHUB_LOG_MODULES = (
+    *_DEFAULT_BRANCH_LOG_MODULES,
+    "docverse_server.handlers.webhooks.github",
+    "docverse_server.worker.functions.git_ref_audit",
+    "docverse_server.worker.functions.project_github_resolve",
+)
+"""Modules whose log lines the GitHub page's log table may quote."""
+
+_KEEPER_SYNC_SERVICE_MODULE = "docverse_server.services.keeper_sync.service"
+"""Module that logs keeper-sync's ``__main`` tracking derivation."""
+
+_KEEPER_SYNC_TRACKING_MESSAGE = "Derived keeper-sync edition tracking and kind"
+"""The debug line saying where a synced edition's tracking came from."""
+
+_LOG_LEVELS = frozenset({"debug", "info", "warning", "error", "exception"})
+"""The structlog methods whose first argument is a log line's message."""
+
+_DOCUMENTED_TYPES: dict[object, str] = {
+    str: "string",
+    int: "integer",
+    float: "float",
+    bool: "boolean",
+    timedelta: "duration",
+}
+"""The metrics page's Type-column word for each scalar payload annotation.
+
+Enum-valued fields read ``enum``, and a nullable field appends
+``or null``; see :func:`_documented_type`.
+"""
 
 
 def _read(name: str) -> str:
@@ -126,6 +218,134 @@ def _section(page: str, heading: str) -> str:
     return parts[1].split("\n## ", 1)[0]
 
 
+def _stamped_columns(table: str, stamp: Callable[..., object]) -> set[str]:
+    """``table.column`` for every column one ``set_sync_dates`` writes.
+
+    The stamp's keyword-only parameters *are* the columns it sets, so
+    reading them off the signature means a column added to (or renamed
+    in) keeper-sync's clock stamp is one the page has to name.
+    """
+    return {
+        f"{table}.{name}"
+        for name, parameter in inspect.signature(stamp).parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+
+
+async def _registered_events() -> dict[str, type[EventPayload]]:
+    """Return every event ``DocverseEvents.initialize`` registers, by name.
+
+    Runs the real ``initialize`` against a manager that only records
+    what it was asked to create, so the roster is exactly what every
+    process registers at startup rather than a hand-kept list that could
+    miss the next event added.
+    """
+    manager = Mock(spec=EventManager)
+    manager.create_publisher = AsyncMock(return_value=Mock())
+    await DocverseEvents().initialize(manager)
+    return {
+        call.args[0]: call.args[1]
+        for call in manager.create_publisher.call_args_list
+    }
+
+
+def _event_section(page: str, name: str) -> str:
+    """Return the body of the metrics catalog's section for one event.
+
+    The catalog gives each event a ``### `name``` heading; the section
+    runs to the next heading of the same or a higher level.
+    """
+    parts = page.split(f"\n### `{name}`\n", 1)
+    assert len(parts) == 2, f"the page has no section for {name!r}"
+    return re.split(r"\n#{1,3} ", parts[1], maxsplit=1)[0]
+
+
+def _cells(row: str) -> list[str]:
+    """Split one Markdown table row into its stripped cells."""
+    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+
+def _field_cells(section: str, field: str) -> list[str] | None:
+    """Cells of the table row documenting ``field``, or ``None``."""
+    prefix = f"| `{field}` |"
+    for line in section.splitlines():
+        if line.startswith(prefix):
+            return _cells(line)
+    return None
+
+
+def _documented_fields(section: str) -> list[str]:
+    """Names in the first cell of a catalog section's field table.
+
+    Only the table headed ``| Field | Type | Stored as |``, so a section's
+    other tables, such as ``github_webhook_received``'s outcomes, are not
+    mistaken for fields.
+    """
+    lines = section.splitlines()
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("| Field | Type | Stored as |")
+        ),
+        None,
+    )
+    assert start is not None, "the section has no field table"
+    names: list[str] = []
+    for line in lines[start + 2 :]:
+        if not line.startswith("|"):
+            break
+        match = re.match(r"\| `([^`]+)` \|", line)
+        assert match is not None, f"field row names no field: {line!r}"
+        names.append(match.group(1))
+    return names
+
+
+def _enum_of(annotation: object) -> type[StrEnum] | None:
+    """Return the metrics enum a payload field is typed with, if any."""
+    for candidate in (annotation, *get_args(annotation)):
+        if isinstance(candidate, type) and issubclass(candidate, StrEnum):
+            return candidate
+    return None
+
+
+def _documented_type(annotation: object) -> str:
+    """Return the metrics page's Type cell for a payload field annotation.
+
+    Read off the payload model rather than the Avro schema, because the
+    page describes a field the way its emitter writes it: a
+    ``timedelta`` is a ``duration`` (seconds once it is in InfluxDB),
+    whatever Avro type carries it.
+    """
+    members = get_args(annotation)
+    if NoneType in members:
+        (inner,) = (member for member in members if member is not NoneType)
+        return f"{_documented_type(inner)} or null"
+    if _enum_of(annotation) is not None:
+        return "enum"
+    return _DOCUMENTED_TYPES[annotation]
+
+
+def _phalanx_tags(page: str) -> list[str]:
+    """Return the ``influxTags`` list the metrics page quotes from Phalanx.
+
+    The list lives in Phalanx, which this repository cannot read, so the
+    page's quotation of it is what the per-event Stored-as cells are
+    checked against.
+    """
+    for block in page.split("```yaml\n")[1:]:
+        body = block.split("```", 1)[0]
+        if "influxTags:" in body:
+            listing = body.split("influxTags:", 1)[1]
+            return [
+                line.strip().removeprefix("- ")
+                for line in listing.splitlines()
+                if line.strip().startswith("- ")
+            ]
+    msg = "the page quotes no influxTags list"
+    raise AssertionError(msg)
+
+
 def _import_name(cls: type) -> str:
     """Return the dotted name an exception class is imported by.
 
@@ -139,17 +359,138 @@ def _import_name(cls: type) -> str:
     return f"{cls.__module__}.{cls.__name__}"
 
 
-def _route_path(name: str) -> str:
-    """URL path of one keeper-sync route, looked up by handler name.
+def _route_path(name: str, *, router: APIRouter = keeper_sync_router) -> str:
+    """URL path of one route, looked up by handler name.
 
-    Read off the router rather than written out, so a page quoting an
-    endpoint's URL cannot survive that URL being moved.
+    Read off the router (the keeper-sync one unless told otherwise)
+    rather than written out, so a page quoting an endpoint's URL cannot
+    survive that URL being moved.
     """
-    for route in keeper_sync_router.routes:
+    for route in router.routes:
         if isinstance(route, APIRoute) and route.name == name:
             return route.path
-    msg = f"no keeper-sync route named {name!r}"
+    msg = f"no route named {name!r}"
     raise AssertionError(msg)
+
+
+def _subsection(section: str, heading: str) -> str:
+    """Return the body of a section's ``### heading`` subsection.
+
+    Runs to the next third-level heading or the end of the section.
+    """
+    parts = section.split(f"\n### {heading}\n", 1)
+    assert len(parts) == 2, f"the section has no {heading!r} subsection"
+    return parts[1].split("\n### ", 1)[0]
+
+
+def _code_rows(text: str) -> list[list[str]]:
+    """Cells of every table row whose first cell is inline code."""
+    return [
+        _cells(line) for line in text.splitlines() if line.startswith("| `")
+    ]
+
+
+def _inline_code(text: str) -> set[str]:
+    """Every inline-code span in ``text``, without its backticks."""
+    return set(re.findall(r"`([^`]+)`", text))
+
+
+def _documented_default(default: object) -> str:
+    """Return the Default cell a settings table gives a field's default.
+
+    A boolean reads the way its environment variable is spelled, and a
+    setting with no default reads "unset".
+    """
+    if default is None:
+        return "unset"
+    if isinstance(default, bool):
+        return f"`{str(default).lower()}`"
+    return f"`{default}`"
+
+
+def _webhook_subscriptions() -> set[str]:
+    """Every event, or ``event.action``, the webhook endpoint dispatches.
+
+    Read off the gidgethub router's registration tables. They are
+    private, but they are the only record of what the handler module
+    registered, so a callback added for a new event or action is one
+    the page has to gain a row for.
+    """
+    names = set(_event_router._shallow_routes)
+    for event, details in _event_router._deep_routes.items():
+        for values in details.values():
+            names.update(f"{event}.{value}" for value in values)
+    return names
+
+
+@dataclass(frozen=True, slots=True)
+class _LogCall:
+    """One structlog call: its level and the fields it adds."""
+
+    level: str
+    fields: frozenset[str]
+
+
+def _module_tree(module_name: str) -> ast.Module:
+    """Parse a module's source into a syntax tree."""
+    return ast.parse(inspect.getsource(importlib.import_module(module_name)))
+
+
+def _log_calls(module_name: str) -> dict[str, list[_LogCall]]:
+    """Every log line a module writes, keyed by its message.
+
+    Read off the module's syntax tree: any ``debug`` / ``info`` /
+    ``warning`` / ``error`` / ``exception`` call whose first argument is
+    a string literal, with the keyword arguments it passes. Adjacent
+    literals are one constant by then, so a message wrapped across
+    source lines is matched whole.
+    """
+    calls: dict[str, list[_LogCall]] = {}
+    for node in ast.walk(_module_tree(module_name)):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _LOG_LEVELS
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            continue
+        calls.setdefault(node.args[0].value, []).append(
+            _LogCall(
+                level=node.func.attr,
+                fields=frozenset(
+                    keyword.arg
+                    for keyword in node.keywords
+                    if keyword.arg is not None
+                ),
+            )
+        )
+    return calls
+
+
+def _bound_log_fields(module_name: str) -> set[str]:
+    """Every field a module binds onto a logger with ``.bind(...)``."""
+    return {
+        keyword.arg
+        for node in ast.walk(_module_tree(module_name))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "bind"
+        for keyword in node.keywords
+        if keyword.arg is not None
+    }
+
+
+def _documented_log_lines(page: str) -> dict[str, _LogCall]:
+    """Return the GitHub page's log-line table, keyed by message."""
+    table = _subsection(_section(page, "Reading an outcome"), "Log lines")
+    return {
+        cells[0].strip("`"): _LogCall(
+            level=cells[1], fields=frozenset(_inline_code(cells[2]))
+        )
+        for cells in _code_rows(table)
+    }
 
 
 def _query_parameter_names(endpoint: Callable[..., object]) -> set[str]:
@@ -349,6 +690,71 @@ def test_scope_endpoint_paths_documented() -> None:
     }
     paths = {_route_path(name) for name in names}
     assert not sorted(path for path in paths if path not in page)
+
+
+def test_timestamps_section_names_every_stamped_column() -> None:
+    """The scope page says which columns keeper-sync sets from LTD.
+
+    Read off the two ``set_sync_dates`` stamps, so the page cannot
+    keep describing a clock the sync has stopped writing, or miss one
+    it has started to.
+    """
+    section = _section(_read(_SCOPE_PAGE), _TIMESTAMPS_SECTION)
+    columns = _stamped_columns(
+        "editions", EditionStore.set_sync_dates
+    ) | _stamped_columns("builds", BuildStore.set_sync_dates)
+    assert columns, "keeper-sync stamps no columns"
+    assert not _uncoded(columns, section)
+
+
+def test_timestamps_section_names_the_backfill_signals() -> None:
+    """The section names the backfill's run endpoint and its read-outs.
+
+    The backfill is a full org run, so the section has to name the
+    endpoint that launches one; ``restamped_edition_count`` on the
+    project's summary log line is how an operator confirms it did
+    anything, and ``dates_restamped`` is the per-edition flag it counts.
+    """
+    section = _section(_read(_SCOPE_PAGE), _TIMESTAMPS_SECTION)
+    assert hasattr(ProjectSyncResult, "restamped_edition_count")
+    assert "dates_restamped" in {
+        field.name for field in fields(EditionSyncOutcome)
+    }
+    assert _route_path("post_org_keeper_sync_run") in section
+    assert not _uncoded(
+        {"restamped_edition_count", "dates_restamped"}, section
+    )
+
+
+def test_timestamps_section_covers_what_the_clock_drives() -> None:
+    """The section covers ``draft_inactivity`` and the project clock.
+
+    Re-dating a draft to LTD's last rebuild can make the lifecycle rule
+    reap it on the next tick, which an operator has to hear about
+    before running the backfill; and ``projects.date_updated`` is the
+    clock the stamp deliberately leaves alone.
+    """
+    section = _section(_read(_SCOPE_PAGE), _TIMESTAMPS_SECTION)
+    rule_type = DraftInactivityRule.model_fields["type"].default
+    assert not _uncoded({rule_type, "projects.date_updated"}, section)
+
+
+def test_docs_index_links_the_timestamps_section() -> None:
+    """The index points at the timestamps section by its anchor."""
+    assert "keeper-sync-scope.md#timestamps-mirror-ltd" in _read("index.md")
+
+
+def test_draft_inactivity_rule_links_the_timestamps_section() -> None:
+    """The rule's own documentation points at the timestamps section.
+
+    ``DraftInactivityRule``'s docstring is the rule's schema description
+    in the OpenAPI document, so it is where an operator reading about
+    ``max_days_inactive`` has to learn that a synced draft is judged on
+    LTD's clock.
+    """
+    doc = DraftInactivityRule.__doc__ or ""
+    assert _SCOPE_PAGE in doc
+    assert _TIMESTAMPS_SECTION in doc
 
 
 def test_conditional_get_endpoints_documented() -> None:
@@ -601,3 +1007,430 @@ def test_build_retry_transport_errors_documented() -> None:
     section = _section(_read(_TRANSPORT_PAGE), "The build-level retry")
     classes = (*RETRYABLE_TRANSPORT_ERRORS, *RETRYABLE_SOURCE_TRANSPORT_ERRORS)
     assert not _uncoded({_import_name(cls) for cls in classes}, section)
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_covers_every_registered_event() -> None:
+    """Every event ``DocverseEvents.initialize`` registers has a section.
+
+    Read off the registration itself, so an event added to the catalog
+    without a section here — the one place an operator can look up what
+    a measurement holds — fails, and each section has to name the
+    measurement its event lands in.
+    """
+    page = _read(_METRICS_PAGE)
+    events = await _registered_events()
+    assert events, "DocverseEvents registers no events"
+    missing = sorted(
+        name for name in events if f"\n### `{name}`\n" not in page
+    )
+    assert not missing
+    unnamed = sorted(
+        name
+        for name in events
+        if f"`{_METRICS_TOPIC}.{name}`" not in _event_section(page, name)
+    )
+    assert not unnamed
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_types_every_event_field() -> None:
+    """Every payload field is a row of its event's table, correctly typed.
+
+    Every field, the shared ``organization`` and ``project`` included:
+    on this page, unlike the operations pages, the table is the
+    reference. The Type cell is derived from the payload annotation, so
+    a field turning nullable, or changing unit, has to be carried here.
+    """
+    page = _read(_METRICS_PAGE)
+    wrong: list[str] = []
+    for name, payload in (await _registered_events()).items():
+        section = _event_section(page, name)
+        for field, info in payload.model_fields.items():
+            cells = _field_cells(section, field)
+            expected = _documented_type(info.annotation)
+            if cells is None or cells[1] != expected:
+                wrong.append(f"{name}.{field}: {expected}")
+    assert not wrong
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_documents_no_field_an_event_lacks() -> None:
+    """Every row of an event's field table is a field the payload carries.
+
+    The converse of the check above: a field dropped from a payload has
+    to leave its table too, or a dashboard author goes looking for a
+    column no point will ever have.
+    """
+    page = _read(_METRICS_PAGE)
+    stale: list[str] = []
+    for name, payload in (await _registered_events()).items():
+        section = _event_section(page, name)
+        stale.extend(
+            f"{name}.{field}"
+            for field in _documented_fields(section)
+            if field not in payload.model_fields
+        )
+    assert not stale
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_marks_the_phalanx_tags() -> None:
+    """Each field's Stored-as cell agrees with the quoted tag list.
+
+    Telegraf applies the one ``influxTags`` list to every Docverse
+    measurement, so a field is a tag exactly when its name is on the
+    list, whichever event it belongs to. Every name on the list must also
+    be a field some event carries, or the list is tagging nothing.
+    """
+    page = _read(_METRICS_PAGE)
+    tags = _phalanx_tags(page)
+    events = await _registered_events()
+    assert tags, "the page quotes an empty tag list"
+    assert len(tags) == len(set(tags)), "the tag list repeats a name"
+    carried = {
+        field for payload in events.values() for field in payload.model_fields
+    }
+    assert not sorted(set(tags) - carried)
+    wrong: list[str] = []
+    for name, payload in events.items():
+        section = _event_section(page, name)
+        for field in payload.model_fields:
+            cells = _field_cells(section, field)
+            expected = "tag" if field in tags else "field"
+            if cells is None or cells[2] != expected:
+                wrong.append(f"{name}.{field}: {expected}")
+    assert not wrong
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_says_which_events_each_tag_applies_to() -> None:
+    """The Tags section's table names every event each tag lands on.
+
+    A tag name applies to every event carrying a field of that name,
+    which is easy to forget when adding one: this table is where the
+    page spells that out, so it is checked against the payloads here.
+    The cell either lists the events, or says ``every event`` and may
+    name the ones ``except`` it.
+    """
+    page = _read(_METRICS_PAGE)
+    section = _section(page, "Tags")
+    events = await _registered_events()
+    wrong: list[str] = []
+    for tag in _phalanx_tags(page):
+        cells = _field_cells(section, tag)
+        carriers = {
+            name
+            for name, payload in events.items()
+            if tag in payload.model_fields
+        }
+        if cells is None:
+            wrong.append(tag)
+            continue
+        named = set(re.findall(r"`([^`]+)`", cells[1]))
+        if cells[1] == "every event" or cells[1].startswith(
+            "every event except "
+        ):
+            if carriers != set(events) - named:
+                wrong.append(tag)
+        elif named != carriers:
+            wrong.append(tag)
+    assert not wrong
+
+
+@pytest.mark.asyncio
+async def test_metrics_page_names_every_enum_value() -> None:
+    """Every value an enum-typed field can carry is named in its section.
+
+    Those values are what a query filters on and what a tag's series are,
+    so each has to be quotable from the page rather than guessed at.
+    """
+    page = _read(_METRICS_PAGE)
+    missing: list[str] = []
+    for name, payload in (await _registered_events()).items():
+        section = _event_section(page, name)
+        for field, info in payload.model_fields.items():
+            enum = _enum_of(info.annotation)
+            if enum is None:
+                continue
+            values = {member.value for member in enum}
+            missing.extend(
+                f"{name}.{field}={value}"
+                for value in _uncoded(values, section)
+            )
+    assert not missing
+
+
+def test_metrics_page_names_every_status_class() -> None:
+    """The ``api_request`` section names every ``status_class`` value.
+
+    ``status_class`` is a string in the Avro schema, because enum symbols
+    may not begin with a digit, so the enum check above cannot see it;
+    its vocabulary is :class:`HttpStatusClass` all the same.
+    """
+    section = _event_section(_read(_METRICS_PAGE), "api_request")
+    assert not _uncoded({value.value for value in HttpStatusClass}, section)
+
+
+def test_metrics_page_tables_every_webhook_outcome() -> None:
+    """Each webhook outcome has a row naming the status it answers with.
+
+    Naming an outcome somewhere in the section is not enough: the
+    outcome table is where an operator reads whether an outcome is
+    GitHub's doing, a caller's mistake, or Docverse failing, and the
+    response status on its row is what tells those apart.
+    """
+    section = _event_section(_read(_METRICS_PAGE), "github_webhook_received")
+    untabled = [
+        outcome.value
+        for outcome in WebhookOutcome
+        if (cells := _field_cells(section, outcome.value)) is None
+        or re.fullmatch(r"[1-5]\d\d", cells[1]) is None
+    ]
+    assert not untabled
+
+
+def test_metrics_page_names_every_method() -> None:
+    """The ``api_request`` section names every ``method`` value.
+
+    ``method`` is a string in the Avro schema, so the enum check above
+    cannot see it either; its vocabulary is :class:`HttpMethod`, the nine
+    RFC 9110 methods and the ``OTHER`` sentinel a dashboard filters on.
+    """
+    section = _event_section(_read(_METRICS_PAGE), "api_request")
+    assert not _uncoded({value.value for value in HttpMethod}, section)
+
+
+def test_metrics_page_has_an_example_query_per_capability() -> None:
+    """The page carries one InfluxQL query for each PRD #713 question.
+
+    Sync lag, request volume, request latency, and webhook deliveries:
+    each query has to read its measurement and group by the tags that
+    answer its question.
+    """
+    queries = _section(_read(_METRICS_PAGE), "Example queries")
+    blocks = [
+        block.split("```", 1)[0] for block in queries.split("```sql\n")[1:]
+    ]
+    wanted = [
+        (
+            "edition_published",
+            (
+                'PERCENTILE("ltd_lag", 50)',
+                'PERCENTILE("ltd_lag", 95)',
+                '"organization" = ',
+                "now() - 24h",
+            ),
+        ),
+        ("api_request", ('GROUP BY time(1m), "route", "status_class"',)),
+        ("api_request", ('PERCENTILE("duration", 95)', 'GROUP BY "route"')),
+        (
+            "github_webhook_received",
+            ('GROUP BY time(1h), "event_type", "outcome"',),
+        ),
+    ]
+    unanswered = [
+        f"{event}: {snippets}"
+        for event, snippets in wanted
+        if not any(
+            f'"{_METRICS_TOPIC}.{event}"' in block
+            and all(snippet in block for snippet in snippets)
+            for block in blocks
+        )
+    ]
+    assert not unanswered
+
+
+def test_docs_index_links_the_metrics_page() -> None:
+    """The index points at the metrics catalog."""
+    assert _METRICS_PAGE in _read("index.md")
+
+
+def test_transport_page_metrics_event_links_the_metrics_page() -> None:
+    """The transport page's metrics-event section points at the catalog."""
+    reading = _section(_read(_TRANSPORT_PAGE), "Reading a copy")
+    metrics_event = reading.split("\n### Logs\n", 1)[0]
+    assert _METRICS_PAGE in metrics_event
+
+
+def test_conditional_get_section_links_the_metrics_page() -> None:
+    """The conventions page's conditional GET section points at the catalog."""
+    section = _section(
+        _read(_API_PAGE), "Conditional GET: the `ETag` validator"
+    )
+    assert _METRICS_PAGE in section
+
+
+def test_docs_index_links_the_github_integration_page() -> None:
+    """The index points at the GitHub integration page."""
+    assert _GITHUB_PAGE in _read("index.md")
+
+
+def test_github_webhook_table_matches_the_router() -> None:
+    """The webhook table has one row per event the endpoint dispatches.
+
+    Checked both ways: a callback registered for an event or action the
+    table does not name is behaviour an operator would have to read the
+    handler to discover, and a row for one the router no longer
+    registers describes a delivery that is now ``ignored``.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Webhook events")
+    documented = {cells[0].strip("`") for cells in _code_rows(section)}
+    subscriptions = _webhook_subscriptions()
+    assert subscriptions, "the webhook router registers no events"
+    assert documented == subscriptions
+
+
+def test_github_page_names_every_default_branch_trigger() -> None:
+    """Every ``trigger`` the default-branch rule logs is documented.
+
+    The trigger is how an operator tells a webhook-driven rewrite from
+    one the audit made after a missed delivery, so every value has to be
+    quotable from the page.
+    """
+    page = _read(_GITHUB_PAGE)
+    triggers = {trigger.value for trigger in DefaultBranchTrigger}
+    assert triggers, "the rule reports no triggers"
+    assert not _uncoded(triggers, page)
+
+
+def test_github_page_documents_the_default_branch_field() -> None:
+    """The page names the read-only ``github.default_branch`` field.
+
+    The field is on the binding the API returns and absent from the one
+    it accepts, which is what "GitHub is the source of truth" means on
+    the wire.
+    """
+    assert "default_branch" in ProjectGitHubBinding.model_fields
+    assert "default_branch" not in ProjectGitHubBindingCreate.model_fields
+    assert not _uncoded({"github.default_branch"}, _read(_GITHUB_PAGE))
+
+
+def test_github_knobs_documented_with_env_var_and_default() -> None:
+    """Every GitHub setting is a row naming its env var and default.
+
+    Checked both ways, off :class:`Configuration`: a GitHub or audit
+    setting the table lacks is one an operator cannot find, and a row
+    naming a setting that no longer exists is a knob that does nothing.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Configuration")
+    env_prefix = Configuration.model_config.get("env_prefix", "")
+    knobs = {
+        name
+        for name in Configuration.model_fields
+        if name.startswith(_GITHUB_KNOB_PREFIXES)
+    }
+    assert knobs, "configuration exposes no GitHub knobs"
+    documented = {cells[0].strip("`") for cells in _code_rows(section)}
+    assert documented == knobs
+    for name in sorted(knobs):
+        cells = _cells(_table_row(section, name))
+        env_var = f"{env_prefix}{name}".upper()
+        default = Configuration.model_fields[name].default
+        assert cells[1] == f"`{env_var}`", name
+        assert cells[2] == _documented_default(default), name
+
+
+def test_github_audit_backfill_names_the_feature_flag() -> None:
+    """The backfill section names the flag the audit only runs behind.
+
+    The audit is how an upgraded environment's ``NULL`` columns are
+    filled, and it ships disabled, so an operator reading how the
+    backfill works has to learn there that it needs turning on.
+    """
+    section = _section(_read(_GITHUB_PAGE), "The audit is the backfill")
+    assert "git_ref_audit_enabled" in Configuration.model_fields
+    assert not _uncoded({"git_ref_audit_enabled"}, section)
+
+
+def test_github_log_lines_exist_in_the_code() -> None:
+    """Every row of the log table is a line the code writes, exactly.
+
+    The message has to be one a GitHub module emits, at the level the
+    row says, adding exactly the fields the row lists, so a renamed
+    message or a dropped field cannot leave the page describing a line
+    nobody can grep for.
+    """
+    documented = _documented_log_lines(_read(_GITHUB_PAGE))
+    assert documented, "the page documents no log lines"
+    emitted: dict[str, list[_LogCall]] = {}
+    for module_name in _GITHUB_LOG_MODULES:
+        for message, calls in _log_calls(module_name).items():
+            emitted.setdefault(message, []).extend(calls)
+    wrong = sorted(
+        message
+        for message, row in documented.items()
+        if row not in emitted.get(message, [])
+    )
+    assert not wrong
+
+
+def test_github_page_documents_every_default_branch_log_line() -> None:
+    """Every line the default-branch rule and processor write has a row.
+
+    Read off the two modules' syntax trees, so a log line added to
+    either has to be carried into the table.
+    """
+    documented = _documented_log_lines(_read(_GITHUB_PAGE))
+    missing = sorted(
+        message
+        for module_name in _DEFAULT_BRANCH_LOG_MODULES
+        for message in _log_calls(module_name)
+        if message not in documented
+    )
+    assert not missing
+
+
+def test_github_log_fields_table_matches_the_bound_context() -> None:
+    """The log-fields table lists exactly what the two modules bind.
+
+    Those fields ride on every line the table below it lists, so they
+    are documented once rather than on each row.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Reading an outcome")
+    table = _subsection(section, "Log fields")
+    documented = {cells[0].strip("`") for cells in _code_rows(table)}
+    bound = {
+        field
+        for module_name in _DEFAULT_BRANCH_LOG_MODULES
+        for field in _bound_log_fields(module_name)
+    }
+    assert bound, "the default-branch modules bind no fields"
+    assert documented == bound
+
+
+def test_github_keeper_sync_section_names_the_tracking_log() -> None:
+    """The keeper-sync section quotes the line reporting ``tracking_source``.
+
+    The line is how an operator tells a synced ``__main`` that follows
+    the default branch from one mirroring LTD, so its message, the
+    fields that say so, and every ``tracking_source`` value have to be
+    on the page and in the code.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Keeper-synced projects")
+    fields = {"tracking_source", "ltd_tracked_refs", "git_ref"}
+    calls = _log_calls(_KEEPER_SYNC_SERVICE_MODULE).get(
+        _KEEPER_SYNC_TRACKING_MESSAGE, []
+    )
+    assert any(fields <= call.fields for call in calls)
+    assert f"`{_KEEPER_SYNC_TRACKING_MESSAGE}`" in section
+    sources = {source.value for source in TrackingDerivationSource}
+    assert not _uncoded(fields | sources, section)
+
+
+def test_github_manual_fallback_documented() -> None:
+    """The operators' section quotes the edition endpoints it relies on.
+
+    Read off the editions router and the ``PATCH`` body model, so the
+    recipe cannot keep naming a path or a field that has moved.
+    """
+    section = _section(
+        _read(_GITHUB_PAGE), "Pinned `__main` editions are left for operators"
+    )
+    patch = _route_path("patch_edition", router=editions_router)
+    delete = _route_path("delete_edition", router=editions_router)
+    assert f"PATCH {patch.replace('{edition}', '__main')}" in section
+    assert f"DELETE {delete}" in section
+    fields = {"tracking_mode", "tracking_params", "build"}
+    assert fields <= set(EditionUpdate.model_fields)
+    assert not _uncoded(fields, section)

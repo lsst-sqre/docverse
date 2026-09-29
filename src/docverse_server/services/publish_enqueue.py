@@ -19,6 +19,7 @@ recoverable rows behind rather than silently dropping the publish.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -77,6 +78,7 @@ async def enqueue_publish_for_edition(
     keeper_sync_run_id: int | None = None,
     trigger_override: EditionPublishTrigger | None = None,
     precheck: Callable[[], Awaitable[None]] | None = None,
+    ltd_date_rebuilt: datetime | None = None,
 ) -> PublishEnqueueResult:
     """Drive one ``(edition, build)`` pair through the publish path.
 
@@ -138,6 +140,14 @@ async def enqueue_publish_for_edition(
     and falls through to the ``build`` default; spelling the default out
     would put a value in the payload that no caller chose.
 
+    ``ltd_date_rebuilt`` is the LTD Keeper rebuild a fresh keeper-sync
+    visit imported for this edition. It rides in the payload under the
+    same key as an ISO-8601 string normalised to UTC, and
+    ``publish_edition`` subtracts it from its success time to report the
+    ``EditionPublishedEvent``'s ``ltd_lag``. Like ``trigger`` it is
+    omitted when ``None``, so every other caller's payload is exactly
+    what it was before the key existed.
+
     ``precheck`` is for a caller whose decision to enqueue was made
     somewhere Phase A's transaction cannot see — most of all the
     ``edition_reconcile`` loop (task #631), which picks its pairs in a
@@ -191,6 +201,10 @@ async def enqueue_publish_for_edition(
     }
     if trigger_override is not None:
         payload["trigger"] = trigger_override.value
+    if ltd_date_rebuilt is not None:
+        payload["ltd_date_rebuilt"] = ltd_date_rebuilt.astimezone(
+            UTC
+        ).isoformat()
     enqueued = await queue_backend.enqueue("publish_edition", payload)
     async with session.begin():
         await queue_job_store.set_backend_job_id(

@@ -229,7 +229,12 @@ def _eval_draft_inactivity(
     editions: list[Edition],
     now: datetime,
 ) -> set[int]:
-    """Return edition ids that match ``DraftInactivityRule``."""
+    """Return edition ids that match ``DraftInactivityRule``.
+
+    A keeper-synced edition's ``date_updated`` is LTD's last rebuild,
+    which keeper-sync re-asserts on every visit, rather than its import
+    time; see "Timestamps mirror LTD" in ``docs/keeper-sync-scope.md``.
+    """
     threshold = now - timedelta(days=rule.max_days_inactive)
     matched: set[int] = set()
     for edition in editions:

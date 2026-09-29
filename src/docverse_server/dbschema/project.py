@@ -68,6 +68,17 @@ class SqlProject(Base):
         BigInteger, nullable=True
     )
 
+    # The repository's default branch as GitHub last reported it
+    # (PRD #721). GitHub is the source of truth, so no API write path
+    # sets it: the ``project_github_resolve`` worker seeds it from
+    # ``GET /repos/{owner}/{repo}``. A PATCH that unbinds or rebinds the
+    # project clears it with the rest of the old repository's metadata.
+    # NULL means "not yet learned", and every consumer falls back to
+    # ``"main"`` for it.
+    github_default_branch: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+
     slug_rewrite_rules: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB, nullable=True
     )

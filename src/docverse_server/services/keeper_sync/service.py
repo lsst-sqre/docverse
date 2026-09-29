@@ -59,7 +59,7 @@ from docverse_server.domain.lifecycle import (
     RefDeletedRule,
 )
 from docverse_server.domain.organization import Organization
-from docverse_server.domain.project import Project
+from docverse_server.domain.project import FALLBACK_DEFAULT_BRANCH, Project
 from docverse_server.domain.semver_aggregate import (
     SemverAggregateSpec,
     semver_aggregate_specs,
@@ -81,6 +81,7 @@ from docverse_server.exceptions import (
     NotFoundError,
     format_ltd_edition_slugs,
 )
+from docverse_server.services.default_branch import DuplicateDraftRetirer
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
 )
@@ -124,11 +125,15 @@ from docverse_server.storage.project_store import ProjectStore
 from .copier import CopyResult, CopyTally
 from .mappers import (
     EditionKindDerivation,
+    TrackingDerivation,
+    TrackingDerivationSource,
+    derive_edition_dates,
     derive_edition_kind,
     derive_edition_slug,
     derive_edition_source_prefix,
     derive_synced_build_git_ref,
     map_edition_tracking,
+    tracking_reads_live_refs,
 )
 
 __all__ = [
@@ -373,6 +378,17 @@ class BuildCopyReport:
     succeeded: bool
     """Whether the copy, after any re-run, stored every object."""
 
+    ltd_lag_seconds: float | None
+    """Seconds from LTD's ``date_rebuilt`` for the edition to the copy's end.
+
+    Measured when the copy finished, successfully or not, so a
+    build-level re-run falls inside it. Only a rebuild of an edition
+    Docverse already mirrors measures one (see
+    :func:`_measures_sync_lag`): ``None`` on the edition's first import,
+    and when LTD reports no ``date_rebuilt``. Not clamped: a rebuild
+    stamped ahead of Docverse's clock gives a negative value.
+    """
+
 
 #: Type alias for the ``on_build_copied`` hook: awaited with one
 #: :class:`BuildCopyReport` per build copy. The keeper-sync worker's
@@ -390,7 +406,12 @@ class BuildSyncOutcome:
     """
 
     docverse_build_id: int | None
-    """``None`` when the call short-circuited (state matched LTD)."""
+    """The Docverse build LTD's build maps to.
+
+    Set on every path out of ``sync_build`` — a fresh copy, a
+    convergence onto an existing build, and the "state matches LTD"
+    short circuit, which reads it off the ``keeper_sync_state`` row.
+    """
 
     docverse_build_public_id: str | None
     """``None`` when the call short-circuited (state matched LTD)."""
@@ -399,6 +420,16 @@ class BuildSyncOutcome:
     content_hash: str | None
     object_count: int | None
     total_size_bytes: int | None
+
+    ltd_date_created: datetime
+    """LTD's ``date_created`` for the build: when LTD built the content.
+
+    The value :meth:`KeeperSyncService.sync_edition`'s clock transaction
+    stamps onto the Docverse build (PRD #706). ``sync_build`` fetches
+    the LTD build on every path, the short circuit included, so carrying
+    the date back here is what keeps the stamp from costing a second
+    LTD request.
+    """
 
 
 @dataclass(frozen=True)
@@ -491,6 +522,80 @@ class _EditionStateKey:
     annotations: dict[str, Any]
 
 
+@dataclass
+class _LiveRefsCache:
+    """A project's live GitHub ref set, fetched at most once per sync.
+
+    Two consumers in one :meth:`KeeperSyncService.sync_project` read the
+    set: the proactive lifecycle pass (``ref_deleted``) and ``__main``'s
+    default-branch tracking (PRD #721). Whichever asks first pays the
+    GitHub round-trip; the other reuses the answer — including a
+    ``None`` from a failed or unconfigured fetch, which is not retried.
+    """
+
+    fetched: bool = False
+    """Whether a fetch was attempted (or skipped as unconfigured)."""
+
+    refs: frozenset[str] | None = None
+    """The live ref names, or ``None`` when none are known."""
+
+
+def _carries_tracking(
+    edition: Edition,
+    *,
+    tracking_mode: TrackingMode,
+    tracking_params: dict[str, Any],
+) -> bool:
+    """Whether *edition* already carries a tracking pair.
+
+    A stored ``NULL`` ``tracking_params`` reads as ``{}``, the params the
+    mapper gives every mode that carries none, so an ``lsst_doc`` edition
+    created with ``NULL`` is not rewritten on every visit.
+    """
+    return (
+        edition.tracking_mode == tracking_mode
+        and (edition.tracking_params or {}) == tracking_params
+    )
+
+
+def _carries_derivation(
+    edition: Edition, tracking: TrackingDerivation
+) -> bool:
+    """Whether *edition* already carries a derivation's tracking pair."""
+    return _carries_tracking(
+        edition,
+        tracking_mode=tracking.tracking_mode,
+        tracking_params=tracking.tracking_params,
+    )
+
+
+def _derive_tracking(
+    ltd_edition: LtdEdition,
+    *,
+    ltd_build: LtdBuild | None,
+    default_branch: str | None,
+    live_refs: frozenset[str] | None,
+    current: Edition | None,
+) -> TrackingDerivation:
+    """Map an LTD edition's tracking, recording which arm produced it.
+
+    *current* is the Docverse edition the pair is for, as it stands
+    now; only ``__main``'s is ever consulted (see
+    :class:`~docverse_server.services.keeper_sync.mappers.TrackingDerivationSource`).
+    """
+    return map_edition_tracking(
+        ltd_edition,
+        build=ltd_build,
+        default_branch=default_branch,
+        live_refs=live_refs,
+        current_tracking=(
+            None
+            if current is None
+            else (current.tracking_mode, current.tracking_params)
+        ),
+    )
+
+
 #: Kinds a *different* derivation owns, which the per-LTD-edition
 #: derivation must therefore never overwrite. ``derive_edition_kind``
 #: only ever answers ``main``/``release``/``draft``; the semver aggregate
@@ -558,6 +663,35 @@ def _date_rebuilt_marker_retracted(state: KeeperSyncState) -> bool:
     )
 
 
+def _measures_sync_lag(
+    edition_state: KeeperSyncState | None, edition: Edition
+) -> bool:
+    """Report whether importing LTD's build now measures a sync lag.
+
+    ``now - date_rebuilt`` is how long Docverse took to follow LTD's
+    rebuild only when Docverse was already mirroring the edition when
+    LTD rebuilt it. Both halves of "already mirroring" are read before
+    this visit writes anything:
+
+    * **An edition state row from an earlier visit.** It is keyed on
+      the LTD edition id, which survives rebuilds. The *build* row does
+      not: LTD rebuilds an edition by pointing it at a newly uploaded
+      build, so every rebuild brings a build id no row has seen yet. A
+      first import has no edition row either — nor does an adopted
+      native edition's first keeper-sync import — and its
+      ``date_rebuilt`` is whenever LTD last rebuilt the edition: years
+      ago, on a backfill.
+    * **A current build on the Docverse edition.** A first import whose
+      copy failed still wrote the state row, so the next visit's retry
+      would otherwise pass for a rebuild. It never repointed the
+      edition, so the edition has no build yet.
+
+    Takes *edition* as ``sync_edition`` holds it before ``sync_build``
+    runs, when ``current_build_id`` is still the pre-visit pointer.
+    """
+    return edition_state is not None and edition.current_build_id is not None
+
+
 @dataclass(frozen=True)
 class AggregateEditionOutcome:
     """One semver aggregate edition the backfill created or advanced.
@@ -618,6 +752,39 @@ class EditionSyncOutcome:
     tombstone short-circuit, a non-semver ref, aggregates switched off)
     and in the steady state where the aggregates already point at the
     build.
+    """
+
+    dates_restamped: bool = False
+    """``True`` when the visit rewrote a clock to LTD's.
+
+    Set by the final clock transaction of
+    :meth:`KeeperSyncService.sync_edition` (PRD #706) when it changed the
+    edition's row, its current build's, or one of the semver aggregates
+    (``15``, ``15.2``) serving that build. ``False`` when every row
+    already carried LTD's dates, on a tombstone short-circuit, and when
+    the stamp itself failed — the next visit re-asserts the values
+    either way.
+    """
+
+    ltd_date_rebuilt: datetime | None = None
+    """LTD's ``date_rebuilt`` for the edition, when this visit measured lag.
+
+    Set only when the visit imported a fresh build (``build_outcome``
+    not short-circuited) for an edition Docverse already mirrored — see
+    :func:`_measures_sync_lag` — so the time since it is how long LTD's
+    rebuild took to reach Docverse. The worker forwards it as-is into the
+    ``publish_edition`` payloads it enqueues from this outcome, the
+    edition's own and those of the semver aggregates its release moved,
+    and the ``edition_published`` event reports ``ltd_lag`` from it (PRD
+    #713); the copy's ``BuildCopyReport.ltd_lag_seconds`` is measured
+    from the same value.
+
+    ``None`` on a first import, whose ``date_rebuilt`` dates a rebuild
+    from before Docverse mirrored the edition (years old, on a
+    backfill); on a short-circuited build, whose rebuild an earlier visit
+    imported; on a tombstone short-circuit or a build-less edition; and
+    when LTD reports no ``date_rebuilt``. This field is the single
+    decision: consumers forward it without re-deriving freshness.
     """
 
     @property
@@ -688,6 +855,24 @@ class ProjectSyncResult:
     edition_outcomes: list[EditionSyncOutcome]
     edition_failures: tuple[EditionSyncFailure, ...] = ()
 
+    @property
+    def restamped_edition_count(self) -> int:
+        """How many editions this sync moved onto LTD's clock (PRD #706).
+
+        Counts the outcomes whose :attr:`EditionSyncOutcome.dates_restamped`
+        is set. Because every visit re-asserts LTD's dates, this is the
+        operator's read on the backfill: a full org run over projects
+        imported before the clock stamp reports non-zero, and a repeat
+        run reports zero once every edition carries LTD's clock. A
+        freshly imported edition counts on its import visit only: the
+        publish that visit enqueues leaves ``date_updated`` alone (see
+        :meth:`EditionStore.set_publish_status`), so the next visit
+        finds nothing to restamp.
+        """
+        return sum(
+            1 for outcome in self.edition_outcomes if outcome.dates_restamped
+        )
+
 
 @dataclass(frozen=True)
 class KeeperSyncContext:
@@ -725,6 +910,7 @@ class KeeperSyncService:
         lock_service: LockService | None = None,
         copy_retry_delay_seconds: float = DEFAULT_COPY_RETRY_DELAY_SECONDS,
         on_build_copied: BuildCopiedCallback | None = None,
+        draft_retirer: DuplicateDraftRetirer | None = None,
     ) -> None:
         self._session = session
         self._org_store = context.org_store
@@ -744,6 +930,7 @@ class KeeperSyncService:
         self._lock_service = lock_service
         self._copy_retry_delay_seconds = copy_retry_delay_seconds
         self._on_build_copied = on_build_copied
+        self._draft_retirer = draft_retirer
 
     @property
     def copy_retry_delay_seconds(self) -> float:
@@ -758,9 +945,14 @@ class KeeperSyncService:
 
         The same key the native path takes in
         ``EditionTrackingService._set_current_build_locked`` and in the
-        ``publish_edition`` worker, so a project mid-migration —
-        publishing natively while keeper-sync still polls — cannot
-        interleave two pointer writes on one edition.
+        ``publish_edition`` worker, so a project mid-migration — cut
+        over to publishing natively but not yet excluded from
+        keeper-sync scope, so keeper-sync still polls it — cannot
+        interleave two pointer writes on one edition. The lock covers
+        the pointer only. The edition's clock is kept apart by rule
+        instead: once a native build has replaced the one keeper-sync
+        imported, :meth:`_stamp_ltd_clock` stops stamping the edition,
+        and LTD's dates no longer apply to it.
 
         Acquisition follows the DM-54693 convention established by
         ``build_processing`` and ``publish_edition``: resolve the key
@@ -912,11 +1104,16 @@ class KeeperSyncService:
         ltd_editions = await self._ltd_client.list_editions_for_product(
             ltd_slug
         )
+        live_refs = _LiveRefsCache()
         skip_ltd_ids = await self._proactive_lifecycle_pass(
             org=org,
             project=project,
             ltd_editions=ltd_editions,
             rewrite_rules=rewrite_rules,
+            live_refs=live_refs,
+        )
+        tracking_live_refs = await self._tracking_live_refs(
+            project=project, ltd_editions=ltd_editions, cache=live_refs
         )
         outcomes: list[EditionSyncOutcome] = []
         failures: list[EditionSyncFailure] = []
@@ -940,6 +1137,7 @@ class KeeperSyncService:
                     ltd_edition=ltd_edition,
                     rewrite_rules=rewrite_rules,
                     autocreation=autocreation,
+                    live_refs=tracking_live_refs,
                 )
             except Exception as exc:
                 if not isinstance(exc, _PERMANENT_EDITION_FAILURE_TYPES):
@@ -1087,6 +1285,7 @@ class KeeperSyncService:
         org: Organization,
         project: Project,
         ltd_editions: list[LtdEdition],
+        live_refs: _LiveRefsCache,
         rewrite_rules: Sequence[AnySlugRewriteRule] = (),
     ) -> set[int]:
         """Tombstone LTD editions a lifecycle rule would delete on import.
@@ -1112,8 +1311,10 @@ class KeeperSyncService:
         only the non-proactive paths can omit them.
 
         The per-project GitHub ref pre-fetch happens here (once,
-        outside any open write transaction) and is shared across every
-        edition. A ``RepositoryNotAccessibleError`` or
+        outside any open write transaction, into the caller's
+        *live_refs* cache) and is shared across every edition — and
+        with ``__main``'s default-branch tracking, which reads the same
+        cache. A ``RepositoryNotAccessibleError`` or
         ``RepositoryRefFetchError`` is caught, logged, and downgrades
         the pass — ``ref_deleted`` cannot match without ``live_refs``,
         so those projects fall through to KEEP and the regular
@@ -1156,7 +1357,7 @@ class KeeperSyncService:
             row.ltd_id: row for row in state_rows if row.ltd_id is not None
         }
 
-        live_refs = await self._fetch_live_refs(project=project)
+        refs = await self._live_refs(project=project, cache=live_refs)
         now = _now()
         skip_ltd_ids: set[int] = set()
         for ltd_edition in ltd_editions:
@@ -1180,7 +1381,7 @@ class KeeperSyncService:
                     builds=[],
                     edition_build_history=[],
                     now=now,
-                    live_refs=live_refs,
+                    live_refs=refs,
                 ),
             )
             matched_rule = decision.edition_matches.get(transient.id)
@@ -1206,6 +1407,52 @@ class KeeperSyncService:
             skip_ltd_ids.add(ltd_edition.ltd_id)
         return skip_ltd_ids
 
+    async def _tracking_live_refs(
+        self,
+        *,
+        project: Project,
+        ltd_editions: Sequence[LtdEdition],
+        cache: _LiveRefsCache,
+    ) -> frozenset[str] | None:
+        """Return the live ref set the editions' tracking should read.
+
+        LTD's ``main`` edition follows the project's default branch once
+        its own ref is gone (PRD #721), which only the live ref set can
+        tell. The proactive lifecycle pass has usually fetched it
+        already; a project with no lifecycle rules has not, and pays the
+        round-trip here only when LTD's ref differs from a known default
+        branch — see
+        :func:`~docverse_server.services.keeper_sync.mappers.tracking_reads_live_refs`.
+        """
+        if cache.fetched or not any(
+            tracking_reads_live_refs(
+                ltd_edition, default_branch=project.github_default_branch
+            )
+            for ltd_edition in ltd_editions
+        ):
+            return cache.refs
+        return await self._live_refs(project=project, cache=cache)
+
+    async def _live_refs(
+        self, *, project: Project, cache: _LiveRefsCache
+    ) -> frozenset[str] | None:
+        """Return the project's live ref set, fetching it on first use.
+
+        ``None`` when the GitHub collaborators are unconfigured, and
+        otherwise whatever :meth:`_fetch_live_refs` answers. The answer
+        is cached either way, so one sync costs at most one GitHub
+        round-trip. Like :meth:`_fetch_live_refs`, must not be called
+        inside ``session.begin()``.
+        """
+        if not cache.fetched:
+            cache.fetched = True
+            if (
+                self._binding_resolver is not None
+                and self._ref_set_fetcher is not None
+            ):
+                cache.refs = await self._fetch_live_refs(project=project)
+        return cache.refs
+
     async def _fetch_live_refs(
         self, *, project: Project
     ) -> frozenset[str] | None:
@@ -1215,7 +1462,8 @@ class KeeperSyncService:
         ``ref_deleted`` rule simply does not fire) or when the GitHub
         round-trip fails — both are accepted "rule disabled, KEEP wins"
         outcomes. ``draft_inactivity`` is unaffected because it does
-        not read ``live_refs``.
+        not read ``live_refs``, and ``__main`` keeps LTD's tracked ref
+        because a missing set is no evidence that ref is gone.
 
         ``ProjectGitHubBindingResolver.resolve`` owns its own short
         read transaction and mints the GitHub installation token
@@ -1242,8 +1490,8 @@ class KeeperSyncService:
             )
         except RepositoryNotAccessibleError as exc:
             self._logger.info(
-                "Proactive lifecycle: GitHub repository not accessible,"
-                " ref_deleted disabled for this pass",
+                "Keeper sync: GitHub repository not accessible, live"
+                " refs unavailable for this pass",
                 owner=exc.owner,
                 repo=exc.repo,
                 installation_id=binding.installation_id,
@@ -1253,8 +1501,8 @@ class KeeperSyncService:
             return None
         except RepositoryRefFetchError as exc:
             self._logger.warning(
-                "Proactive lifecycle: GitHub ref fetch failed,"
-                " ref_deleted disabled for this pass",
+                "Keeper sync: GitHub ref fetch failed, live refs"
+                " unavailable for this pass",
                 owner=exc.owner,
                 repo=exc.repo,
                 installation_id=binding.installation_id,
@@ -1301,7 +1549,7 @@ class KeeperSyncService:
                     github=github,
                     default_edition=DefaultEditionConfig(
                         tracking_mode=TrackingMode.git_ref,
-                        tracking_params={"git_ref": "main"},
+                        tracking_params={"git_ref": FALLBACK_DEFAULT_BRANCH},
                     ),
                 ),
             )
@@ -1325,6 +1573,7 @@ class KeeperSyncService:
         org_slug: str | None = None,
         rewrite_rules: Sequence[AnySlugRewriteRule] = (),
         autocreation: EditionAutocreationConfig | None = None,
+        live_refs: frozenset[str] | None = None,
     ) -> EditionSyncOutcome:
         """Sync one LTD edition (and its current build) into Docverse.
 
@@ -1332,6 +1581,17 @@ class KeeperSyncService:
         consulted when deriving the edition's kind for ``git_refs`` /
         ``manual`` editions. The empty default still picks up the
         built-in version heuristics.
+
+        ``live_refs`` is the repository's live ref set when
+        :meth:`sync_project` fetched one. With the project's
+        ``github_default_branch``, it lets LTD's ``main`` edition follow
+        a default-branch rename LTD never heard of (PRD #721) — see
+        :class:`~docverse_server.services.keeper_sync.mappers.TrackingDerivationSource`.
+        ``None`` is no evidence either way: a ``__main`` another trigger
+        already converged on the default branch stays there, and every
+        other edition maps exactly as LTD reports it. ``__main``'s
+        tracking is written under its ``EDITION_UPDATE`` lock — see
+        :meth:`_converge_main_tracking`.
 
         ``autocreation`` is the project's resolved edition-autocreation
         config, which gates the semver aggregate backfill;
@@ -1384,20 +1644,42 @@ class KeeperSyncService:
                 str(ltd_edition.build_url)
             )
 
-        tracking_mode, tracking_params = map_edition_tracking(
-            ltd_edition, build=ltd_build_for_mapping
-        )
+        docverse_slug = derive_edition_slug(ltd_edition.slug)
+        if docverse_slug == DEFAULT_EDITION_SLUG:
+            # Written here, under the edition's lock, rather than by
+            # ``_ensure_edition`` inside the transaction below: this
+            # service takes an advisory lock only with no transaction
+            # open (see ``_edition_update_lock``).
+            tracking = await self._converge_main_tracking(
+                org_id=org_id,
+                project=project,
+                ltd_edition=ltd_edition,
+                ltd_build=ltd_build_for_mapping,
+                live_refs=live_refs,
+            )
+        else:
+            tracking = _derive_tracking(
+                ltd_edition,
+                ltd_build=ltd_build_for_mapping,
+                default_branch=project.github_default_branch,
+                live_refs=live_refs,
+                current=None,
+            )
         kind_derivation = derive_edition_kind(
             ltd_edition,
-            git_ref=tracking_params.get("git_ref"),
+            git_ref=tracking.tracking_params.get("git_ref"),
             rules=rewrite_rules,
         )
-        docverse_slug = derive_edition_slug(ltd_edition.slug)
         self._logger.debug(
-            "Derived keeper-sync edition kind",
+            "Derived keeper-sync edition tracking and kind",
             ltd_edition_id=ltd_edition.ltd_id,
             ltd_edition_slug=ltd_edition.slug,
             ltd_mode=ltd_edition.mode,
+            ltd_tracked_refs=ltd_edition.tracked_refs,
+            tracking_mode=tracking.tracking_mode.value,
+            git_ref=tracking.tracking_params.get("git_ref"),
+            tracking_source=tracking.source.value,
+            default_branch=project.github_default_branch,
             edition_kind=kind_derivation.kind.value,
             kind_source=kind_derivation.source.value,
             kind_detail=kind_derivation.detail,
@@ -1424,8 +1706,8 @@ class KeeperSyncService:
                 docverse_slug=docverse_slug,
                 kind_derivation=kind_derivation,
                 title=ltd_edition.title,
-                tracking_mode=tracking_mode,
-                tracking_params=tracking_params,
+                tracking_mode=tracking.tracking_mode,
+                tracking_params=tracking.tracking_params,
             )
             await self._state_store.upsert(
                 org_id=org_id,
@@ -1446,6 +1728,14 @@ class KeeperSyncService:
             kind_derivation=kind_derivation,
         )
 
+        # Decided once, here, while ``edition`` still carries its
+        # pre-visit build: both lag fields read it, the copy report's
+        # through ``sync_build`` and the outcome's below.
+        ltd_lag_since = (
+            ltd_edition.date_rebuilt
+            if _measures_sync_lag(edition_state, edition)
+            else None
+        )
         build_outcome: BuildSyncOutcome | None = None
         aggregate_outcomes: tuple[AggregateEditionOutcome, ...] = ()
         if ltd_edition.build_url is not None:
@@ -1456,6 +1746,7 @@ class KeeperSyncService:
                 edition=edition,
                 ltd_edition=ltd_edition,
                 ltd_build=ltd_build_for_mapping,
+                ltd_lag_since=ltd_lag_since,
             )
             if (
                 build_outcome.docverse_build_id is not None
@@ -1489,7 +1780,7 @@ class KeeperSyncService:
                     aggregate_outcomes = (
                         await self._backfill_semver_aggregates(
                             project_id=project.id,
-                            git_ref=tracking_params.get("git_ref"),
+                            git_ref=tracking.tracking_params.get("git_ref"),
                             build_id=build_outcome.docverse_build_id,
                             autocreation=(
                                 autocreation or DEFAULT_EDITION_AUTOCREATION
@@ -1514,6 +1805,18 @@ class KeeperSyncService:
                         project=project.slug,
                     )
 
+        # Last: the kind convergence and ``sync_build``'s repoint both
+        # write this edition's row through the ORM, whose ``onupdate``
+        # moves ``date_updated`` back to now, and the aggregate backfill
+        # does the same to ``15`` / ``15.2``, so a stamp any earlier in
+        # the visit would not survive them. See :meth:`_stamp_ltd_clock`.
+        dates_restamped = await self._stamp_ltd_clock(
+            edition=edition,
+            ltd_edition=ltd_edition,
+            build_outcome=build_outcome,
+            git_ref=tracking.tracking_params.get("git_ref"),
+        )
+
         return EditionSyncOutcome(
             docverse_edition_id=edition.id,
             # Report the *persisted* edition's slug, not the keeper-derived
@@ -1531,7 +1834,313 @@ class KeeperSyncService:
             build_outcome=build_outcome,
             short_circuited=False,
             aggregate_outcomes=aggregate_outcomes,
+            dates_restamped=dates_restamped,
+            # A short-circuited build imported nothing this visit, so
+            # there is no lag to report however known the edition is.
+            ltd_date_rebuilt=(
+                ltd_lag_since
+                if build_outcome is not None
+                and not build_outcome.short_circuited
+                else None
+            ),
         )
+
+    async def _stamp_ltd_clock(
+        self,
+        *,
+        edition: Edition,
+        ltd_edition: LtdEdition,
+        build_outcome: BuildSyncOutcome | None,
+        git_ref: str | None,
+    ) -> bool:
+        """Stamp a synced edition's rows with LTD's timestamps (PRD #706).
+
+        Keeper-sync owns the clock of the rows it keeps in sync: the
+        edition's ``date_created`` / ``date_updated`` are LTD's, from
+        :func:`~docverse_server.services.keeper_sync.mappers.derive_edition_dates`,
+        not the moment of import, and so is the clock of the Docverse
+        build ``sync_build`` mapped the edition's LTD build to — see
+        :meth:`_stamp_build_clock`. A release's semver aggregates
+        (``15``, ``15.2``) have no LTD row of their own, so the ones
+        serving its build follow its ``date_updated`` — see
+        :meth:`_stamp_aggregate_clocks`; *git_ref* is the edition's
+        tracked ref, which names them. This is the visit's final
+        transaction, because every earlier edition write moves
+        ``date_updated`` to now through the ORM ``onupdate`` — see
+        :meth:`EditionStore.set_sync_dates`. The edition rows are
+        stamped before the build, per the lock order
+        :mod:`docverse_server.storage.edition_store` documents, and the
+        aggregates before their release: the slug order in which
+        ``track_build`` takes the same rows for a native upload of the
+        release's tag.
+
+        Keeper-sync owns the clock only of an edition still serving the
+        build it imported. When the edition row's ``current_build_id``
+        is not the Docverse build *build_outcome* mapped this LTD
+        edition to, the edition has moved on to a native build: a
+        project cut over to publishing directly to Docverse but still in
+        keeper-sync scope, whose frozen LTD edition makes ``sync_build``
+        short-circuit on "state matches LTD" and leave the native
+        pointer alone. That edition keeps its own clock, so nothing is
+        written — build and aggregates included — and the stamp reports
+        ``False``. This is what makes the cutover assumption (a repo
+        publishes to LTD or to Docverse, never both) safe however late
+        the project is excluded from keeper-sync scope. The comparison
+        reads the row fresh inside the stamp's transaction, not
+        *edition*, which was loaded before ``sync_build`` ran and misses
+        its repoint, and any native one since. A build-less LTD edition
+        (*build_outcome* ``None``) has no build to compare and is
+        stamped as before.
+
+        The edition stamp only ever moves the row's clock *earlier* —
+        see :meth:`EditionStore.set_sync_dates`. Several LTD editions
+        can resolve to one row in :meth:`_ensure_edition` (a
+        ``git_refs`` edition and a ``manual`` one pinned to a build of
+        the same ref; two LTD slugs that differ only in case), and
+        stamped verbatim they would overwrite each other on every poll,
+        so the project would report restamps, and re-render its
+        dashboard, forever. Earlier-only, the row settles on the
+        earliest of their dates, column by column. The two rules
+        compose: when one of those editions rebuilds, ``sync_build``
+        repoints the row, which moves ``date_updated`` to now, and its
+        stamp lowers that to the new ``date_rebuilt``; the others no
+        longer serve the row's build, so the guard above skips their
+        stamps and the row follows the edition that rebuilt.
+
+        Each stamp is a compare-and-set, so a visit whose rows already
+        match writes nothing and reports ``False``. An edition
+        soft-deleted mid-visit is left alone, build and aggregates
+        included.
+
+        A failure is logged and reported as ``False`` rather than
+        raised, for the same reason the aggregate backfill's is: the
+        edition is already imported and repointed by now, and an
+        exception here would cost it the outcome that enqueues its
+        publish. The next visit re-asserts the dates anyway.
+
+        Returns
+        -------
+        bool
+            Whether the edition row, its build's row, or one of its
+            aggregates' rows changed.
+        """
+        date_created, date_updated = derive_edition_dates(ltd_edition)
+        restamped_build: Build | None = None
+        restamped_aggregates: list[Edition] = []
+        try:
+            async with self._session.begin():
+                current = await self._edition_store.get_by_id(edition.id)
+                if current is None:
+                    return False
+                if (
+                    build_outcome is not None
+                    and current.current_build_id
+                    != build_outcome.docverse_build_id
+                ):
+                    self._logger.debug(
+                        "Edition moved off its LTD build; leaving its clock",
+                        edition_id=edition.id,
+                        edition_slug=current.slug,
+                        project_id=current.project_id,
+                        ltd_edition_id=ltd_edition.ltd_id,
+                        current_build_id=current.current_build_id,
+                        ltd_build_docverse_id=(
+                            build_outcome.docverse_build_id
+                        ),
+                    )
+                    return False
+                if build_outcome is not None:
+                    restamped_aggregates = await self._stamp_aggregate_clocks(
+                        project_id=current.project_id,
+                        git_ref=git_ref,
+                        build_id=build_outcome.docverse_build_id,
+                        date_updated=date_updated,
+                    )
+                restamped = await self._edition_store.set_sync_dates(
+                    edition.id,
+                    date_created=date_created,
+                    date_updated=date_updated,
+                )
+                if build_outcome is not None:
+                    restamped_build = await self._stamp_build_clock(
+                        build_outcome
+                    )
+        except Exception as exc:
+            sentry_sdk.capture_exception(exc)
+            self._logger.exception(
+                "Edition clock stamp failed; edition sync still succeeded",
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+                project_id=edition.project_id,
+                ltd_edition_id=ltd_edition.ltd_id,
+            )
+            return False
+        if restamped:
+            self._logger.info(
+                "Restamped edition dates from LTD",
+                edition_id=edition.id,
+                edition_slug=current.slug,
+                project_id=current.project_id,
+                ltd_edition_id=ltd_edition.ltd_id,
+                previous_date_updated=current.date_updated.isoformat(),
+                # What the earlier-only stamp wrote, which is not LTD's
+                # value when the row was already earlier.
+                date_updated=min(
+                    current.date_updated, date_updated
+                ).isoformat(),
+            )
+        if restamped_build is not None and build_outcome is not None:
+            self._logger.info(
+                "Restamped build dates from LTD",
+                build_id=restamped_build.id,
+                edition_id=edition.id,
+                project_id=current.project_id,
+                ltd_edition_id=ltd_edition.ltd_id,
+                previous_date_created=restamped_build.date_created.isoformat(),
+                previous_date_completed=(
+                    restamped_build.date_completed.isoformat()
+                    if restamped_build.date_completed is not None
+                    else None
+                ),
+                date_created=build_outcome.ltd_date_created.isoformat(),
+            )
+        for aggregate in restamped_aggregates:
+            self._logger.info(
+                "Restamped semver aggregate dates from LTD",
+                edition_id=aggregate.id,
+                edition_slug=aggregate.slug,
+                release_edition_id=edition.id,
+                project_id=current.project_id,
+                ltd_edition_id=ltd_edition.ltd_id,
+                build_id=aggregate.current_build_id,
+                previous_date_updated=aggregate.date_updated.isoformat(),
+                date_updated=date_updated.isoformat(),
+            )
+        return (
+            restamped
+            or restamped_build is not None
+            or bool(restamped_aggregates)
+        )
+
+    async def _stamp_aggregate_clocks(
+        self,
+        *,
+        project_id: int,
+        git_ref: str | None,
+        build_id: int | None,
+        date_updated: datetime,
+    ) -> list[Edition]:
+        """Give a release's aggregates on its build the release's clock.
+
+        Runs inside :meth:`_stamp_ltd_clock`'s transaction. The ``N`` /
+        ``N.M`` editions :meth:`_backfill_semver_aggregates` maintains
+        are Docverse-only, so each one whose ``current_build_id`` is
+        this release's build takes the release's stamped
+        ``date_updated``; its ``date_created`` is its own and is written
+        back unchanged. An aggregate on any other build — an older or
+        newer release's, a native upload's — is not this release's to
+        date, and an operator's own edition on an aggregate's slug is
+        not an aggregate.
+
+        The aggregates are looked up by the slugs *git_ref* implies on
+        every visit, not taken from the backfill's outcomes, which only
+        exist on the visit that moved the pointer. An aggregate imported
+        before PRD #706 carries its import time, and one a later
+        Docverse-side write drifted carries that write's, yet every
+        later visit skips the backfill on its marker, so neither would
+        ever be re-dated from the outcomes. One ``SELECT`` of at most
+        two named slugs per release visit re-asserts the clock for both.
+
+        The stamp only ever moves an aggregate's ``date_updated``
+        *earlier* — the rule :meth:`EditionStore.set_sync_dates` applies
+        to every edition row, checked here against the row just read so
+        that an aggregate already at or before the release's date costs
+        no statement. Two releases in one series whose content converged
+        onto one build both find the aggregate on "their" build, and
+        stamping each verbatim would make them overwrite each other on
+        every poll. Every write the stamp exists to undo — the import, a
+        repoint — moves the clock to now, later than any LTD date, so
+        the earlier-only rule still corrects each one.
+
+        Returns
+        -------
+        list of Edition
+            The aggregates the stamp changed, as they were before it,
+            for the caller's log lines.
+        """
+        if build_id is None:
+            return []
+        version = parse_stable_semver(git_ref)
+        if version is None:
+            return []
+        modes = {
+            spec.slug: spec.tracking_mode
+            for spec in semver_aggregate_specs(version)
+        }
+        if not modes:
+            return []
+        aggregates = await self._edition_store.list_by_slugs_on_build(
+            project_id=project_id, slugs=list(modes), build_id=build_id
+        )
+        restamped: list[Edition] = []
+        for aggregate in aggregates:
+            if (
+                aggregate.tracking_mode is not modes.get(aggregate.slug)
+                or aggregate.date_updated <= date_updated
+            ):
+                continue
+            if await self._edition_store.set_sync_dates(
+                aggregate.id,
+                date_created=aggregate.date_created,
+                date_updated=date_updated,
+            ):
+                restamped.append(aggregate)
+        return restamped
+
+    async def _stamp_build_clock(
+        self, build_outcome: BuildSyncOutcome
+    ) -> Build | None:
+        """Stamp the Docverse build behind *build_outcome* with LTD's date.
+
+        Runs inside :meth:`_stamp_ltd_clock`'s transaction. Both
+        ``date_created`` and ``date_completed`` take the LTD build's
+        ``date_created``: LTD built and published the content at that
+        moment, and the Docverse row's own values only record the copy.
+
+        The stamp only ever moves a build's clock *earlier*. One Docverse
+        build can stand for several LTD builds: ``sync_build`` converges
+        any LTD build whose bytes a completed build already holds onto
+        that build (``main`` and a tag built from one commit, say). Were
+        each visit to write its own LTD build's date, the editions
+        sharing the row would overwrite each other on every poll. The
+        content existed from the earliest of those LTD builds on, so a
+        row already dated at or before this LTD build is left alone —
+        which also keeps the upload time of a native build that LTD's
+        copy of the same content converged onto.
+
+        Returns
+        -------
+        Build or None
+            The build as it was *before* the stamp when the stamp
+            changed it, for the caller's log line; ``None`` when the
+            row already matched, already carries an earlier date, or
+            does not exist.
+        """
+        build_id = build_outcome.docverse_build_id
+        if build_id is None:
+            return None
+        build = await self._build_store.get_by_id(build_id)
+        if (
+            build is None
+            or build.date_created < build_outcome.ltd_date_created
+        ):
+            return None
+        changed = await self._build_store.set_sync_dates(
+            build_id,
+            date_created=build_outcome.ltd_date_created,
+            date_completed=build_outcome.ltd_date_created,
+        )
+        return build if changed else None
 
     async def _backfill_semver_aggregates(
         self,
@@ -1777,6 +2386,9 @@ class KeeperSyncService:
     ) -> Edition:
         """Look up or create an edition and realign its tracking columns.
 
+        ``__main`` is looked up only: its tracking has already been
+        realigned, under its lock, by :meth:`_converge_main_tracking`.
+
         ``kind_derivation`` seeds a newly created edition's kind
         outright. Existing rows — matched by slug, adopted by
         ``git_ref``, or handed back by a ``create_internal`` that lost
@@ -1789,13 +2401,15 @@ class KeeperSyncService:
         edition = await self._edition_store.get_by_slug(
             project_id=project_id, slug=docverse_slug
         )
-        if edition is None and docverse_slug == DEFAULT_EDITION_SLUG:
-            msg = (
-                f"Default edition {DEFAULT_EDITION_SLUG!r} missing for "
-                f"project_id={project_id}; project creation should have"
-                " auto-created it"
-            )
-            raise RuntimeError(msg)
+        if docverse_slug == DEFAULT_EDITION_SLUG:
+            if edition is None:
+                msg = (
+                    f"Default edition {DEFAULT_EDITION_SLUG!r} missing for "
+                    f"project_id={project_id}; project creation should have"
+                    " auto-created it"
+                )
+                raise RuntimeError(msg)
+            return edition
         if edition is None:
             # PRD #409: native auto-creation and keeper-sync derive an
             # edition's slug from a branch differently, so the same
@@ -1862,12 +2476,124 @@ class KeeperSyncService:
         tracking_mode: TrackingMode,
         tracking_params: dict[str, Any],
     ) -> None:
-        """Realign an existing edition's tracking columns with LTD."""
+        """Realign an existing edition's tracking columns with LTD.
+
+        Writes nothing when the edition already carries the pair.
+        """
+        if _carries_tracking(
+            edition,
+            tracking_mode=tracking_mode,
+            tracking_params=tracking_params,
+        ):
+            return
         await self._edition_store.update_tracking(
             edition_id=edition.id,
             tracking_mode=tracking_mode,
             tracking_params=tracking_params,
         )
+
+    async def _converge_main_tracking(
+        self,
+        *,
+        org_id: int,
+        project: Project,
+        ltd_edition: LtdEdition,
+        ltd_build: LtdBuild | None,
+        live_refs: frozenset[str] | None,
+    ) -> TrackingDerivation:
+        """Derive ``__main``'s tracking from LTD and write it, locked.
+
+        ``__main``'s tracking has four writers: this visit and the
+        webhook, resolve, and audit triggers of
+        :class:`~docverse_server.services.default_branch.DefaultBranchService`.
+        The derivation reads ``__main`` as it stands, so a ``__main``
+        another trigger already moved onto the recorded default branch
+        stays there (``converged``) instead of reverting to LTD's stale
+        ref.
+
+        Shaped like :meth:`_refresh_kind`: a lock-free pre-check, then
+        the write under the edition's ``EDITION_UPDATE`` lock — the key
+        ``DefaultBranchService`` holds for its rewrite — with the row
+        re-read and the tracking re-derived inside it, so a trigger
+        that converged ``__main`` while this visit waited is respected
+        rather than overwritten. A visit whose derivation already
+        matches writes nothing and takes no lock.
+
+        When the write moves ``__main`` onto the default branch
+        (``default_branch``), the ``draft`` editions tracking that
+        branch are retired in the same transaction, as
+        ``DefaultBranchService`` does after its own rewrite — see
+        :class:`~docverse_server.services.default_branch.DuplicateDraftRetirer`.
+        Direct unit-test constructions without a retirer skip that step.
+
+        Returns the derived tracking, which is ``__main``'s tracking
+        after the call. A project with no ``__main`` gets the derivation
+        back unwritten, and :meth:`_ensure_edition` reports it.
+        """
+        default_branch = project.github_default_branch
+        async with self._session.begin():
+            main = await self._edition_store.get_by_slug(
+                project_id=project.id, slug=DEFAULT_EDITION_SLUG
+            )
+        tracking = _derive_tracking(
+            ltd_edition,
+            ltd_build=ltd_build,
+            default_branch=default_branch,
+            live_refs=live_refs,
+            current=main,
+        )
+        if main is None or _carries_derivation(main, tracking):
+            return tracking
+        async with (
+            self._edition_update_lock(
+                org_id=org_id, project_id=project.id, edition_id=main.id
+            ),
+            self._session.begin(),
+        ):
+            current = await self._edition_store.get_by_id(main.id)
+            if current is None:
+                return tracking
+            tracking = _derive_tracking(
+                ltd_edition,
+                ltd_build=ltd_build,
+                default_branch=default_branch,
+                live_refs=live_refs,
+                current=current,
+            )
+            if _carries_derivation(current, tracking):
+                return tracking
+            await self._edition_store.update_tracking(
+                edition_id=current.id,
+                tracking_mode=tracking.tracking_mode,
+                tracking_params=tracking.tracking_params,
+            )
+            drafts_retired: tuple[int, ...] = ()
+            if (
+                tracking.source is TrackingDerivationSource.default_branch
+                and self._draft_retirer is not None
+            ):
+                drafts_retired = await self._draft_retirer.retire(
+                    project=project,
+                    ref=tracking.tracking_params["git_ref"],
+                    logger=self._logger.bind(
+                        trigger="keeper_sync",
+                        project_id=project.id,
+                        project_slug=project.slug,
+                    ),
+                )
+        self._logger.info(
+            "Realigned keeper-synced __main tracking",
+            project_id=project.id,
+            edition_id=current.id,
+            previous_tracking_mode=current.tracking_mode.value,
+            previous_git_ref=(current.tracking_params or {}).get("git_ref"),
+            tracking_mode=tracking.tracking_mode.value,
+            git_ref=tracking.tracking_params.get("git_ref"),
+            tracking_source=tracking.source.value,
+            default_branch=default_branch,
+            drafts_retired=len(drafts_retired),
+        )
+        return tracking
 
     async def _refresh_kind(
         self,
@@ -1938,6 +2664,7 @@ class KeeperSyncService:
         ltd_edition: LtdEdition,
         ltd_build: LtdBuild | None = None,
         org_slug: str | None = None,
+        ltd_lag_since: datetime | None = None,
     ) -> BuildSyncOutcome:
         """Sync the LTD edition's current build into Docverse.
 
@@ -1949,6 +2676,12 @@ class KeeperSyncService:
         the build (e.g. ``sync_edition`` does so for ``manual`` editions
         to derive the tracking pair). Skipping the refetch saves a round
         trip to LTD.
+
+        ``ltd_lag_since`` is the LTD ``date_rebuilt`` a copy's
+        :class:`BuildCopyReport` measures ``ltd_lag_seconds`` from, or
+        ``None`` for no lag. ``sync_edition`` sets it only for a rebuild
+        of an edition Docverse already mirrors (see
+        :func:`_measures_sync_lag`), so this method never decides it.
 
         The bucket prefix the content is read from is resolved once, by
         :meth:`_resolve_build_source`, and that one prefix feeds both the
@@ -2005,6 +2738,7 @@ class KeeperSyncService:
                 content_hash=existing_state.content_hash,
                 object_count=None,
                 total_size_bytes=None,
+                ltd_date_created=ltd_build.date_created,
             )
 
         source = await self._resolve_build_source(
@@ -2070,6 +2804,7 @@ class KeeperSyncService:
                 content_hash=manifest_hash,
                 object_count=None,
                 total_size_bytes=None,
+                ltd_date_created=ltd_build.date_created,
             )
 
         git_ref = derive_synced_build_git_ref(ltd_edition, ltd_build)
@@ -2089,6 +2824,7 @@ class KeeperSyncService:
             source_prefix=source.prefix,
             dest_prefix=new_build.storage_prefix,
             project_slug=project.slug,
+            ltd_date_rebuilt=ltd_lag_since,
             logger=self._logger.bind(
                 ltd_build_id=ltd_build.ltd_id,
                 edition_slug=edition.slug,
@@ -2196,6 +2932,7 @@ class KeeperSyncService:
             content_hash=copy_result.content_hash,
             object_count=copy_result.object_count,
             total_size_bytes=copy_result.total_size_bytes,
+            ltd_date_created=ltd_build.date_created,
         )
 
     async def _copy_build_content(
@@ -2204,6 +2941,7 @@ class KeeperSyncService:
         source_prefix: str,
         dest_prefix: str,
         project_slug: str,
+        ltd_date_rebuilt: datetime | None,
         logger: structlog.stdlib.BoundLogger,
     ) -> CopyResult:
         """Copy one build's content and report the copy to the hook.
@@ -2215,6 +2953,10 @@ class KeeperSyncService:
         failure still propagates unchanged once the report is out. A
         cancelled copy (the arq job timing out) is not reported: it
         neither landed nor failed on its own account.
+
+        ``ltd_date_rebuilt`` is the LTD edition's ``date_rebuilt``, which
+        the report measures its ``ltd_lag_seconds`` from, or ``None`` when
+        this import measures no lag (``sync_build``'s ``ltd_lag_since``).
         """
         started = monotonic()
         passes: list[CopyTally] = []
@@ -2230,6 +2972,7 @@ class KeeperSyncService:
                 project_slug=project_slug,
                 passes=passes,
                 started=started,
+                ltd_date_rebuilt=ltd_date_rebuilt,
                 succeeded=False,
                 logger=logger,
             )
@@ -2240,6 +2983,7 @@ class KeeperSyncService:
             project_slug=project_slug,
             passes=passes,
             started=started,
+            ltd_date_rebuilt=ltd_date_rebuilt,
             succeeded=True,
             logger=logger,
         )
@@ -2311,37 +3055,50 @@ class KeeperSyncService:
         project_slug: str,
         passes: Sequence[CopyTally],
         started: float,
+        ltd_date_rebuilt: datetime | None,
         succeeded: bool,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         """Hand ``on_build_copied`` the report for one build copy, if wired.
 
-        The hook is a side channel, so it may not decide the copy's fate:
-        whatever it raises is sent to Sentry and logged, and the copy's
-        own result or exception carries on as if it had not run — the
-        same isolation ``sync_project`` gives ``on_edition_synced``.
+        The report is a side channel, so it may not decide the copy's
+        fate: whatever building it or running the hook raises is sent to
+        Sentry and logged, and the copy's own result or exception carries
+        on as if it had not run — the same isolation ``sync_project``
+        gives ``on_edition_synced``. A lag that cannot be measured costs
+        only the lag (see :func:`_measure_ltd_lag_seconds`); the report
+        still goes out.
+
+        Called as the copy ends, so this is where both clocks stop:
+        ``duration_seconds`` on the monotonic clock from ``started``, and
+        ``ltd_lag_seconds`` on the wall clock from ``ltd_date_rebuilt``,
+        the only clock LTD's timestamp can be compared against.
         """
         if self._on_build_copied is None:
             return
-        last = passes[-1]
-        report = BuildCopyReport(
-            project_slug=project_slug,
-            object_count=last.object_count,
-            total_size_bytes=last.total_size_bytes,
-            duration_seconds=monotonic() - started,
-            peak_concurrent_copies=max(
-                tally.peak_concurrent_copies for tally in passes
-            ),
-            retried_object_count=sum(
-                tally.retried_object_count for tally in passes
-            ),
-            exhausted_object_count=sum(
-                tally.exhausted_object_count for tally in passes
-            ),
-            build_retry_used=len(passes) > 1,
-            succeeded=succeeded,
-        )
+        duration_seconds = monotonic() - started
         try:
+            last = passes[-1]
+            report = BuildCopyReport(
+                project_slug=project_slug,
+                object_count=last.object_count,
+                total_size_bytes=last.total_size_bytes,
+                duration_seconds=duration_seconds,
+                peak_concurrent_copies=max(
+                    tally.peak_concurrent_copies for tally in passes
+                ),
+                retried_object_count=sum(
+                    tally.retried_object_count for tally in passes
+                ),
+                exhausted_object_count=sum(
+                    tally.exhausted_object_count for tally in passes
+                ),
+                build_retry_used=len(passes) > 1,
+                succeeded=succeeded,
+                ltd_lag_seconds=_measure_ltd_lag_seconds(
+                    ltd_date_rebuilt, logger=logger
+                ),
+            )
             await self._on_build_copied(report)
         except Exception as exc:
             sentry_sdk.capture_exception(exc)
@@ -2591,6 +3348,34 @@ def _now() -> datetime:
     return datetime.now(tz=UTC)
 
 
+def _measure_ltd_lag_seconds(
+    ltd_date_rebuilt: datetime | None,
+    *,
+    logger: structlog.stdlib.BoundLogger,
+) -> float | None:
+    """Measure a build copy's ``ltd_lag_seconds``, or give ``None``.
+
+    ``None`` when there is no ``ltd_date_rebuilt`` to measure from, and
+    also when it cannot be compared against Docverse's clock. An LTD
+    response cannot hand the service a naive timestamp
+    (:class:`~docverse_server.storage.ltd.LtdEdition` reads one as UTC),
+    but the lag is a metrics-only calculation, so a ``TypeError`` from
+    any other source of the value is sent to Sentry and logged rather
+    than raised: it costs the report its lag, never the copy its outcome.
+    """
+    if ltd_date_rebuilt is None:
+        return None
+    try:
+        return (_now() - ltd_date_rebuilt).total_seconds()
+    except TypeError as exc:
+        sentry_sdk.capture_exception(exc)
+        logger.exception(
+            "Could not measure LTD sync lag; reporting none",
+            ltd_date_rebuilt=ltd_date_rebuilt.isoformat(),
+        )
+        return None
+
+
 async def _sleep(delay: float) -> None:
     """Wait before re-running a failed build copy.
 
@@ -2705,16 +3490,16 @@ def _transient_edition_from_ltd(
     evaluator deliberately does not fetch builds (defeats the
     bandwidth-saving point). Those editions fall through to
     ``sync_edition`` and the regular ``lifecycle_eval`` pass handles
-    them post-import. ``date_updated`` mirrors LTD's ``date_rebuilt``
-    when set (LTD's analogue of Docverse's edition-touch timestamp)
-    and falls back to ``date_created`` otherwise.
+    them post-import. The dates come from :func:`derive_edition_dates`,
+    the same mapping :meth:`KeeperSyncService.sync_edition` stamps onto
+    the imported row, so ``draft_inactivity`` judges an edition on the
+    same clock before and after its import.
     """
     try:
-        tracking_mode, tracking_params = map_edition_tracking(
-            ltd_edition, build=None
-        )
+        tracking = map_edition_tracking(ltd_edition, build=None)
     except ValueError:
         return None
+    date_created, date_updated = derive_edition_dates(ltd_edition)
     return Edition(
         id=ltd_edition.ltd_id,
         slug=derive_edition_slug(ltd_edition.slug),
@@ -2722,13 +3507,13 @@ def _transient_edition_from_ltd(
         project_id=project_id,
         kind=derive_edition_kind(
             ltd_edition,
-            git_ref=tracking_params.get("git_ref"),
+            git_ref=tracking.tracking_params.get("git_ref"),
             rules=rewrite_rules,
         ).kind,
-        tracking_mode=tracking_mode,
-        tracking_params=tracking_params or None,
+        tracking_mode=tracking.tracking_mode,
+        tracking_params=tracking.tracking_params or None,
         lifecycle_exempt=False,
-        date_created=ltd_edition.date_created,
-        date_updated=ltd_edition.date_rebuilt or ltd_edition.date_created,
+        date_created=date_created,
+        date_updated=date_updated,
         date_deleted=None,
     )

@@ -454,7 +454,7 @@ async def patch_project(
 ) -> Project:
     async with context.session.begin():
         service = context.factory.create_project_service()
-        org, project = await service.update(
+        org, project, previous_default_branch = await service.update(
             org_slug=org_slug, slug=project_slug, data=data
         )
         default_edition = await service.get_default_edition(project.id)
@@ -475,16 +475,19 @@ async def patch_project(
         project_slug=project_slug,
     )
     # Only a PATCH that actually rewrote the binding is worth a
-    # resolve (task #651). A retitle leaves all five ``github_*``
+    # resolve (task #651). A retitle leaves all six ``github_*``
     # columns alone, so the worker would re-read the ids it already
     # resolved — a maintenance-queue job per edit, and one more write
-    # to a row whose representation did not change.
+    # to a row whose representation did not change. The rebind cleared
+    # ``github_default_branch``, so the job carries the old value as its
+    # evidence that ``__main``'s ref is gone (PRD #721).
     if patch_changes_github_binding(data):
         await try_enqueue_project_github_resolve_by_id(
             factory=context.factory,
             session=context.session,
             logger=context.logger,
             project_id=project.id,
+            previous_default_branch=previous_default_branch,
         )
     return Project.from_domain(
         project,

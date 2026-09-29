@@ -47,6 +47,13 @@ class DraftInactivityRule(BaseModel):
     ``date_updated`` is older than ``max_days_inactive`` days. Other
     edition kinds (``release``, ``main``, ``alternate``) are never
     candidates for this rule, regardless of staleness.
+
+    For an edition synced from LTD Keeper, ``date_updated`` is LTD's
+    ``date_rebuilt`` (or its ``date_created`` when LTD never rebuilt
+    the edition), not the moment Docverse imported it, so a draft LTD
+    last rebuilt long ago is a candidate however recently it was
+    synced. See "Timestamps mirror LTD" in the Docverse repository's
+    ``docs/keeper-sync-scope.md``.
     """
 
     model_config = ConfigDict(extra="forbid")

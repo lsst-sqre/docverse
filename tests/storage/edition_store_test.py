@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -2474,6 +2474,127 @@ async def test_find_matching_lsst_doc_main_rejected_when_showing_version(
         await db_session.commit()
 
 
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_default_branch_unpublished(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc accepts the project's default branch when unpublished.
+
+    A project whose repository's default branch is ``master`` builds
+    its pre-release docs there, so that ref — not the literal ``main``
+    — is what a fresh ``lsst_doc`` edition falls back to.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="master", default_branch="master"
+        )
+        assert [e.slug for e in matched] == ["current"]
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_main_is_not_prerelease_on_master(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc ignores ``main`` when the default branch is elsewhere.
+
+    ``main`` is only the fallback for a project whose default branch
+    is unknown. Once it is known to be ``master``, a stray ``main``
+    build is an ordinary branch and never lands on the ``lsst_doc``
+    edition.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="main", default_branch="master"
+        )
+        assert matched == []
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_default_branch_when_showing_it(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc accepts the default branch while it is showing it."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        master_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(git_ref="master", content_hash=_HASH),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+            build_id=master_build.id,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="master", default_branch="master"
+        )
+        assert [e.slug for e in matched] == ["current"]
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_find_matching_lsst_doc_default_branch_rejected_on_version(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """lsst_doc rejects the default branch once it shows a release."""
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        version_build = await build_store.create(
+            project_id=project_id,
+            data=BuildCreate(git_ref="v1.0", content_hash=_HASH),
+            uploader="testuser",
+            project_slug="ed-proj",
+        )
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+            build_id=version_build.id,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref="master", default_branch="master"
+        )
+        assert matched == []
+        await db_session.commit()
+
+
 # ── Main-slug/kind invariant (ck_editions_main_slug_kind) ─────────────────
 
 
@@ -3617,3 +3738,416 @@ async def test_list_org_editions_for_reconcile_is_org_scoped(
         )
 
     assert [row.edition_slug for row in rows] == ["mine"]
+
+
+async def _read_edition_clock(
+    db_session: AsyncSession, edition_id: int
+) -> tuple[datetime, datetime]:
+    """Read ``(date_created, date_updated)`` straight from the database.
+
+    A column-level SELECT for the same reason as
+    :func:`_read_project_date_updated`: ``set_sync_dates`` is a Core
+    ``UPDATE``, and an identity-mapped entity could predate it.
+    """
+    row = (
+        await db_session.execute(
+            select(SqlEdition.date_created, SqlEdition.date_updated).where(
+                SqlEdition.id == edition_id
+            )
+        )
+    ).one()
+    return row.date_created, row.date_updated
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_writes_the_given_values(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Keeper-sync's clock stamp lands verbatim, ``onupdate`` or not.
+
+    ``editions.date_updated`` carries an ORM ``onupdate=now()``, which
+    would overwrite any write that leaves the column out of its
+    ``SET`` clause. The stamp names both columns explicitly, so the
+    LTD values survive — including an offset other than UTC, which
+    ``timestamptz`` stores as the same instant.
+    """
+    pacific = timezone(timedelta(hours=-8))
+    created = datetime(2017, 6, 1, 9, 30, tzinfo=pacific)
+    updated = datetime(2023, 11, 20, 16, 45, 12, 345678, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="synced",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "synced"},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        changed = await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+    assert changed is True
+
+    async with db_session.begin():
+        assert await _read_edition_clock(db_session, edition_id) == (
+            created,
+            updated,
+        )
+
+
+async def _read_edition_xmin(db_session: AsyncSession, edition_id: int) -> str:
+    """Read the row's ``xmin``: the transaction that wrote its version.
+
+    PostgreSQL writes a new row version for every ``UPDATE`` that
+    matches a row, even one that sets each column to the value it
+    already holds, so an unchanged ``xmin`` proves no write happened.
+    """
+    xmin: str = (
+        await db_session.execute(
+            text("SELECT xmin::text FROM editions WHERE id = :id"),
+            {"id": edition_id},
+        )
+    ).scalar_one()
+    return xmin
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_matching_row_is_not_written(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A re-stamp with the values the row holds writes nothing.
+
+    Keeper-sync re-asserts LTD's clock on every visit, so the steady
+    state — every poll of an unchanged project — must cost a
+    non-matching compare rather than a rewritten row per edition.
+    """
+    created = datetime(2018, 2, 3, tzinfo=UTC)
+    updated = datetime(2022, 7, 8, 12, 0, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="steady",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "steady"},
+        )
+        await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await _read_edition_xmin(db_session, edition_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        changed = await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+    assert changed is False
+
+    async with db_session.begin():
+        assert await _read_edition_xmin(db_session, edition_id) == before
+        assert await _read_edition_clock(db_session, edition_id) == (
+            created,
+            updated,
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_only_moves_the_clock_earlier(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A stamp lowers each column to the earlier value and never raises it.
+
+    Several LTD editions can resolve to one Docverse row, and each
+    visit stamps it with its own LTD dates. Written verbatim, they
+    would overwrite each other on every poll; kept earlier-only, the
+    row settles on the earliest of them. A stamp later on both columns
+    matches nothing — no row version — and a mixed one moves only the
+    column it would lower.
+    """
+    created = datetime(2018, 2, 3, tzinfo=UTC)
+    updated = datetime(2022, 7, 8, 12, 0, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="shared",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "shared"},
+        )
+        await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await _read_edition_xmin(db_session, edition_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        later = await edition_store.set_sync_dates(
+            edition_id,
+            date_created=created + timedelta(days=1),
+            date_updated=updated + timedelta(days=1),
+        )
+        await db_session.commit()
+    assert later is False
+    async with db_session.begin():
+        assert await _read_edition_xmin(db_session, edition_id) == before
+        assert await _read_edition_clock(db_session, edition_id) == (
+            created,
+            updated,
+        )
+
+    earlier_created = created - timedelta(days=30)
+    async with db_session.begin():
+        mixed = await edition_store.set_sync_dates(
+            edition_id,
+            date_created=earlier_created,
+            date_updated=updated + timedelta(days=1),
+        )
+        await db_session.commit()
+    assert mixed is True
+    async with db_session.begin():
+        assert await _read_edition_clock(db_session, edition_id) == (
+            earlier_created,
+            updated,
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_is_undone_by_a_later_orm_write(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Any later ORM write to the row moves ``date_updated`` back to now.
+
+    Pins why keeper-sync stamps in its *last* transaction of a visit:
+    the repoint and a kind convergence both go through the ORM, whose
+    ``onupdate`` re-stamps ``date_updated`` with the transaction time.
+    A stamp that ran before either would not survive the visit.
+    """
+    created = datetime(2016, 5, 6, tzinfo=UTC)
+    updated = datetime(2020, 9, 10, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="drifts",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "drifts"},
+        )
+        await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        await edition_store.update_kind(
+            edition_id=edition_id, kind=EditionKind.release
+        )
+        write_time = (
+            await db_session.execute(select(func.now()))
+        ).scalar_one()
+        await db_session.commit()
+
+    async with db_session.begin():
+        date_created, date_updated = await _read_edition_clock(
+            db_session, edition_id
+        )
+    assert date_created == created
+    assert date_updated == write_time
+
+
+@pytest.mark.asyncio
+async def test_set_publish_status_leaves_the_edition_clock(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A ``publish_status`` flip does not move ``date_updated``.
+
+    Publishing moves no content — the repoint that enqueued it already
+    did — so it must not read back as a change. A freshly keeper-synced
+    edition carries LTD's dates when its publish runs, and the
+    ``dashboard_build`` that publish cascades renders whatever clock the
+    row holds by then.
+    """
+    created = datetime(2016, 5, 6, tzinfo=UTC)
+    updated = datetime(2020, 9, 10, tzinfo=UTC)
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="publishes",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "publishes"},
+        )
+        await edition_store.set_sync_dates(
+            edition_id, date_created=created, date_updated=updated
+        )
+        await db_session.commit()
+
+    for status in (
+        PublishStatus.pending,
+        PublishStatus.publishing,
+        PublishStatus.published,
+    ):
+        async with db_session.begin():
+            await edition_store.set_publish_status(
+                edition_id=edition_id, status=status
+            )
+            await db_session.commit()
+
+    async with db_session.begin():
+        assert await _read_edition_clock(db_session, edition_id) == (
+            created,
+            updated,
+        )
+        edition = await edition_store.get_by_id(edition_id)
+    assert edition is not None
+    assert edition.publish_status == PublishStatus.published
+
+
+@pytest.mark.asyncio
+async def test_set_publish_status_missing_edition_raises(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Flipping the status of an edition that does not exist raises."""
+    async with db_session.begin():
+        with pytest.raises(RuntimeError, match="Edition id=999999 not found"):
+            await edition_store.set_publish_status(
+                edition_id=999999, status=PublishStatus.pending
+            )
+
+
+@pytest.mark.asyncio
+async def test_set_sync_dates_leaves_the_project_clock(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Re-dating ``__main`` does not move ``projects.date_updated``.
+
+    The project clock tells an ``updated_since`` poller that content
+    moved (PRD #634); a stamp only rewrites the edition's history.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        edition_id = await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug=DEFAULT_EDITION_SLUG,
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        before = await _read_project_date_updated(db_session, project_id)
+        await db_session.commit()
+
+    async with db_session.begin():
+        changed = await edition_store.set_sync_dates(
+            edition_id,
+            date_created=datetime(2015, 1, 1, tzinfo=UTC),
+            date_updated=datetime(2021, 1, 1, tzinfo=UTC),
+        )
+        await db_session.commit()
+    assert changed is True
+
+    async with db_session.begin():
+        assert await _read_project_date_updated(db_session, project_id) == (
+            before
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_by_slugs_on_build_names_only_live_rows_on_the_build(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Only the named, live editions serving the build come back.
+
+    Keeper-sync's aggregate clock stamp (PRD #706) asks this for the
+    ``15`` / ``15.2`` rows behind a release's build on every visit, so
+    it must answer from the named slugs alone: an aggregate on another
+    build, a soft-deleted one, and an unnamed edition on the same build
+    are all left out. Slugs match case-insensitively, as in
+    ``get_by_slug``, and rows come back in slug order.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        build_store = BuildStore(session=db_session, logger=logger)
+        release_build, other_build = [
+            await build_store.create(
+                project_id=project_id,
+                data=BuildCreate(
+                    git_ref=git_ref,
+                    content_hash=f"sha256:{digit * 64}",
+                ),
+                uploader="testuser",
+                project_slug="ed-proj",
+            )
+            for git_ref, digit in (("15.2.1", "1"), ("15.3.0", "2"))
+        ]
+        editions = {
+            slug: await _create_edition_internal(
+                edition_store,
+                project_id,
+                slug=slug,
+                kind=EditionKind.minor,
+                tracking_mode=TrackingMode.semver_minor,
+                build_id=build_id,
+            )
+            for slug, build_id in (
+                ("15.2", release_build.id),
+                ("15", release_build.id),
+                ("15.3", other_build.id),
+                ("15.1", release_build.id),
+                ("Mixed", release_build.id),
+                ("unnamed", release_build.id),
+            )
+        }
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="15.1",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        found = await edition_store.list_by_slugs_on_build(
+            project_id=project_id,
+            slugs=["15.2", "15", "15.3", "15.1", "mixed", "missing"],
+            build_id=release_build.id,
+        )
+        none_named = await edition_store.list_by_slugs_on_build(
+            project_id=project_id, slugs=[], build_id=release_build.id
+        )
+
+    assert [(e.slug, e.id) for e in found] == [
+        ("15", editions["15"]),
+        ("15.2", editions["15.2"]),
+        ("Mixed", editions["Mixed"]),
+    ]
+    assert all(e.current_build_id == release_build.id for e in found)
+    assert none_named == []

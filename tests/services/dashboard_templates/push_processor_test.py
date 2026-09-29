@@ -320,6 +320,39 @@ async def test_process_returns_empty_when_no_bindings_match_repo_ref(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "repository", ["acme/templates", None], ids=["string", "null"]
+)
+async def test_process_ignores_a_non_mapping_repository(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    repository: object,
+) -> None:
+    """A ``repository`` that is not an object is logged and ignored.
+
+    Answered with no jobs rather than raising, so the handler still
+    returns 200 and GitHub does not redeliver a payload that will never
+    parse.
+    """
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    payload = _make_push_payload(
+        owner="acme", repo="templates", ref="refs/heads/main"
+    )
+    payload["repository"] = repository
+
+    async with httpx.AsyncClient() as http_client, db_session.begin():
+        processor = _make_processor(
+            db_session,
+            arq_queue=arq_queue,
+            http_client=http_client,
+            mock_github=mock_github,
+        )
+        jobs = await processor.process(payload)
+
+    assert jobs == []
+
+
+@pytest.mark.asyncio
 async def test_process_root_path_slash_matches_any_change(
     db_session: AsyncSession,
     mock_github: GitHubMock,

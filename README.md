@@ -34,6 +34,9 @@ by `metrics_configuration_factory`:
 - `SCHEMA_MANAGER_*` — the Confluent-compatible schema-registry URL used to
   register and evolve the event Avro schemas.
 
+The event catalog, with every event's fields, the InfluxDB tags Phalanx
+configures, and example queries, is [`docs/metrics.md`](docs/metrics.md).
+
 Events publish to the `lsst.square.metrics.events.docverse` topic. The
 `phalanx-docverse` deployment is responsible for supplying the `KAFKA_*` /
 `SCHEMA_MANAGER_*` values and for registering that topic in Sasquatch;

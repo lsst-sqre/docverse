@@ -13,6 +13,7 @@ from docverse_server.domain.dashboard_github_template import (
     DashboardGitHubTemplateBinding,
 )
 from docverse_server.domain.queue import QueueJob
+from docverse_server.services.github_payload import repository_coordinates
 from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
 )
@@ -76,17 +77,9 @@ class PushEventProcessor:
         match the push's ``(owner, repo, ref)`` or when none of the
         matching bindings' ``root_path`` overlap the changed-path set).
         """
-        repo = payload.get("repository", {})
-        owner_block = repo.get("owner", {})
-        fallback_owner, fallback_repo = _split_full_name_tuple(
-            repo.get("full_name")
-        ) or (None, None)
-        owner = (
-            owner_block.get("login")
-            or owner_block.get("name")
-            or fallback_owner
-        )
-        repo_name = repo.get("name") or fallback_repo
+        coordinates = repository_coordinates(payload.get("repository"))
+        owner, repo_name = coordinates.owner, coordinates.name
+        repo_id = coordinates.repo_id
         ref = payload.get("ref")
         if not (owner and repo_name and ref):
             self._logger.warning(
@@ -98,7 +91,6 @@ class PushEventProcessor:
             return []
 
         normalized_ref = normalize_github_ref(ref)
-        repo_id = _coerce_int(repo.get("id"))
 
         bindings = await self._lookup_bindings(
             owner=owner, repo=repo_name, ref=normalized_ref, repo_id=repo_id
@@ -220,28 +212,6 @@ class PushEventProcessor:
             before=before,
             after=after,
         )
-
-
-def _split_full_name_tuple(full_name: object) -> tuple[str, str] | None:
-    if isinstance(full_name, str) and "/" in full_name:
-        owner, repo = full_name.split("/", 1)
-        return owner, repo
-    return None
-
-
-def _coerce_int(value: object) -> int | None:
-    """Return ``value`` as ``int`` when it is a non-bool int, else ``None``.
-
-    GitHub webhooks send numeric IDs as JSON ints, but defensive
-    payload parsing prefers a strict guard: the ``not isinstance(bool)``
-    clause keeps the ``isinstance(True, int)`` quirk from leaking a
-    truth value through as the repo id.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    return None
 
 
 def _normalize_root(root_path: str) -> str:

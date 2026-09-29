@@ -8,12 +8,20 @@ every Sasquatch consumer, and this file is where that break shows up.
 
 from __future__ import annotations
 
+import pytest
+
 from docverse.models import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
     RefDeletedRule,
 )
-from docverse_server.metrics import LifecycleActionTrigger, LifecycleReapAction
+from docverse_server.metrics import (
+    HttpMethod,
+    HttpStatusClass,
+    LifecycleActionTrigger,
+    LifecycleReapAction,
+    WebhookOutcome,
+)
 
 
 def test_purgatory_cleanup_is_a_lifecycle_action_trigger() -> None:
@@ -41,3 +49,109 @@ def test_retention_expired_is_a_lifecycle_reap_action() -> None:
         RefDeletedRule().type,
     }
     assert LifecycleReapAction.retention_expired.value not in rule_types
+
+
+def test_http_method_values() -> None:
+    """The methods are RFC 9110's nine tokens plus one sentinel.
+
+    ``method`` is an InfluxDB tag on ``api_request``, so these values are
+    what a query quotes, and the closed list is what bounds the tag's
+    cardinality.
+    """
+    assert [member.value for member in HttpMethod] == [
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "DELETE",
+        "CONNECT",
+        "OPTIONS",
+        "TRACE",
+        "PATCH",
+        "OTHER",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("GET", HttpMethod.get),
+        ("get", HttpMethod.get),
+        ("Delete", HttpMethod.delete),
+        ("PATCH", HttpMethod.patch),
+        ("FOOBAR", HttpMethod.other),
+        ("PROPFIND", HttpMethod.other),
+        ("OTHER", HttpMethod.other),
+        ("", HttpMethod.other),
+    ],
+)
+def test_http_method_from_request_method(
+    token: str, expected: HttpMethod
+) -> None:
+    """A token maps to its RFC 9110 method, upper-cased, or else ``OTHER``."""
+    assert HttpMethod.from_request_method(token) is expected
+
+
+def test_http_status_class_values() -> None:
+    """The status classes are pinned by the value dashboards group on.
+
+    ``status_class`` is an InfluxDB tag on ``api_request``, so its values
+    are what a query's ``GROUP BY`` and ``WHERE`` clauses quote; the
+    RFC 9110 class shorthand (``4xx``) is the vocabulary an operator
+    already uses for them.
+    """
+    assert [member.value for member in HttpStatusClass] == [
+        "1xx",
+        "2xx",
+        "3xx",
+        "4xx",
+        "5xx",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (100, HttpStatusClass.informational),
+        (200, HttpStatusClass.successful),
+        (204, HttpStatusClass.successful),
+        (304, HttpStatusClass.redirection),
+        (404, HttpStatusClass.client_error),
+        (499, HttpStatusClass.client_error),
+        (500, HttpStatusClass.server_error),
+        (599, HttpStatusClass.server_error),
+    ],
+)
+def test_http_status_class_from_status_code(
+    status_code: int, expected: HttpStatusClass
+) -> None:
+    """A status code maps to its class by its hundreds digit."""
+    assert HttpStatusClass.from_status_code(status_code) is expected
+
+
+@pytest.mark.parametrize("status_code", [0, 99, 600])
+def test_http_status_class_rejects_codes_outside_rfc_range(
+    status_code: int,
+) -> None:
+    """A code outside ``100``-``599`` has no class and is refused."""
+    with pytest.raises(ValueError, match=str(status_code)):
+        HttpStatusClass.from_status_code(status_code)
+
+
+def test_webhook_outcome_values() -> None:
+    """The webhook outcomes are pinned by the value dashboards group on.
+
+    ``outcome`` is an InfluxDB tag on ``github_webhook_received``, so
+    these values are what a query's ``GROUP BY`` and ``WHERE`` clauses
+    quote, and renaming one is a schema break for every dashboard. A new
+    outcome is appended, so every existing symbol keeps its index in the
+    Avro enum.
+    """
+    assert [member.value for member in WebhookOutcome] == [
+        "dispatched",
+        "ignored",
+        "invalid_signature",
+        "not_configured",
+        "error",
+        "malformed",
+    ]

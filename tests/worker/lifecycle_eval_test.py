@@ -10,7 +10,9 @@ drained.
 from __future__ import annotations
 
 import importlib
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -54,6 +56,7 @@ from docverse_server.metrics import (
     LifecycleReapAction,
     build_event_manager,
 )
+from docverse_server.services.keeper_sync.mappers import derive_edition_dates
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -70,6 +73,7 @@ from docverse_server.storage.keeper_sync import (
 from docverse_server.storage.lifecycle_eval_run_store import (
     LifecycleEvalRunStore,
 )
+from docverse_server.storage.ltd import LtdEdition
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
@@ -77,6 +81,10 @@ from docverse_server.worker.functions.lifecycle_eval import lifecycle_eval
 from tests.worker.conftest import make_worker_ctx
 
 NOW = datetime(2026, 5, 12, 12, 0, 0, tzinfo=UTC)
+
+LTD_FIXTURES_DIR = (
+    Path(__file__).parent.parent / "storage" / "ltd" / "fixtures"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -408,6 +416,83 @@ async def test_lifecycle_eval_soft_deletes_stale_drafts_and_orphan_builds(
             assert run is not None
             # One child queue_job, terminal → run rolls to succeeded.
             assert run.status is LifecycleEvalRunStatus.succeeded
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_eval_reaps_draft_restamped_onto_stale_ltd_clock(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A keeper-synced draft ages by LTD's clock, not its import moment.
+
+    PRD #706 accepts this consequence: keeper-sync stamps an imported
+    edition's ``date_updated`` with LTD's ``date_rebuilt``, and that is
+    the column ``draft_inactivity`` reads. A draft imported just now but
+    last rebuilt on LTD longer ago than ``max_days_inactive`` is
+    therefore reaped on the next tick, with no grace period.
+
+    The draft is seeded on its import clock (``NOW``), which on its own
+    is nowhere near stale, and then stamped exactly as the keeper-sync
+    clock transaction stamps it.
+    """
+    org_rules = LifecycleRuleSet(
+        root=[DraftInactivityRule(max_days_inactive=30)]
+    )
+    ltd_payload = json.loads(
+        (LTD_FIXTURES_DIR / "edition_branch_git_refs.json").read_text()
+    )
+    ltd_payload["date_created"] = (NOW - timedelta(days=90)).isoformat()
+    ltd_payload["date_rebuilt"] = (NOW - timedelta(days=60)).isoformat()
+    ltd_edition = LtdEdition.model_validate(ltd_payload)
+
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, slug="lce-restamp-org", lifecycle_rules=org_rules
+        )
+        project_id = await _seed_project(
+            db_session, org_id=org_id, slug="restamp-project"
+        )
+        edition_id = await _seed_edition(
+            db_session,
+            project_id=project_id,
+            slug="u-jsick-feature",
+            kind=EditionKind.draft,
+            date_updated=NOW,
+        )
+        date_created, date_updated = derive_edition_dates(ltd_edition)
+        assert await EditionStore(
+            session=db_session, logger=_logger()
+        ).set_sync_dates(
+            edition_id, date_created=date_created, date_updated=date_updated
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client)
+    result = await lifecycle_eval(
+        ctx,
+        {
+            "org_id": org_id,
+            "org_slug": org_slug,
+            "lifecycle_eval_run_id": run_id,
+            "queue_job_id": queue_job_id,
+        },
+    )
+    await http_client.aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            date_deleted = (
+                await session.execute(
+                    select(SqlEdition.date_deleted).where(
+                        SqlEdition.id == edition_id
+                    )
+                )
+            ).scalar_one()
+            assert date_deleted is not None
 
 
 @pytest.mark.asyncio

@@ -58,6 +58,16 @@ def _blob_sha(data: bytes) -> str:
     return hashlib.sha1(header + data, usedforsecurity=False).hexdigest()
 
 
+def _ref_entry(ref: str) -> dict[str, object]:
+    """Return one ``git/matching-refs`` entry for a full ref name."""
+    return {
+        "ref": ref,
+        "node_id": f"node-{ref}",
+        "url": f"{_GITHUB_API}/{ref}",
+        "object": {"sha": "deadbeef", "type": "commit"},
+    }
+
+
 @dataclass(slots=True)
 class GitHubMock:
     """respx seeder for the GitHub REST endpoints the GitHub App touches.
@@ -174,6 +184,7 @@ class GitHubMock:
         *,
         repo_id: int = 1,
         owner_id: int = 1,
+        default_branch: str = "main",
     ) -> None:
         """Register ``GET /repos/{owner}/{repo}`` returning numeric IDs.
 
@@ -184,6 +195,10 @@ class GitHubMock:
         IDs may accept the (1, 1) defaults; tests that round-trip
         captured IDs into the database should pass values that match
         the rest of the assertion.
+
+        ``default_branch`` mirrors the field GitHub always returns on
+        this endpoint; the resolve worker records it (PRD #721). Tests
+        exercising a ``master`` repository pass it explicitly.
         """
         self.router.get(f"{_GITHUB_API}/repos/{owner}/{repo}").mock(
             return_value=httpx.Response(
@@ -192,9 +207,45 @@ class GitHubMock:
                     "id": repo_id,
                     "name": repo,
                     "owner": {"login": owner, "id": owner_id},
+                    "default_branch": default_branch,
                 },
             )
         )
+
+    def seed_refs(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        branches: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> tuple[respx.Route, respx.Route]:
+        """Register the ``git/matching-refs`` heads and tags listings.
+
+        ``GitHubRefSetFetcher`` reads a repository's live ref set from
+        these two endpoints, one page each here. Returns the heads and
+        tags routes so a caller can assert how often the set was
+        fetched — including never.
+        """
+        heads = self.router.get(
+            f"{_GITHUB_API}/repos/{owner}/{repo}/git/matching-refs/heads"
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    _ref_entry(f"refs/heads/{name}") for name in branches or []
+                ],
+            )
+        )
+        tag_route = self.router.get(
+            f"{_GITHUB_API}/repos/{owner}/{repo}/git/matching-refs/tags"
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json=[_ref_entry(f"refs/tags/{name}") for name in tags or []],
+            )
+        )
+        return heads, tag_route
 
     def installation_auth(
         self,

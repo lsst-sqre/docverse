@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import timedelta
 from typing import Annotated, Any
 
 import gidgethub
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from gidgethub import sansio
 from gidgethub.routing import Router as GidgethubRouter
@@ -15,6 +19,7 @@ from docverse_server.dependencies.context import (
     context_dependency,
 )
 from docverse_server.factory import WebhookDispatch
+from docverse_server.metrics import GitHubWebhookReceivedEvent, WebhookOutcome
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_slug,
 )
@@ -23,12 +28,20 @@ from docverse_server.services.dashboard_templates import (
     PushEventProcessor,
     RenameEventProcessor,
 )
+from docverse_server.services.default_branch_announce import (
+    announce_main_rewrite,
+)
+from docverse_server.services.default_branch_processor import (
+    DefaultBranchEventProcessor,
+    DefaultBranchProjectResult,
+    DefaultBranchTarget,
+)
 from docverse_server.services.ref_deleted_processor import (
     RefDeletedWebhookProcessor,
 )
 from docverse_server.storage.github import GitHubAppNotConfiguredError
 
-__all__ = ["router"]
+__all__ = ["WebhookDeliveryReport", "router"]
 
 router = APIRouter(include_in_schema=False)
 """FastAPI router for GitHub webhook endpoints.
@@ -37,6 +50,35 @@ Mounted under ``config.path_prefix`` from ``main.py`` so the public
 URL is ``POST {path_prefix}/webhooks/github``. Excluded from the
 OpenAPI schema because the API surface is GitHub's webhook contract,
 not the Docverse REST API.
+"""
+
+
+@dataclass(slots=True)
+class WebhookDeliveryReport:
+    """What one delivery's callbacks did, for its metrics event.
+
+    A gidgethub callback returns nothing, so the handler passes one of
+    these to every callback as the ``report`` keyword and reads it back
+    once the callbacks finish. Only the callbacks that enqueue jobs write
+    to it; the rest absorb it through their ``**_unused``.
+    """
+
+    jobs_enqueued: int = 0
+    """How many background jobs the callbacks enqueued."""
+
+
+_UNPARSEABLE_DELIVERY_ERRORS = (gidgethub.BadRequest, LookupError, ValueError)
+"""What ``sansio.Event.from_http`` raises for a delivery it cannot parse.
+
+gidgethub verifies the signature first, so only a signed delivery gets
+this far. It then raises ``gidgethub.BadRequest`` for a content type
+that is neither JSON nor a form, or a body that does not decode;
+``KeyError`` (a ``LookupError``) for a missing ``X-GitHub-Event`` or
+``X-GitHub-Delivery`` header; and a bare ``LookupError`` for a charset
+Python has no codec for. ``ValueError`` covers a decode failure that
+escapes gidgethub's own wrapping. The handler answers each with a
+``400``, recorded as :attr:`WebhookOutcome.malformed
+<docverse_server.metrics.WebhookOutcome.malformed>`.
 """
 
 
@@ -57,6 +99,7 @@ async def _handle_push(
     *,
     push: PushEventProcessor,
     context: RequestContext,
+    report: WebhookDeliveryReport,
     **_unused: Any,
 ) -> None:
     """Translate a push event into ``dashboard_sync`` enqueues.
@@ -65,14 +108,16 @@ async def _handle_push(
     enqueuer; the handler wraps both the binding lookup and the
     ``queue_jobs`` inserts in a single ``session.begin()`` so a failure
     aborts the whole webhook delivery cleanly. Handing those rows to arq
-    waits until after that commit (task #550). ``**_unused`` absorbs the
-    rename/installation processors that gidgethub's dispatcher passes
-    to every callback uniformly.
+    waits until after that commit (task #550). The enqueued jobs are
+    counted on ``report`` for the delivery's metrics event.
+    ``**_unused`` absorbs the rename/installation processors that
+    gidgethub's dispatcher passes to every callback uniformly.
     """
     async with context.session.begin():
         jobs = await push.process(event.data)
         await context.session.commit()
     await context.factory.queue_dispatcher.dispatch()
+    report.jobs_enqueued += len(jobs)
     context.logger.info("Processed push webhook", enqueued=len(jobs))
 
 
@@ -102,6 +147,126 @@ async def _handle_repository_transferred(
     async with context.session.begin():
         await rename.process_repository_transferred(event.data)
         await context.session.commit()
+
+
+@_event_router.register("repository", action="edited")
+async def _handle_repository_edited(
+    event: sansio.Event,
+    *,
+    default_branch: DefaultBranchEventProcessor,
+    context: RequestContext,
+    report: WebhookDeliveryReport,
+    **_unused: Any,
+) -> None:
+    """Converge ``__main`` on a repository's new default branch.
+
+    Only an edit that changes the default branch does anything; the
+    processor logs and ignores the rest (description, topics, ...).
+
+    Shaped like the daily ``git_ref_audit``'s convergence rather than
+    :func:`_handle_delete`: the projects the delivery reaches are read
+    in one short transaction, then each is converged — column write,
+    ``__main`` rewrite, draft retire, repoint — in a transaction of its
+    own. The rule holds the project's ``__main`` ``EDITION_UPDATE`` lock
+    while it writes, so one delivery-wide transaction would wait on each
+    later project's lock while still holding every earlier project's
+    uncommitted rows. See :func:`_converge_default_branch_target` for
+    what follows each commit.
+
+    A project whose convergence raises — a CDN ``unpublish`` refusal,
+    say — rolls back only its own writes and does not stop the projects
+    after it; the projects converged before it stay converged. Once
+    every project has had its turn, the first such exception is
+    re-raised, so the delivery answers ``500`` and records ``error`` for
+    GitHub's redelivery, which is inert for the projects that did
+    converge. Every publish job and every dashboard build actually
+    enqueued is counted on ``report``, failures or not.
+    """
+    async with context.session.begin():
+        targets = await default_branch.resolve_targets(event.data)
+    if not targets:
+        return
+    results: list[DefaultBranchProjectResult] = []
+    failure: Exception | None = None
+    failed = 0
+    for target in targets:
+        try:
+            await _converge_default_branch_target(
+                target,
+                default_branch=default_branch,
+                context=context,
+                report=report,
+                results=results,
+            )
+        except Exception as exc:
+            # A ``publish_edition`` the rule deferred before the failure
+            # names a row the rollback just removed; left pending, the
+            # next project's ``dispatch()`` would hand arq a job whose
+            # row no worker can find.
+            context.factory.queue_dispatcher.discard()
+            context.logger.warning(
+                "Default branch convergence failed for a project",
+                org=target.org_slug,
+                project=target.project.slug,
+                project_id=target.project.id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            failed += 1
+            if failure is None:
+                failure = exc
+            else:
+                # Only the first is re-raised to reach Sentry as the
+                # delivery's 500.
+                sentry_sdk.capture_exception(exc)
+    context.logger.info(
+        "Processed repository.edited default branch change",
+        projects_converged=len(results),
+        projects_failed=failed,
+        main_rewrites=sum(r.outcome.main_rewritten for r in results),
+    )
+    if failure is not None:
+        raise failure
+
+
+async def _converge_default_branch_target(
+    target: DefaultBranchTarget,
+    *,
+    default_branch: DefaultBranchEventProcessor,
+    context: RequestContext,
+    report: WebhookDeliveryReport,
+    results: list[DefaultBranchProjectResult],
+) -> None:
+    """Converge one project in its own transaction, then announce it.
+
+    After the commit the deferred ``publish_edition`` job is handed to
+    arq, and a rewritten ``__main`` is announced as a ``PATCH`` of the
+    edition would be, through
+    :func:`~docverse_server.services.default_branch_announce.announce_main_rewrite`.
+    The repoint's ``publish_edition`` and the announcement's
+    ``dashboard_build`` are both counted on ``report``.
+
+    The result is appended to ``results`` as soon as the transaction
+    commits, so a later failure dispatching or announcing it still
+    counts the rewrite that is durable.
+    """
+    async with context.session.begin():
+        result = await default_branch.converge(target)
+        await context.session.commit()
+    results.append(result)
+    await context.factory.queue_dispatcher.dispatch()
+    if result.outcome.repointed_build_id is not None:
+        report.jobs_enqueued += 1
+    if await announce_main_rewrite(
+        factory=context.factory,
+        session=context.session,
+        events=context.events,
+        logger=context.logger,
+        org_slug=result.org_slug,
+        project_slug=result.project_slug,
+        outcome=result.outcome,
+    ):
+        report.jobs_enqueued += 1
 
 
 @_event_router.register("organization", action="renamed")
@@ -156,6 +321,7 @@ async def _handle_delete(
     *,
     ref_deleted: RefDeletedWebhookProcessor,
     context: RequestContext,
+    report: WebhookDeliveryReport,
     **_unused: Any,
 ) -> None:
     """Soft-delete draft editions tracking the deleted branch/tag.
@@ -167,19 +333,23 @@ async def _handle_delete(
     per affected project so the project index drops the retired
     editions; the enqueue runs in its own transaction (post-commit,
     matching the daily ``git_ref_audit`` worker) so an enqueue
-    failure cannot roll back the soft-delete + unpublish.
+    failure cannot roll back the soft-delete + unpublish. Only the
+    builds actually enqueued are counted on ``report``: a project
+    whose dashboard build is already queued, or whose enqueue failed,
+    adds nothing.
     """
     async with context.session.begin():
         result = await ref_deleted.process(event.data)
         await context.session.commit()
     for affected in result.affected_projects:
-        await try_enqueue_dashboard_build_by_slug(
+        if await try_enqueue_dashboard_build_by_slug(
             factory=context.factory,
             session=context.session,
             logger=context.logger,
             org_slug=affected.org_slug,
             project_slug=affected.project_slug,
-        )
+        ):
+            report.jobs_enqueued += 1
 
 
 @router.post(
@@ -202,17 +372,32 @@ async def post_github_webhook(
     that would page operators on every GitHub redelivery attempt.
 
     Returns ``401`` when the request is unsigned or the HMAC does
-    not match the configured webhook secret. ``415`` is returned by
-    ``gidgethub`` directly when the content-type is wrong.
+    not match the configured webhook secret. Returns ``400`` for a
+    signed delivery that ``gidgethub`` cannot parse (a content type
+    other than JSON or a form, a body that does not decode, or a
+    missing ``X-GitHub-Event`` or ``X-GitHub-Delivery``).
 
-    Returns ``200`` for all signed deliveries — including event
+    Returns ``200`` for every other signed delivery — including event
     types this app does not subscribe to — so GitHub's redelivery
     machinery does not retry deliveries we have intentionally
     chosen not to act on.
+
+    Every delivery publishes exactly one ``github_webhook_received``
+    metrics event recording its
+    :class:`~docverse_server.metrics.WebhookOutcome`, just before the
+    handler returns or raises. An unparseable delivery is recorded as
+    ``malformed``, so a caller's mistake never counts as ``error``. Any
+    other exception, such as a callback failing, is recorded as
+    ``error`` and then re-raised unchanged, so the ``500`` and Sentry's
+    capture of it are unaffected.
     """
+    started = time.monotonic()
     try:
         dispatch: WebhookDispatch = context.factory.create_webhook_dispatch()
     except GitHubAppNotConfiguredError as exc:
+        await _record_delivery(
+            context, started=started, outcome=WebhookOutcome.not_configured
+        )
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="GitHub App is not configured",
@@ -226,25 +411,142 @@ async def post_github_webhook(
             secret=dispatch.webhook_secret,
         )
     except gidgethub.ValidationFailure as exc:
+        await _record_delivery(
+            context, started=started, outcome=WebhookOutcome.invalid_signature
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid webhook signature",
         ) from exc
+    except _UNPARSEABLE_DELIVERY_ERRORS as exc:
+        await _record_delivery(
+            context, started=started, outcome=WebhookOutcome.malformed
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed webhook delivery",
+        ) from exc
+    except Exception:
+        await _record_delivery(
+            context, started=started, outcome=WebhookOutcome.error
+        )
+        raise
 
     context.rebind_logger(
         github_event=event.event, github_delivery_id=event.delivery_id
     )
+    github_repository = _repository_full_name(event.data)
 
-    await _event_router.dispatch(
-        event,
-        push=dispatch.push,
-        rename=dispatch.rename,
-        installation=dispatch.installation,
-        ref_deleted=dispatch.ref_deleted,
-        context=context,
+    # Match once and run the callbacks found here, rather than handing the
+    # event to Router.dispatch, which would match it all over again.
+    callbacks = _event_router.fetch(event)
+    if not callbacks:
+        await _record_delivery(
+            context,
+            started=started,
+            outcome=WebhookOutcome.ignored,
+            event_type=event.event,
+            github_repository=github_repository,
+        )
+        return {"status": "ok"}
+
+    report = WebhookDeliveryReport()
+    try:
+        for callback in callbacks:
+            await callback(
+                event,
+                push=dispatch.push,
+                rename=dispatch.rename,
+                installation=dispatch.installation,
+                ref_deleted=dispatch.ref_deleted,
+                default_branch=dispatch.default_branch,
+                context=context,
+                report=report,
+            )
+    except Exception:
+        await _record_delivery(
+            context,
+            started=started,
+            outcome=WebhookOutcome.error,
+            event_type=event.event,
+            github_repository=github_repository,
+            jobs_enqueued=report.jobs_enqueued,
+        )
+        raise
+    await _record_delivery(
+        context,
+        started=started,
+        outcome=WebhookOutcome.dispatched,
+        event_type=event.event,
+        github_repository=github_repository,
+        jobs_enqueued=report.jobs_enqueued,
     )
-
     return {"status": "ok"}
+
+
+async def _record_delivery(
+    context: RequestContext,
+    *,
+    started: float,
+    outcome: WebhookOutcome,
+    event_type: str | None = None,
+    github_repository: str | None = None,
+    jobs_enqueued: int = 0,
+) -> None:
+    """Publish one delivery's ``github_webhook_received`` event.
+
+    Best-effort: a failure to publish is logged and swallowed, so a
+    metrics outage can never change a delivery's response, nor replace
+    the exception of a delivery that is already failing.
+
+    Parameters
+    ----------
+    context
+        The request context whose event publishers to use.
+    started
+        The :func:`time.monotonic` reading taken when the handler
+        received the delivery.
+    outcome
+        What became of the delivery.
+    event_type
+        The verified delivery's ``X-GitHub-Event``; ``None`` for a
+        delivery that was not verified.
+    github_repository
+        The verified payload's ``repository.full_name``, if any.
+    jobs_enqueued
+        How many jobs the delivery's callbacks enqueued.
+    """
+    try:
+        await context.events.github_webhook_received.publish(
+            GitHubWebhookReceivedEvent(
+                event_type=event_type,
+                outcome=outcome,
+                jobs_enqueued=jobs_enqueued,
+                elapsed=timedelta(seconds=time.monotonic() - started),
+                github_repository=github_repository,
+            )
+        )
+    except Exception:
+        context.logger.exception(
+            "Failed to publish github_webhook_received metrics event",
+            outcome=outcome.value,
+        )
+
+
+def _repository_full_name(data: object) -> str | None:
+    """Return a payload's ``repository.full_name``, if it has one.
+
+    Read defensively because the payload is GitHub's, not a validated
+    model: events such as ``ping`` and ``installation`` name no single
+    repository, and any shape other than a string yields ``None``.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    repository = data.get("repository")
+    if not isinstance(repository, Mapping):
+        return None
+    full_name = repository.get("full_name")
+    return full_name if isinstance(full_name, str) else None
 
 
 def _lowercase_headers(headers: Mapping[str, str]) -> dict[str, str]:

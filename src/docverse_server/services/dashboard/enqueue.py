@@ -207,7 +207,7 @@ async def try_enqueue_dashboard_build_by_slug(
     logger: structlog.stdlib.BoundLogger,
     org_slug: str,
     project_slug: str,
-) -> None:
+) -> bool:
     """Enqueue one ``dashboard_build`` job in its own transaction.
 
     Exceptions are logged but never re-raised, so the caller's flow is
@@ -216,11 +216,20 @@ async def try_enqueue_dashboard_build_by_slug(
     have already committed any work it wants persisted — and only once
     that transaction commits is the job handed to arq, so a worker
     cannot be delivered a job whose row it can't yet see (task #550).
+
+    Returns
+    -------
+    bool
+        ``True`` when a new job was enqueued; ``False`` when the project
+        already had an active ``dashboard_build`` (the dedup skip of
+        :meth:`DashboardBuildEnqueuer.enqueue_for_project`) or the
+        enqueue failed. Callers that count their enqueues, such as the
+        GitHub ``delete`` webhook's metrics event, sum this.
     """
     try:
         async with session.begin():
             service = factory.create_dashboard_build_enqueuer()
-            await service.enqueue_for_project_slug(
+            job = await service.enqueue_for_project_slug(
                 org_slug=org_slug, project_slug=project_slug
             )
             await session.commit()
@@ -232,6 +241,8 @@ async def try_enqueue_dashboard_build_by_slug(
             org_slug=org_slug,
             project_slug=project_slug,
         )
+        return False
+    return job is not None
 
 
 async def try_enqueue_dashboard_build_by_id(

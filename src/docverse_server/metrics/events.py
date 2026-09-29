@@ -13,6 +13,7 @@ from safir.dependencies.metrics import EventMaker
 from safir.metrics import EventManager, EventPublisher
 
 from .payloads import (
+    ApiRequestEvent,
     BuildContentCopiedEvent,
     BuildProcessedEvent,
     BuildUploadedEvent,
@@ -21,6 +22,7 @@ from .payloads import (
     EditionLifecycleEvent,
     EditionPublishedEvent,
     EditionReconcileCompletedEvent,
+    GitHubWebhookReceivedEvent,
     KeeperSyncRunCompletedEvent,
     LifecycleActionEvent,
     MembershipChangedEvent,
@@ -55,6 +57,8 @@ class DocverseEvents(EventMaker):
     purgatory_cleanup_completed: EventPublisher[PurgatoryCleanupCompletedEvent]
     conditional_get: EventPublisher[ConditionalGetEvent]
     build_content_copied: EventPublisher[BuildContentCopiedEvent]
+    api_request: EventPublisher[ApiRequestEvent]
+    github_webhook_received: EventPublisher[GitHubWebhookReceivedEvent]
 
     async def initialize(self, manager: EventManager) -> None:
         """Register a publisher for every Docverse event type.
@@ -105,4 +109,10 @@ class DocverseEvents(EventMaker):
         )
         self.build_content_copied = await manager.create_publisher(
             "build_content_copied", BuildContentCopiedEvent
+        )
+        self.api_request = await manager.create_publisher(
+            "api_request", ApiRequestEvent
+        )
+        self.github_webhook_received = await manager.create_publisher(
+            "github_webhook_received", GitHubWebhookReceivedEvent
         )

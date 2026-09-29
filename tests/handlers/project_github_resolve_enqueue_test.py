@@ -14,11 +14,16 @@ live publishing flow; the POST test pins that queue target explicitly.
 from __future__ import annotations
 
 import pytest
+import structlog
 from httpx import AsyncClient
 from safir.arq import MockArqQueue
 from safir.dependencies.arq import arq_dependency
+from safir.dependencies.db_session import db_session_dependency
+from sqlalchemy import select
 
 from docverse_server.config import Configuration
+from docverse_server.dbschema.project import SqlProject
+from docverse_server.storage.project_store import ProjectStore
 from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 from tests.conftest import seed_org_with_admin
 from tests.support.arq_testing import count_jobs_by_name, get_jobs_by_name
@@ -170,6 +175,65 @@ async def test_patch_project_with_github_enqueues_resolve(
     project_id = payloads[-1]["project_id"]
     assert isinstance(project_id, int)
     assert project_id > 0
+
+
+async def _set_github_default_branch(slug: str, value: str) -> int:
+    """Record a project's default branch; return the project's row id."""
+    logger = structlog.get_logger("docverse")
+    async for session in db_session_dependency():
+        async with session.begin():
+            project_id = (
+                await session.execute(
+                    select(SqlProject.id).where(SqlProject.slug == slug)
+                )
+            ).scalar_one()
+            store = ProjectStore(session=session, logger=logger)
+            await store.set_github_default_branch(
+                project_id=project_id, value=value
+            )
+            await session.commit()
+        return project_id
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_patch_project_rebind_resolve_carries_previous_default_branch(
+    client: AsyncClient,
+) -> None:
+    """A rebind's resolve payload carries the branch the PATCH cleared.
+
+    Rebinding clears ``github_default_branch`` with the rest of the old
+    repository's metadata, which erases the evidence the resolve needs
+    to move a ``__main`` still tracking the old repository's default
+    branch (PRD #721). The payload keeps it instead. A create has no
+    previous branch, so its payload stays ``project_id`` alone.
+    """
+    await _setup(client)
+    create = await client.post(
+        "/docverse/orgs/pgr-org/projects",
+        json={
+            "slug": "gh-rebind",
+            "title": "GH Rebind",
+            "github": {"owner": "lsst", "repo": "rebind-a"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert create.status_code == 201
+    project_id = await _set_github_default_branch("gh-rebind", "master")
+    assert _resolve_payloads()[-1] == {"project_id": project_id}
+
+    patch = await client.patch(
+        "/docverse/orgs/pgr-org/projects/gh-rebind",
+        json={"github": {"owner": "lsst", "repo": "rebind-b"}},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert patch.status_code == 200
+
+    assert _resolve_payloads()[-1] == {
+        "project_id": project_id,
+        "previous_default_branch": "master",
+    }
 
 
 @pytest.mark.asyncio

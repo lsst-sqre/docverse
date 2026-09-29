@@ -2,29 +2,69 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import importlib
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any, NamedTuple
 
 import httpx
 import pytest
 import sentry_sdk
 import structlog
 from arq import Retry
+from httpx import AsyncClient
 from pydantic import SecretStr
+from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import select
+from safir.metrics import MockEventPublisher
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.testing import capture_logs
 
-from docverse.models import OrganizationCreate, ProjectCreate
+from docverse.models import (
+    BuildCreate,
+    BuildStatus,
+    EditionKind,
+    OrganizationCreate,
+    ProjectCreate,
+    ProjectUpdate,
+    TrackingMode,
+)
 from docverse.models.projects import ProjectGitHubBindingCreate
+from docverse.models.queue_enums import PublishStatus
+from docverse_server.config import Configuration
+from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.project import SqlProject
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
+from docverse_server.metrics import (
+    DocverseEvents,
+    LifecycleAction,
+    MetricsEditionKind,
+    build_event_manager,
+)
+from docverse_server.services.default_branch import DefaultBranchOutcome
+from docverse_server.services.project import ProjectService
+from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.worker.functions.project_github_resolve import (
     PROJECT_GITHUB_RESOLVE_MAX_TRIES,
     project_github_resolve,
 )
+from tests.conftest import seed_org_with_admin
+from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
 from tests.worker.conftest import make_worker_ctx
+
+_RESOLVE_MODULE = importlib.import_module(
+    "docverse_server.worker.functions.project_github_resolve"
+)
+"""The resolve worker's module.
+
+``docverse_server.worker.functions`` re-exports the function under the
+module's own name, so attribute access reaches the function instead.
+"""
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -84,6 +124,19 @@ async def _fetch_project_github_ids(
         )
         row = result.one()
         return (row[0], row[1], row[2], row[3], row[4])
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+async def _fetch_project_default_branch(project_id: int) -> str | None:
+    """Return one project's ``github_default_branch`` column."""
+    async for session in db_session_dependency():
+        result = await session.execute(
+            select(SqlProject.github_default_branch).where(
+                SqlProject.id == project_id
+            )
+        )
+        return result.scalar_one()
     msg = "No database session available"
     raise RuntimeError(msg)
 
@@ -152,6 +205,156 @@ async def test_project_github_resolve_persists_three_ids(
     assert owner_id == 111
     assert repo_id == 12345
     assert installation_id == 42
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_records_default_branch(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """The resolve records GitHub's default branch alongside the ids.
+
+    ``GET /repos/{owner}/{repo}`` reports ``default_branch`` in the same
+    body the numeric ids come from, so the resolve seeds
+    ``projects.github_default_branch`` without another round-trip
+    (PRD #721). A ``master`` repository is the case that matters: it is
+    the one a ``"main"`` fallback gets wrong.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+    assert await _fetch_project_default_branch(project_id) is None
+
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert result == "completed"
+    assert await _fetch_project_default_branch(project_id) == "master"
+    (
+        _owner,
+        _repo,
+        owner_id,
+        repo_id,
+        installation_id,
+    ) = await _fetch_project_github_ids(project_id)
+    assert (owner_id, repo_id, installation_id) == (111, 12345, 42)
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_updates_changed_default_branch(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A re-resolve after a rename stores the new default branch.
+
+    The ids are already resolved, so only the default branch differs;
+    the write still lands and moves the project's clock, because
+    ``github.default_branch`` is on the wire.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme", "templates", repo_id=12345, owner_id=111, default_branch="main"
+    )
+
+    async with db_session.begin():
+        store = ProjectStore(session=db_session, logger=_logger())
+        await store.update_github_metadata(
+            project_id=project_id,
+            expected_owner="acme",
+            expected_repo="templates",
+            installation_id=42,
+            owner_id=111,
+            repo_id=12345,
+        )
+        await store.set_github_default_branch(
+            project_id=project_id, value="master"
+        )
+        await db_session.commit()
+    baseline = await _fetch_project_date_updated(project_id)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert result == "completed"
+    assert await _fetch_project_default_branch(project_id) == "main"
+    assert await _fetch_project_date_updated(project_id) > baseline
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_default_branch_reaches_the_api(
+    client: AsyncClient,
+    mock_github: GitHubMock,
+) -> None:
+    """After a resolve, the project GET reports ``github.default_branch``.
+
+    The end-to-end shape of the PRD #721 seed: a project bound through
+    the API reads ``default_branch: null`` until the resolve worker
+    runs against a GitHub that reports ``master``, then reads
+    ``"master"``.
+    """
+    await seed_org_with_admin(client, "pgr-api-org", "testuser")
+    created = await client.post(
+        "/docverse/orgs/pgr-api-org/projects",
+        json={
+            "slug": "pgr-api-proj",
+            "title": "PGR API Proj",
+            "github": {"owner": "acme", "repo": "templates"},
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert created.status_code == 201
+    assert created.json()["github"]["default_branch"] is None
+
+    async for session in db_session_dependency():
+        project_id = (
+            await session.execute(
+                select(SqlProject.id).where(SqlProject.slug == "pgr-api-proj")
+            )
+        ).scalar_one()
+        break
+
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+    assert result == "completed"
+
+    response = await client.get(
+        "/docverse/orgs/pgr-api-org/projects/pgr-api-proj",
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    assert response.json()["github"]["default_branch"] == "master"
 
 
 @pytest.mark.asyncio
@@ -500,3 +703,726 @@ async def test_project_github_resolve_does_not_retry_bad_credentials(
     assert result == "failed"
     assert len(captured) == 1
     assert route.call_count == 1
+
+
+_BUILD_BASE = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class _Converging(NamedTuple):
+    project_id: int
+    main_id: int
+    main_build_id: int
+    draft_id: int
+
+
+async def _seed_converging_project(
+    db_session: AsyncSession,
+    *,
+    org_slug: str,
+    stored_default_branch: str | None,
+    main_ref: str,
+    branch: str = "main",
+    ids_stored: bool = True,
+) -> _Converging:
+    """Seed a project whose ``__main`` tracks ``main_ref``.
+
+    By default the ids are already stored, as after an earlier resolve;
+    ``ids_stored=False`` seeds a project fresh from its create instead.
+    The column holds ``stored_default_branch``. A completed ``branch``
+    build and the ``branch`` draft tracking auto-created give a rewrite
+    onto ``branch`` something to repoint at and retire.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(
+            db_session, org_slug=org_slug
+        )
+        store = ProjectStore(session=db_session, logger=_logger())
+        if ids_stored:
+            await store.update_github_metadata(
+                project_id=project_id,
+                expected_owner="acme",
+                expected_repo="templates",
+                installation_id=42,
+                owner_id=111,
+                repo_id=12345,
+            )
+        if stored_default_branch is not None:
+            await store.set_github_default_branch(
+                project_id=project_id, value=stored_default_branch
+            )
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        main = await edition_store.create_internal(
+            project_id=project_id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Latest",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": main_ref},
+        )
+        draft = await edition_store.create_internal(
+            project_id=project_id,
+            slug=branch,
+            title=branch,
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": branch},
+        )
+        build_store = BuildStore(session=db_session, logger=_logger())
+        build = await build_store.create(
+            project_id=project_id,
+            project_slug="pgr-proj",
+            data=BuildCreate(
+                git_ref=branch, content_hash="sha256:" + "e" * 64
+            ),
+            uploader="testuser",
+        )
+        for status in (BuildStatus.processing, BuildStatus.completed):
+            await build_store.transition_status(
+                build_id=build.id, new_status=status
+            )
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == build.id)
+            .values(date_created=_BUILD_BASE)
+        )
+        await db_session.commit()
+    return _Converging(
+        project_id=project_id,
+        main_id=main.id,
+        main_build_id=build.id,
+        draft_id=draft.id,
+    )
+
+
+async def _load_edition(edition_id: int) -> Edition | None:
+    async for session in db_session_dependency():
+        async with session.begin():
+            return await EditionStore(
+                session=session, logger=_logger()
+            ).get_by_id(edition_id)
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+async def _resolve_with(
+    *,
+    mock_github: GitHubMock,
+    project_id: int,
+    events: DocverseEvents,
+    arq_queue: MockArqQueue,
+    previous_default_branch: str | None = None,
+) -> str:
+    """Run one resolve with metrics and the arq queue observable.
+
+    ``previous_default_branch`` lands in the payload as a ``PATCH``
+    rebind puts it there.
+    """
+    payload: dict[str, object] = {"project_id": project_id}
+    if previous_default_branch is not None:
+        payload["previous_default_branch"] = previous_default_branch
+    async with httpx.AsyncClient() as http_client:
+        ctx = make_worker_ctx(
+            http_client=http_client,
+            arq_queue=arq_queue,
+            github_app_id=mock_github.app_id,
+            github_app_private_key=SecretStr(mock_github.private_key_pem),
+            github_webhook_secret=SecretStr("webhook-secret"),
+            events=events,
+        )
+        return await project_github_resolve(ctx, payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_default_branch", "previous_default_branch"),
+    [(None, "master"), ("master", None)],
+    ids=["rebind-payload", "stored-column"],
+)
+async def test_project_github_resolve_rewrites_main_on_the_old_branch(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    stored_default_branch: str | None,
+    previous_default_branch: str | None,
+) -> None:
+    """A resolve learning a new branch moves ``__main`` off the old one.
+
+    The old default branch (``master``) comes from the payload after a
+    ``PATCH`` rebind, which cleared the column, and otherwise from the
+    column's previous value. Either way a ``__main`` still tracking it
+    is rewritten onto ``main``, the ``main`` draft is retired, and
+    ``__main`` is repointed and announced exactly as the webhook would
+    (PRD #721).
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-rewrite",
+        stored_default_branch=stored_default_branch,
+        main_ref="master",
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme", "templates", repo_id=12345, owner_id=111, default_branch="main"
+    )
+    mock_github.seed_refs("acme", "templates", branches=["main"])
+
+    with capture_logs() as captured:
+        result = await _resolve_with(
+            mock_github=mock_github,
+            project_id=seeded.project_id,
+            events=events,
+            arq_queue=arq_queue,
+            previous_default_branch=previous_default_branch,
+        )
+
+    assert result == "completed"
+    assert await _fetch_project_default_branch(seeded.project_id) == "main"
+    main = await _load_edition(seeded.main_id)
+    assert main is not None
+    assert main.tracking_params == {"git_ref": "main"}
+    assert main.current_build_id == seeded.main_build_id
+    assert main.publish_status is PublishStatus.pending
+    assert await _load_edition(seeded.draft_id) is None
+    assert count_jobs_by_name(arq_queue, "publish_edition") == 1
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 1
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    [event] = publisher.published
+    assert event.action is LifecycleAction.update
+    assert event.edition_kind is MetricsEditionKind.main
+    assert (event.organization, event.project) == ("pgr-rewrite", "pgr-proj")
+    [rewrite_log] = [
+        entry
+        for entry in captured
+        if entry["event"] == "Rewrote __main to track the default branch"
+    ]
+    assert rewrite_log["trigger"] == "resolve"
+    assert rewrite_log["old_default_branch"] == "master"
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_default_branch", "main_ref", "default_branch", "live_branches"),
+    [
+        ("master", "docs", "main", None),
+        (None, "main", "master", ["master", "main"]),
+    ],
+    ids=["main-not-on-old-branch", "first-resolve-main-ref-live"],
+)
+async def test_project_github_resolve_only_records_the_branch(
+    *,
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    stored_default_branch: str | None,
+    main_ref: str,
+    default_branch: str,
+    live_branches: list[str] | None,
+) -> None:
+    """Without evidence that ``__main``'s ref is gone, only the column moves.
+
+    A ``__main`` tracking something other than the column's previous
+    value is pinned deliberately. A first resolve has no previous value
+    but fetches the live ref set, and a ``__main`` on the ``main``
+    fallback of a ``master`` repository that also has a ``main`` branch
+    tracks a ref that still exists, so it stays pinned there too.
+    Neither queues a job or announces anything.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-guard",
+        stored_default_branch=stored_default_branch,
+        main_ref=main_ref,
+        branch=default_branch,
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch=default_branch,
+    )
+    if live_branches is not None:
+        mock_github.seed_refs("acme", "templates", branches=live_branches)
+
+    result = await _resolve_with(
+        mock_github=mock_github,
+        project_id=seeded.project_id,
+        events=events,
+        arq_queue=arq_queue,
+    )
+
+    assert result == "completed"
+    assert (
+        await _fetch_project_default_branch(seeded.project_id)
+        == default_branch
+    )
+    main = await _load_edition(seeded.main_id)
+    assert main is not None
+    assert main.tracking_params == {"git_ref": main_ref}
+    assert main.current_build_id is None
+    assert await _load_edition(seeded.draft_id) is not None
+    assert count_jobs_by_name(arq_queue, "publish_edition") == 0
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 0
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    assert publisher.published == []
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_first_learn_rewrites_a_gone_fallback(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A fresh project on a ``master``-only repo converges on its resolve.
+
+    Creation seeds ``__main`` with the ``main`` fallback. Until task #747
+    the resolve that followed only recorded ``master``: with no old
+    default branch and no live ref set it had no evidence that ``main``
+    was gone, so every push built a ``master`` draft while ``__main``
+    served nothing until an audit tick. On a first learn the resolve now
+    fetches the live ref set, with the installation token of the ids it
+    just committed, and hands it to the rule as the audit would, so
+    ``__main`` is rewritten, the ``master`` draft retired, and ``__main``
+    repointed and announced in the same job.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-first-learn",
+        stored_default_branch=None,
+        main_ref="main",
+        branch="master",
+        ids_stored=False,
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+    heads, _tags = mock_github.seed_refs(
+        "acme", "templates", branches=["master"]
+    )
+
+    with capture_logs() as captured:
+        result = await _resolve_with(
+            mock_github=mock_github,
+            project_id=seeded.project_id,
+            events=events,
+            arq_queue=arq_queue,
+        )
+
+    assert result == "completed"
+    assert heads.call_count == 1
+    assert heads.calls.last.request.headers["Authorization"] == (
+        f"Bearer {mock_github.default_token}"
+    )
+    assert await _fetch_project_default_branch(seeded.project_id) == "master"
+    main = await _load_edition(seeded.main_id)
+    assert main is not None
+    assert main.tracking_params == {"git_ref": "master"}
+    assert main.current_build_id == seeded.main_build_id
+    assert main.publish_status is PublishStatus.pending
+    assert await _load_edition(seeded.draft_id) is None
+    assert count_jobs_by_name(arq_queue, "publish_edition") == 1
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 1
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    [event] = publisher.published
+    assert event.action is LifecycleAction.update
+    assert event.edition_kind is MetricsEditionKind.main
+    [rewrite_log] = [
+        entry
+        for entry in captured
+        if entry["event"] == "Rewrote __main to track the default branch"
+    ]
+    assert rewrite_log["trigger"] == "resolve"
+    assert rewrite_log["main_rewritten_from"] == "main"
+    await manager.aclose()
+
+
+_REF_FETCH_FAILED_MESSAGE = (
+    "Resolve: GitHub ref fetch failed, recording default branch without "
+    "live refs"
+)
+
+
+def _fail_heads(mock_github: GitHubMock, status_code: int) -> None:
+    """Answer the heads listing with ``status_code``."""
+    mock_github.router.get(
+        "https://api.github.com/repos/acme/templates/git/matching-refs/heads"
+    ).mock(return_value=httpx.Response(status_code, json={"message": "nope"}))
+
+
+def _fail_second_token_exchange(mock_github: GitHubMock) -> None:
+    """Mint the resolve's own token, then fail the ref fetch's exchange."""
+    mock_github.router.post(
+        "https://api.github.com/app/installations/42/access_tokens"
+    ).mock(
+        side_effect=[
+            httpx.Response(
+                201,
+                json={
+                    "token": mock_github.default_token,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                },
+            ),
+            httpx.Response(502, json={"message": "Bad Gateway"}),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "break_fetch",
+    [
+        lambda mock_github: _fail_heads(mock_github, 404),
+        lambda mock_github: _fail_heads(mock_github, 500),
+        _fail_second_token_exchange,
+    ],
+    ids=["not-accessible", "fetch-error", "token-exchange"],
+)
+async def test_project_github_resolve_first_learn_ref_fetch_failure(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+    break_fetch: Callable[[GitHubMock], None],
+) -> None:
+    """A failed first-learn ref fetch still records the default branch.
+
+    The live ref set is extra evidence, not the job's purpose, so a
+    GitHub failure fetching it neither retries nor fails the resolve:
+    the column is recorded, ``__main`` is left for the audit to judge,
+    and the job completes with a warning and no Sentry event.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-fetch-fail",
+        stored_default_branch=None,
+        main_ref="main",
+        branch="master",
+        ids_stored=False,
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+    mock_github.seed_refs("acme", "templates", branches=["master"])
+    break_fetch(mock_github)
+    captured_exceptions: list[BaseException] = []
+    monkeypatch.setattr(
+        sentry_sdk, "capture_exception", captured_exceptions.append
+    )
+
+    with capture_logs() as captured:
+        result = await _resolve_with(
+            mock_github=mock_github,
+            project_id=seeded.project_id,
+            events=events,
+            arq_queue=arq_queue,
+        )
+
+    assert result == "completed"
+    assert await _fetch_project_default_branch(seeded.project_id) == "master"
+    main = await _load_edition(seeded.main_id)
+    assert main is not None
+    assert main.tracking_params == {"git_ref": "main"}
+    assert main.current_build_id is None
+    assert await _load_edition(seeded.draft_id) is not None
+    assert count_jobs_by_name(arq_queue, "publish_edition") == 0
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 0
+    [warning] = [
+        entry
+        for entry in captured
+        if entry["event"] == _REF_FETCH_FAILED_MESSAGE
+    ]
+    assert warning["log_level"] == "warning"
+    assert captured_exceptions == []
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_known_default_branch_fetches_no_refs(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """Only a first learn fetches the live ref set.
+
+    Once the column holds a branch, the resolve's evidence is that
+    previous value, as before, and it spends no GitHub requests on the
+    ref set: the audit fetches it daily anyway.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-known",
+        stored_default_branch="master",
+        main_ref="docs",
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme", "templates", repo_id=12345, owner_id=111, default_branch="main"
+    )
+    heads, tags = mock_github.seed_refs("acme", "templates", branches=["main"])
+
+    result = await _resolve_with(
+        mock_github=mock_github,
+        project_id=seeded.project_id,
+        events=events,
+        arq_queue=arq_queue,
+    )
+
+    assert result == "completed"
+    assert await _fetch_project_default_branch(seeded.project_id) == "main"
+    assert (heads.call_count, tags.call_count) == (0, 0)
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_rebound_mid_resolve_records_nothing(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A project rebound while GitHub answered keeps no stale branch.
+
+    The rebind's own resolve reads the new repository; this one's ids
+    and default branch describe the old one, so neither is written.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+
+    async def rebind_then_answer(request: httpx.Request) -> httpx.Response:
+        async for session in db_session_dependency():
+            async with session.begin():
+                await session.execute(
+                    update(SqlProject)
+                    .where(SqlProject.id == project_id)
+                    .values(github_repo="moved")
+                )
+        return httpx.Response(
+            200,
+            json={
+                "id": 12345,
+                "name": "templates",
+                "owner": {"login": "acme", "id": 111},
+                "default_branch": "master",
+            },
+        )
+
+    mock_github.router.get("https://api.github.com/repos/acme/templates").mock(
+        side_effect=rebind_then_answer
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert result == "skipped"
+    assert await _fetch_project_default_branch(project_id) is None
+
+
+def _interleave_after_ids_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    write: Callable[[], Awaitable[None]],
+) -> None:
+    """Run ``write`` after the resolve commits the ids, before the branch.
+
+    The resolve commits the three ``github_*_id`` columns and then
+    applies the default branch in a second transaction; ``write`` lands
+    in the window between the two, as a webhook or a ``PATCH`` handled
+    concurrently would.
+    """
+    apply_default_branch: Callable[
+        ..., Awaitable[DefaultBranchOutcome | None]
+    ] = _RESOLVE_MODULE._apply_default_branch
+
+    async def interleaved(**kwargs: Any) -> DefaultBranchOutcome | None:
+        await write()
+        return await apply_default_branch(**kwargs)
+
+    monkeypatch.setattr(_RESOLVE_MODULE, "_apply_default_branch", interleaved)
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_rename_after_ids_commit_records_branch(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rename landing between the two commits still records the branch.
+
+    ``repository.renamed`` matches the project on the ``github_repo_id``
+    this resolve just committed and keeps it, so the row still describes
+    the repository GitHub answered for, under its new name. The default
+    branch belongs to that same repository and is recorded.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(db_session)
+        await db_session.commit()
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+
+    async def rename() -> None:
+        async for session in db_session_dependency():
+            async with session.begin():
+                renamed = await ProjectStore(
+                    session=session, logger=_logger()
+                ).rename_repo_by_repo_id(
+                    github_repo_id=12345, new_repo="renamed"
+                )
+            assert renamed == [project_id]
+
+    _interleave_after_ids_commit(monkeypatch, rename)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        result = await project_github_resolve(ctx, {"project_id": project_id})
+
+    assert result == "completed"
+    assert await _fetch_project_github_ids(project_id) == (
+        "acme",
+        "renamed",
+        111,
+        12345,
+        42,
+    )
+    assert await _fetch_project_default_branch(project_id) == "master"
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_rebind_after_ids_commit_is_metadata_only(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``PATCH`` rebind between the two commits skips only the branch.
+
+    The ids were already committed for the old repository when the
+    ``PATCH`` moved the binding (clearing them, as a rebind does), so the
+    old repository's default branch is not recorded against the new
+    binding. The job says so with its own outcome and log line rather
+    than the pre-commit ``"skipped"``, which wrote nothing.
+    """
+    async with db_session.begin():
+        _org_id, project_id = await _seed_org_and_project(
+            db_session, org_slug="pgr-window-rebind"
+        )
+        await db_session.commit()
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+
+    async def rebind() -> None:
+        async for session in db_session_dependency():
+            async with session.begin():
+                await ProjectService(
+                    store=ProjectStore(session=session, logger=_logger()),
+                    org_store=OrganizationStore(
+                        session=session, logger=_logger()
+                    ),
+                    edition_store=EditionStore(
+                        session=session, logger=_logger()
+                    ),
+                    logger=_logger(),
+                ).update(
+                    org_slug="pgr-window-rebind",
+                    slug="pgr-proj",
+                    data=ProjectUpdate(
+                        github=ProjectGitHubBindingCreate(
+                            owner="acme", repo="moved"
+                        )
+                    ),
+                )
+
+    _interleave_after_ids_commit(monkeypatch, rebind)
+
+    with capture_logs() as captured:
+        async with httpx.AsyncClient() as http_client:
+            ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+            result = await project_github_resolve(
+                ctx, {"project_id": project_id}
+            )
+
+    assert result == "metadata_only"
+    assert await _fetch_project_github_ids(project_id) == (
+        "acme",
+        "moved",
+        None,
+        None,
+        None,
+    )
+    assert await _fetch_project_default_branch(project_id) is None
+    messages = [entry["event"] for entry in captured]
+    assert (
+        "Skipping persist: project binding changed during resolve"
+        not in messages
+    )
+    [skip_log] = [
+        entry for entry in captured if entry["event"] == _METADATA_ONLY_MESSAGE
+    ]
+    assert skip_log["log_level"] == "info"
+    assert (
+        skip_log["github_installation_id"],
+        skip_log["github_owner_id"],
+        skip_log["github_repo_id"],
+        skip_log["github_default_branch"],
+    ) == (42, 111, 12345, "master")
+
+
+_METADATA_ONLY_MESSAGE = (
+    "Recorded GitHub ids but skipped default branch: project rebound or "
+    "deleted after the ids were committed"
+)

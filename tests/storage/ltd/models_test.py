@@ -8,6 +8,7 @@ first.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,36 @@ def test_build_round_trip() -> None:
     assert build.uploaded is True
     assert build.git_refs == ["main"]
     assert build.ltd_id == 42
+
+
+@pytest.mark.parametrize(
+    "field", ["date_created", "date_rebuilt", "date_ended"]
+)
+def test_edition_naive_dates_are_read_as_utc(field: str) -> None:
+    """A timestamp serialised without an offset is the same instant in UTC."""
+    payload = _load("edition_main_git_refs.json")
+    payload[field] = "2026-04-30T18:30:00"
+    edition = LtdEdition.model_validate(payload)
+    assert getattr(edition, field) == datetime(2026, 4, 30, 18, 30, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("field", ["date_created", "date_ended"])
+def test_build_naive_dates_are_read_as_utc(field: str) -> None:
+    payload = _load("build.json")
+    payload[field] = "2026-04-30T18:30:00"
+    build = LtdBuild.model_validate(payload)
+    assert getattr(build, field) == datetime(2026, 4, 30, 18, 30, tzinfo=UTC)
+
+
+def test_edition_aware_dates_keep_their_offset() -> None:
+    """Only a missing offset is filled in; a present one is left alone."""
+    payload = _load("edition_main_git_refs.json")
+    payload["date_rebuilt"] = "2026-04-30T20:30:00+02:00"
+    edition = LtdEdition.model_validate(payload)
+    assert edition.date_rebuilt is not None
+    assert edition.date_rebuilt.utcoffset() == timedelta(hours=2)
+    assert edition.date_rebuilt == datetime(2026, 4, 30, 18, 30, tzinfo=UTC)
+    assert edition.date_ended is None
 
 
 def test_extra_fields_are_ignored() -> None:

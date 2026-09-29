@@ -12,8 +12,9 @@ failing paths — without depending on real S3 or R2.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
-from datetime import timedelta
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 from types import TracebackType
@@ -32,7 +33,7 @@ from safir.testing.sentry import (
     capture_events_fixture,
     sentry_init_fixture,
 )
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
@@ -54,12 +55,15 @@ from docverse_server.dbschema.edition_build_history import (
     SqlEditionBuildHistory,
 )
 from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
+from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.project import SqlProject
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
     generate_base32_id,
     validate_base32_id,
 )
+from docverse_server.domain.dashboard_context import DashboardContext
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.queue import JobStatus
@@ -71,7 +75,11 @@ from docverse_server.metrics import (
     build_event_manager,
 )
 from docverse_server.sentry import initialize_sentry
-from docverse_server.services.dashboard.enqueue import DashboardBuildEnqueuer
+from docverse_server.services.dashboard.enqueue import (
+    DashboardBuildEnqueuer,
+    try_enqueue_dashboard_build_by_id,
+)
+from docverse_server.services.dashboard.publisher import DashboardPublisher
 from docverse_server.services.keeper_sync import service as service_module
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.services.lock_service import LockClass, LockKey
@@ -86,6 +94,7 @@ from docverse_server.storage.keeper_sync import (
 )
 from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse_server.storage.ltd import (
+    LtdEdition,
     LtdNotFoundError,
     LtdSourceAccessDeniedError,
 )
@@ -93,7 +102,12 @@ from docverse_server.storage.objectstore import MockObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions import (
+    keeper_sync as keeper_sync_worker_module,
+)
+from docverse_server.worker.functions.dashboard_build import dashboard_build
 from docverse_server.worker.functions.keeper_sync import keeper_sync_project
+from docverse_server.worker.functions.publish_edition import publish_edition
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.support.objectstore import ScriptedUploadStore
@@ -331,6 +345,9 @@ async def test_keeper_sync_project_runs_service_and_enqueues_publish(
     assert publish_payload["edition_slug"] == "__main"
     assert publish_payload["project_slug"] == "pipelines"
     assert publish_payload["org_id"] == org_id
+    # A first import measures no sync lag: LTD's ``date_rebuilt`` dates a
+    # rebuild that happened before Docverse mirrored the edition.
+    assert "ltd_date_rebuilt" not in publish_payload
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -625,6 +642,95 @@ async def test_keeper_sync_project_short_circuit_skips_publish_enqueue(
     assert len(publish_after_second) == 1
 
 
+async def _drift_edition_clocks(*, org_id: int) -> None:
+    """Move every ``pipelines`` edition's ``date_updated`` to now.
+
+    Stands in for whatever leaves a synced row off LTD's clock between
+    visits: an import from before PRD #706, a kind convergence, an
+    operator's ``PATCH``. The next visit then has a clock to restamp.
+    """
+    project_id = await _project_id_for(org_id=org_id)
+    async for session in db_session_dependency():
+        async with session.begin():
+            await session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.project_id == project_id)
+                .values(date_updated=func.now())
+            )
+        return
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_summary_log_counts_restamped_editions(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The project's terminal log line reports how many clocks moved.
+
+    ``restamped_edition_count`` is the operator's read on the PRD #706
+    backfill: a full org run over already-synced projects reports a
+    non-zero count, and a repeat run reports zero once every edition
+    carries LTD's clock.
+
+    Four passes over one unchanged LTD ``main``. The first imports and
+    stamps it. Its publish enqueue flips ``publish_status`` without
+    moving the clock, so the second pass finds nothing to fix. A drift
+    then stands in for a row imported before the stamp existed: the
+    third pass re-asserts LTD's dates, and the fourth is clean again.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+
+    _seed_ltd(mock_discovery)
+    _patch_factory_io(
+        monkeypatch,
+        object_store=MockObjectStore(),
+        source_objects={"pipelines/builds/42/index.html": b"<html>v1</html>"},
+    )
+
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+
+    async def summary_restamped_counts(backend_job_id: str) -> list[int]:
+        async with db_session.begin():
+            queue_job_id = await _seed_project_queue_job(
+                db_session,
+                org_id=org_id,
+                run_id=run_id,
+                backend_job_id=backend_job_id,
+            )
+        with capture_logs() as logs:
+            result = await keeper_sync_project(
+                ctx,
+                {
+                    "org_id": org_id,
+                    "org_slug": org_slug,
+                    "run_id": run_id,
+                    "queue_job_id": queue_job_id,
+                    "ltd_slug": "pipelines",
+                    "ltd_base_url": LTD_BASE,
+                },
+            )
+        assert result == "completed"
+        return [
+            event["restamped_edition_count"]
+            for event in logs
+            if event["event"] == "Keeper-sync project completed"
+        ]
+
+    assert await summary_restamped_counts("test-arq-project-1") == [1]
+    assert await summary_restamped_counts("test-arq-project-2") == [0]
+    await _drift_edition_clocks(org_id=org_id)
+    assert await summary_restamped_counts("test-arq-project-3") == [1]
+    assert await summary_restamped_counts("test-arq-project-4") == [0]
+    await ctx["http_client"].aclose()
+
+
 @pytest.mark.asyncio
 async def test_keeper_sync_project_self_heals_unpublished_short_circuit(
     app: None,
@@ -712,6 +818,9 @@ async def test_keeper_sync_project_self_heals_unpublished_short_circuit(
     assert second_payload["edition_slug"] == "__main"
     assert second_payload["project_slug"] == "pipelines"
     assert second_payload["org_id"] == org_id
+    # A self-heal republishes a rebuild imported on an earlier visit, so
+    # the time since LTD's rebuild is no sync lag and is not reported.
+    assert "ltd_date_rebuilt" not in second_payload
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -999,6 +1108,21 @@ def _copied_events(events: DocverseEvents) -> list[BuildContentCopiedEvent]:
     return list(publisher.published)
 
 
+def _assert_copy_lag(
+    event: BuildContentCopiedEvent, *, date_rebuilt: datetime
+) -> None:
+    """Assert ``event`` reports the copy's lag behind an LTD rebuild.
+
+    The lag runs from LTD's ``date_rebuilt`` to the copy's end, so it
+    covers at least the copy itself and at most the time since that
+    rebuild.
+    """
+    assert event.ltd_lag_seconds is not None
+    since_rebuilt = datetime.now(tz=UTC) - date_rebuilt
+    assert event.duration_seconds <= event.ltd_lag_seconds
+    assert event.ltd_lag_seconds <= since_rebuilt.total_seconds()
+
+
 @pytest.mark.asyncio
 async def test_keeper_sync_project_publishes_build_content_copied(
     app: None,
@@ -1036,6 +1160,8 @@ async def test_keeper_sync_project_publishes_build_content_copied(
     assert event.build_retry_used is False
     assert event.succeeded is True
     assert event.duration_seconds >= 0
+    # The copy is ``main``'s first import, which measures no sync lag.
+    assert event.ltd_lag_seconds is None
 
 
 @pytest.mark.asyncio
@@ -1576,6 +1702,13 @@ async def test_keeper_sync_project_publishes_backfilled_aggregates(
         job.kwargs["payload"]["edition_slug"] for job in publish_jobs
     )
     assert publish_slugs == ["15", "15.2", "15.2.1", "__main"]
+    # A first import measures no sync lag, and the aggregates it moved
+    # report the release's (absent) lag.
+    assert [
+        job.kwargs["payload"]["edition_slug"]
+        for job in publish_jobs
+        if "ltd_date_rebuilt" in job.kwargs["payload"]
+    ] == []
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -1884,19 +2017,32 @@ async def test_keeper_sync_project_partial_failure_publishes_succeeded_only(
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
     ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
 
-    result = await keeper_sync_project(
-        ctx,
-        {
-            "org_id": org_id,
-            "org_slug": org_slug,
-            "run_id": run_id,
-            "queue_job_id": queue_job_id,
-            "ltd_slug": "pipelines",
-            "ltd_base_url": LTD_BASE,
-        },
-    )
+    with capture_logs() as captured:
+        result = await keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
     await ctx["http_client"].aclose()
     assert result == "completed_with_errors"
+
+    # The partial run's summary line still reports the clock stamps:
+    # only ``__main`` produced an outcome, and its import was stamped.
+    summaries = [
+        event
+        for event in captured
+        if event["event"]
+        == "Keeper-sync project completed with edition failures"
+    ]
+    assert len(summaries) == 1
+    assert summaries[0]["log_level"] == "warning"
+    assert summaries[0]["restamped_edition_count"] == 1
 
     publish_jobs = get_jobs_by_name(
         mock_arq, "publish_edition", queue_name="docverse:queue"
@@ -2286,6 +2432,8 @@ async def test_keeper_sync_project_self_heals_unpublished_aggregate(
     # recovered.
     assert healed_slugs == ["__main", "15.2"]
     aggregate_job = healed[1]
+    # The healed aggregate's release was imported on an earlier visit.
+    assert "ltd_date_rebuilt" not in aggregate_job.kwargs["payload"]
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -3021,3 +3169,715 @@ async def test_keeper_sync_project_self_heal_skips_settled_editions(
         mock_arq, "publish_edition", queue_name="docverse:queue"
     )
     assert len(publish_after_second) == len(publish_after_first)
+
+
+@dataclass
+class _RestampSync:
+    """One seeded ``pipelines`` product driven through repeated syncs.
+
+    Each :meth:`run_pass` is a fresh ``keeper_sync_project`` job against
+    the same, unchanged LTD state, so every pass after the first
+    short-circuits its builds and can only move dates (PRD #706) —
+    unless the test rebuilds an LTD edition between passes, putting the
+    new build's content into :attr:`source_objects`.
+    """
+
+    ctx: dict[str, Any]
+    mock_arq: MockArqQueue
+    org_id: int
+    org_slug: str
+    run_id: int
+    source_objects: dict[str, bytes]
+    """The LTD bucket the copier reads, keyed like LTD's object keys."""
+
+    async def run_pass(
+        self, db_session: AsyncSession, *, backend_job_id: str
+    ) -> list[MutableMapping[str, Any]]:
+        """Run one completed job and return the log lines it emitted."""
+        async with db_session.begin():
+            queue_job_id = await _seed_project_queue_job(
+                db_session,
+                org_id=self.org_id,
+                run_id=self.run_id,
+                backend_job_id=backend_job_id,
+            )
+        with capture_logs() as logs:
+            result = await keeper_sync_project(
+                self.ctx,
+                {
+                    "org_id": self.org_id,
+                    "org_slug": self.org_slug,
+                    "run_id": self.run_id,
+                    "queue_job_id": queue_job_id,
+                    "ltd_slug": "pipelines",
+                    "ltd_base_url": LTD_BASE,
+                },
+            )
+        assert result == "completed"
+        return logs
+
+
+async def _prepare_restamp_sync(
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    seed_ltd: Callable[[respx.Router], None] = _seed_ltd,
+    events: DocverseEvents | None = None,
+) -> _RestampSync:
+    """Seed the ``pipelines`` product for a multi-pass restamp test.
+
+    ``seed_ltd`` stubs the LTD side: the single ``main`` by default, or
+    one of the two-edition fixtures (builds 42 and 43) when one job has
+    to carry more than one restamp outcome. ``events`` records the
+    metrics the jobs publish, for a test that reads them back.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+    seed_ltd(mock_discovery)
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>branch</html>",
+    }
+    _patch_factory_io(
+        monkeypatch,
+        object_store=MockObjectStore(),
+        source_objects=source_objects,
+    )
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), arq_queue=mock_arq, events=events
+    )
+    return _RestampSync(
+        ctx=ctx,
+        mock_arq=mock_arq,
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        source_objects=source_objects,
+    )
+
+
+def _restamped_count(logs: Sequence[Mapping[str, Any]]) -> int:
+    """Read ``restamped_edition_count`` off the job's summary log line."""
+    [count] = [
+        event["restamped_edition_count"]
+        for event in logs
+        if event["event"] == "Keeper-sync project completed"
+    ]
+    return int(count)
+
+
+def _spy_dashboard_enqueues(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record every project the keeper-sync worker asks to re-render.
+
+    Wraps the worker module's ``try_enqueue_dashboard_build_by_id`` and
+    still delegates to it, so the ``dashboard_build`` rows and arq jobs
+    land as they would in production. The returned list counts the
+    *calls*, which the enqueuer's own active-job dedup would otherwise
+    hide.
+    """
+    calls: list[int] = []
+
+    async def _spy(
+        *,
+        factory: Factory,
+        session: AsyncSession,
+        logger: structlog.stdlib.BoundLogger,
+        org_id: int,
+        project_id: int,
+    ) -> None:
+        calls.append(project_id)
+        await try_enqueue_dashboard_build_by_id(
+            factory=factory,
+            session=session,
+            logger=logger,
+            org_id=org_id,
+            project_id=project_id,
+        )
+
+    monkeypatch.setattr(
+        keeper_sync_worker_module, "try_enqueue_dashboard_build_by_id", _spy
+    )
+    return calls
+
+
+async def _dashboard_build_project_ids(*, org_id: int) -> list[int | None]:
+    """Return the project id of every ``dashboard_build`` row in the org."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            rows = await session.execute(
+                select(SqlQueueJob.project_id).where(
+                    SqlQueueJob.kind == JobKind.dashboard_build.value,
+                    SqlQueueJob.org_id == org_id,
+                )
+            )
+            return list(rows.scalars().all())
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_restamp_only_job_enqueues_one_dashboard(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A job that only moves dates re-renders the project's dashboard once.
+
+    The dashboard is rendered at publish time, so a visit that restamps
+    a short-circuited edition without publishing it would leave ``/v/``
+    showing the dates it was rendered with. Two LTD editions are
+    imported, then both clocks drift back to now, so the second job
+    restamps both and publishes neither. That job asks for exactly one
+    ``dashboard_build`` for the project, not one per restamped edition.
+    """
+    harness = await _prepare_restamp_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        seed_ltd=_seed_two_edition_ltd,
+    )
+    dashboard_calls = _spy_dashboard_enqueues(monkeypatch)
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    publishes_after_first = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publishes_after_first) == 2
+    await _drift_edition_clocks(org_id=harness.org_id)
+
+    logs = await harness.run_pass(
+        db_session, backend_job_id="test-arq-project-2"
+    )
+    await harness.ctx["http_client"].aclose()
+
+    assert _restamped_count(logs) == 2
+    publishes_after_second = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publishes_after_second) == len(publishes_after_first)
+    project_id = await _project_id_for(org_id=harness.org_id)
+    assert dashboard_calls == [project_id]
+    assert await _dashboard_build_project_ids(org_id=harness.org_id) == [
+        project_id
+    ]
+    assert len(get_jobs_by_name(harness.mock_arq, "dashboard_build")) == 1
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_published_restamp_skips_dashboard(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restamped edition that is also published leaves the dashboard be.
+
+    A fresh import stamps LTD's clock onto the new rows, so its outcome
+    reports ``dates_restamped``, but it also enqueues the edition's
+    publish, whose success path cascades a ``dashboard_build`` of its
+    own. Keeper-sync must not ask for a second one.
+    """
+    harness = await _prepare_restamp_sync(
+        db_session, mock_discovery, monkeypatch
+    )
+    dashboard_calls = _spy_dashboard_enqueues(monkeypatch)
+
+    logs = await harness.run_pass(
+        db_session, backend_job_id="test-arq-project-1"
+    )
+    await harness.ctx["http_client"].aclose()
+
+    assert _restamped_count(logs) == 1
+    publishes = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    assert len(publishes) == 1
+    assert dashboard_calls == []
+    assert await _dashboard_build_project_ids(org_id=harness.org_id) == []
+
+
+def _spy_dashboard_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[DashboardContext]:
+    """Record the context of every dashboard the worker renders.
+
+    Wraps ``DashboardPublisher.build_context`` and still delegates to
+    it, so the render proceeds as in production; the returned list
+    holds exactly what each render's template was given.
+    """
+    contexts: list[DashboardContext] = []
+    original = DashboardPublisher.build_context
+
+    async def _build_context(
+        self: DashboardPublisher,
+        *,
+        org_id: int,
+        project_id: int,
+        rendered_at: datetime | None = None,
+    ) -> DashboardContext:
+        context = await original(
+            self,
+            org_id=org_id,
+            project_id=project_id,
+            rendered_at=rendered_at,
+        )
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(DashboardPublisher, "build_context", _build_context)
+    return contexts
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_fresh_import_publish_keeps_ltd_clock(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh import's own publish renders the dashboard on LTD's clock.
+
+    The import visit stamps LTD's dates last and enqueues the edition's
+    publish, which flips ``publish_status`` on its way to ``published``
+    and then cascades the ``dashboard_build`` that renders ``/v/``. The
+    flips move no content, so they must not move the clock either: the
+    first render shows LTD's ``date_rebuilt``, not "updated just now",
+    and the project's next visit finds nothing to restamp.
+    """
+    harness = await _prepare_restamp_sync(
+        db_session, mock_discovery, monkeypatch
+    )
+    ltd_main = LtdEdition.model_validate(_load("edition_main_git_refs.json"))
+    assert ltd_main.date_rebuilt is not None
+    rendered = _spy_dashboard_contexts(monkeypatch)
+
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    [publish_job] = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    publish_result = await publish_edition(
+        harness.ctx, publish_job.kwargs["payload"]
+    )
+
+    assert publish_result == "completed"
+    assert await _edition_clocks(org_id=harness.org_id) == {
+        "__main": ltd_main.date_rebuilt
+    }
+
+    [dashboard_job] = get_jobs_by_name(harness.mock_arq, "dashboard_build")
+    dashboard_result = await dashboard_build(
+        harness.ctx, dashboard_job.kwargs["payload"]
+    )
+
+    assert dashboard_result == "completed"
+    [context] = rendered
+    assert context.editions.main is not None
+    assert context.editions.main.date_updated == ltd_main.date_rebuilt
+
+    logs = await harness.run_pass(
+        db_session, backend_job_id="test-arq-project-2"
+    )
+    await harness.ctx["http_client"].aclose()
+
+    assert _restamped_count(logs) == 0
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_unrestamped_job_skips_dashboard(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A steady-state job that moves no clock asks for no dashboard.
+
+    The first job imports ``main``; a drift moves its clock back to now,
+    and the second job re-asserts LTD's (and asks for the one render).
+    After that, every row already carries LTD's dates, so the third
+    job's outcome reports ``dates_restamped=False`` and must not
+    re-render the dashboard on every reconciliation tick.
+    """
+    harness = await _prepare_restamp_sync(
+        db_session, mock_discovery, monkeypatch
+    )
+    dashboard_calls = _spy_dashboard_enqueues(monkeypatch)
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    await _drift_edition_clocks(org_id=harness.org_id)
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-2")
+    assert len(dashboard_calls) == 1
+    dashboard_calls.clear()
+
+    logs = await harness.run_pass(
+        db_session, backend_job_id="test-arq-project-3"
+    )
+    await harness.ctx["http_client"].aclose()
+
+    assert _restamped_count(logs) == 0
+    assert dashboard_calls == []
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_dashboard_enqueue_error_completes_job(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dashboard enqueue that raises is logged; the job still completes.
+
+    The refresh is best-effort: by the time it runs, the job's editions
+    have synced and their clocks are committed, so an enqueue failure
+    must not turn the job ``failed``. It is logged at error level like a
+    raising publish-enqueue callback.
+    """
+    harness = await _prepare_restamp_sync(
+        db_session, mock_discovery, monkeypatch
+    )
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    await _drift_edition_clocks(org_id=harness.org_id)
+
+    async def _raise(**kwargs: Any) -> None:
+        msg = "dashboard enqueue exploded"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        keeper_sync_worker_module, "try_enqueue_dashboard_build_by_id", _raise
+    )
+    logs = await harness.run_pass(
+        db_session, backend_job_id="test-arq-project-2"
+    )
+    await harness.ctx["http_client"].aclose()
+
+    assert _restamped_count(logs) == 1
+    errors = [
+        event
+        for event in logs
+        if event["event"]
+        == "Dashboard enqueue for restamped editions raised; continuing"
+    ]
+    assert len(errors) == 1
+    assert errors[0]["log_level"] == "error"
+    assert errors[0]["project_id"] == await _project_id_for(
+        org_id=harness.org_id
+    )
+
+
+async def _edition_clocks(*, org_id: int) -> dict[str, datetime]:
+    """Return each ``pipelines`` edition's committed ``date_updated``."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            rows = await session.execute(
+                select(SqlEdition.slug, SqlEdition.date_updated)
+                .join(SqlProject, SqlProject.id == SqlEdition.project_id)
+                .where(
+                    SqlProject.org_id == org_id,
+                    SqlProject.slug == "pipelines",
+                )
+            )
+            return dict(rows.tuples().all())
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_requests_dashboard_after_every_restamp(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The render is requested only once every edition's clock is final.
+
+    ``dashboard_build`` runs on the main worker, not the sync queue, so
+    a render requested at the first restamp-only edition could finish
+    while the job is still restamping the rest. With one request per
+    job, nothing would re-render afterwards. The spy snapshots every
+    edition's committed ``date_updated`` at the moment of the request;
+    the snapshot must already match the rows the job leaves behind.
+    """
+    harness = await _prepare_restamp_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        seed_ltd=_seed_two_edition_ltd,
+    )
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    await _drift_edition_clocks(org_id=harness.org_id)
+    clocks_at_request: list[dict[str, datetime]] = []
+
+    async def _snapshot(**kwargs: Any) -> None:
+        clocks_at_request.append(await _edition_clocks(org_id=harness.org_id))
+
+    monkeypatch.setattr(
+        keeper_sync_worker_module,
+        "try_enqueue_dashboard_build_by_id",
+        _snapshot,
+    )
+    before = await _edition_clocks(org_id=harness.org_id)
+    logs = await harness.run_pass(
+        db_session, backend_job_id="test-arq-project-2"
+    )
+    await harness.ctx["http_client"].aclose()
+
+    assert _restamped_count(logs) == 2
+    after = await _edition_clocks(org_id=harness.org_id)
+    assert set(after) == {"__main", "u-jsick-feature"}
+    assert all(after[slug] != before[slug] for slug in after)
+    assert clocks_at_request == [after]
+
+
+async def _rewind_aggregate_backfill(
+    *, org_id: int, aggregate_slug: str, release_ltd_slug: str
+) -> None:
+    """Make the release's next visit move one of its aggregates again.
+
+    Clears the aggregate's pointer and drops the release edition's
+    ``aggregates_backfilled_build_id`` marker, so the next visit re-runs
+    the backfill on a short-circuited build and publishes the aggregate
+    it moves back onto the release — the re-sync shape
+    ``_enqueue_publish_for_aggregates`` documents.
+    """
+    project_id = await _project_id_for(org_id=org_id)
+    async for session in db_session_dependency():
+        async with session.begin():
+            await session.execute(
+                update(SqlEdition)
+                .where(
+                    SqlEdition.project_id == project_id,
+                    SqlEdition.slug == aggregate_slug,
+                )
+                .values(current_build_id=None)
+            )
+            state = (
+                await session.execute(
+                    select(SqlKeeperSyncState).where(
+                        SqlKeeperSyncState.org_id == org_id,
+                        SqlKeeperSyncState.resource_type
+                        == ResourceType.edition.value,
+                        SqlKeeperSyncState.ltd_slug == release_ltd_slug,
+                    )
+                )
+            ).scalar_one()
+            annotations = dict(state.annotations or {})
+            assert "aggregates_backfilled_build_id" in annotations
+            del annotations["aggregates_backfilled_build_id"]
+            state.annotations = annotations
+        return
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_aggregate_publish_skips_dashboard(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restamp that publishes a semver aggregate leaves the dashboard be.
+
+    The release's own build short-circuits, so the edition itself is not
+    republished, but the visit moves the ``15.2`` aggregate back onto the
+    release and publishes it. That aggregate's publish cascades a
+    ``dashboard_build`` the same way an edition's does, so the restamp
+    the same visit reports must not ask for another.
+    """
+    harness = await _prepare_restamp_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        seed_ltd=_seed_release_edition_ltd,
+    )
+    dashboard_calls = _spy_dashboard_enqueues(monkeypatch)
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    steady = await harness.run_pass(
+        db_session, backend_job_id="test-arq-project-2"
+    )
+    assert _restamped_count(steady) == 0
+    await _rewind_aggregate_backfill(
+        org_id=harness.org_id,
+        aggregate_slug="15.2",
+        release_ltd_slug="15.2.1",
+    )
+    dashboard_calls.clear()
+    publishes_before = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+
+    logs = await harness.run_pass(
+        db_session, backend_job_id="test-arq-project-3"
+    )
+    await harness.ctx["http_client"].aclose()
+
+    assert _restamped_count(logs) == 1
+    publishes_after = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    republished = [
+        job.kwargs["payload"]["edition_slug"]
+        for job in publishes_after[len(publishes_before) :]
+    ]
+    assert republished == ["15.2"]
+    assert dashboard_calls == []
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_short_circuited_aggregate_reports_no_lag(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An aggregate moved by an unchanged release names no LTD rebuild.
+
+    The release's build short-circuited, so LTD's ``date_rebuilt`` is a
+    rebuild an earlier visit imported. Carrying it into the aggregate's
+    publish would report the time since that old rebuild as sync lag,
+    the same reason keeper-sync's self-heal publishes report none.
+    """
+    harness = await _prepare_restamp_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        seed_ltd=_seed_release_edition_ltd,
+    )
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    await _rewind_aggregate_backfill(
+        org_id=harness.org_id,
+        aggregate_slug="15.2",
+        release_ltd_slug="15.2.1",
+    )
+    publishes_before = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-2")
+    await harness.ctx["http_client"].aclose()
+
+    republished = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )[len(publishes_before) :]
+    assert [job.kwargs["payload"]["edition_slug"] for job in republished] == [
+        "15.2"
+    ]
+    assert "ltd_date_rebuilt" not in republished[0].kwargs["payload"]
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_reports_ltd_lag_for_a_rebuilt_edition(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rebuild of an edition Docverse already mirrors reports its lag.
+
+    The first job imports ``main`` for the first time, so neither its
+    publish nor its ``build_content_copied`` event names a rebuild. LTD
+    then rebuilds ``main`` onto a new build: the second job's publish
+    payload carries that rebuild's ``date_rebuilt``, which
+    ``edition_published`` measures ``ltd_lag`` from, and its copy event
+    measures ``ltd_lag_seconds`` from the same timestamp.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    harness = await _prepare_restamp_sync(
+        db_session, mock_discovery, monkeypatch, events=events
+    )
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    _repoint_ltd_main_edition(mock_discovery, build_slug="44")
+    harness.source_objects["pipelines/builds/44/index.html"] = (
+        b"<html>main v2</html>"
+    )
+
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-2")
+    await harness.ctx["http_client"].aclose()
+
+    first, second = (
+        job.kwargs["payload"]
+        for job in get_jobs_by_name(
+            harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+        )
+    )
+    assert "ltd_date_rebuilt" not in first
+    assert second["edition_slug"] == "__main"
+    assert second["ltd_date_rebuilt"] == "2026-05-02T18:30:00+00:00"
+    first_copy, second_copy = _copied_events(events)
+    assert first_copy.ltd_lag_seconds is None
+    _assert_copy_lag(
+        second_copy, date_rebuilt=datetime(2026, 5, 2, 18, 30, tzinfo=UTC)
+    )
+
+
+def _rebuild_ltd_release_edition(
+    mock_discovery: respx.Router, source_objects: dict[str, bytes]
+) -> None:
+    """Rebuild :func:`_seed_release_edition_ltd`'s ``15.2.1`` onto build 44.
+
+    The release republished onto a newly uploaded build with new
+    content, as LTD does for any rebuild; ``respx`` replaces the
+    ``/editions/2`` route seeded before.
+    """
+    release_edition = _load("edition_branch_git_refs.json")
+    release_edition["slug"] = "15.2.1"
+    release_edition["title"] = "15.2.1"
+    release_edition["tracked_refs"] = ["15.2.1"]
+    release_edition["build_url"] = f"{LTD_BASE}/builds/44"
+    release_edition["date_rebuilt"] = "2026-05-03T09:00:00.000000+00:00"
+    release_build = _load("build.json")
+    release_build["self_url"] = f"{LTD_BASE}/builds/44"
+    release_build["slug"] = "44"
+    release_build["bucket_root_dir"] = "pipelines/builds/44"
+    release_build["git_refs"] = ["15.2.1"]
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(200, json=release_edition)
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/44").mock(
+        return_value=httpx.Response(200, json=release_build)
+    )
+    source_objects["pipelines/builds/44/index.html"] = b"<html>15.2.1</html>"
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_rebuilt_release_reports_lag_on_aggregates(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aggregates a rebuilt release moves report the release's lag.
+
+    ``15`` and ``15.2`` advance onto the release's new build because LTD
+    rebuilt ``15.2.1``, so their publishes carry the release's
+    ``date_rebuilt`` just as the release's own does.
+    """
+    harness = await _prepare_restamp_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        seed_ltd=_seed_release_edition_ltd,
+    )
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    _rebuild_ltd_release_edition(mock_discovery, harness.source_objects)
+    publishes_before = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-2")
+    await harness.ctx["http_client"].aclose()
+
+    republished = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )[len(publishes_before) :]
+    rebuilt_by_slug = {
+        job.kwargs["payload"]["edition_slug"]: job.kwargs["payload"].get(
+            "ltd_date_rebuilt"
+        )
+        for job in republished
+    }
+    assert rebuilt_by_slug == {
+        "15.2.1": "2026-05-03T09:00:00+00:00",
+        "15.2": "2026-05-03T09:00:00+00:00",
+        "15": "2026-05-03T09:00:00+00:00",
+    }

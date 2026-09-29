@@ -33,6 +33,11 @@ from .services.dashboard_templates import (
     RenameEventProcessor,
     TemplateResolver,
 )
+from .services.default_branch import (
+    DefaultBranchService,
+    DuplicateDraftRetirer,
+)
+from .services.default_branch_processor import DefaultBranchEventProcessor
 from .services.edition import EditionService
 from .services.edition_publishing import EditionPublishingService
 from .services.edition_reconcile import EditionReconcileService
@@ -124,6 +129,7 @@ class WebhookDispatch:
     rename: RenameEventProcessor
     installation: InstallationEventProcessor
     ref_deleted: RefDeletedWebhookProcessor
+    default_branch: DefaultBranchEventProcessor
 
 
 class Factory:
@@ -389,12 +395,14 @@ class Factory:
     def create_github_ref_set_fetcher(self) -> GitHubRefSetFetcher:
         """Create a :class:`GitHubRefSetFetcher`.
 
-        Used by the daily ``git_ref_audit`` worker (PRD #346) and by
-        the proactive ``sync_project`` pre-fetch (PRD #332). Both
-        callers paginate ``git/matching-refs/{heads,tags}`` against
-        the shared ``httpx.AsyncClient`` and attach installation
-        auth per request, so the fetcher is built once per worker
-        tick and shared across per-project fan-out.
+        Used by the daily ``git_ref_audit`` worker (PRD #346), by
+        the proactive ``sync_project`` pre-fetch (PRD #332), and by
+        ``project_github_resolve`` when it first learns a project's
+        default branch (PRD #721). Every caller paginates
+        ``git/matching-refs/{heads,tags}`` against the shared
+        ``httpx.AsyncClient`` and attaches installation auth per
+        request, so the fetcher is built once per worker tick and
+        shared across per-project fan-out.
 
         Raises
         ------
@@ -749,6 +757,36 @@ class Factory:
             logger=self._logger,
         )
 
+    def create_default_branch_service(self) -> DefaultBranchService:
+        """Create the service converging ``__main`` on a default branch.
+
+        Shares this factory's queue dispatcher through the edition
+        service, so the ``publish_edition`` job a repoint defers is
+        handed to arq by the caller's post-commit ``dispatch()``.
+        """
+        return DefaultBranchService(
+            project_store=self.create_project_store(),
+            edition_store=self.create_edition_store(),
+            build_store=self.create_build_store(),
+            edition_service=self.create_edition_service(),
+            publishing_service=self.create_edition_publishing_service(),
+            lock_service=self.create_lock_service(),
+            logger=self._logger,
+        )
+
+    def create_duplicate_draft_retirer(self) -> DuplicateDraftRetirer:
+        """Create the retirer of drafts duplicating a converged ``__main``.
+
+        Keeper-sync's, for the visits whose own mapping moves a synced
+        ``__main`` onto the default branch. ``DefaultBranchService``
+        builds its own from the collaborators it already holds.
+        """
+        return DuplicateDraftRetirer(
+            edition_store=self.create_edition_store(),
+            edition_service=self.create_edition_service(),
+            publishing_service=self.create_edition_publishing_service(),
+        )
+
     def create_edition_publishing_service(self) -> EditionPublishingService:
         """Create an EditionPublishingService."""
         return EditionPublishingService(
@@ -902,12 +940,19 @@ class Factory:
             publishing_service=self.create_edition_publishing_service(),
             logger=self._logger,
         )
+        default_branch = DefaultBranchEventProcessor(
+            project_store=self.create_project_store(),
+            org_store=self.create_org_store(),
+            default_branch_service=self.create_default_branch_service(),
+            logger=self._logger,
+        )
         return WebhookDispatch(
             webhook_secret=webhook_secret.get_secret_value(),
             push=push,
             rename=rename,
             installation=installation,
             ref_deleted=ref_deleted,
+            default_branch=default_branch,
         )
 
     def create_dashboard_publisher(self) -> DashboardPublisher:
@@ -1241,6 +1286,10 @@ class Factory:
         ``on_build_copied`` is handed one report per build-content copy;
         the keeper-sync worker passes a hook that publishes it as a
         ``BuildContentCopiedEvent``.
+
+        Also wires a :class:`DuplicateDraftRetirer`, so a visit that moves
+        a synced ``__main`` onto the project's default branch retires the
+        ``draft`` tracking that branch, as the default-branch rule does.
         """
         ltd_client = self.create_ltd_client(base_url=ltd_base_url)
 
@@ -1302,6 +1351,7 @@ class Factory:
             lock_service=self.create_lock_service(),
             copy_retry_delay_seconds=self._keeper_sync_copy_retry_delay_seconds,
             on_build_copied=on_build_copied,
+            draft_retirer=self.create_duplicate_draft_retirer(),
         )
 
 

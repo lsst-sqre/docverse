@@ -695,6 +695,132 @@ async def test_update_github_metadata_skips_on_binding_change(
     assert after.github_installation_id is None
 
 
+async def _create_bound_project(
+    store: ProjectStore, org_store: OrganizationStore, *, slug: str
+) -> int:
+    """Create one GitHub-bound project and return its id."""
+    org_id = await _create_org(org_store)
+    created = await store.create(
+        org_id=org_id,
+        data=ProjectCreate(
+            slug=slug,
+            title=slug.replace("-", " ").title(),
+            github=ProjectGitHubBindingCreate(owner="acme", repo="repo"),
+        ),
+        github_owner="acme",
+        github_repo="repo",
+    )
+    return created.id
+
+
+@pytest.mark.asyncio
+async def test_set_github_default_branch_writes_and_advances_clock(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A new default branch is stored, reported, and moves the clock.
+
+    ``github.default_branch`` is on the project GET, so learning it is
+    a change a poller watching ``date_updated`` has to see (PRD #721).
+    """
+    async with db_session.begin():
+        project_id = await _create_bound_project(
+            store, org_store, slug="gdb-write"
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(project_id)
+    assert before is not None
+    assert before.github_default_branch is None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        changed = await store.set_github_default_branch(
+            project_id=project_id, value="master"
+        )
+        await db_session.commit()
+    assert changed is True
+
+    async with db_session.begin():
+        after = await store.get_by_id(project_id)
+    assert after is not None
+    assert after.github_default_branch == "master"
+    assert after.date_updated > baseline
+
+
+@pytest.mark.asyncio
+async def test_set_github_default_branch_same_value_pins_clock(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """Re-reporting the stored branch returns ``False`` and moves nothing.
+
+    The resolve worker and the daily audit both re-read the default
+    branch on every visit, so an unchanged value must not stamp
+    ``date_updated`` — that would hand every poller a phantom change.
+    """
+    async with db_session.begin():
+        project_id = await _create_bound_project(
+            store, org_store, slug="gdb-same"
+        )
+        await store.set_github_default_branch(
+            project_id=project_id, value="main"
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        before = await store.get_by_id(project_id)
+    assert before is not None
+    baseline = before.date_updated
+
+    await asyncio.sleep(0.05)
+    async with db_session.begin():
+        changed = await store.set_github_default_branch(
+            project_id=project_id, value="main"
+        )
+        await db_session.commit()
+    assert changed is False
+
+    async with db_session.begin():
+        after = await store.get_by_id(project_id)
+    assert after is not None
+    assert after.github_default_branch == "main"
+    assert after.date_updated == baseline
+
+
+@pytest.mark.asyncio
+async def test_set_github_default_branch_replaces_a_different_value(
+    db_session: AsyncSession,
+    store: ProjectStore,
+    org_store: OrganizationStore,
+) -> None:
+    """A rename (``master`` → ``main``) overwrites the stored value."""
+    async with db_session.begin():
+        project_id = await _create_bound_project(
+            store, org_store, slug="gdb-rename"
+        )
+        await store.set_github_default_branch(
+            project_id=project_id, value="master"
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        changed = await store.set_github_default_branch(
+            project_id=project_id, value="main"
+        )
+        await db_session.commit()
+    assert changed is True
+
+    async with db_session.begin():
+        after = await store.get_by_id(project_id)
+    assert after is not None
+    assert after.github_default_branch == "main"
+
+
 @pytest.mark.asyncio
 async def test_soft_delete(
     db_session: AsyncSession,

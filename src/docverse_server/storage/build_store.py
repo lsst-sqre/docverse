@@ -7,7 +7,7 @@ from typing import overload
 
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import Interval, select, update
+from sqlalchemy import Interval, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
@@ -421,6 +421,49 @@ class BuildStore:
         )
         return result.scalar_one_or_none()
 
+    async def get_latest_completed_for_ref(
+        self, *, project_id: int, git_ref: str
+    ) -> Build | None:
+        """Return the newest build a ``git_ref`` edition could serve now.
+
+        The default-branch convergence (PRD #721) uses this to repoint
+        ``__main`` the moment its tracked ref is rewritten, rather than
+        leaving it on the old branch's content until the next push.
+        That makes the candidate set narrower than
+        :meth:`get_latest_build_id_for_ref`'s, which answers the
+        supersession question and so counts a build still in flight:
+
+        - Only ``completed`` builds, since nothing else has content in
+          the object store an edition could point at.
+        - Only builds with no ``alternate_name``, since a plain
+          ``git_ref`` edition never matches a deployment-scoped build
+          (``EditionStore._edition_matches``).
+        - Soft-deleted rows excluded, as there.
+
+        "Newest" is by ``date_created`` (then ``id``), the column the
+        stale-build guard in
+        :meth:`~docverse_server.storage.edition_store.EditionStore.set_current_build`
+        compares, rather than by ``id``: keeper-sync re-stamps an
+        imported build's ``date_created`` from LTD, so insertion order
+        is not date order on a migrated project.
+        """
+        result = await self._session.execute(
+            select(SqlBuild)
+            .where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.git_ref == git_ref,
+                SqlBuild.alternate_name.is_(None),
+                SqlBuild.status == BuildStatus.completed,
+                SqlBuild.date_deleted.is_(None),
+            )
+            .order_by(SqlBuild.date_created.desc(), SqlBuild.id.desc())
+            .limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return Build.model_validate(row)
+
     async def list_by_project(
         self,
         project_id: int,
@@ -789,6 +832,60 @@ class BuildStore:
         await self._session.flush()
         await self._session.refresh(row)
         return Build.model_validate(row)
+
+    async def set_sync_dates(
+        self,
+        build_id: int,
+        *,
+        date_created: datetime,
+        date_completed: datetime,
+    ) -> bool:
+        """Stamp a build's clock with explicit values (PRD #706).
+
+        Keeper-sync's way of making a synced build carry LTD's build
+        date instead of the moment Docverse imported it: the
+        ``date_created`` server default and the completion stamp
+        :meth:`transition_status` writes both record the import. The
+        values are written verbatim; deciding *which* value a build
+        should carry is the caller's job.
+
+        ``IS DISTINCT FROM`` in the ``WHERE`` makes the stamp a
+        compare-and-set, like
+        :meth:`~docverse_server.storage.edition_store.EditionStore.set_sync_dates`:
+        a row that already carries both values matches nothing, so a
+        steady-state sync visit writes no row version. Unlike the
+        edition stamp, this one writes any value, later ones included;
+        the caller's earlier-only rule for a build shared by several
+        LTD builds is applied before the call.
+
+        Parameters
+        ----------
+        build_id
+            The build to stamp.
+        date_created
+            The value for ``date_created``; timezone-aware.
+        date_completed
+            The value for ``date_completed``; timezone-aware.
+
+        Returns
+        -------
+        bool
+            ``True`` if the row changed, ``False`` if it already
+            carried both values or does not exist.
+        """
+        result = await self._session.execute(
+            update(SqlBuild)
+            .where(
+                SqlBuild.id == build_id,
+                or_(
+                    SqlBuild.date_created.is_distinct_from(date_created),
+                    SqlBuild.date_completed.is_distinct_from(date_completed),
+                ),
+            )
+            .values(date_created=date_created, date_completed=date_completed)
+            .returning(SqlBuild.id)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def soft_delete(self, *, build_id: int) -> bool:
         """Soft-delete a build by setting date_deleted.

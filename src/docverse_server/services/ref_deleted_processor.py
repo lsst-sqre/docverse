@@ -14,6 +14,7 @@ from docverse_server.services.edition import EditionService
 from docverse_server.services.edition_publishing import (
     EditionPublishingService,
 )
+from docverse_server.services.github_payload import repository_coordinates
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import TombstoneReason
 from docverse_server.storage.organization_store import OrganizationStore
@@ -113,27 +114,16 @@ class RefDeletedWebhookProcessor:
         discipline as the existing push and rename processors: a
         missing or wrong-shape field logs a warning and returns an
         empty result so the handler can still answer 200 to GitHub.
+        The ``repository`` block is read by
+        :func:`~docverse_server.services.github_payload.repository_coordinates`,
+        so a block reaches the same projects here as it does for
+        ``repository.edited``.
         """
         ref_type = payload.get("ref_type")
         ref = payload.get("ref")
-        repo = payload.get("repository") or {}
-        owner_block = repo.get("owner") if isinstance(repo, Mapping) else None
-        if not isinstance(owner_block, Mapping):
-            owner_block = {}
-        fallback_owner, fallback_repo = _split_full_name_tuple(
-            repo.get("full_name") if isinstance(repo, Mapping) else None
-        ) or (None, None)
-        owner = (
-            owner_block.get("login")
-            or owner_block.get("name")
-            or fallback_owner
-        )
-        repo_name = (
-            repo.get("name") if isinstance(repo, Mapping) else None
-        ) or fallback_repo
-        repo_id = (
-            _coerce_int(repo.get("id")) if isinstance(repo, Mapping) else None
-        )
+        coordinates = repository_coordinates(payload.get("repository"))
+        owner, repo_name = coordinates.owner, coordinates.name
+        repo_id = coordinates.repo_id
 
         if not isinstance(ref_type, str) or ref_type not in _BRANCH_OR_TAG:
             self._logger.info(
@@ -286,25 +276,3 @@ class RefDeletedWebhookProcessor:
             return None
         cache[org_id] = org.slug
         return org.slug
-
-
-def _split_full_name_tuple(full_name: object) -> tuple[str, str] | None:
-    if isinstance(full_name, str) and "/" in full_name:
-        owner, repo = full_name.split("/", 1)
-        return owner, repo
-    return None
-
-
-def _coerce_int(value: object) -> int | None:
-    """Return ``value`` as ``int`` when it is a non-bool int, else ``None``.
-
-    Mirrors :func:`docverse_server.services.dashboard_templates.push_processor
-    ._coerce_int`: GitHub webhooks send numeric IDs as JSON ints, but the
-    ``isinstance(True, int)`` quirk would otherwise leak a truth value
-    through as the repo id.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    return None

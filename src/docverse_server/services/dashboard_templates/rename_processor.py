@@ -7,6 +7,7 @@ from typing import Any
 
 import structlog
 
+from docverse_server.services.github_payload import coerce_int
 from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingStore,
     DashboardGitHubTemplateStore,
@@ -58,7 +59,7 @@ class RenameEventProcessor:
         cannot reach them.
         """
         repo = payload.get("repository", {})
-        repo_id = _coerce_int(repo.get("id"))
+        repo_id = coerce_int(repo.get("id"))
         new_repo = repo.get("name")
         owner_block = repo.get("owner", {})
         owner = owner_block.get("login") or owner_block.get("name")
@@ -126,11 +127,11 @@ class RenameEventProcessor:
         for the transfer to land on it.
         """
         repo = payload.get("repository", {})
-        repo_id = _coerce_int(repo.get("id"))
+        repo_id = coerce_int(repo.get("id"))
         new_repo = repo.get("name")
         owner_block = repo.get("owner", {})
         new_owner = owner_block.get("login") or owner_block.get("name")
-        new_owner_id = _coerce_int(owner_block.get("id"))
+        new_owner_id = coerce_int(owner_block.get("id"))
 
         if repo_id is None or not isinstance(new_owner, str):
             self._logger.warning(
@@ -187,7 +188,7 @@ class RenameEventProcessor:
         un-synced bindings matching the old login.
         """
         org_block = payload.get("organization", {})
-        org_id = _coerce_int(org_block.get("id"))
+        org_id = coerce_int(org_block.get("id"))
         new_login = org_block.get("login")
         old_login = payload.get("changes", {}).get("login", {}).get("from")
 
@@ -226,18 +227,3 @@ class RenameEventProcessor:
             templates_updated=len(template_ids),
             bindings_updated_unsynced=len(unsynced_ids),
         )
-
-
-def _coerce_int(value: object) -> int | None:
-    """Return ``value`` as ``int`` when it is a non-bool int, else ``None``.
-
-    Mirrors the strict guard in :class:`PushEventProcessor`: GitHub
-    sends numeric IDs as JSON ints, but a malformed payload that sent
-    ``"id": true`` would otherwise leak ``1`` through as a real id
-    because ``isinstance(True, int)`` is ``True`` in Python.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    return None

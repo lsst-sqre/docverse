@@ -5,21 +5,27 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
+from datetime import timedelta
 from typing import Any
 
 import pytest
 import pytest_asyncio
 import structlog
 from fastapi import FastAPI
+from gidgethub import sansio
 from httpx import AsyncClient
 from pydantic import SecretStr
 from safir.arq import MockArqQueue
 from safir.dependencies.arq import arq_dependency
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 
 from docverse.models import OrganizationCreate
 from docverse_server.dependencies.context import context_dependency
+from docverse_server.handlers.webhooks import github as github_webhooks
+from docverse_server.metrics import GitHubWebhookReceivedEvent, WebhookOutcome
+from docverse_server.services.dashboard_templates import PushEventProcessor
 from docverse_server.storage.dashboard_templates.github import (
     DashboardGitHubTemplateBindingCreate,
     DashboardGitHubTemplateBindingStore,
@@ -68,6 +74,25 @@ async def github_app_enabled(
             private_key=saved[1],
             webhook_secret=saved[2],
         )
+
+
+def _received_events() -> list[GitHubWebhookReceivedEvent]:
+    """Return the ``github_webhook_received`` events recorded so far.
+
+    The ``app`` fixture clears the mock publishers before each test, so
+    this is exactly the current test's deliveries.
+    """
+    publisher = context_dependency.events.github_webhook_received
+    assert isinstance(publisher, MockEventPublisher)
+    return list(publisher.published)
+
+
+def _assert_timed(event: GitHubWebhookReceivedEvent) -> None:
+    """Assert that a recorded delivery measured its ``elapsed`` time.
+
+    ``elapsed`` is measured on every path, whatever the outcome.
+    """
+    assert event.elapsed > timedelta(0)
 
 
 def _push_payload(
@@ -405,3 +430,407 @@ async def test_post_signed_unrelated_event_is_no_op(
     assert response.status_code == 200
     after = count_jobs_by_name(arq_queue, "dashboard_sync")
     assert after == before
+
+
+@pytest.mark.asyncio
+async def test_delivery_records_anonymous_api_request(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """A delivery is one ``api_request`` with no caller and no org.
+
+    GitHub posts without passing through Gafaelfawr, so the event is
+    unauthenticated, and the webhook route names no organization or
+    project for the event to be sliced by.
+    """
+    publisher = context_dependency.events.api_request
+    assert isinstance(publisher, MockEventPublisher)
+    publisher.published.clear()
+    body = json.dumps({"zen": "Speak like a human."}).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "ping",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000002",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.method == "POST"
+    assert event.route == "/webhooks/github"
+    assert event.status_code == 200
+    assert event.authenticated is False
+    assert event.organization is None
+    assert event.project is None
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_delivery_records_not_configured(
+    client: AsyncClient,
+) -> None:
+    """A delivery to an unconfigured deployment is one ``not_configured``.
+
+    The header is unverifiable without a webhook secret, so the event
+    names no event type, and the 404 is unchanged.
+    """
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=b"{}",
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000010",
+        },
+    )
+
+    assert response.status_code == 404
+    events = _received_events()
+    assert len(events) == 1
+    event = events[0]
+    assert event.outcome == WebhookOutcome.not_configured
+    assert event.event_type is None
+    assert event.jobs_enqueued == 0
+    assert event.github_repository is None
+    _assert_timed(event)
+
+
+@pytest.mark.asyncio
+async def test_bad_signature_records_invalid_signature(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """A delivery whose HMAC does not verify is one ``invalid_signature``.
+
+    Neither the header nor the payload of an unverified delivery is
+    trusted, so the event names no event type and no repository, and
+    the 401 is unchanged.
+    """
+    body = json.dumps(_push_payload()).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000011",
+            "X-Hub-Signature-256": _sign("wrong-secret", body),
+        },
+    )
+
+    assert response.status_code == 401
+    events = _received_events()
+    assert len(events) == 1
+    event = events[0]
+    assert event.outcome == WebhookOutcome.invalid_signature
+    assert event.event_type is None
+    assert event.jobs_enqueued == 0
+    assert event.github_repository is None
+    _assert_timed(event)
+
+
+@pytest.mark.asyncio
+async def test_unsubscribed_event_records_ignored(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """A signed ``ping`` no callback subscribes to is one ``ignored``.
+
+    The delivery is still answered 200 so GitHub does not redeliver it,
+    and a ``ping`` names no repository.
+    """
+    body = json.dumps({"zen": "Speak like a human."}).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "ping",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000012",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+
+    assert response.status_code == 200
+    events = _received_events()
+    assert len(events) == 1
+    event = events[0]
+    assert event.outcome == WebhookOutcome.ignored
+    assert event.event_type == "ping"
+    assert event.jobs_enqueued == 0
+    assert event.github_repository is None
+    _assert_timed(event)
+
+
+@pytest.mark.asyncio
+async def test_bound_push_records_dispatched_with_jobs_enqueued(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """A signed push matching a binding is one ``dispatched`` event.
+
+    ``jobs_enqueued`` is the number of ``dashboard_sync`` jobs the push
+    landed on the queue, and ``github_repository`` is the payload's
+    ``owner/repo``.
+    """
+    arq_queue = arq_dependency._arq_queue
+    assert isinstance(arq_queue, MockArqQueue)
+    before = count_jobs_by_name(arq_queue, "dashboard_sync")
+    await _seed_binding(root_path="/")
+    body = json.dumps(
+        _push_payload(changed_files=["templates/blue/dashboard.html.jinja"])
+    ).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000013",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+
+    assert response.status_code == 200
+    enqueued = count_jobs_by_name(arq_queue, "dashboard_sync") - before
+    assert enqueued == 1
+    events = _received_events()
+    assert len(events) == 1
+    event = events[0]
+    assert event.outcome == WebhookOutcome.dispatched
+    assert event.event_type == "push"
+    assert event.jobs_enqueued == enqueued
+    assert event.github_repository == "acme/templates"
+    _assert_timed(event)
+
+
+@pytest.mark.asyncio
+async def test_dispatched_delivery_matches_its_callbacks_once(
+    client: AsyncClient,
+    github_app_enabled: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dispatched delivery is matched against the router exactly once.
+
+    The handler matches the event to tell a subscribed delivery from an
+    ignored one, then runs the callbacks that match found, rather than
+    handing the event to ``Router.dispatch`` to be matched a second time.
+    """
+    event_router = github_webhooks._event_router
+    fetch = event_router.fetch
+    matched: list[str] = []
+
+    def _counting_fetch(event: sansio.Event) -> frozenset[Any]:
+        matched.append(event.event)
+        return fetch(event)
+
+    monkeypatch.setattr(event_router, "fetch", _counting_fetch)
+    await _seed_binding(root_path="/")
+    body = json.dumps(
+        _push_payload(changed_files=["templates/blue/dashboard.html.jinja"])
+    ).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000017",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+
+    assert response.status_code == 200
+    assert matched == ["push"]
+    events = _received_events()
+    assert len(events) == 1
+    assert events[0].outcome == WebhookOutcome.dispatched
+    assert events[0].jobs_enqueued == 1
+
+
+@pytest.mark.asyncio
+async def test_failing_callback_records_error(
+    client: AsyncClient,
+    github_app_enabled: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A callback that raises is one ``error`` event, then re-raises.
+
+    The exception still escapes the handler unchanged, so the 500 and
+    Sentry's capture of it are what they were before the event existed.
+    In this ASGI-transport rig the uncaught exception bubbles up through
+    ``httpx`` rather than becoming a response, hence ``pytest.raises``.
+    """
+
+    async def _fail(
+        self: PushEventProcessor, payload: Mapping[str, Any]
+    ) -> None:
+        _ = (self, payload)
+        msg = "push processing failed"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(PushEventProcessor, "process", _fail)
+    body = json.dumps(_push_payload()).encode("utf-8")
+
+    with pytest.raises(RuntimeError, match="push processing failed"):
+        await client.post(
+            _WEBHOOK_PATH,
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000014",
+                "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+            },
+        )
+
+    events = _received_events()
+    assert len(events) == 1
+    event = events[0]
+    assert event.outcome == WebhookOutcome.error
+    assert event.event_type == "push"
+    assert event.jobs_enqueued == 0
+    assert event.github_repository == "acme/templates"
+    _assert_timed(event)
+
+
+_SIGNED_JSON_HEADERS = {
+    "Content-Type": "application/json",
+    "X-GitHub-Event": "push",
+    "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000015",
+}
+"""The headers of a well-formed push delivery, less its signature."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param(
+            {**_SIGNED_JSON_HEADERS, "Content-Type": "text/plain"},
+            id="content-type-neither-json-nor-form",
+        ),
+        pytest.param(
+            {
+                **_SIGNED_JSON_HEADERS,
+                "Content-Type": "application/json; charset=no-such-codec",
+            },
+            id="unknown-charset",
+        ),
+        pytest.param(
+            {
+                key: value
+                for key, value in _SIGNED_JSON_HEADERS.items()
+                if key != "X-GitHub-Event"
+            },
+            id="missing-x-github-event",
+        ),
+        pytest.param(
+            {
+                key: value
+                for key, value in _SIGNED_JSON_HEADERS.items()
+                if key != "X-GitHub-Delivery"
+            },
+            id="missing-x-github-delivery",
+        ),
+    ],
+)
+async def test_unparseable_signed_delivery_records_malformed(
+    client: AsyncClient,
+    github_app_enabled: None,
+    headers: dict[str, str],
+) -> None:
+    """A signed delivery gidgethub cannot parse is one ``malformed`` event.
+
+    The caller's mistake is answered 400 rather than raised as a 500, so
+    it does not land under ``error``, which an operator alerts on. With
+    no event parsed, the event names no event type or repository.
+    """
+    body = json.dumps(_push_payload()).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            **headers,
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+
+    assert response.status_code == 400
+    events = _received_events()
+    assert len(events) == 1
+    event = events[0]
+    assert event.outcome == WebhookOutcome.malformed
+    assert event.event_type is None
+    assert event.jobs_enqueued == 0
+    assert event.github_repository is None
+    _assert_timed(event)
+
+
+@pytest.mark.asyncio
+async def test_unsigned_unparseable_delivery_records_invalid_signature(
+    client: AsyncClient,
+    github_app_enabled: None,
+) -> None:
+    """An unsigned request of any shape is ``invalid_signature``.
+
+    gidgethub checks the signature before it parses anything, so a
+    scanner posting a form or plain text without a signature is refused
+    401, never counted as ``malformed``.
+    """
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=b"x=1",
+        headers={"Content-Type": "text/plain"},
+    )
+
+    assert response.status_code == 401
+    events = _received_events()
+    assert len(events) == 1
+    assert events[0].outcome == WebhookOutcome.invalid_signature
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_does_not_change_the_response(
+    client: AsyncClient,
+    github_app_enabled: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metrics backend that raises never fails a delivery.
+
+    The event is best-effort: its publish error is logged and swallowed,
+    so the delivery is answered exactly as it would be without metrics.
+    """
+    publisher = context_dependency.events.github_webhook_received
+
+    async def _fail(payload: GitHubWebhookReceivedEvent) -> None:
+        _ = payload
+        msg = "metrics backend down"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(publisher, "publish", _fail)
+    body = json.dumps({"zen": "Speak like a human."}).encode("utf-8")
+
+    response = await client.post(
+        _WEBHOOK_PATH,
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-GitHub-Event": "ping",
+            "X-GitHub-Delivery": "00000000-0000-0000-0000-000000000016",
+            "X-Hub-Signature-256": _sign(_WEBHOOK_SECRET, body),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}

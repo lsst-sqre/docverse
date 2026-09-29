@@ -38,6 +38,11 @@ What follows the order, and how:
 - :meth:`~docverse_server.storage.project_store.ProjectStore.soft_delete`
   cascades in this order already, which is what makes it safe for it to
   end up holding all three.
+- ``KeeperSyncService._stamp_ltd_clock``, keeper-sync's end-of-visit
+  clock transaction (PRD #706), stamps its ``editions`` rows — a
+  release's semver aggregates, then the release itself, the slug order
+  ``track_build`` takes them in — before the build row the edition's
+  LTD build maps to, and never the project.
 
 **Composite writers** — the transactions that write ``builds`` or other
 ``editions`` rows *around* a repoint — cannot get the order from
@@ -64,6 +69,8 @@ else.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -72,7 +79,7 @@ from safir.database import (
     CountedPaginatedQueryRunner,
     PaginationCursor,
 )
-from sqlalchemy import ColumnElement, Select, select, update
+from sqlalchemy import ColumnElement, Select, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -96,6 +103,7 @@ from docverse_server.domain.edition import (
     RepointOutcome,
 )
 from docverse_server.domain.edition_reconcile import ReconcileEdition
+from docverse_server.domain.project import FALLBACK_DEFAULT_BRANCH
 from docverse_server.domain.version import (
     EupsDailyVersion,
     EupsMajorVersion,
@@ -881,6 +889,43 @@ class EditionStore:
         )
         return list(result.scalars().all())
 
+    async def list_by_slugs_on_build(
+        self,
+        *,
+        project_id: int,
+        slugs: Sequence[str],
+        build_id: int,
+    ) -> list[Edition]:
+        """List a project's live editions among *slugs* serving a build.
+
+        Keeper-sync's lookup of the semver aggregates (``15``,
+        ``15.2``) a synced release's build backs, so their clocks can
+        follow the release's (PRD #706): one indexed ``SELECT`` over at
+        most a couple of named slugs, not a scan of the project. Slug
+        matching is case-insensitive, as in :meth:`get_by_slug`, and an
+        edition on any other build is left out.
+
+        Returned in slug order, the order ``track_build`` locks
+        co-matching rows in.
+        """
+        if not slugs:
+            return []
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id == project_id,
+                func.lower(SqlEdition.slug).in_([s.lower() for s in slugs]),
+                SqlEdition.current_build_id == build_id,
+                SqlEdition.date_deleted.is_(None),
+            )
+            .order_by(SqlEdition.slug)
+        )
+        result = await self._session.execute(stmt)
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in result.all()
+        ]
+
     async def list_org_editions_for_reconcile(
         self, *, org_id: int
     ) -> list[ReconcileEdition]:
@@ -996,16 +1041,41 @@ class EditionStore:
     async def set_publish_status(
         self, *, edition_id: int, status: PublishStatus
     ) -> None:
-        """Set the ``publish_status`` column on an edition row."""
+        """Set the ``publish_status`` column on an edition row.
+
+        Leaves ``date_updated`` where it was. A status flip moves no
+        content — the repoint that enqueued the publish already moved
+        the clock — so it must not read back as a change. That matters
+        most for a keeper-synced edition (PRD #706): its import visit
+        stamps LTD's dates last, and the publish that visit enqueues
+        then flips this column three times before the
+        ``dashboard_build`` it cascades renders the edition's clock.
+
+        Written as a core ``UPDATE`` that pins ``date_updated`` to its
+        own value, because only a column the statement names escapes
+        the ORM's ``onupdate=now()``, and ORM attribute assignment
+        cannot name one it does not change. See the note on
+        ``SqlDashboardGitHubTemplateBinding.date_updated`` for the
+        idiom.
+
+        Raises
+        ------
+        RuntimeError
+            If no edition row has *edition_id*.
+        """
         result = await self._session.execute(
-            select(SqlEdition).where(SqlEdition.id == edition_id)
+            update(SqlEdition)
+            .where(SqlEdition.id == edition_id)
+            .values(
+                publish_status=status.value,
+                # Pinned: publishing is not a content change.
+                date_updated=SqlEdition.date_updated,
+            )
+            .returning(SqlEdition.id)
         )
-        row = result.scalar_one_or_none()
-        if row is None:
+        if result.scalar_one_or_none() is None:
             msg = f"Edition id={edition_id} not found"
             raise RuntimeError(msg)
-        row.publish_status = status.value
-        await self._session.flush()
 
     async def set_alternate_name(
         self, *, edition_id: int, alternate_name: str
@@ -1020,6 +1090,87 @@ class EditionStore:
             raise RuntimeError(msg)
         row.alternate_name = alternate_name
         await self._session.flush()
+
+    async def set_sync_dates(
+        self,
+        edition_id: int,
+        *,
+        date_created: datetime,
+        date_updated: datetime,
+    ) -> bool:
+        """Move an edition's clock back to explicit values (PRD #706).
+
+        Keeper-sync's way of making a synced edition carry LTD's history
+        instead of the moment Docverse imported it. Both columns are
+        named in the ``SET`` clause, which is what keeps the ORM's
+        ``onupdate=now()`` on ``date_updated`` from applying: that
+        default fills only a column a statement leaves out. The
+        converse is why the caller stamps *last* — every later ORM
+        write to the row (a repoint, a kind convergence) leaves
+        ``date_updated`` out and so moves it back to now.
+        :meth:`set_publish_status` is the exception: it pins the column,
+        so the publish a visit enqueues does not undo its stamp.
+
+        The stamp only ever moves a date *earlier*: each column becomes
+        the ``LEAST`` of its current value and the given one, and ``>``
+        in the ``WHERE`` makes it a compare-and-set, so a row already
+        at or before both values matches nothing and a steady-state
+        sync visit writes no row version. A row several LTD editions
+        resolve to is why — ``KeeperSyncService._ensure_edition`` lands
+        a ``git_refs`` edition and a ``manual`` one pinned to a build of
+        the same ref on one row, and so does ``get_by_slug`` for two LTD
+        slugs that differ only in case. Stamped verbatim, each visit
+        would overwrite the others' dates, so the clock would flip and
+        the row report a restamp on every poll forever; earlier-only,
+        the row settles on the earliest of their dates, column by
+        column, and later visits write nothing.
+
+        Earlier-only still undoes every drift the stamp exists for: the
+        import moment, a repoint, and a kind convergence all move
+        ``date_updated`` to now, later than any LTD date. An LTD
+        rebuild still moves the clock forward, because ``sync_build``'s
+        repoint onto the rebuilt content first moves ``date_updated`` to
+        now, and the rebuilding edition's stamp then lowers it to the
+        new ``date_rebuilt``. A rebuild whose bytes converge onto the
+        build the row already serves moves no pointer, and so no clock:
+        its content is no newer than before.
+
+        ``projects.date_updated`` is deliberately left alone. The
+        project clock means "the content behind this project moved" to
+        a consumer polling with ``updated_since`` (PRD #634), and
+        re-dating an edition's history moves no content.
+
+        Parameters
+        ----------
+        edition_id
+            The edition to stamp.
+        date_created
+            The latest value ``date_created`` may keep; timezone-aware.
+        date_updated
+            The latest value ``date_updated`` may keep; timezone-aware.
+
+        Returns
+        -------
+        bool
+            ``True`` if the row changed, ``False`` if it already carried
+            both values or earlier ones, or does not exist.
+        """
+        result = await self._session.execute(
+            update(SqlEdition)
+            .where(
+                SqlEdition.id == edition_id,
+                or_(
+                    SqlEdition.date_created > date_created,
+                    SqlEdition.date_updated > date_updated,
+                ),
+            )
+            .values(
+                date_created=func.least(SqlEdition.date_created, date_created),
+                date_updated=func.least(SqlEdition.date_updated, date_updated),
+            )
+            .returning(SqlEdition.id)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def soft_delete(
         self,
@@ -1239,11 +1390,26 @@ class EditionStore:
         project_id: int,
         git_ref: str,
         alternate_name: str | None = None,
+        default_branch: str = FALLBACK_DEFAULT_BRANCH,
     ) -> list[Edition]:
         """Find editions that match a git_ref or alternate_name.
 
         Used by the build processing worker to determine which editions
         should be updated when a build completes.
+
+        Parameters
+        ----------
+        project_id
+            Internal id of the project whose editions are searched.
+        git_ref
+            The build's git ref.
+        alternate_name
+            The build's alternate (deployment) scope, if any.
+        default_branch
+            The project's default branch — its
+            ``github_default_branch``, or the ``main`` fallback when
+            that is unknown. An ``lsst_doc`` edition treats a build on
+            this branch as its pre-release ref.
         """
         conditions = [
             SqlEdition.project_id == project_id,
@@ -1259,7 +1425,12 @@ class EditionStore:
             edition = self._validate(
                 edition_row, build_public_id, build_git_ref
             )
-            if self._edition_matches(edition, git_ref, alternate_name):
+            if self._edition_matches(
+                edition,
+                git_ref,
+                alternate_name,
+                default_branch=default_branch,
+            ):
                 matching.append(edition)
 
         return matching
@@ -1269,6 +1440,8 @@ class EditionStore:
         edition: Edition,
         git_ref: str,
         alternate_name: str | None,
+        *,
+        default_branch: str,
     ) -> bool:
         """Test whether *edition* matches the given git ref."""
         mode = edition.tracking_mode
@@ -1301,7 +1474,9 @@ class EditionStore:
             return EupsDailyVersion.parse(git_ref) is not None
 
         if mode == TrackingMode.lsst_doc:
-            return _lsst_doc_matches(edition, git_ref)
+            return _lsst_doc_matches(
+                edition, git_ref, default_branch=default_branch
+            )
 
         return False
 
@@ -1325,11 +1500,19 @@ def _semver_matches(
     )
 
 
-def _lsst_doc_matches(edition: Edition, git_ref: str) -> bool:
-    """Check whether *git_ref* matches an lsst_doc edition."""
+def _lsst_doc_matches(
+    edition: Edition, git_ref: str, *, default_branch: str
+) -> bool:
+    """Check whether *git_ref* matches an lsst_doc edition.
+
+    Any ``vX.Y`` release tag matches. The project's *default_branch* is
+    the pre-release fallback: it matches only while the edition has no
+    build or is still serving that same branch, so a release, once
+    published, is never displaced by the branch.
+    """
     if LsstDocVersion.parse(git_ref) is not None:
         return True
-    return git_ref == "main" and (
+    return git_ref == default_branch and (
         edition.current_build_id is None
-        or edition.current_build_git_ref == "main"
+        or edition.current_build_git_ref == default_branch
     )

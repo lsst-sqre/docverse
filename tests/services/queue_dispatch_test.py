@@ -146,3 +146,28 @@ async def test_dispatch_failure_leaves_an_orphan_shaped_row(
     assert row is not None
     assert row.status == JobStatus.queued
     assert row.backend_job_id is None
+
+
+@pytest.mark.asyncio
+async def test_discard_drops_pending_without_enqueueing(
+    app: None, db_session: AsyncSession
+) -> None:
+    """``discard`` forgets deferrals, so a later ``dispatch`` skips them.
+
+    The caller's transaction rolled back and took the deferred rows with
+    it; handing arq those jobs on the next ``dispatch`` would deliver a
+    job whose row a worker can never find.
+    """
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    _, job = await _seed_job(db_session, slug="qd-discard")
+    dispatcher = make_dispatcher(db_session, arq_queue=arq_queue)
+
+    dispatcher.defer(
+        queue_job=job, job_type="dashboard_build", payload={"org_id": 1}
+    )
+    (discarded,) = dispatcher.discard()
+
+    assert discarded.queue_job_id == job.id
+    assert dispatcher.pending == ()
+    assert await dispatcher.dispatch() == []
+    assert get_jobs_by_name(arq_queue, "dashboard_build") == []
