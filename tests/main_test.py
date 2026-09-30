@@ -5,7 +5,9 @@ These exercise the integration of the GitHub App startup validator
 real FastAPI lifespan. The validator itself is unit-tested in
 ``tests/storage/github/startup_test.py`` — this file confirms that the
 lifespan calls it and that the resulting ``context_dependency`` state
-makes the webhook endpoint behave correctly.
+makes the webhook endpoint behave correctly. The last tests confirm the
+lifespan starts the opt-in memory sampler (PRD #753) only when
+configured, and stops it on exit.
 
 Every test here runs the real lifespan itself, whose shutdown closes
 process-global dependencies. They therefore take the ``own_app_lifespan``
@@ -15,7 +17,9 @@ and shutdowns cannot hollow it out for the rest of the session.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+import asyncio
+from collections.abc import AsyncGenerator, MutableMapping
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -218,3 +222,66 @@ async def test_lifespan_skips_validation_when_secrets_unset(
         if call.request.url.path == "/app"
     ]
     assert app_calls == []
+
+
+def _memory_sampler_tasks() -> list[asyncio.Task[Any]]:
+    """Return the memory-sampler tasks still running on this event loop."""
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith("memory-sampler-") and not task.done()
+    ]
+
+
+async def _wait_for_memory_sample(
+    captured: list[MutableMapping[str, Any]],
+) -> MutableMapping[str, Any]:
+    """Wait for the first ``"Memory sample"`` line; fail after 5 s."""
+    async with asyncio.timeout(5):
+        while True:
+            for entry in captured:
+                if entry["event"] == "Memory sample":
+                    return entry
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_runs_no_memory_sampler_by_default(
+    own_app_lifespan: None,
+) -> None:
+    """With memory diagnostics unset the API samples and logs nothing."""
+    assert config.memory_diagnostics_enabled is False
+    with capture_logs() as captured:
+        async with LifespanManager(docverse_app):
+            _override_arq_and_user_info()
+            await asyncio.sleep(0.05)
+            tasks = _memory_sampler_tasks()
+
+    assert tasks == []
+    assert not [e for e in captured if str(e["event"]).startswith("Memory")]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_runs_a_memory_sampler_when_enabled(
+    own_app_lifespan: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabled, the API samples as ``api`` until the lifespan exits."""
+    monkeypatch.setattr(config, "memory_diagnostics_enabled", True)
+    monkeypatch.setattr(config, "memory_diagnostics_interval_seconds", 1)
+
+    with capture_logs() as captured:
+        async with LifespanManager(docverse_app):
+            _override_arq_and_user_info()
+            [task] = _memory_sampler_tasks()
+            sample = await _wait_for_memory_sample(captured)
+
+    [enabled] = [
+        e for e in captured if e["event"] == "Memory diagnostics enabled"
+    ]
+    assert enabled["component"] == "api"
+    assert enabled["interval_seconds"] == 1
+    assert sample["component"] == "api"
+    assert "rss_peak_bytes" in sample
+    assert task.done()
+    assert _memory_sampler_tasks() == []
