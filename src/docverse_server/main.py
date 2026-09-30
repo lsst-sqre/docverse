@@ -23,6 +23,7 @@ from safir.slack.webhook import SlackRouteErrorHandler
 from .config import config
 from .database import get_current_revision
 from .dependencies.context import context_dependency
+from .diagnostics.memory import start_memory_sampler, stop_memory_sampler
 from .handlers.admin import admin_router
 from .handlers.internal import internal_router
 from .handlers.orgs import orgs_router
@@ -67,6 +68,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "Docverse startup",
         app_version=version("docverse-server"),
         db_revision=db_revision,
+    )
+    # Off unless ``memory_diagnostics_enabled`` (PRD #753); started
+    # before the clients below so that, with tracemalloc on, their
+    # allocations are traced too.
+    memory_sampler = await start_memory_sampler(
+        config, component="api", logger=logger
     )
 
     await db_session_dependency.initialize(
@@ -122,6 +129,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     context_dependency.set_github_app_html_url(github_app_html_url)
     yield
+    if memory_sampler is not None:
+        await stop_memory_sampler(memory_sampler, logger=logger)
     await context_dependency.aclose()
     await event_manager.aclose()
     await http_client_dependency.aclose()

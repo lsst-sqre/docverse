@@ -24,10 +24,13 @@ import pytest
 import structlog
 from structlog.testing import capture_logs
 
+from docverse_server.config import Configuration
 from docverse_server.diagnostics import memory
 from docverse_server.diagnostics.memory import (
     MemorySampler,
     read_memory_sample,
+    start_memory_sampler,
+    stop_memory_sampler,
 )
 
 #: A trimmed ``/proc/self/status`` as a Linux kernel prints it.
@@ -488,3 +491,130 @@ async def test_announcement_reports_tracing_already_on() -> None:
     [enabled] = _events(captured, "Memory diagnostics enabled")
     assert enabled["tracemalloc_enabled"] is True
     assert enabled["tracemalloc_frames"] == 1
+
+
+def _config(**settings: Any) -> Configuration:
+    """Build a configuration with the given memory-diagnostics settings."""
+    return Configuration(
+        **{
+            f"memory_diagnostics_{key}": value
+            for key, value in settings.items()
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_memory_sampler_applies_the_configuration() -> None:
+    """Each ``memory_diagnostics_*`` setting reaches the running sampler."""
+    config = _config(
+        enabled=True,
+        interval_seconds=3600,
+        tracemalloc_enabled=True,
+        tracemalloc_frames=3,
+        top_n=4,
+    )
+    with capture_logs() as captured:
+        sampler = await start_memory_sampler(
+            config,
+            component="api",
+            logger=structlog.get_logger("docverse_server.diagnostics.test"),
+        )
+        assert sampler is not None
+        try:
+            assert tracemalloc.is_tracing()
+            assert tracemalloc.get_traceback_limit() == 3
+            [sample] = await _wait_for_samples(captured, 1)
+        finally:
+            await stop_memory_sampler(
+                sampler,
+                logger=structlog.get_logger(
+                    "docverse_server.diagnostics.test"
+                ),
+            )
+
+    [enabled] = _events(captured, "Memory diagnostics enabled")
+    assert enabled["component"] == "api"
+    assert enabled["interval_seconds"] == 3600
+    assert enabled["tracemalloc_enabled"] is True
+    assert enabled["tracemalloc_frames"] == 3
+    assert enabled["top_n"] == 4
+    assert sample["component"] == "api"
+    assert len(sample["top_sites"]) <= 4
+    assert not tracemalloc.is_tracing()
+
+
+@pytest.mark.asyncio
+async def test_start_memory_sampler_is_off_by_default() -> None:
+    """With the settings at their defaults nothing starts or is logged."""
+    with capture_logs() as captured:
+        sampler = await start_memory_sampler(
+            _config(),
+            component="api",
+            logger=structlog.get_logger("docverse_server.diagnostics.test"),
+        )
+
+    assert sampler is None
+    assert captured == []
+    assert not tracemalloc.is_tracing()
+
+
+class _InfoFailsLogger:
+    """A logger whose ``info`` raises, as a broken log sink would."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def info(self, *args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("log sink down")
+
+    def warning(self, *args: Any, **kwargs: Any) -> None:
+        self._inner.warning(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_failed_start_is_logged_and_undone() -> None:
+    """A sampler that cannot start warns, returns None, and stops tracing.
+
+    Here the announcement fails after ``start()`` has turned tracing on;
+    the process must neither fail its startup nor be left traced.
+    """
+    with capture_logs() as captured:
+        logger = _InfoFailsLogger(
+            structlog.get_logger("docverse_server.diagnostics.test")
+        )
+        sampler = await start_memory_sampler(
+            _config(enabled=True, tracemalloc_enabled=True),
+            component="worker",
+            logger=logger,  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0.05)
+
+    assert sampler is None
+    [warning] = _events(captured, "Memory diagnostics failed to start")
+    assert warning["log_level"] == "warning"
+    assert warning["component"] == "worker"
+    assert warning["exc_info"] is True
+    assert _events(captured, "Memory sample") == []
+    assert not tracemalloc.is_tracing()
+
+
+@pytest.mark.asyncio
+async def test_failed_stop_is_logged_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sampler that fails to stop does not fail the process's shutdown."""
+
+    async def failing_stop(self: MemorySampler) -> None:
+        raise RuntimeError("stop failed")
+
+    monkeypatch.setattr(MemorySampler, "stop", failing_stop)
+    with capture_logs() as captured:
+        await stop_memory_sampler(
+            _sampler(),
+            logger=structlog.get_logger("docverse_server.diagnostics.test"),
+        )
+
+    [warning] = _events(captured, "Memory diagnostics failed to stop")
+    assert warning["log_level"] == "warning"
+    assert warning["component"] == "worker-keeper-sync"
+    assert warning["exc_info"] is True

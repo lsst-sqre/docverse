@@ -30,12 +30,16 @@ from typing import Any
 
 from structlog.stdlib import BoundLogger
 
+from ..config import Configuration
+
 __all__ = [
     "PROC_STATUS_PATH",
     "MemorySample",
     "MemorySampler",
     "read_memory_sample",
     "read_proc_status",
+    "start_memory_sampler",
+    "stop_memory_sampler",
 ]
 
 PROC_STATUS_PATH = Path("/proc/self/status")
@@ -262,6 +266,11 @@ class MemorySampler:
         self._task: asyncio.Task[None] | None = None
         self._started_tracing = False
 
+    @property
+    def component(self) -> str:
+        """The process label this sampler logs on every line."""
+        return self._component
+
     async def start(self) -> None:
         """Start tracing if configured, and the sampling task.
 
@@ -341,6 +350,80 @@ class MemorySampler:
     ) -> tuple[MemorySample, tracemalloc.Snapshot | None]:
         return read_memory_sample(
             previous, top_n=self._top_n, proc_status_text=read_proc_status()
+        )
+
+
+async def start_memory_sampler(
+    config: Configuration, *, component: str, logger: BoundLogger
+) -> MemorySampler | None:
+    """Start the sampler a process's configuration asks for, if any.
+
+    Each Docverse process calls this once at startup and hands the
+    result to `stop_memory_sampler` at shutdown.
+
+    Parameters
+    ----------
+    config
+        The process's configuration; its ``memory_diagnostics_*``
+        settings decide whether and how the process samples.
+    component
+        The process's Sentry ``component`` label, logged on every line.
+    logger
+        Logger for the sampler and for this function's own warnings.
+
+    Returns
+    -------
+    MemorySampler or None
+        The running sampler, or ``None`` when ``memory_diagnostics_enabled``
+        is false or the sampler failed to start. Setting
+        ``memory_diagnostics_tracemalloc_enabled`` on its own logs a
+        warning and starts nothing. Diagnostics never stop a process from
+        starting, so a failure to start is logged, not raised.
+    """
+    if not config.memory_diagnostics_enabled:
+        if config.memory_diagnostics_tracemalloc_enabled:
+            logger.warning(
+                "Memory diagnostics disabled; ignoring tracemalloc setting",
+                component=component,
+            )
+        return None
+    sampler = MemorySampler(
+        interval_seconds=config.memory_diagnostics_interval_seconds,
+        tracemalloc_enabled=config.memory_diagnostics_tracemalloc_enabled,
+        tracemalloc_frames=config.memory_diagnostics_tracemalloc_frames,
+        top_n=config.memory_diagnostics_top_n,
+        logger=logger,
+        component=component,
+    )
+    try:
+        await sampler.start()
+    except Exception:
+        logger.warning(
+            "Memory diagnostics failed to start",
+            component=component,
+            exc_info=True,
+        )
+        # Undo whatever part of start() ran, such as tracing it began.
+        await stop_memory_sampler(sampler, logger=logger)
+        return None
+    return sampler
+
+
+async def stop_memory_sampler(
+    sampler: MemorySampler, *, logger: BoundLogger
+) -> None:
+    """Stop a sampler at shutdown, logging rather than raising a failure.
+
+    A process's shutdown still has its real resources to close after
+    this, so a sampler that fails to stop must not prevent it.
+    """
+    try:
+        await sampler.stop()
+    except Exception:
+        logger.warning(
+            "Memory diagnostics failed to stop",
+            component=sampler.component,
+            exc_info=True,
         )
 
 

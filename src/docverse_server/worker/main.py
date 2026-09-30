@@ -30,6 +30,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse_server.config import Configuration
 from docverse_server.database import get_current_revision
+from docverse_server.diagnostics.memory import (
+    start_memory_sampler,
+    stop_memory_sampler,
+)
 from docverse_server.factory import Factory
 from docverse_server.metrics import build_event_manager
 from docverse_server.sentry import (
@@ -360,6 +364,29 @@ async def initialize_worker_ltd_s3_source(
     return source
 
 
+async def start_worker_memory_sampler(
+    ctx: dict[str, Any],
+    *,
+    settings: Configuration,
+    component: DocverseSentryComponent,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Start this worker process's memory sampler, if configured.
+
+    ``settings.memory_diagnostics_enabled`` gates it (PRD #753). A
+    running sampler is recorded as ``ctx["memory_sampler"]``, which
+    :func:`shutdown` stops; with diagnostics off, or if the sampler
+    fails to start, the key is left unset and startup carries on.
+    ``component`` is the pool's Sentry label, so each pool's samples can
+    be told apart in the logs.
+    """
+    sampler = await start_memory_sampler(
+        settings, component=component, logger=logger
+    )
+    if sampler is not None:
+        ctx["memory_sampler"] = sampler
+
+
 _QUEUE_STATS_CRON_MINUTES = set(range(0, 60, 5))
 """Five-minute cadence for the ``arq_queue_stats`` gauge.
 
@@ -567,6 +594,11 @@ async def _startup(
         db_revision=db_revision,
         queue_name=queue_name,
     )
+    # Started before the pools, clients and LTD source below so that,
+    # with tracemalloc on, their allocations are traced too.
+    await start_worker_memory_sampler(
+        ctx, settings=config, component=component, logger=logger
+    )
 
     await initialize_worker_db_pool(max_jobs=max_jobs)
 
@@ -696,6 +728,12 @@ async def startup_maintenance(ctx: dict[str, Any]) -> None:
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     """Clean up resources for the arq worker process."""
+    logger = structlog.get_logger("docverse_server.worker")
+    # First, so the sampler stops even if a later close fails, or if
+    # startup failed before the resources closed below were opened.
+    memory_sampler = ctx.pop("memory_sampler", None)
+    if memory_sampler is not None:
+        await stop_memory_sampler(memory_sampler, logger=logger)
     arq_queue = ctx.get("arq_queue")
     if arq_queue is not None:
         # Private-attribute access until safir adds a public shutdown API;
@@ -710,7 +748,6 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     if ltd_s3_source is not None:
         await ltd_s3_source.close()
     await db_session_dependency.aclose()
-    logger = structlog.get_logger("docverse_server.worker")
     logger.info("Worker shutdown complete")
 
 
