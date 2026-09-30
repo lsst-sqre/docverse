@@ -57,6 +57,14 @@ that back each of them up.
   post-upgrade backfill; how keeper-sync keeps synced projects
   converged; and the manual `PATCH` for a `__main` the rule leaves
   pinned.
+- [Memory diagnostics](memory-diagnostics.md) — the opt-in sampler
+  every Docverse process carries: what each `Memory sample` field
+  means, the five `DOCVERSE_MEMORY_DIAGNOSTICS_*` settings and their
+  `config.memoryDiagnostics` Phalanx values, how to turn it on for
+  roundtable-dev, how to tell Python-heap growth from fragmentation,
+  when to try `MALLOC_ARENA_MAX=2`, how to read `top_sites` from one
+  tick to the next, and why tracemalloc stays in development
+  environments.
 
 The other maintenance-pool jobs do not have operations pages yet;
 until they do, their module docstrings under

@@ -48,6 +48,7 @@ from docverse.models.keeper_sync import (
     _MAX_SLUG_PATTERNS,
 )
 from docverse_server.config import Configuration
+from docverse_server.diagnostics.memory import MemorySample
 from docverse_server.domain.edition_reconcile import ReconcileReason, _Skip
 from docverse_server.handlers.orgs.editions import router as editions_router
 from docverse_server.handlers.orgs.keeper_sync import (
@@ -67,6 +68,7 @@ from docverse_server.metrics import (
     HttpStatusClass,
     WebhookOutcome,
 )
+from docverse_server.sentry import DocverseSentryComponent
 from docverse_server.services.default_branch import DefaultBranchTrigger
 from docverse_server.services.edition_reconcile import (
     EditionReconcileOutcome,
@@ -157,6 +159,21 @@ _KEEPER_SYNC_SERVICE_MODULE = "docverse_server.services.keeper_sync.service"
 
 _KEEPER_SYNC_TRACKING_MESSAGE = "Derived keeper-sync edition tracking and kind"
 """The debug line saying where a synced edition's tracking came from."""
+
+_MEMORY_PAGE = "memory-diagnostics.md"
+"""Operations page for the opt-in memory sampler (PRD #753)."""
+
+_MEMORY_MODULE = "docverse_server.diagnostics.memory"
+"""Module that writes every memory-diagnostics log line."""
+
+_MEMORY_KNOB_PREFIX = "memory_diagnostics_"
+"""Name prefix of the settings that shape the memory sampler."""
+
+_MEMORY_PHALANX_GROUP = "config.memoryDiagnostics"
+"""Phalanx values group the chart renders the sampler's settings from."""
+
+_MEMORY_LOGS_SECTION = "What the sampler logs"
+"""Memory page section holding its sample-field and log-line tables."""
 
 _LOG_LEVELS = frozenset({"debug", "info", "warning", "error", "exception"})
 """The structlog methods whose first argument is a log line's message."""
@@ -482,9 +499,15 @@ def _bound_log_fields(module_name: str) -> set[str]:
     }
 
 
-def _documented_log_lines(page: str) -> dict[str, _LogCall]:
-    """Return the GitHub page's log-line table, keyed by message."""
-    table = _subsection(_section(page, "Reading an outcome"), "Log lines")
+def _documented_log_lines(
+    page: str, *, section: str = "Reading an outcome"
+) -> dict[str, _LogCall]:
+    """Return a page's log-line table, keyed by message.
+
+    The table is the ``### Log lines`` subsection of ``section``, which
+    defaults to the GitHub page's.
+    """
+    table = _subsection(_section(page, section), "Log lines")
     return {
         cells[0].strip("`"): _LogCall(
             level=cells[1], fields=frozenset(_inline_code(cells[2]))
@@ -1434,3 +1457,224 @@ def test_github_manual_fallback_documented() -> None:
     fields = {"tracking_mode", "tracking_params", "build"}
     assert fields <= set(EditionUpdate.model_fields)
     assert not _uncoded(fields, section)
+
+
+def _camel_case(name: str) -> str:
+    """Spell a snake_case setting name the way Phalanx values are spelled."""
+    first, *rest = name.split("_")
+    return first + "".join(part.capitalize() for part in rest)
+
+
+def _memory_knobs() -> set[str]:
+    """Every ``memory_diagnostics_*`` setting :class:`Configuration` has."""
+    return {
+        name
+        for name in Configuration.model_fields
+        if name.startswith(_MEMORY_KNOB_PREFIX)
+    }
+
+
+def _memory_phalanx_key(name: str) -> str:
+    """Return a sampler setting's key under ``config.memoryDiagnostics``."""
+    return _camel_case(name.removeprefix(_MEMORY_KNOB_PREFIX))
+
+
+def _memory_sample(*, traced: bool) -> MemorySample:
+    """Build a sample as if taken with tracemalloc on (``traced``) or off."""
+    traced_value = 1 if traced else None
+    return MemorySample(
+        rss_bytes=1,
+        rss_peak_bytes=1,
+        gc_counts=(0, 0, 0),
+        gc_objects=traced_value,
+        tracemalloc_current_bytes=traced_value,
+        tracemalloc_peak_bytes=traced_value,
+        top_sites=(),
+    )
+
+
+def _memory_log_calls() -> dict[str, list[_LogCall]]:
+    """Every line the sampler module writes, with its fields as logged.
+
+    ``exc_info=True`` is read as ``exception``: Safir's production
+    profile renders the traceback under that key, which is the one an
+    operator reads in the JSON logs.
+    """
+    return {
+        message: [
+            _LogCall(
+                level=call.level,
+                fields=frozenset(
+                    "exception" if field == "exc_info" else field
+                    for field in call.fields
+                ),
+            )
+            for call in calls
+        ]
+        for message, calls in _log_calls(_MEMORY_MODULE).items()
+    }
+
+
+def test_docs_index_links_the_memory_diagnostics_page() -> None:
+    """The index's Operations section points at the memory page."""
+    assert _MEMORY_PAGE in _section(_read("index.md"), "Operations")
+
+
+def test_memory_knobs_documented_with_env_var_default_and_value() -> None:
+    """Every sampler setting is a row naming its env var, default and value.
+
+    Checked both ways off :class:`Configuration`, like the GitHub table:
+    a ``memory_diagnostics_*`` setting the table lacks is a knob an
+    operator cannot find, and a row for one that no longer exists does
+    nothing. The Phalanx column is the setting's name, less the prefix,
+    in camelCase under ``config.memoryDiagnostics``.
+    """
+    section = _section(_read(_MEMORY_PAGE), "Configuration")
+    env_prefix = Configuration.model_config.get("env_prefix", "")
+    knobs = _memory_knobs()
+    assert knobs, "configuration exposes no memory diagnostics knobs"
+    documented = {cells[0].strip("`") for cells in _code_rows(section)}
+    assert documented == knobs
+    for name in sorted(knobs):
+        cells = _cells(_table_row(section, name))
+        env_var = f"{env_prefix}{name}".upper()
+        default = Configuration.model_fields[name].default
+        value = f"{_MEMORY_PHALANX_GROUP}.{_memory_phalanx_key(name)}"
+        assert cells[1] == f"`{env_var}`", name
+        assert cells[2] == _documented_default(default), name
+        assert cells[3] == f"`{value}`", name
+
+
+def test_memory_sample_fields_documented() -> None:
+    """The fields table is exactly what a ``Memory sample`` line carries.
+
+    Read off :meth:`MemorySample.log_fields` plus the ``component`` label
+    the sampler adds, so a field added to the line is a row the page has
+    to gain. The Present column has to say which fields only a traced
+    sample carries, since an untraced line leaves them off rather than
+    logging nulls.
+    """
+    section = _section(_read(_MEMORY_PAGE), _MEMORY_LOGS_SECTION)
+    rows = {
+        cells[0].strip("`"): cells
+        for cells in _code_rows(_subsection(section, "Sample fields"))
+    }
+    always = {"component", *_memory_sample(traced=False).log_fields()}
+    carried = {"component", *_memory_sample(traced=True).log_fields()}
+    assert set(rows) == carried
+    for name, cells in sorted(rows.items()):
+        expected = "always" if name in always else "with tracemalloc"
+        assert cells[1] == expected, name
+
+
+def test_memory_log_lines_match_the_code() -> None:
+    """The log table lists exactly the lines the sampler module writes.
+
+    Both ways: a row whose message, level or fields drifted from the
+    code is a line nobody can grep for, and a line the module adds is
+    one the page has to gain a row for.
+    """
+    documented = _documented_log_lines(
+        _read(_MEMORY_PAGE), section=_MEMORY_LOGS_SECTION
+    )
+    emitted = _memory_log_calls()
+    assert emitted, "the sampler module writes no log lines"
+    assert set(documented) == set(emitted)
+    wrong = sorted(
+        message
+        for message, row in documented.items()
+        if row not in emitted[message]
+    )
+    assert not wrong
+
+
+def test_memory_page_names_every_sampling_component() -> None:
+    """Every process label a sampler logs under is on the page.
+
+    ``cli`` is the one Sentry component that starts no sampler; each of
+    the others is a process whose samples an operator filters by.
+    """
+    components = set(get_args(DocverseSentryComponent)) - {"cli"}
+    assert components
+    section = _section(_read(_MEMORY_PAGE), _MEMORY_LOGS_SECTION)
+    assert not _uncoded(components, section)
+
+
+def test_memory_dev_snippet_uses_the_documented_phalanx_keys() -> None:
+    """The roundtable-dev values snippet turns on sampler and tracing.
+
+    Its keys under ``memoryDiagnostics`` have to be ones the
+    Configuration table names, so a renamed setting cannot leave the
+    snippet setting a value the chart ignores.
+    """
+    section = _section(_read(_MEMORY_PAGE), "Enabling on roundtable-dev")
+    parts = section.split("```yaml\n", 1)
+    assert len(parts) == 2, "the section quotes no values snippet"
+    block = parts[1].split("```", 1)[0]
+    assert "memoryDiagnostics:" in block
+    # The snippet sits in a list item, so every line of it is indented.
+    keys = set(re.findall(r"^\s+(\w+):", block, flags=re.MULTILINE))
+    keys -= {"config", "memoryDiagnostics"}
+    known = {_memory_phalanx_key(name) for name in _memory_knobs()}
+    assert keys, "the snippet sets no memoryDiagnostics values"
+    assert keys <= known
+    assert re.search(r"^\s+enabled: true$", block, flags=re.MULTILINE)
+    assert re.search(
+        r"^\s+tracemallocEnabled: true$", block, flags=re.MULTILINE
+    )
+
+
+def test_memory_leak_signature_guide_documented() -> None:
+    """The reading guide covers both signatures and the arena experiment.
+
+    Presence only: the section has to compare the fields the two
+    signatures are told apart by, and name the glibc setting to try
+    when the gap is outside the Python heap.
+    """
+    section = _section(_read(_MEMORY_PAGE), "Reading a leak signature")
+    for heading in (
+        "Python-heap growth",
+        "Fragmentation or native memory",
+        "The `MALLOC_ARENA_MAX` experiment",
+    ):
+        _subsection(section, heading)
+    assert not _uncoded(
+        {
+            "rss_bytes",
+            "rss_peak_bytes",
+            "tracemalloc_current_bytes",
+            "top_sites",
+            "MALLOC_ARENA_MAX=2",
+        },
+        section,
+    )
+
+
+def test_memory_top_sites_reading_documented() -> None:
+    """The ``top_sites`` section explains the diff and the cutoff.
+
+    Each site is a per-tick diff cut at ``memory_diagnostics_top_n`` and
+    grouped at ``memory_diagnostics_tracemalloc_frames``, so reading one
+    across ticks means knowing both settings and both diff columns.
+    """
+    section = _section(_read(_MEMORY_PAGE), "Reading `top_sites` across ticks")
+    assert {
+        "memory_diagnostics_top_n",
+        "memory_diagnostics_tracemalloc_frames",
+    } <= _memory_knobs()
+    assert not _uncoded(
+        {
+            "size_diff",
+            "count_diff",
+            "memory_diagnostics_top_n",
+            "memory_diagnostics_tracemalloc_frames",
+        },
+        section,
+    )
+
+
+def test_memory_tracemalloc_cost_documented() -> None:
+    """The cost section names the switch it argues stays off outside dev."""
+    section = _section(_read(_MEMORY_PAGE), "What tracemalloc costs")
+    assert "memory_diagnostics_tracemalloc_enabled" in _memory_knobs()
+    assert not _uncoded({"memory_diagnostics_tracemalloc_enabled"}, section)
