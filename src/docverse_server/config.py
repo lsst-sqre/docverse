@@ -10,6 +10,7 @@ from pydantic import (
     BeforeValidator,
     Field,
     HttpUrl,
+    PrivateAttr,
     SecretStr,
     model_validator,
 )
@@ -24,6 +25,7 @@ from .services.cdn_purge_coalescer import DEFAULT_PURGE_MIN_INTERVAL_SECONDS
 __all__ = [
     "EDITION_RECONCILE_REAPER_MARGIN_SECONDS",
     "KEEPER_SYNC_REAPER_MARGIN_SECONDS",
+    "KEEPER_SYNC_SLICE_MARGIN_SECONDS",
     "Configuration",
     "config",
 ]
@@ -42,6 +44,21 @@ index that the tier cron treats as an active job. The margin only
 needs to cover the finalisation window plus scheduling slop, and is
 sized at one full ``keeper_sync_reaper`` cron gap
 (``cron(minute={0, 30})``, so 30 min).
+"""
+
+
+KEEPER_SYNC_SLICE_MARGIN_SECONDS = 600
+"""Headroom kept between the keeper-sync slice budget and the job
+timeout, in seconds.
+
+``keeper_sync_project`` checks its slice budget only before starting
+an edition, never mid-copy, so the last edition a slice starts runs
+past the budget by however long that edition takes. The margin is the
+time that edition has to finish before arq's
+``keeper_sync_job_timeout_seconds`` cancels the job; ten minutes
+covers a large build's copy with room to spare (PRD #765). A larger
+edition than that is what the no-progress guard and raising the
+timeout are for.
 """
 
 
@@ -82,6 +99,25 @@ def _default_keeper_sync_reaper_threshold(data: dict[str, Any]) -> int:
     """
     timeout = data.get("keeper_sync_job_timeout_seconds", 3600)
     return int(timeout) + KEEPER_SYNC_REAPER_MARGIN_SECONDS
+
+
+def _default_keeper_sync_slice_budget(data: dict[str, Any]) -> int:
+    """Derive the keeper-sync slice budget from the job timeout.
+
+    Pydantic passes the already-validated fields declared before
+    ``keeper_sync_slice_budget_seconds``, which includes
+    ``keeper_sync_job_timeout_seconds``. The budget is the timeout less
+    :data:`KEEPER_SYNC_SLICE_MARGIN_SECONDS` (3000 s at the stock
+    3600 s timeout), but never less than a third of the timeout: the
+    two rules meet at a 900 s timeout, and below it the floor keeps the
+    derived budget positive, so a test environment that drives the
+    timeout down to seconds still starts without also setting the
+    budget. Runs only when the env var is unset, so an explicit
+    ``DOCVERSE_KEEPER_SYNC_SLICE_BUDGET_SECONDS`` still wins (subject to
+    :meth:`Configuration._check_keeper_sync_slice_budget`).
+    """
+    timeout = int(data.get("keeper_sync_job_timeout_seconds", 3600))
+    return max(timeout - KEEPER_SYNC_SLICE_MARGIN_SECONDS, timeout // 3)
 
 
 def _default_edition_reconcile_reaper_threshold(data: dict[str, Any]) -> int:
@@ -333,10 +369,39 @@ class Configuration(BaseSettings):
         description=(
             "Wraps the keeper-sync arq functions on"
             " ``KeeperSyncWorkerSettings``: arq cancels a job that runs"
-            " past this. Lower this in test/staging to surface"
-            " stuck-worker behaviour quickly — the default"
-            " ``keeper_sync_reaper_threshold_seconds`` is derived from"
-            " this value, so it follows the timeout down."
+            " past this. The middle rung of a three-number ladder,"
+            " ``keeper_sync_slice_budget_seconds`` < this <"
+            " ``keeper_sync_reaper_threshold_seconds``: both neighbours"
+            " derive from this value (the budget to this less"
+            " ``KEEPER_SYNC_SLICE_MARGIN_SECONDS``, the reaper threshold"
+            " to this plus ``KEEPER_SYNC_REAPER_MARGIN_SECONDS``), so"
+            " lowering it in test/staging to surface stuck-worker"
+            " behaviour quickly drags both down with it. Raising it is"
+            " also the escape hatch for an edition too large to copy"
+            " inside one slice, since the budget follows it up."
+        ),
+    )
+
+    keeper_sync_slice_budget_seconds: int = Field(
+        default_factory=_default_keeper_sync_slice_budget,
+        title="Keeper-sync slice budget, in seconds",
+        description=(
+            "How long one ``keeper_sync_project`` job keeps starting"
+            " editions before it stops and hands the rest of the project"
+            " to a continuation job, so a project of any size converges"
+            " across a chain of jobs that each finish inside"
+            " ``keeper_sync_job_timeout_seconds`` (PRD #765). The budget"
+            " is checked before each edition, never mid-copy, so it must"
+            " sit below that timeout by enough for the last edition a"
+            " slice starts to finish copying. The bottom rung of the"
+            " ladder this < ``keeper_sync_job_timeout_seconds`` <"
+            " ``keeper_sync_reaper_threshold_seconds``. It has no"
+            " literal default: it derives to the timeout less"
+            " ``KEEPER_SYNC_SLICE_MARGIN_SECONDS`` (3000 s at the stock"
+            " 3600 s timeout), floored at a third of the timeout so a"
+            " seconds-long test timeout still derives a positive budget."
+            " Setting the env var overrides the derivation, and must"
+            " stay greater than 0 and less than the timeout."
         ),
     )
 
@@ -481,9 +546,11 @@ class Configuration(BaseSettings):
             " OOM-killed worker pod). ``keeper_sync_reaper`` fails any"
             " keeper-sync child ``queue_jobs`` row that has been"
             " ``in_progress`` longer than this without"
-            " ``date_completed``. Unlike the other reaper thresholds"
-            " this one has no literal default: it derives to"
-            " ``keeper_sync_job_timeout_seconds`` +"
+            " ``date_completed``. The top rung of the ladder"
+            " ``keeper_sync_slice_budget_seconds`` <"
+            " ``keeper_sync_job_timeout_seconds`` < this. Unlike the"
+            " other reaper thresholds this one has no literal default:"
+            " it derives to ``keeper_sync_job_timeout_seconds`` +"
             " ``KEEPER_SYNC_REAPER_MARGIN_SECONDS`` (5400 s at the"
             " stock 3600 s timeout). Because the keeper-sync functions"
             " run with ``max_tries=1``, arq has already cancelled any"
@@ -491,7 +558,10 @@ class Configuration(BaseSettings):
             " past that point is dead and the old flat 6 h wait only"
             " kept the project parked behind the partial unique index"
             " the tier cron reads as an active job. Setting the env var"
-            " overrides the derivation outright."
+            " overrides the derivation downwards only: a value above"
+            " timeout + margin is capped there, and the sync worker"
+            " logs a warning at startup naming the requested and"
+            " effective values (PRD #765)."
         ),
     )
 
@@ -937,6 +1007,64 @@ class Configuration(BaseSettings):
         ),
     )
 
+    _keeper_sync_reaper_threshold_requested_seconds: int | None = PrivateAttr(
+        default=None
+    )
+
+    @model_validator(mode="after")
+    def _cap_keeper_sync_reaper_threshold(self) -> Configuration:
+        """Cap the keeper-sync reaper threshold at timeout + margin.
+
+        arq has cancelled any keeper-sync job by
+        ``keeper_sync_job_timeout_seconds``, so a row still
+        ``in_progress`` past that plus
+        :data:`KEEPER_SYNC_REAPER_MARGIN_SECONDS` is dead, and waiting
+        longer only keeps the project behind its active-job mutex and
+        the organization's run 409-blocked (#699: a Phalanx pin of
+        21600 s held prod for six hours). An explicit value above the
+        cap is rewritten to the cap, and the requested value is kept on
+        :attr:`keeper_sync_reaper_threshold_requested_seconds` so the
+        sync worker can warn about it at startup; a value at or below
+        the cap, including the derived default, is left alone.
+        """
+        cap = (
+            self.keeper_sync_job_timeout_seconds
+            + KEEPER_SYNC_REAPER_MARGIN_SECONDS
+        )
+        requested = self.keeper_sync_reaper_threshold_seconds
+        if requested > cap:
+            self._keeper_sync_reaper_threshold_requested_seconds = requested
+            self.keeper_sync_reaper_threshold_seconds = cap
+        return self
+
+    @model_validator(mode="after")
+    def _check_keeper_sync_slice_budget(self) -> Configuration:
+        """Refuse a slice budget outside ``(0, job timeout)``.
+
+        ``keeper_sync_project`` stops starting editions once the budget
+        has elapsed and hands the rest of the project to a continuation
+        job. A budget of zero or less stops every slice before its first
+        edition, so the chain makes no progress; one at or above
+        ``keeper_sync_job_timeout_seconds`` is never reached before arq
+        cancels the job, so the slice fails instead of continuing. The
+        derived default always sits inside the range; only an explicit
+        override, or a timeout of a second or two, can trip this.
+        """
+        budget = self.keeper_sync_slice_budget_seconds
+        timeout = self.keeper_sync_job_timeout_seconds
+        if not 0 < budget < timeout:
+            raise ValueError(
+                f"keeper_sync_slice_budget_seconds ({budget}) must be"
+                " greater than 0 and less than"
+                f" keeper_sync_job_timeout_seconds ({timeout}): a slice"
+                " stops starting editions once its budget elapses, so"
+                " a budget of 0 or less makes no progress and one at or"
+                " past the timeout is cancelled by arq before it can"
+                " hand the rest of the project to a continuation job."
+                " Leave it unset to derive it from the timeout."
+            )
+        return self
+
     @model_validator(mode="after")
     def _check_edition_reconcile_reaper_threshold(self) -> Configuration:
         """Refuse a reconcile reaper threshold the job timeout can reach.
@@ -969,6 +1097,20 @@ class Configuration(BaseSettings):
                 " reconcile faster in a test environment."
             )
         return self
+
+    @property
+    def keeper_sync_reaper_threshold_requested_seconds(self) -> int | None:
+        """The explicit keeper-sync reaper threshold that was capped.
+
+        ``None`` unless the configured
+        ``keeper_sync_reaper_threshold_seconds`` exceeded
+        ``keeper_sync_job_timeout_seconds`` +
+        :data:`KEEPER_SYNC_REAPER_MARGIN_SECONDS`, in which case this is
+        the value the operator asked for and
+        ``keeper_sync_reaper_threshold_seconds`` holds the cap that
+        applies instead.
+        """
+        return self._keeper_sync_reaper_threshold_requested_seconds
 
     @property
     def arq_redis_settings(self) -> RedisSettings | None:
