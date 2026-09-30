@@ -658,3 +658,57 @@ def test_memory_knob_descriptions_defer_connections_to_the_upload_cap(
     assert description is not None
     assert "``keeper_sync_upload_concurrency``" in description
     assert "+ 10" not in description
+
+
+def test_memory_diagnostics_defaults_off() -> None:
+    """Every memory-diagnostics knob ships off or neutral (PRD #753).
+
+    The sampler and tracemalloc are dev-only diagnostics: nothing is
+    sampled, traced, or logged until an environment opts in.
+    """
+    config = Configuration()
+    assert config.memory_diagnostics_enabled is False
+    assert config.memory_diagnostics_interval_seconds == 60
+    assert config.memory_diagnostics_tracemalloc_enabled is False
+    assert config.memory_diagnostics_tracemalloc_frames == 5
+    assert config.memory_diagnostics_top_n == 10
+
+
+def test_memory_diagnostics_env_var_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All five memory-diagnostics knobs are env-overridable."""
+    monkeypatch.setenv("DOCVERSE_MEMORY_DIAGNOSTICS_ENABLED", "true")
+    monkeypatch.setenv("DOCVERSE_MEMORY_DIAGNOSTICS_INTERVAL_SECONDS", "15")
+    monkeypatch.setenv(
+        "DOCVERSE_MEMORY_DIAGNOSTICS_TRACEMALLOC_ENABLED", "true"
+    )
+    monkeypatch.setenv("DOCVERSE_MEMORY_DIAGNOSTICS_TRACEMALLOC_FRAMES", "3")
+    monkeypatch.setenv("DOCVERSE_MEMORY_DIAGNOSTICS_TOP_N", "25")
+    config = Configuration()
+    assert config.memory_diagnostics_enabled is True
+    assert config.memory_diagnostics_interval_seconds == 15
+    assert config.memory_diagnostics_tracemalloc_enabled is True
+    assert config.memory_diagnostics_tracemalloc_frames == 3
+    assert config.memory_diagnostics_top_n == 25
+
+
+@pytest.mark.parametrize(
+    "knob", ["interval_seconds", "tracemalloc_frames", "top_n"]
+)
+def test_memory_diagnostics_counts_refuse_zero(
+    monkeypatch: pytest.MonkeyPatch, knob: str
+) -> None:
+    """A zero interval, frame depth, or site count is refused at startup.
+
+    A zero interval would spin the sampler, and ``tracemalloc.start(0)``
+    and a top-0 site list are meaningless; one is the smallest useful
+    value of each.
+    """
+    env_var = f"DOCVERSE_MEMORY_DIAGNOSTICS_{knob.upper()}"
+    monkeypatch.setenv(env_var, "0")
+    with pytest.raises(ValidationError):
+        Configuration()
+
+    monkeypatch.setenv(env_var, "1")
+    assert getattr(Configuration(), f"memory_diagnostics_{knob}") == 1

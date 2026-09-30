@@ -846,6 +846,86 @@ class Configuration(BaseSettings):
         ),
     )
 
+    memory_diagnostics_enabled: bool = Field(
+        default=False,
+        title="Whether each process runs the memory sampler",
+        description=(
+            "Gates the opt-in memory sampler (PRD #753,"
+            " ``docverse_server.diagnostics.memory``). When true, the API"
+            " process and each of the three arq worker pools log one"
+            ' ``"Memory sample"`` line every'
+            " ``memory_diagnostics_interval_seconds``, carrying the"
+            " process's resident size and high-water mark (``VmRSS`` /"
+            " ``VmHWM`` from ``/proc/self/status``) and the garbage"
+            " collector's generation counts, so a leak can be located"
+            " from pod logs in a read-only, capability-dropped container"
+            " that no profiler can attach to. Ships false: nothing is"
+            " sampled or logged until an environment opts in, and"
+            " ``memory_diagnostics_tracemalloc_enabled`` does nothing"
+            " without this."
+        ),
+    )
+
+    memory_diagnostics_interval_seconds: int = Field(
+        60,
+        ge=1,
+        title="Seconds between memory samples",
+        description=(
+            "How often the memory sampler logs a sample when"
+            " ``memory_diagnostics_enabled`` is true. Each process logs"
+            " one line per interval, so this sets the log volume the"
+            " sampler adds: 60 s is one line per minute per pod. With"
+            " ``memory_diagnostics_tracemalloc_enabled`` each sample also"
+            " takes a tracemalloc snapshot, which is O(heap), so a much"
+            " shorter interval adds measurable CPU on a large heap."
+        ),
+    )
+
+    memory_diagnostics_tracemalloc_enabled: bool = Field(
+        default=False,
+        title="Whether the memory sampler also traces Python allocations",
+        description=(
+            "Adds Python's ``tracemalloc`` on top of the memory sampler:"
+            " each sample then also carries the traced heap's current"
+            " and peak size, the live object count, and the"
+            " ``memory_diagnostics_top_n`` allocation sites whose size"
+            " changed most since the previous sample. **Overhead:**"
+            " tracing roughly doubles the Python heap's memory"
+            " overhead and slows every allocation, so this is a"
+            " development-environment diagnostic only — never leave it"
+            " on in production. Has no effect unless"
+            " ``memory_diagnostics_enabled`` is also true."
+        ),
+    )
+
+    memory_diagnostics_tracemalloc_frames: int = Field(
+        5,
+        ge=1,
+        title="Stack frames tracemalloc records per allocation",
+        description=(
+            "Frame depth passed to ``tracemalloc.start()`` when"
+            " ``memory_diagnostics_tracemalloc_enabled`` is true, and"
+            " therefore the depth at which each top allocation site is"
+            " reported: two allocations are one site only when their"
+            " last this-many frames match. Deeper stacks tell apart"
+            " callers of a shared allocation helper, at the cost of"
+            " more tracing memory per live allocation."
+        ),
+    )
+
+    memory_diagnostics_top_n: int = Field(
+        10,
+        ge=1,
+        title="Allocation sites reported per memory sample",
+        description=(
+            "How many allocation sites each memory sample reports under"
+            " ``top_sites`` when"
+            " ``memory_diagnostics_tracemalloc_enabled`` is true: the"
+            " sites whose traced size changed most since the previous"
+            " sample, largest change first."
+        ),
+    )
+
     superadmin_usernames: Annotated[
         list[str], BeforeValidator(_parse_comma_separated)
     ] = Field(
