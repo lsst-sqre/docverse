@@ -5,16 +5,20 @@ from __future__ import annotations
 import asyncio
 from types import TracebackType
 from typing import Self
+from unittest.mock import Mock
 
 import httpx
 import pytest
 import structlog
+from aiobotocore.session import get_session
 from cryptography.fernet import Fernet
+from fastapi import Request, Response
 from safir.arq import MockArqQueue
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse.models import CredentialProvider, OrganizationCreate
+from docverse_server.dependencies.context import ContextDependency
 from docverse_server.factory import Factory
+from docverse_server.metrics.events import DocverseEvents
 from docverse_server.services.credential_encryptor import CredentialEncryptor
 from docverse_server.services.default_branch import DuplicateDraftRetirer
 from docverse_server.services.keeper_sync.copier import (
@@ -33,6 +37,8 @@ from docverse_server.storage.queue_backend import (
     ArqQueueBackend,
     NullQueueBackend,
 )
+from tests.support.botocore_sessions import record_aiobotocore_sessions
+from tests.support.objectstore import seed_minio_service
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -98,44 +104,6 @@ def _always_throttled(attempts: list[int]) -> httpx.MockTransport:
         return httpx.Response(503, headers={"Retry-After": "30"})
 
     return httpx.MockTransport(handler)
-
-
-async def _seed_minio_service(session: AsyncSession, factory: Factory) -> int:
-    """Seed an org whose ``minio`` object-store service resolves for real.
-
-    Returns the org id. ``create_objectstore_for_org`` then walks the
-    genuine service-row and credential-decryption path, so a test sees
-    the store the factory actually builds rather than a stand-in.
-    """
-    async with session.begin():
-        org = await factory.create_org_store().create(
-            OrganizationCreate(
-                slug="budget-org",
-                title="Budget Org",
-                base_domain="budget.example.com",
-            )
-        )
-        await factory.create_credential_service().create(
-            org_slug="budget-org",
-            label="minio-cred",
-            provider=CredentialProvider.s3,
-            credentials={
-                "access_key_id": "key-id",
-                "secret_access_key": "secret",
-            },
-        )
-        await factory.create_service_store().create(
-            organization_id=org.id,
-            label="minio",
-            category="object_storage",
-            provider="minio",
-            config={
-                "endpoint_url": "https://minio.example.com",
-                "bucket": "docs",
-            },
-            credential_label="minio-cred",
-        )
-    return org.id
 
 
 @pytest.mark.asyncio
@@ -207,6 +175,88 @@ async def test_factory_create_ltd_s3_source_returns_unopened(
     )
     source = factory.create_ltd_s3_source()
     assert isinstance(source, LtdS3Source)
+
+
+@pytest.mark.asyncio
+async def test_factory_s3_clients_come_from_its_aiobotocore_session(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every S3 client a factory holding a session opens comes from it.
+
+    The API and every worker hand their per-request and per-job
+    factories one process-lifetime session, so opening an org's object
+    store or an LTD source must construct no session of its own: each
+    one would re-parse botocore's S3 service model and endpoint ruleset
+    (PRD #753).
+    """
+    shared = get_session()
+    factory = Factory(
+        session=db_session,
+        logger=_logger(),
+        credential_encryptor=CredentialEncryptor(
+            current_key=Fernet.generate_key().decode()
+        ),
+        default_queue_name="docverse:queue",
+        aiobotocore_session=shared,
+    )
+    org_id = await seed_minio_service(db_session, factory)
+    sessions = record_aiobotocore_sessions(monkeypatch)
+
+    async with db_session.begin():
+        store = await factory.create_objectstore_for_org(
+            org_id=org_id, service_label="minio"
+        )
+    async with store, factory.create_ltd_s3_source():
+        pass
+
+    assert factory.aiobotocore_session is shared
+    assert sessions == []
+
+
+@pytest.mark.asyncio
+async def test_request_factory_s3_clients_share_the_api_session(
+    db_session: AsyncSession,
+    mock_events: DocverseEvents,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The API's per-request factories open S3 clients from its session.
+
+    The lifespan hands ``context_dependency`` one session per process;
+    each request's :class:`HandlerFactory` has to pass it to the stores
+    and LTD sources it builds, or every build upload and dashboard
+    render would re-parse botocore's S3 service model (PRD #753).
+    """
+    shared = get_session()
+    dependency = ContextDependency()
+    await dependency.initialize(
+        credential_encryptor=CredentialEncryptor(
+            current_key=Fernet.generate_key().decode()
+        ),
+        events=mock_events,
+        aiobotocore_session=shared,
+    )
+    context = await dependency(
+        request=Mock(spec=Request),
+        response=Mock(spec=Response),
+        session=db_session,
+        logger=_logger(),
+        arq_queue=MockArqQueue(default_queue_name="docverse:queue"),
+    )
+    factory = context.factory
+    org_id = await seed_minio_service(db_session, factory)
+    sessions = record_aiobotocore_sessions(monkeypatch)
+
+    async with db_session.begin():
+        store = await factory.create_objectstore_for_org(
+            org_id=org_id, service_label="minio"
+        )
+    async with store, factory.create_ltd_s3_source():
+        pass
+
+    assert dependency.aiobotocore_session is shared
+    assert factory.aiobotocore_session is shared
+    assert sessions == []
 
 
 @pytest.mark.asyncio
@@ -470,7 +520,7 @@ async def test_copier_destination_uses_keeper_sync_upload_budget(
             keeper_sync_upload_max_attempts=3,
             keeper_sync_upload_max_backoff_seconds=25.0,
         )
-        org_id = await _seed_minio_service(db_session, factory)
+        org_id = await seed_minio_service(db_session, factory)
         monkeypatch.setattr(
             factory,
             "create_ltd_s3_source",
@@ -519,7 +569,7 @@ async def test_objectstore_for_org_keeps_the_shared_upload_budget(
             keeper_sync_upload_max_attempts=3,
             keeper_sync_upload_max_backoff_seconds=25.0,
         )
-        org_id = await _seed_minio_service(db_session, factory)
+        org_id = await seed_minio_service(db_session, factory)
         async with db_session.begin():
             store = await factory.create_objectstore_for_org(
                 org_id=org_id, service_label="minio"
@@ -579,7 +629,7 @@ async def test_copier_destination_puts_over_the_copy_client(
             copy_http_client=copy_http_client,
             default_queue_name="docverse:queue",
         )
-        org_id = await _seed_minio_service(db_session, factory)
+        org_id = await seed_minio_service(db_session, factory)
         monkeypatch.setattr(
             factory,
             "create_ltd_s3_source",
@@ -623,7 +673,7 @@ async def test_copier_destination_falls_back_to_the_shared_client(
             http_client=http_client,
             default_queue_name="docverse:queue",
         )
-        org_id = await _seed_minio_service(db_session, factory)
+        org_id = await seed_minio_service(db_session, factory)
         monkeypatch.setattr(
             factory,
             "create_ltd_s3_source",
@@ -673,7 +723,7 @@ async def test_objectstore_for_org_keeps_the_shared_client(
             copy_http_client=copy_http_client,
             default_queue_name="docverse:queue",
         )
-        org_id = await _seed_minio_service(db_session, factory)
+        org_id = await seed_minio_service(db_session, factory)
         async with db_session.begin():
             store = await factory.create_objectstore_for_org(
                 org_id=org_id, service_label="minio"
@@ -733,7 +783,7 @@ async def test_copier_destination_uploads_under_the_upload_limiter(
             keeper_sync_copy_concurrency=8,
             keeper_sync_upload_limiter=asyncio.Semaphore(1),
         )
-        org_id = await _seed_minio_service(db_session, factory)
+        org_id = await seed_minio_service(db_session, factory)
         objects = {
             f"proj/builds/1/page-{index}.html": b"<html></html>"
             for index in range(3)
@@ -789,7 +839,7 @@ async def test_other_stores_get_no_upload_limiter(
         default_queue_name="docverse:queue",
         keeper_sync_upload_limiter=asyncio.Semaphore(1),
     )
-    org_id = await _seed_minio_service(db_session, factory)
+    org_id = await seed_minio_service(db_session, factory)
     async with db_session.begin():
         await factory.create_objectstore_for_org(
             org_id=org_id, service_label="minio"

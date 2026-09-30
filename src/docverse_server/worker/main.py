@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 import structlog
+from aiobotocore.session import AioSession, get_session
 from arq import cron, func
 from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
@@ -335,7 +336,10 @@ def initialize_worker_http_clients(
 
 
 async def initialize_worker_ltd_s3_source(
-    ctx: dict[str, Any], *, logger: structlog.stdlib.BoundLogger
+    ctx: dict[str, Any],
+    *,
+    session: AioSession,
+    logger: structlog.stdlib.BoundLogger,
 ) -> LtdS3Source:
     """Open this worker process's LTD source and record it in ctx.
 
@@ -354,9 +358,14 @@ async def initialize_worker_ltd_s3_source(
     client it is opened whichever pool is starting, and opens no
     connection until a copy uses it. ``ctx["ltd_s3_source"]`` records it
     and :func:`shutdown` closes it.
+
+    ``session`` is the process's one aiobotocore session, the one the
+    worker's destination stores open their clients from too, so the
+    source's client costs no service-model parse of its own (PRD #753).
     """
     source = LtdS3Source(
         max_pool_connections=config.keeper_sync_upload_concurrency,
+        session=session,
         logger=logger,
     )
     await source.open()
@@ -447,6 +456,7 @@ class WorkerFactoryBuilder:
         keeper_sync_copy_retry_delay_seconds: float,
         keeper_sync_upload_limiter: asyncio.Semaphore,
         ltd_s3_source: LtdS3Source | None = None,
+        aiobotocore_session: AioSession | None = None,
     ) -> None:
         # Process-lifetime, like ``http_client``: keeper-sync enqueues one
         # ``publish_edition`` job per synced edition, so folding a publish
@@ -495,6 +505,12 @@ class WorkerFactoryBuilder:
         # ctxs that never download from LTD need not open one, and their
         # per-job factories then open a source per copier instead.
         self._ltd_s3_source = ltd_s3_source
+        # Process-lifetime like ``ltd_s3_source``, which is opened from
+        # it, and optional for the same reason: test ctxs need not create
+        # one, and their per-job factories' stores then create a session
+        # each. Nothing to close: a session holds no connections, only
+        # the clients opened from it do.
+        self._aiobotocore_session = aiobotocore_session
 
     @property
     def github_app_enabled(self) -> bool:
@@ -552,6 +568,7 @@ class WorkerFactoryBuilder:
             ),
             keeper_sync_upload_limiter=self._keeper_sync_upload_limiter,
             ltd_s3_source=self._ltd_s3_source,
+            aiobotocore_session=self._aiobotocore_session,
         )
 
 
@@ -613,7 +630,16 @@ async def _startup(
     )
 
     http_client, copy_http_client = initialize_worker_http_clients(ctx)
-    ltd_s3_source = await initialize_worker_ltd_s3_source(ctx, logger=logger)
+    # One per worker process, like the LTD source opened from it: every
+    # S3 client the process opens — the LTD source's and each build
+    # copy's destination store's — comes from this session, so botocore
+    # parses the S3 service model and endpoint ruleset once per process
+    # rather than once per copy (PRD #753). A session holds no
+    # connections, so ``shutdown`` has nothing of its own to close.
+    aiobotocore_session = get_session()
+    ltd_s3_source = await initialize_worker_ltd_s3_source(
+        ctx, session=aiobotocore_session, logger=logger
+    )
     discovery = DiscoveryClient(
         http_client,
         base_url=str(config.repertoire_base_url),
@@ -664,6 +690,7 @@ async def _startup(
             config.keeper_sync_upload_concurrency
         ),
         ltd_s3_source=ltd_s3_source,
+        aiobotocore_session=aiobotocore_session,
     )
     await validate_github_app(
         state=factory_builder,

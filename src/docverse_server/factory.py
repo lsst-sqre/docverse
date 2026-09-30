@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import structlog
+from aiobotocore.session import AioSession
 from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
 from safir.arq import ArqQueue
@@ -162,6 +163,7 @@ class Factory:
         ),
         keeper_sync_upload_limiter: asyncio.Semaphore | None = None,
         ltd_s3_source: LtdSourceProtocol | None = None,
+        aiobotocore_session: AioSession | None = None,
     ) -> None:
         # A Factory is per-job / per-request, so an instance created here
         # coalesces nothing beyond the single publish this Factory drives
@@ -240,6 +242,18 @@ class Factory:
         # ``WorkerFactoryBuilder`` so LTD downloads reuse its connections
         # across builds and jobs.
         self._ltd_s3_source = ltd_s3_source
+        # The aiobotocore session every S3 client this factory's stores
+        # and LTD sources open is created from. A session parses
+        # botocore's S3 service model and endpoint ruleset on first use,
+        # and the keeper-sync copier builds a destination store per build
+        # copy and manifest hash, so a session per store churned that
+        # work, and its garbage, thousands of times per backfill (PRD
+        # #753). ``None`` keeps directly constructed factories (tests,
+        # scripts) building a session per store as before; the API
+        # lifespan and the arq worker's ``_startup`` each create one per
+        # process and thread it through ``ContextDependency`` and
+        # ``WorkerFactoryBuilder``.
+        self._aiobotocore_session = aiobotocore_session
         # Created lazily and then shared: a service defers an enqueue on
         # it and the caller that owns the commit dispatches from the same
         # instance, so the pending list has to survive between the two.
@@ -305,6 +319,16 @@ class Factory:
         ``None`` (each copier opens and closes a source of its own).
         """
         return self._ltd_s3_source
+
+    @property
+    def aiobotocore_session(self) -> AioSession | None:
+        """Process-lifetime aiobotocore session shared by S3 clients, if any.
+
+        The API's or worker's one session when one was given, otherwise
+        ``None`` (each store and LTD source creates a session of its
+        own).
+        """
+        return self._aiobotocore_session
 
     @property
     def queue_dispatcher(self) -> QueueDispatcher:
@@ -1153,6 +1177,7 @@ class Factory:
             max_attempts=upload_max_attempts,
             max_backoff_seconds=upload_max_backoff_seconds,
             upload_limiter=upload_limiter,
+            aiobotocore_session=self._aiobotocore_session,
         )
 
     def create_ltd_client(
@@ -1171,8 +1196,16 @@ class Factory:
     def create_ltd_s3_source(
         self, *, bucket: str = "lsst-the-docs"
     ) -> LtdS3Source:
-        """Create an unopened anonymous S3 source for ``bucket``."""
-        return LtdS3Source(bucket=bucket, logger=self._logger)
+        """Create an unopened anonymous S3 source for ``bucket``.
+
+        The source opens its client from :attr:`aiobotocore_session` when
+        the factory holds one.
+        """
+        return LtdS3Source(
+            bucket=bucket,
+            session=self._aiobotocore_session,
+            logger=self._logger,
+        )
 
     def create_build_content_copier_for_org(
         self,
@@ -1375,6 +1408,7 @@ class HandlerFactory(Factory):
         github_app_html_url: str | None = None,
         github_app_validated: bool = True,
         default_queue_name: str,
+        aiobotocore_session: AioSession | None = None,
     ) -> None:
         super().__init__(
             session=session,
@@ -1389,6 +1423,7 @@ class HandlerFactory(Factory):
             github_webhook_secret=github_webhook_secret,
             github_app_validated=github_app_validated,
             default_queue_name=default_queue_name,
+            aiobotocore_session=aiobotocore_session,
         )
         self._user_info_store = user_info_store
         self._github_app_html_url = github_app_html_url

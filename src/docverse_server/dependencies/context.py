@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 
 import httpx
+from aiobotocore.session import AioSession
 from fastapi import Depends, Request, Response
 from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
@@ -100,6 +101,7 @@ class ContextDependency:
         self._github_app_validated: bool = True
         self._github_app_html_url: str | None = None
         self._events: DocverseEvents | None = None
+        self._aiobotocore_session: AioSession | None = None
 
     @property
     def github_app_enabled(self) -> bool:
@@ -121,6 +123,16 @@ class ContextDependency:
     def github_app_id(self) -> int | None:
         """Return the configured GitHub App numeric ID, or ``None``."""
         return self._github_app_id
+
+    @property
+    def aiobotocore_session(self) -> AioSession | None:
+        """Return the process's aiobotocore session, or ``None``.
+
+        The lifespan creates one per process and every request's factory
+        opens its S3 clients from it (PRD #753). ``None`` before the
+        lifespan has run, when each store creates a session of its own.
+        """
+        return self._aiobotocore_session
 
     @property
     def events(self) -> DocverseEvents:
@@ -177,6 +189,7 @@ class ContextDependency:
                 github_app_validated=self._github_app_validated,
                 github_app_html_url=self._github_app_html_url,
                 default_queue_name=self._arq_queue_name,
+                aiobotocore_session=self._aiobotocore_session,
             ),
         )
 
@@ -193,11 +206,14 @@ class ContextDependency:
         github_app_private_key: SecretStr | None = None,
         github_webhook_secret: SecretStr | None = None,
         events: DocverseEvents | None = None,
+        aiobotocore_session: AioSession | None = None,
     ) -> None:
         """Initialize the process-wide shared context."""
         self._initialized = True
         if events is not None:
             self._events = events
+        if aiobotocore_session is not None:
+            self._aiobotocore_session = aiobotocore_session
         if user_info_store is not None:
             self._user_info_store = user_info_store
         if credential_encryptor is not None:
