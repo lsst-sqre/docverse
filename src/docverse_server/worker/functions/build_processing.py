@@ -53,6 +53,7 @@ from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions._cancellation import (
     ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
     RunFinaliser,
+    cancellation_recorded,
     record_cancellation,
 )
 
@@ -242,6 +243,7 @@ class _MidUploadRetirement:
     """
 
 
+@cancellation_recorded
 async def build_processing(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:

@@ -26,6 +26,7 @@ from docverse_server.services.lock_service import LockKey
 from docverse_server.worker.functions._cancellation import (
     ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
     RunFinaliser,
+    cancellation_recorded,
     record_cancellation,
 )
 
@@ -40,6 +41,7 @@ timeout or a worker shutdown cancelled the job mid-sync. The row's
 """
 
 
+@cancellation_recorded
 async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     """Sync one dashboard-template binding from GitHub.
 

@@ -20,10 +20,12 @@ from docverse_server.metrics import DashboardBuiltEvent
 from docverse_server.services.lock_service import LockKey
 from docverse_server.worker.functions._cancellation import (
     ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+    cancellation_recorded,
     record_cancellation,
 )
 
 
+@cancellation_recorded
 async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     """Render and publish one project's dashboard.
 

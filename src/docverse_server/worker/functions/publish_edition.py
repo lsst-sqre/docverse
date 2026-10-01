@@ -48,6 +48,7 @@ from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions._cancellation import (
     RunFinaliser,
+    cancellation_recorded,
     record_cancellation,
 )
 
@@ -82,6 +83,7 @@ class _PublishSkip:
     """The structlog event the retirement logs."""
 
 
+@cancellation_recorded
 async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     """Sync one edition's current build to its organization's CDN.
 

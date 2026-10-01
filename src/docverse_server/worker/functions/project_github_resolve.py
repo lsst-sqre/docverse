@@ -58,6 +58,7 @@ from docverse_server.storage.github import (
 )
 from docverse_server.worker.functions._cancellation import (
     ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+    cancellation_recorded,
     record_handoff_cancellation,
 )
 
@@ -170,6 +171,7 @@ def _retry_defer_seconds(job_try: int) -> float:
     return min(RETRY_MAX_DEFER_SECONDS, RETRY_BASE_DEFER_SECONDS * multiplier)
 
 
+@cancellation_recorded
 async def project_github_resolve(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:

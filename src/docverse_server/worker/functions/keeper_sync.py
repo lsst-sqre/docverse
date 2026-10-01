@@ -122,6 +122,7 @@ from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions._cancellation import (
     ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+    cancellation_recorded,
     discovery_run_finaliser,
     keeper_sync_run_finaliser,
     record_cancellation,
@@ -451,6 +452,7 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
     raise RuntimeError(msg)
 
 
+@cancellation_recorded
 async def keeper_sync_run_discovery(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
@@ -634,6 +636,7 @@ async def keeper_sync_run_discovery(
     raise RuntimeError(msg)
 
 
+@cancellation_recorded
 async def keeper_sync_project(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
@@ -2353,6 +2356,7 @@ async def _reconcile_run_children(
         )
 
 
+@cancellation_recorded
 async def keeper_sync_tier_main(ctx: dict[str, Any]) -> str:
     """Cron (every 5 min): refresh ``main`` editions whose LTD rebuilt.
 
@@ -2380,6 +2384,7 @@ async def keeper_sync_tier_main(ctx: dict[str, Any]) -> str:
     )
 
 
+@cancellation_recorded
 async def keeper_sync_tier_discovery(ctx: dict[str, Any]) -> str:
     """Cron (every 30 min): enqueue projects with unseen LTD resources.
 
@@ -2403,6 +2408,7 @@ async def keeper_sync_tier_discovery(ctx: dict[str, Any]) -> str:
     )
 
 
+@cancellation_recorded
 async def keeper_sync_tier_other(ctx: dict[str, Any]) -> str:
     """Cron (hourly): refresh non-``main`` editions older than the threshold.
 

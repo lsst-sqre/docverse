@@ -9,6 +9,7 @@ drained.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,7 @@ from docverse.models import (
 )
 from docverse.models.queue_enums import JobKind, JobStatus
 from docverse_server.config import Configuration
+from docverse_server.config import config as worker_config
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.edition_build_history import (
@@ -78,6 +80,7 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.lifecycle_eval import lifecycle_eval
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.worker.conftest import make_worker_ctx
 
 NOW = datetime(2026, 5, 12, 12, 0, 0, tzinfo=UTC)
@@ -777,6 +780,65 @@ async def test_lifecycle_eval_failure_marks_queue_job_and_finalises_run(
                 session=session, logger=_logger()
             )
             run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status is LifecycleEvalRunStatus.partial_failure
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_eval_cancel_fails_the_row_and_finalises_the_run(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An arq cancel mid-pass fails the row and rolls up its run.
+
+    The cancel lands while the worker loads the org's projects — the
+    ``CancelledError`` sibling of the failure above, which the
+    ``except Exception`` branch never sees. The row fails with a
+    ``CancelledError`` payload read against the maintenance pool's
+    timeout instead of waiting for ``lifecycle_reaper``, and the
+    single-child run rolls to ``partial_failure`` as it does on that
+    failure path, before the cancel re-raises.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="lce-cancel")
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    hang = HangUntilCancelled()
+    monkeypatch.setattr(ProjectStore, "list_all_by_org", hang)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = make_worker_ctx(http_client=http_client)
+        task = asyncio.create_task(
+            lifecycle_eval(
+                ctx,
+                {
+                    "org_id": org_id,
+                    "org_slug": org_slug,
+                    "lifecycle_eval_run_id": run_id,
+                    "queue_job_id": queue_job_id,
+                },
+            )
+        )
+        await cancel_when_reached(task, hang.reached)
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job_id
+            )
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["type"] == "CancelledError"
+            assert qj.errors["reason"] == "worker_shutdown"
+            assert qj.errors["timeout_seconds"] == (
+                worker_config.maintenance_job_timeout_seconds
+            )
+            run = await LifecycleEvalRunStore(
+                session=session, logger=_logger()
+            ).get(run_id)
             assert run is not None
             assert run.status is LifecycleEvalRunStatus.partial_failure
 

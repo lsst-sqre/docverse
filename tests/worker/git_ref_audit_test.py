@@ -10,6 +10,7 @@ the parent ``git_ref_audit_runs`` row.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -39,6 +40,7 @@ from docverse.models import (
 from docverse.models.projects import ProjectGitHubBindingCreate
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
+from docverse_server.config import config as worker_config
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.project import SqlProject
@@ -79,6 +81,7 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.git_ref_audit import git_ref_audit
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import count_jobs_by_name, get_jobs_by_name
 from tests.support.github_mock import GitHubMock
 from tests.worker.conftest import make_worker_ctx
@@ -1939,3 +1942,62 @@ async def test_git_ref_audit_drops_a_failed_convergence_publish_job(
                 row = await store.get(job.kwargs["payload"]["queue_job_id"])
                 assert row is not None
                 assert row.backend_job_id == job.id
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_cancel_fails_the_row_and_finalises_the_run(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An arq cancel mid-audit fails the row and rolls up its run.
+
+    The org's pass is cancelled while it loads the org's GitHub-bound
+    projects, as a rolling deploy's SIGTERM would catch it. Its row must
+    not sit ``in_progress`` until ``lifecycle_reaper``: it fails with a
+    ``CancelledError`` payload read against the maintenance pool's
+    timeout, and — being the run's only child — rolls the parent
+    ``git_ref_audit_runs`` row to ``partial_failure`` exactly as the
+    ``except Exception`` branch would, before the cancel re-raises.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-cancel")
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    hang = HangUntilCancelled()
+    monkeypatch.setattr(ProjectStore, "list_github_bound_by_org", hang)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = make_worker_ctx(http_client=http_client)
+        task = asyncio.create_task(
+            git_ref_audit(
+                ctx,
+                {
+                    "org_id": org_id,
+                    "org_slug": org_slug,
+                    "git_ref_audit_run_id": run_id,
+                    "queue_job_id": queue_job_id,
+                },
+            )
+        )
+        await cancel_when_reached(task, hang.reached)
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job_id
+            )
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["type"] == "CancelledError"
+            assert qj.errors["reason"] == "worker_shutdown"
+            assert qj.errors["timeout_seconds"] == (
+                worker_config.maintenance_job_timeout_seconds
+            )
+            run = await GitRefAuditRunStore(
+                session=session, logger=_logger()
+            ).get(run_id)
+            assert run is not None
+            assert run.status == GitRefAuditRunStatus.partial_failure

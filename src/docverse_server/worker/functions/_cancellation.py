@@ -24,6 +24,12 @@ cancel there leaves the child ``queued`` with no ``backend_job_id`` — an
 orphan the reapers' orphan sweeps fail only once it has idled past their
 window, holding any active-job mutex it occupies until then. The helper
 fails it at once.
+
+A function that uses either helper is also decorated with
+:func:`cancellation_recorded`. The helpers are context managers inside
+each body, invisible from outside; the marker is what a test reads off
+the functions the ``WorkerSettings`` classes register to check that
+every ``queue_jobs``-backed function is covered.
 """
 
 from __future__ import annotations
@@ -59,11 +65,13 @@ from docverse_server.storage.queue_job_store import QueueJobStore
 
 __all__ = [
     "ARQ_DEFAULT_JOB_TIMEOUT_SECONDS",
+    "CANCELLATION_RECORDED_ATTR",
     "JOB_TIMEOUT_MESSAGE",
     "TIMEOUT_REASON_SLACK",
     "CancellationReason",
     "ProgressReporter",
     "RunFinaliser",
+    "cancellation_recorded",
     "discovery_run_finaliser",
     "keeper_sync_run_finaliser",
     "record_cancellation",
@@ -133,6 +141,26 @@ last few seconds of a job's allowance is recorded as a timeout. Clock
 skew needs no slack: the elapsed time is measured entirely on the
 database's clock (:meth:`QueueJobStore.get_elapsed_since_start`).
 """
+
+
+CANCELLATION_RECORDED_ATTR = "__docverse_cancellation_recorded__"
+"""Attribute :func:`cancellation_recorded` sets on a worker function."""
+
+
+def cancellation_recorded[F: Callable[..., Awaitable[Any]]](fn: F) -> F:
+    """Mark an arq worker function as recording its own cancellation.
+
+    Apply it to every function whose body runs under
+    :func:`record_cancellation` or :func:`record_handoff_cancellation`.
+    It changes nothing about how the function runs: it sets
+    :data:`CANCELLATION_RECORDED_ATTR` so the coverage test can tell,
+    from the coroutines the ``WorkerSettings`` classes register, which
+    functions are covered. The attribute survives
+    :func:`~docverse_server.sentry.instrument_arq_task`, whose
+    :func:`functools.wraps` copies the function's ``__dict__``.
+    """
+    setattr(fn, CANCELLATION_RECORDED_ATTR, True)
+    return fn
 
 
 @dataclass(frozen=True, slots=True)
