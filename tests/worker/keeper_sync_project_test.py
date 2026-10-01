@@ -11,6 +11,7 @@ failing paths — without depending on real S3 or R2.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ from docverse.models import (
 )
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
+from docverse_server.config import config as worker_config
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.edition_build_history import (
     SqlEditionBuildHistory,
@@ -3881,3 +3883,228 @@ async def test_keeper_sync_project_rebuilt_release_reports_lag_on_aggregates(
         "15.2": "2026-05-03T09:00:00+00:00",
         "15": "2026-05-03T09:00:00+00:00",
     }
+
+
+def _hang_route(route: respx.Route) -> asyncio.Event:
+    """Make ``route`` hang until its caller is cancelled.
+
+    Returns an event set once the request arrives, so a test can cancel
+    ``keeper_sync_project`` exactly while it is awaiting LTD — the way
+    arq's timeout or a worker shutdown catches a job mid-sync.
+    """
+    reached = asyncio.Event()
+
+    async def _hang(request: httpx.Request) -> httpx.Response:
+        reached.set()
+        await asyncio.Event().wait()
+        msg = "unreachable: the request is cancelled while it hangs"
+        raise AssertionError(msg)
+
+    route.mock(side_effect=_hang)
+    return reached
+
+
+async def _cancel_when_reached(
+    task: asyncio.Task[str],
+    reached: asyncio.Event,
+    *,
+    started_ago: timedelta | None = None,
+    queue_job_id: int | None = None,
+) -> None:
+    """Cancel ``task`` once it reaches the hanging route.
+
+    ``started_ago`` backdates the job's ``date_started`` first, putting
+    the cancel past the pool timeout without waiting for it. The
+    ``CancelledError`` must come back out of the task, as arq needs it
+    to record the job as failed.
+    """
+    waiter = asyncio.create_task(reached.wait())
+    await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+    waiter.cancel()
+    if task.done():
+        await task
+        pytest.fail("keeper_sync_project returned before it was cancelled")
+    if started_ago is not None:
+        assert queue_job_id is not None
+        async for session in db_session_dependency():
+            async with session.begin():
+                await session.execute(
+                    update(SqlQueueJob)
+                    .where(SqlQueueJob.id == queue_job_id)
+                    .values(date_started=func.now() - started_ago)
+                )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize(
+    ("started_ago", "expected_reason"),
+    [
+        pytest.param(None, "worker_shutdown", id="worker_shutdown"),
+        pytest.param(
+            timedelta(seconds=worker_config.keeper_sync_job_timeout_seconds)
+            + timedelta(minutes=1),
+            "job_timeout",
+            id="job_timeout",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_keeper_sync_project_cancel_fails_row_and_finalises_run(
+    *,
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    started_ago: timedelta | None,
+    expected_reason: str,
+) -> None:
+    """An arq cancel mid-sync fails the row and finalises its run (#699).
+
+    The job is cancelled while ``sync_project`` awaits LTD for the main
+    edition's build, as arq's timeout or a rolling deploy's SIGTERM
+    would catch it. The row must not be left ``in_progress`` for the
+    reaper: it fails with a ``CancelledError`` payload whose ``reason``
+    follows the elapsed time, records how far the sync got, rolls the
+    parent run (whose only child it is) up to ``partial_failure`` with
+    ``keeper_sync_run_completed`` published, and the cancel re-raises
+    so arq records the job as failed.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+    _seed_ltd(mock_discovery)
+    reached = _hang_route(mock_discovery.get(f"{LTD_BASE}/builds/42"))
+    _patch_factory_io(
+        monkeypatch, object_store=MockObjectStore(), source_objects={}
+    )
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), arq_queue=mock_arq, events=events
+    )
+
+    task = asyncio.create_task(
+        keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
+    )
+    await _cancel_when_reached(
+        task, reached, started_ago=started_ago, queue_job_id=queue_job_id
+    )
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            qj = await queue_job_store.get(queue_job_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["type"] == "CancelledError"
+            assert qj.errors["reason"] == expected_reason
+            assert qj.errors["timeout_seconds"] == (
+                worker_config.keeper_sync_job_timeout_seconds
+            )
+            # Cancelled on the main edition's build: nothing synced yet.
+            assert qj.progress == {"editions_visited": 0}
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.partial_failure
+
+    publisher = events.keeper_sync_run_completed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == org_slug
+    assert event.success is False
+    assert event.failed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_cancelled_tier_cron_job_touches_no_run(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled tier-cron job fails its row and leaves every run alone.
+
+    Tier crons enqueue ``keeper_sync_project`` with no ``run_id``, so
+    the cancel path has no run to roll up — an in-flight run of the same
+    org must not be finalised on its behalf. The job is cancelled on the
+    second edition's build, after the main edition synced, so the row's
+    progress records the one edition the sync got through.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        unrelated_run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job = await QueueJobStore(
+            session=db_session, logger=_logger()
+        ).create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            backend_job_id="test-arq-tier-project",
+        )
+    _seed_two_edition_ltd(mock_discovery)
+    reached = _hang_route(mock_discovery.get(f"{LTD_BASE}/builds/43"))
+    _patch_factory_io(
+        monkeypatch,
+        object_store=MockObjectStore(),
+        source_objects={
+            "pipelines/builds/42/index.html": b"<html>main</html>"
+        },
+    )
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), arq_queue=mock_arq, events=events
+    )
+
+    task = asyncio.create_task(
+        keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "queue_job_id": queue_job.id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
+    )
+    await _cancel_when_reached(task, reached)
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            qj = await queue_job_store.get(queue_job.id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["reason"] == "worker_shutdown"
+            assert qj.progress == {"editions_visited": 1}
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            unrelated_run = await run_store.get(unrelated_run_id)
+            assert unrelated_run is not None
+            assert unrelated_run.status == KeeperSyncRunStatus.in_progress
+
+    publisher = events.keeper_sync_run_completed
+    assert isinstance(publisher, MockEventPublisher)
+    assert publisher.published == []

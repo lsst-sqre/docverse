@@ -12,7 +12,7 @@ import pytest
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -433,6 +433,44 @@ async def test_fail_if_active_raises_for_missing_row(
     async with db_session.begin():
         with pytest.raises(JobNotFoundError):
             await store.fail_if_active(-1)
+
+
+@pytest.mark.asyncio
+async def test_get_elapsed_since_start_reads_the_database_clock(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A started job's running time is measured on the database's clock.
+
+    ``date_started`` is stamped with the database's ``now()``, so the
+    arq cancellation helper compares it against the same clock when it
+    decides whether a cancel was the pool timeout: reading the worker's
+    clock instead would fold any skew between the two into the verdict.
+    Inside one transaction ``now()`` is fixed, so a row backdated by 90
+    minutes reads back as exactly 90 minutes.
+    """
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        await store.start_if_queued(job.id)
+        await db_session.execute(
+            update(SqlQueueJob)
+            .where(SqlQueueJob.id == job.id)
+            .values(date_started=func.now() - timedelta(minutes=90))
+        )
+        elapsed = await store.get_elapsed_since_start(job.id)
+    assert elapsed == timedelta(minutes=90)
+
+
+@pytest.mark.asyncio
+async def test_get_elapsed_since_start_is_none_before_pickup(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A queued row has no running time, and neither does a missing one."""
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.build_processing, org_id=1)
+        assert await store.get_elapsed_since_start(job.id) is None
+        assert await store.get_elapsed_since_start(-1) is None
 
 
 @pytest.mark.asyncio

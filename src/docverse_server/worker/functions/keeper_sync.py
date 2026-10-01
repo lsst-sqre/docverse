@@ -110,6 +110,10 @@ from docverse_server.storage.ltd import (
 )
 from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions._cancellation import (
+    keeper_sync_run_finaliser,
+    record_cancellation,
+)
 from docverse_server.worker.functions._reaper_log import (
     create_reaped_jobs_payload,
 )
@@ -636,6 +640,16 @@ async def keeper_sync_project(
        as failed. Both branches call :func:`maybe_finalise_run` so a
        terminal child cannot leave the parent run stuck in
        ``in_progress``.
+    5. If arq cancels the job instead — its
+       ``keeper_sync_job_timeout_seconds`` timeout, or a worker shutdown
+       — the ``CancelledError`` bypasses that ``except Exception``, so
+       :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+       fails the row from a fresh session (``errors["reason"]`` tells
+       ``job_timeout`` from ``worker_shutdown``), records the
+       ``editions_visited`` count the ``on_edition_synced`` callback
+       kept, finalises the parent run when there is one, and re-raises.
+       Without it the row sat ``in_progress`` and the run 409-blocked
+       the org until ``keeper_sync_reaper`` noticed (#699).
 
     :meth:`~KeeperSyncService.sync_project` gives each edition its own
     failure boundary, so an unreadable LTD build no longer reaches the
@@ -688,79 +702,112 @@ async def keeper_sync_project(
                 return "skipped"
             org = await org_store.get_by_id(org_id)
 
-        try:
-            if org is None:
-                msg = f"Organization {org_id} not found"
-                raise RuntimeError(msg)
-            publishing_store_label = org.publishing_store_label
-            if publishing_store_label is None:
-                msg = (
-                    f"Org {org_id} has no publishing_store_label "
-                    "configured; keeper-sync requires a publishing "
-                    "object store"
-                )
-                raise RuntimeError(msg)
-
-            service = factory.create_keeper_sync_service(
-                org_id=org_id,
-                service_label=publishing_store_label,
-                ltd_base_url=ltd_base_url,
-                on_build_copied=_build_on_build_copied(
-                    events=ctx.get("events"),
-                    org_slug=org_slug,
-                    ltd_slug=ltd_slug,
-                ),
-            )
-
-            restamp_only_project_ids: set[int] = set()
-            on_edition_synced = _build_on_edition_synced(
-                factory=factory,
-                session=session,
-                queue_job_store=queue_job_store,
-                org_id=org_id,
-                run_id=run_id,
-                logger=logger,
-                restamp_only_project_ids=restamp_only_project_ids,
-            )
-
-            sync_result = await service.sync_project(
-                org_id=org_id,
-                ltd_slug=ltd_slug,
-                on_edition_synced=on_edition_synced,
-            )
-            await _self_heal_unpublished_editions(
-                factory=factory,
-                session=session,
-                queue_job_store=queue_job_store,
-                org_id=org_id,
-                run_id=run_id,
-                sync_result=sync_result,
-                logger=logger,
-            )
-            await _enqueue_dashboard_for_restamps(
-                factory=factory,
-                session=session,
-                org_id=org_id,
-                project_ids=restamp_only_project_ids,
-                logger=logger,
-            )
-        except Exception as exc:
-            sentry_sdk.capture_exception(exc)
-            logger.exception("Keeper-sync project failed")
-            completion: KeeperSyncRunWithActivity | None = None
-            async with session.begin():
-                await queue_job_store.fail(
-                    queue_job_id,
-                    errors={
-                        "message": str(exc),
-                        "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(),
-                    },
-                )
-                if run_id is not None:
-                    completion = await maybe_finalise_run(
-                        run_store=run_store, run_id=run_id
+        # From here on the job holds an ``in_progress`` row. arq's
+        # timeout and a worker shutdown both cancel the job with a
+        # ``CancelledError`` that the ``except Exception`` below never
+        # sees, so the helper fails the row and rolls the run up on that
+        # path instead of leaving both to the reaper (#699).
+        progress = _ProjectSyncProgress()
+        async with record_cancellation(
+            ctx,
+            queue_job_id=queue_job_id,
+            timeout_seconds=config.keeper_sync_job_timeout_seconds,
+            logger=logger,
+            progress=progress.snapshot,
+            finalise_run=keeper_sync_run_finaliser(run_id),
+        ):
+            try:
+                if org is None:
+                    msg = f"Organization {org_id} not found"
+                    raise RuntimeError(msg)
+                publishing_store_label = org.publishing_store_label
+                if publishing_store_label is None:
+                    msg = (
+                        f"Org {org_id} has no publishing_store_label "
+                        "configured; keeper-sync requires a publishing "
+                        "object store"
                     )
+                    raise RuntimeError(msg)
+
+                service = factory.create_keeper_sync_service(
+                    org_id=org_id,
+                    service_label=publishing_store_label,
+                    ltd_base_url=ltd_base_url,
+                    on_build_copied=_build_on_build_copied(
+                        events=ctx.get("events"),
+                        org_slug=org_slug,
+                        ltd_slug=ltd_slug,
+                    ),
+                )
+
+                restamp_only_project_ids: set[int] = set()
+                on_edition_synced = _build_on_edition_synced(
+                    factory=factory,
+                    session=session,
+                    queue_job_store=queue_job_store,
+                    org_id=org_id,
+                    run_id=run_id,
+                    logger=logger,
+                    restamp_only_project_ids=restamp_only_project_ids,
+                    progress=progress,
+                )
+
+                sync_result = await service.sync_project(
+                    org_id=org_id,
+                    ltd_slug=ltd_slug,
+                    on_edition_synced=on_edition_synced,
+                )
+                await _self_heal_unpublished_editions(
+                    factory=factory,
+                    session=session,
+                    queue_job_store=queue_job_store,
+                    org_id=org_id,
+                    run_id=run_id,
+                    sync_result=sync_result,
+                    logger=logger,
+                )
+                await _enqueue_dashboard_for_restamps(
+                    factory=factory,
+                    session=session,
+                    org_id=org_id,
+                    project_ids=restamp_only_project_ids,
+                    logger=logger,
+                )
+            except Exception as exc:
+                sentry_sdk.capture_exception(exc)
+                logger.exception("Keeper-sync project failed")
+                completion: KeeperSyncRunWithActivity | None = None
+                async with session.begin():
+                    await queue_job_store.fail(
+                        queue_job_id,
+                        errors={
+                            "message": str(exc),
+                            "type": type(exc).__name__,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                    if run_id is not None:
+                        completion = await maybe_finalise_run(
+                            run_store=run_store, run_id=run_id
+                        )
+                await publish_run_completed(
+                    events=ctx.get("events"),
+                    session=session,
+                    org_store=org_store,
+                    completion=completion,
+                    logger=logger,
+                )
+                raise
+
+            edition_failures = sync_result.edition_failures
+            completion = await _finalise_project_job(
+                session=session,
+                queue_job_store=queue_job_store,
+                run_store=run_store,
+                queue_job_id=queue_job_id,
+                run_id=run_id,
+                edition_failures=edition_failures,
+            )
             await publish_run_completed(
                 events=ctx.get("events"),
                 session=session,
@@ -768,26 +815,8 @@ async def keeper_sync_project(
                 completion=completion,
                 logger=logger,
             )
-            raise
-
-        edition_failures = sync_result.edition_failures
-        completion = await _finalise_project_job(
-            session=session,
-            queue_job_store=queue_job_store,
-            run_store=run_store,
-            queue_job_id=queue_job_id,
-            run_id=run_id,
-            edition_failures=edition_failures,
-        )
-        await publish_run_completed(
-            events=ctx.get("events"),
-            session=session,
-            org_store=org_store,
-            completion=completion,
-            logger=logger,
-        )
-        _log_project_completion(logger=logger, sync_result=sync_result)
-        return "completed_with_errors" if edition_failures else "completed"
+            _log_project_completion(logger=logger, sync_result=sync_result)
+            return "completed_with_errors" if edition_failures else "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
@@ -899,6 +928,28 @@ def _edition_failure_progress(
     }
 
 
+@dataclass
+class _ProjectSyncProgress:
+    """Live counters of a running ``keeper_sync_project`` job.
+
+    The ``on_edition_synced`` callback advances them as the sync walks
+    LTD's edition list, and :func:`record_cancellation` reads
+    :meth:`snapshot` onto the job's ``progress`` if arq cancels the job
+    part way, so a cancelled row shows how far it got.
+    """
+
+    editions_visited: int = 0
+    """Editions whose sync returned (every outcome the callback saw).
+
+    An edition whose sync raised is recorded on the
+    ``edition_failures`` progress instead and is not counted here.
+    """
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return the counters as a ``progress`` payload."""
+        return {"editions_visited": self.editions_visited}
+
+
 def _build_on_edition_synced(
     *,
     factory: Factory,
@@ -908,6 +959,7 @@ def _build_on_edition_synced(
     run_id: int | None,
     logger: structlog.stdlib.BoundLogger,
     restamp_only_project_ids: set[int],
+    progress: _ProjectSyncProgress,
 ) -> Callable[[EditionSyncOutcome], Awaitable[None]]:
     """Build the ``on_edition_synced`` callback for ``sync_project``.
 
@@ -925,9 +977,14 @@ def _build_on_edition_synced(
     edition loop is over. An outcome that did enqueue a publish is left
     out because every successful publish already cascades its own
     ``dashboard_build``.
+
+    Every outcome first advances ``progress.editions_visited``: the
+    edition's own sync has already returned, so it counts as visited
+    even if the publish enqueue after it is cancelled.
     """
 
     async def callback(outcome: EditionSyncOutcome) -> None:
+        progress.editions_visited += 1
         published_edition = await _enqueue_publish_for_synced_edition(
             factory=factory,
             session=session,

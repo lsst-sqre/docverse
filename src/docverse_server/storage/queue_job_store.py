@@ -9,7 +9,15 @@ from typing import Any
 import structlog
 from redis.exceptions import RedisError
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import ColumnExpressionArgument, and_, or_, select, update
+from sqlalchemy import (
+    ColumnExpressionArgument,
+    Interval,
+    and_,
+    or_,
+    select,
+    type_coerce,
+    update,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -391,6 +399,32 @@ class QueueJobStore:
         if row is None:
             return None
         return QueueJob.model_validate(row, from_attributes=True)
+
+    async def get_elapsed_since_start(self, job_id: int) -> timedelta | None:
+        """Return how long a job has been running, on the database's clock.
+
+        Computes ``now() - date_started`` in SQL. ``date_started`` is
+        stamped with the database's ``now()`` at pickup, so measuring
+        against the same clock keeps any skew between a worker pod and
+        the database out of the result — which matters to the arq
+        cancellation helper, whose ``job_timeout`` / ``worker_shutdown``
+        verdict compares this against the pool timeout. ``now()`` is the
+        current transaction's start time, so call this early in a short
+        transaction.
+
+        Returns
+        -------
+        datetime.timedelta or None
+            The running time, or ``None`` when the row does not exist or
+            has not been picked up (``date_started`` is ``NULL``).
+        """
+        # ``timestamptz - timestamptz`` is an ``interval`` in PostgreSQL;
+        # ``type_coerce`` only tells SQLAlchemy (and mypy) so.
+        elapsed = type_coerce(func.now() - SqlQueueJob.date_started, Interval)
+        result = await self._session.execute(
+            select(elapsed).where(SqlQueueJob.id == job_id)
+        )
+        return result.scalar_one_or_none()
 
     async def get_by_public_id(self, public_id: int) -> QueueJob | None:
         """Fetch a QueueJob by public Base32 id (int form)."""
