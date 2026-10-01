@@ -1,5 +1,6 @@
 """Object store abstractions and implementations."""
 
+from ._cache import ObjectStoreBuild, ObjectStoreCache, ObjectStoreKey
 from ._exceptions import MAX_REPORTED_OBJECT_FAILURES, ObjectStoreError
 from ._factory import create_objectstore
 from ._mock import MockObjectStore
@@ -10,7 +11,10 @@ __all__ = [
     "MAX_REPORTED_OBJECT_FAILURES",
     "MockObjectStore",
     "ObjectStore",
+    "ObjectStoreBuild",
+    "ObjectStoreCache",
     "ObjectStoreError",
+    "ObjectStoreKey",
     "S3ObjectStore",
     "create_objectstore",
 ]

@@ -175,6 +175,12 @@ _MEMORY_PHALANX_GROUP = "config.memoryDiagnostics"
 _MEMORY_LOGS_SECTION = "What the sampler logs"
 """Memory page section holding its sample-field and log-line tables."""
 
+_OBJECTSTORE_CACHE_MODULE = "docverse_server.storage.objectstore._cache"
+"""Module that writes every shared destination-client log line."""
+
+_OBJECTSTORE_CACHE_SECTION = "Shared destination clients"
+"""Memory page section holding the shared-client log-line table."""
+
 _LOG_LEVELS = frozenset({"debug", "info", "warning", "error", "exception"})
 """The structlog methods whose first argument is a log line's message."""
 
@@ -1493,12 +1499,15 @@ def _memory_sample(*, traced: bool) -> MemorySample:
     )
 
 
-def _memory_log_calls() -> dict[str, list[_LogCall]]:
-    """Every line the sampler module writes, with its fields as logged.
+def _memory_log_calls(
+    module_name: str = _MEMORY_MODULE,
+) -> dict[str, list[_LogCall]]:
+    """Every line a memory-page module writes, with its fields as logged.
 
-    ``exc_info=True`` is read as ``exception``: Safir's production
-    profile renders the traceback under that key, which is the one an
-    operator reads in the JSON logs.
+    ``module_name`` defaults to the sampler module. ``exc_info=True`` is
+    read as ``exception``: Safir's production profile renders the
+    traceback under that key, which is the one an operator reads in the
+    JSON logs.
     """
     return {
         message: [
@@ -1511,7 +1520,7 @@ def _memory_log_calls() -> dict[str, list[_LogCall]]:
             )
             for call in calls
         ]
-        for message, calls in _log_calls(_MEMORY_MODULE).items()
+        for message, calls in _log_calls(module_name).items()
     }
 
 
@@ -1579,6 +1588,27 @@ def test_memory_log_lines_match_the_code() -> None:
     )
     emitted = _memory_log_calls()
     assert emitted, "the sampler module writes no log lines"
+    assert set(documented) == set(emitted)
+    wrong = sorted(
+        message
+        for message, row in documented.items()
+        if row not in emitted[message]
+    )
+    assert not wrong
+
+
+def test_objectstore_cache_log_lines_match_the_code() -> None:
+    """The shared-client log table lists exactly the cache's log lines.
+
+    A dev run counts the worker's destination clients from these lines
+    (#751), so a message, level or field that drifted from the code is
+    one the count cannot be read from.
+    """
+    documented = _documented_log_lines(
+        _read(_MEMORY_PAGE), section=_OBJECTSTORE_CACHE_SECTION
+    )
+    emitted = _memory_log_calls(_OBJECTSTORE_CACHE_MODULE)
+    assert emitted, "the cache module writes no log lines"
     assert set(documented) == set(emitted)
     wrong = sorted(
         message

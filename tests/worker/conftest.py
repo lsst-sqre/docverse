@@ -24,6 +24,7 @@ from docverse_server.config import Configuration
 from docverse_server.metrics.events import DocverseEvents
 from docverse_server.services.credential_encryptor import CredentialEncryptor
 from docverse_server.storage.ltd import LtdS3Source
+from docverse_server.storage.objectstore import ObjectStoreCache
 from docverse_server.worker.main import WorkerFactoryBuilder
 from tests.support.database import ddl_database_url_for
 from tests.support.xdist import verify_worker_isolation
@@ -61,6 +62,7 @@ def make_worker_ctx(
     cdn_purge_enabled: bool = False,
     ltd_s3_source: LtdS3Source | None = None,
     aiobotocore_session: AioSession | None = None,
+    objectstore_cache: ObjectStoreCache | None = None,
 ) -> dict[str, Any]:
     """Build a worker ctx dict that mirrors ``worker.main.startup``.
 
@@ -78,7 +80,10 @@ def make_worker_ctx(
     ``aiobotocore_session`` are the process-lifetime S3 resources
     ``_startup`` creates; tests that leave them out get per-job
     factories whose copiers and stores create their own, as directly
-    constructed factories do.
+    constructed factories do. ``objectstore_cache`` is the same: given,
+    it is recorded in ctx for ``shutdown`` and every per-job factory
+    borrows org store clients from it; left out, each store opens and
+    closes a client of its own.
     """
     if encryptor is None:
         encryptor = CredentialEncryptor(
@@ -111,12 +116,15 @@ def make_worker_ctx(
         ),
         ltd_s3_source=ltd_s3_source,
         aiobotocore_session=aiobotocore_session,
+        objectstore_cache=objectstore_cache,
     )
     ctx: dict[str, Any] = {
         "factory_builder": builder,
         "http_client": http_client,
         "arq_queue": arq_queue,
     }
+    if objectstore_cache is not None:
+        ctx["objectstore_cache"] = objectstore_cache
     if job_id is not None:
         ctx["job_id"] = job_id
     if events is not None:

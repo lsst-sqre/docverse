@@ -51,6 +51,7 @@ from docverse_server.services.keeper_sync.scheduler import (
 )
 from docverse_server.storage.github import validate_github_app
 from docverse_server.storage.ltd import LtdS3Source
+from docverse_server.storage.objectstore import ObjectStoreCache
 
 from .functions import (
     build_processing,
@@ -373,6 +374,29 @@ async def initialize_worker_ltd_s3_source(
     return source
 
 
+def initialize_worker_objectstore_cache(
+    ctx: dict[str, Any],
+    *,
+    logger: structlog.stdlib.BoundLogger,
+) -> ObjectStoreCache:
+    """Create this worker process's object-store client cache.
+
+    Every job's factory resolves its org object stores through this one
+    cache, so the process holds one open destination client per org,
+    service and upload flavour rather than opening one per build copy,
+    manifest hash and job. Each client built an aiohttp connector and an
+    ``ssl.SSLContext`` loaded with the full CA store, and left about
+    2.7 MB of RSS behind that tracemalloc never saw (#751).
+    ``ctx["objectstore_cache"]`` records it and :func:`shutdown` closes
+    every client it holds. Like the copy client and the LTD source,
+    every pool creates one, and it opens nothing until a job uses a
+    store.
+    """
+    cache = ObjectStoreCache(logger=logger)
+    ctx["objectstore_cache"] = cache
+    return cache
+
+
 async def start_worker_memory_sampler(
     ctx: dict[str, Any],
     *,
@@ -457,6 +481,7 @@ class WorkerFactoryBuilder:
         keeper_sync_upload_limiter: asyncio.Semaphore,
         ltd_s3_source: LtdS3Source | None = None,
         aiobotocore_session: AioSession | None = None,
+        objectstore_cache: ObjectStoreCache | None = None,
     ) -> None:
         # Process-lifetime, like ``http_client``: keeper-sync enqueues one
         # ``publish_edition`` job per synced edition, so folding a publish
@@ -511,6 +536,17 @@ class WorkerFactoryBuilder:
         # each. Nothing to close: a session holds no connections, only
         # the clients opened from it do.
         self._aiobotocore_session = aiobotocore_session
+        # Process-lifetime and owned by ``shutdown``, like
+        # ``ltd_s3_source``, and optional for the same reason: test ctxs
+        # need not create one, and their per-job factories' stores then
+        # open and close a client each. Shared so that every job's copies
+        # and stores for one org borrow the same open client (#751).
+        self._objectstore_cache = objectstore_cache
+
+    @property
+    def objectstore_cache(self) -> ObjectStoreCache | None:
+        """Process-lifetime cache of open org object stores, if any."""
+        return self._objectstore_cache
 
     @property
     def github_app_enabled(self) -> bool:
@@ -569,6 +605,7 @@ class WorkerFactoryBuilder:
             keeper_sync_upload_limiter=self._keeper_sync_upload_limiter,
             ltd_s3_source=self._ltd_s3_source,
             aiobotocore_session=self._aiobotocore_session,
+            objectstore_cache=self._objectstore_cache,
         )
 
 
@@ -640,6 +677,7 @@ async def _startup(
     ltd_s3_source = await initialize_worker_ltd_s3_source(
         ctx, session=aiobotocore_session, logger=logger
     )
+    objectstore_cache = initialize_worker_objectstore_cache(ctx, logger=logger)
     discovery = DiscoveryClient(
         http_client,
         base_url=str(config.repertoire_base_url),
@@ -654,10 +692,10 @@ async def _startup(
         default_queue_name=config.arq_queue_name,
     )
 
-    # ``arq_queue``, the two HTTP clients and the LTD source stay in ctx
-    # because ``shutdown`` owns their teardown. The factory builder
-    # captures them by reference, so worker functions never need to look
-    # them up directly.
+    # ``arq_queue``, the two HTTP clients, the LTD source and the object
+    # store cache stay in ctx because ``shutdown`` owns their teardown.
+    # The factory builder captures them by reference, so worker functions
+    # never need to look them up directly.
     ctx["arq_queue"] = arq_queue
     factory_builder = WorkerFactoryBuilder(
         encryptor=encryptor,
@@ -691,6 +729,7 @@ async def _startup(
         ),
         ltd_s3_source=ltd_s3_source,
         aiobotocore_session=aiobotocore_session,
+        objectstore_cache=objectstore_cache,
     )
     await validate_github_app(
         state=factory_builder,
@@ -769,6 +808,12 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     event_manager = ctx.get("event_manager")
     if event_manager is not None:
         await event_manager.aclose()
+    # arq runs ``shutdown`` after the jobs stop, so no job still holds
+    # one of the cached clients; closing them before the HTTP clients
+    # keeps the teardown in the reverse of the order a store uses them.
+    objectstore_cache = ctx.get("objectstore_cache")
+    if objectstore_cache is not None:
+        await objectstore_cache.aclose()
     await ctx["http_client"].aclose()
     await ctx["copy_http_client"].aclose()
     ltd_s3_source = ctx.get("ltd_s3_source")

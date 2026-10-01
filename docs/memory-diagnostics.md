@@ -37,9 +37,75 @@ from a new aiobotocore session, and each new session parsed botocore's S3
 service model and endpoint ruleset again. That happened thousands of
 times per backfill. Now every process creates one session at startup,
 and every S3 client it opens comes from that session: the LTD source's
-client and each copy's destination store. Each copy still opens and
-closes its own destination client. The sampler is how roundtable-dev
-checks whether that fix was enough.
+client and each copy's destination store. The sampler is how
+roundtable-dev checks whether such a fix is enough.
+
+It was not quite enough. The second dev run, with the shared session,
+removed the traced growth and the OOM kill, but the sync worker's RSS
+still grew by about 2.7 MB per destination client it opened, outside
+anything tracemalloc traced. Each worker process now also keeps its
+destination clients open between uses; see
+[Shared destination clients](#shared-destination-clients).
+
+## Shared destination clients
+
+Opening an object store creates an aiobotocore client, and with it an
+aiohttp connector and an `ssl.SSLContext` loaded with the full CA store.
+A worker used to open a store per build copy, per manifest hash and per
+`build_processing`, `dashboard_build` and `purgatory_cleanup` job, and
+close it straight after. On roundtable-dev each of those clients left
+about 2.7 MB of RSS behind, growing the sync worker from 194 MB to
+1019 MB over about 300 stores while the traced heap stayed flat (#751).
+
+Each worker process now creates one `ObjectStoreCache` at startup
+(`ctx["objectstore_cache"]`), and `shutdown` closes every client in it.
+Every job's factory resolves its org object stores through the cache, so
+the process holds one open client per:
+
+- organization and object-store service label;
+- provider and service config;
+- upload flavour: the keeper-sync copier's store, built with the
+  keeper-sync upload budget, the copy HTTP client, and the worker-wide
+  upload limiter, is a separate client from the one every other job
+  uses.
+
+A worker therefore holds at most two clients for each organization's
+object-store service, however many builds it copies.
+
+Each use still reads the service row and decrypts the credential. When
+either one's `date_updated` has changed since the cached client was
+opened, the next use closes that client and opens a new one, so an edited
+service or a rotated credential takes effect without a restart. A client
+that a running copy still holds is closed when that copy releases it.
+
+The API process keeps no cache: a request's store opens a client on
+entry and closes it on exit, as before.
+
+A cached store outlives the job that opened it, so its own log lines,
+such as `Presigned upload failed`, carry the cache's `org_id` and
+`service_label` rather than the job's context. The object `key` on
+those lines still names the project and build, and the copier's own
+lines that follow carry the job's context.
+
+### Log lines
+
+| Message | Level | Fields |
+| --- | --- | --- |
+| `Opened shared object store client` | info | `org_id`, `service_label`, `provider`, `open_clients` |
+| `Replaced shared object store client` | info | `org_id`, `service_label`, `provider`, `open_clients` |
+| `Failed to close shared object store client` | warning | `exception` |
+
+- `open_clients` is the number of clients the process holds after the
+  open, counting a replaced client that a running copy still holds. On
+  a dev run, these lines give the client count to read next to each
+  `Memory sample`: a count that keeps climbing is a cache that is not
+  being hit.
+- `Replaced shared object store client` follows a service edit or a
+  credential rotation, and stands in for the `Opened` line of the new
+  client.
+- `Failed to close shared object store client` is logged at shutdown or
+  on a replacement when the old client fails to close. The remaining
+  clients are still closed.
 
 ## What the sampler logs
 
@@ -393,10 +459,13 @@ its log volume on roundtable-dev is known.
 - `src/docverse_server/worker/main.py` (`_startup` and `shutdown`) and
   `src/docverse_server/main.py` (`lifespan`): where each process starts
   and stops its sampler, and creates its one aiobotocore session.
+- `src/docverse_server/storage/objectstore/_cache.py`:
+  `ObjectStoreCache`, the worker's shared destination clients.
 - [Keeper-sync transport resilience](keeper-sync-transport.md): the
   bound on the object bodies that the sync worker buffers, which its
   memory limit is sized against, and the shared LTD source client.
 - #751, the sync-worker OOM that motivated the sampler, and PRD #753.
 - `tests/docs_test.py`: fails when this page stops matching the
   sampler's settings, its log lines, or the fields a `Memory sample`
-  line carries, or stops naming a process label.
+  line carries, or stops naming a process label, or when the
+  shared-client log table stops matching the cache's log lines.

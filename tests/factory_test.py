@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Self
 from unittest.mock import Mock
@@ -14,8 +15,15 @@ from aiobotocore.session import get_session
 from cryptography.fernet import Fernet
 from fastapi import Request, Response
 from safir.arq import MockArqQueue
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse_server.dbschema.organization_credential import (
+    SqlOrganizationCredential,
+)
+from docverse_server.dbschema.organization_service import (
+    SqlOrganizationService,
+)
 from docverse_server.dependencies.context import ContextDependency
 from docverse_server.factory import Factory
 from docverse_server.metrics.events import DocverseEvents
@@ -32,13 +40,19 @@ from docverse_server.storage._http_retry import (
     MAX_BACKOFF_SECONDS,
 )
 from docverse_server.storage.ltd import LtdClient, LtdS3Source
-from docverse_server.storage.objectstore import MockObjectStore
+from docverse_server.storage.objectstore import (
+    MockObjectStore,
+    ObjectStoreCache,
+)
 from docverse_server.storage.queue_backend import (
     ArqQueueBackend,
     NullQueueBackend,
 )
 from tests.support.botocore_sessions import record_aiobotocore_sessions
-from tests.support.objectstore import seed_minio_service
+from tests.support.objectstore import (
+    record_s3_store_lifecycle,
+    seed_minio_service,
+)
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -848,3 +862,108 @@ async def test_other_stores_get_no_upload_limiter(
     assert len(recorded) == 1
     assert "upload_limiter" in recorded[0]
     assert recorded[0]["upload_limiter"] is None
+
+
+@pytest.mark.asyncio
+async def test_request_factory_opens_and_closes_a_client_per_store(
+    db_session: AsyncSession,
+    mock_events: DocverseEvents,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The API holds no client cache: each store opens and closes its own.
+
+    Only worker processes keep destination clients open for their
+    lifetime (#751). A request's store lives as long as the request, so
+    the API keeps opening a client when a handler enters a store and
+    closing it when the handler leaves.
+    """
+    dependency = ContextDependency()
+    await dependency.initialize(
+        credential_encryptor=CredentialEncryptor(
+            current_key=Fernet.generate_key().decode()
+        ),
+        events=mock_events,
+        aiobotocore_session=get_session(),
+    )
+    context = await dependency(
+        request=Mock(spec=Request),
+        response=Mock(spec=Response),
+        session=db_session,
+        logger=_logger(),
+        arq_queue=MockArqQueue(default_queue_name="docverse:queue"),
+    )
+    factory = context.factory
+    org_id = await seed_minio_service(db_session, factory)
+    lifecycle = record_s3_store_lifecycle(monkeypatch)
+
+    for _ in range(2):
+        async with db_session.begin():
+            store = await factory.create_objectstore_for_org(
+                org_id=org_id, service_label="minio"
+            )
+        async with store:
+            pass
+
+    assert factory.objectstore_cache is None
+    assert len(lifecycle.opened) == 2
+    assert lifecycle.closed == lifecycle.opened
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "table", [SqlOrganizationService, SqlOrganizationCredential]
+)
+async def test_cached_store_reopens_after_service_or_credential_update(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    table: type[SqlOrganizationService | SqlOrganizationCredential],
+) -> None:
+    """A service edit or credential rotation replaces the cached client.
+
+    ``create_objectstore_for_org`` still reads the service row and
+    decrypts the credential on every call, and their ``date_updated``
+    is the fingerprint the cache compares: unchanged, every use shares
+    the one open client; bumped, the next use closes it and opens one
+    new client from the fresh config and credential.
+    """
+    cache = ObjectStoreCache(logger=_logger())
+    factory = Factory(
+        session=db_session,
+        logger=_logger(),
+        credential_encryptor=CredentialEncryptor(
+            current_key=Fernet.generate_key().decode()
+        ),
+        default_queue_name="docverse:queue",
+        aiobotocore_session=get_session(),
+        objectstore_cache=cache,
+    )
+    org_id = await seed_minio_service(db_session, factory)
+    lifecycle = record_s3_store_lifecycle(monkeypatch)
+
+    async def _use_store() -> None:
+        async with db_session.begin():
+            store = await factory.create_objectstore_for_org(
+                org_id=org_id, service_label="minio"
+            )
+        async with store:
+            pass
+
+    await _use_store()
+    await _use_store()
+    assert len(lifecycle.opened) == 1
+    assert lifecycle.closed == []
+
+    async with db_session.begin():
+        await db_session.execute(
+            update(table)
+            .where(table.organization_id == org_id)
+            .values(date_updated=datetime(2030, 1, 1, tzinfo=UTC))
+        )
+    await _use_store()
+    await _use_store()
+
+    assert factory.objectstore_cache is cache
+    assert len(lifecycle.opened) == 2
+    assert lifecycle.closed == lifecycle.opened[:1]
+    await cache.aclose()
+    assert lifecycle.closed == lifecycle.opened

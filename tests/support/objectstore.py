@@ -6,18 +6,27 @@ need retries or run out of them — the two things the keeper-sync
 and an ``httpx.MockTransport`` behind it. :func:`seed_minio_service`
 goes the other way: it seeds an org whose object-store service resolves
 to a real ``S3ObjectStore``, for tests that need the store the factory
-actually builds.
+actually builds. :func:`record_s3_store_lifecycle` counts how often
+those real stores open and close their aiobotocore client.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import CredentialProvider, OrganizationCreate
 from docverse_server.factory import Factory
-from docverse_server.storage.objectstore import MockObjectStore
+from docverse_server.storage.objectstore import MockObjectStore, S3ObjectStore
 
-__all__ = ["ScriptedUploadStore", "seed_minio_service"]
+__all__ = [
+    "S3StoreLifecycle",
+    "ScriptedUploadStore",
+    "record_s3_store_lifecycle",
+    "seed_minio_service",
+]
 
 
 class ScriptedUploadStore(MockObjectStore):
@@ -89,3 +98,40 @@ async def seed_minio_service(session: AsyncSession, factory: Factory) -> int:
             credential_label="minio-cred",
         )
     return org.id
+
+
+@dataclass
+class S3StoreLifecycle:
+    """Every ``S3ObjectStore`` client open and close, in call order."""
+
+    opened: list[S3ObjectStore] = field(default_factory=list)
+    """Stores whose ``open`` ran, once per call."""
+
+    closed: list[S3ObjectStore] = field(default_factory=list)
+    """Stores whose ``close`` ran, once per call."""
+
+
+def record_s3_store_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> S3StoreLifecycle:
+    """Record every ``S3ObjectStore.open`` and ``close`` until the test ends.
+
+    Each ``open`` creates an aiobotocore client, with its own aiohttp
+    connector and SSL context, so the count of opens is the count of
+    destination clients a code path built. The real methods still run.
+    """
+    lifecycle = S3StoreLifecycle()
+    original_open = S3ObjectStore.open
+    original_close = S3ObjectStore.close
+
+    async def _recording_open(self: S3ObjectStore) -> None:
+        lifecycle.opened.append(self)
+        await original_open(self)
+
+    async def _recording_close(self: S3ObjectStore) -> None:
+        lifecycle.closed.append(self)
+        await original_close(self)
+
+    monkeypatch.setattr(S3ObjectStore, "open", _recording_open)
+    monkeypatch.setattr(S3ObjectStore, "close", _recording_close)
+    return lifecycle
