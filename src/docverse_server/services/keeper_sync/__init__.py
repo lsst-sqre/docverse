@@ -9,6 +9,7 @@ See SQR-112 and the parent PRD (#275) for the full design.
 
 from __future__ import annotations
 
+from .budget import SliceBudget
 from .copier import (
     DEFAULT_COPY_CONCURRENCY,
     BuildContentCopier,
@@ -53,6 +54,7 @@ __all__ = [
     "KeeperSyncService",
     "KindDerivationSource",
     "ProjectSyncResult",
+    "SliceBudget",
     "TrackingDerivation",
     "TrackingDerivationSource",
     "derive_edition_kind",

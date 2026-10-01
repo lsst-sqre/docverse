@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any
@@ -118,10 +118,12 @@ from docverse_server.storage.ltd import (
     LtdEditionMode,
     LtdProduct,
     LtdSourceAccessDeniedError,
+    parse_ltd_id,
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 
+from .budget import SliceBudget
 from .copier import CopyResult, CopyTally
 from .mappers import (
     EditionKindDerivation,
@@ -848,12 +850,46 @@ class ProjectSyncResult:
     ``edition_failures`` is empty on a clean sync; a non-empty tuple
     means the run was *partial* — those LTD editions raised and were
     skipped, every other edition still synced.
+
+    The four walk fields describe how far this call got through LTD's
+    edition list, which is what a keeper-sync job sliced by a
+    :class:`~docverse_server.services.keeper_sync.budget.SliceBudget`
+    continues from. An unsliced call walks the whole list, so it reports
+    every edition visited and ``stopped_at_budget`` false. The
+    tombstone short-circuit fetches nothing from LTD and reports zeroes.
     """
 
     docverse_project_id: int | None
     docverse_project_slug: str
     edition_outcomes: list[EditionSyncOutcome]
     edition_failures: tuple[EditionSyncFailure, ...] = ()
+
+    editions_total: int = 0
+    """How many editions LTD lists for the product."""
+
+    editions_visited: int = 0
+    """How many editions this call walked past.
+
+    Every edition the loop dealt with counts — synced, failed, or
+    skipped as a proactive lifecycle tombstone — because each moves the
+    resume cursor on. Editions skipped for sitting at or before
+    ``resume_after_ltd_edition_id`` do not: an earlier slice visited
+    them.
+    """
+
+    stopped_at_budget: bool = False
+    """``True`` when the slice budget ran out with editions left to visit.
+
+    The signal to continue in a new job from
+    :attr:`last_visited_ltd_edition_id`. ``False`` whenever the walk
+    reached the end of the list, including on every unbudgeted call.
+    """
+
+    last_visited_ltd_edition_id: int | None = None
+    """LTD id of the last edition this call visited, ``None`` if none.
+
+    The cursor the next slice resumes after.
+    """
 
     @property
     def restamped_edition_count(self) -> int:
@@ -872,6 +908,80 @@ class ProjectSyncResult:
         return sum(
             1 for outcome in self.edition_outcomes if outcome.dates_restamped
         )
+
+
+@dataclass(frozen=True)
+class _EditionWalk:
+    """The LTD editions one :meth:`KeeperSyncService.sync_project` walks."""
+
+    editions: list[LtdEdition]
+    """The editions to visit, in visiting order."""
+
+    editions_total: int
+    """How many editions LTD lists, including any a cursor skipped."""
+
+
+@dataclass
+class _EditionWalkTally:
+    """What :meth:`KeeperSyncService.sync_project`'s edition loop has seen.
+
+    One per call, so every count here — the consecutive-failure breaker
+    and the end-of-run zero-import guard included — is per slice.
+    """
+
+    outcomes: list[EditionSyncOutcome] = field(default_factory=list)
+    failures: list[EditionSyncFailure] = field(default_factory=list)
+    consecutive_failures: int = 0
+    ltd_successes: int = 0
+    systemic_candidates: int = 0
+    """Failures whose type leaves an outage possible.
+
+    See :data:`_PERMANENT_EDITION_FAILURE_TYPES` for why a permanent
+    fault is excluded from the end-of-run systemic signal, and why the
+    last of *these*, not the last failure outright, is what the abort
+    chains from.
+    """
+
+    last_systemic_candidate: Exception | None = None
+    editions_visited: int = 0
+    last_visited_ltd_edition_id: int | None = None
+    stopped_at_budget: bool = False
+
+    def record_failure(
+        self, *, ltd_edition: LtdEdition, exc: Exception
+    ) -> None:
+        """Count one edition whose sync raised."""
+        if not isinstance(exc, _PERMANENT_EDITION_FAILURE_TYPES):
+            self.systemic_candidates += 1
+            self.last_systemic_candidate = exc
+        self.failures.append(
+            EditionSyncFailure(
+                ltd_edition_id=ltd_edition.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+        )
+        self.consecutive_failures += 1
+
+    def record_outcome(self, outcome: EditionSyncOutcome) -> None:
+        """Count one edition whose sync returned.
+
+        Only an edition that actually reached LTD counts as evidence
+        that the fault was per-edition rather than systemic — see
+        :attr:`EditionSyncOutcome.contacted_ltd` for why tombstone
+        short-circuits and build-less editions are neutral here, exactly
+        as a proactively skipped edition is.
+        """
+        if outcome.contacted_ltd:
+            self.consecutive_failures = 0
+            self.ltd_successes += 1
+        self.outcomes.append(outcome)
+
+    def record_visit(self, ltd_edition: LtdEdition) -> None:
+        """Move the resume cursor past an edition the loop dealt with."""
+        self.editions_visited += 1
+        self.last_visited_ltd_edition_id = ltd_edition.ltd_id
 
 
 @dataclass(frozen=True)
@@ -989,6 +1099,8 @@ class KeeperSyncService:
         on_edition_synced: (
             Callable[[EditionSyncOutcome], Awaitable[None]] | None
         ) = None,
+        budget: SliceBudget | None = None,
+        resume_after_ltd_edition_id: int | None = None,
     ) -> ProjectSyncResult:
         """Sync one LTD product (and all its editions) into Docverse.
 
@@ -1060,6 +1172,22 @@ class KeeperSyncService:
         in the worker picks up any edition the callback failed to act
         on. The default ``None`` preserves all non-worker call sites.
 
+        ``budget`` and ``resume_after_ltd_edition_id`` slice the walk
+        for a project too large for one job. The budget's deadline is
+        checked before each edition, never during one, so a copy that
+        starts inside the budget always finishes; once the deadline has
+        passed the loop stops and reports
+        :attr:`ProjectSyncResult.stopped_at_budget`, and the next slice
+        passes :attr:`ProjectSyncResult.last_visited_ltd_edition_id`
+        back as ``resume_after_ltd_edition_id``. A sliced walk visits
+        ``main`` first, whatever LTD's order, so the first slice of a
+        chain publishes the default edition, and a resumed one skips
+        every edition up to and including the cursor without an LTD
+        call (see :meth:`_plan_edition_walk`). The consecutive-failure
+        breaker and the end-of-run guard both count per slice. With both
+        left at ``None`` the call walks the whole list in LTD's order,
+        exactly as an unsliced sync always has.
+
         Short-circuits before the LTD product fetch when the project's
         ``keeper_sync_state`` row is tombstoned: the operator has
         deleted the project on the Docverse side and the migration
@@ -1101,9 +1229,15 @@ class KeeperSyncService:
             project=project.edition_autocreation,
             org=org.edition_autocreation,
         )
-        ltd_editions = await self._ltd_client.list_editions_for_product(
-            ltd_slug
+        walk = await self._plan_edition_walk(
+            org_id=org.id,
+            ltd_slug=ltd_slug,
+            sliced=(
+                budget is not None or resume_after_ltd_edition_id is not None
+            ),
+            resume_after_ltd_edition_id=resume_after_ltd_edition_id,
         )
+        ltd_editions = walk.editions
         live_refs = _LiveRefsCache()
         skip_ltd_ids = await self._proactive_lifecycle_pass(
             org=org,
@@ -1115,116 +1249,255 @@ class KeeperSyncService:
         tracking_live_refs = await self._tracking_live_refs(
             project=project, ltd_editions=ltd_editions, cache=live_refs
         )
-        outcomes: list[EditionSyncOutcome] = []
-        failures: list[EditionSyncFailure] = []
-        consecutive_failures = 0
-        ltd_successes = 0
-        # Failures whose type leaves an outage possible — see
-        # ``_PERMANENT_EDITION_FAILURE_TYPES`` for why a permanent fault
-        # is excluded from the end-of-run systemic signal, and why the
-        # last of *these*, not the last failure outright, is what the
-        # abort chains from.
-        systemic_candidates = 0
-        last_systemic_candidate: Exception | None = None
+        tally = _EditionWalkTally()
         for ltd_edition in ltd_editions:
-            if ltd_edition.ltd_id in skip_ltd_ids:
-                continue
-            try:
-                outcome = await self.sync_edition(
-                    org_id=org.id,
-                    org_slug=org.slug,
+            # Between editions only: an edition that starts inside the
+            # budget always finishes, however long its copy runs.
+            if budget is not None and budget.exhausted():
+                tally.stopped_at_budget = True
+                break
+            if ltd_edition.ltd_id not in skip_ltd_ids:
+                await self._visit_edition(
+                    org=org,
                     project=project,
+                    ltd_slug=ltd_slug,
                     ltd_edition=ltd_edition,
                     rewrite_rules=rewrite_rules,
                     autocreation=autocreation,
                     live_refs=tracking_live_refs,
+                    tally=tally,
+                    on_edition_synced=on_edition_synced,
                 )
-            except Exception as exc:
-                if not isinstance(exc, _PERMANENT_EDITION_FAILURE_TYPES):
-                    systemic_candidates += 1
-                    last_systemic_candidate = exc
-                sentry_sdk.capture_exception(exc)
-                self._logger.exception(
-                    "Edition sync failed; skipping edition and continuing",
-                    ltd_edition_id=ltd_edition.ltd_id,
-                    ltd_edition_slug=ltd_edition.slug,
-                    project_id=project.id,
-                    project=project.slug,
-                )
-                failures.append(
-                    EditionSyncFailure(
-                        ltd_edition_id=ltd_edition.ltd_id,
-                        ltd_edition_slug=ltd_edition.slug,
-                        error_type=type(exc).__name__,
-                        error_message=str(exc),
-                    )
-                )
-                consecutive_failures += 1
-                if consecutive_failures >= MAX_CONSECUTIVE_EDITION_FAILURES:
-                    recent = [
-                        failure.ltd_edition_slug
-                        for failure in failures[-consecutive_failures:]
-                    ]
-                    self._logger.exception(
-                        "Aborting project sync: consecutive edition failures"
-                        " indicate a systemic outage",
-                        consecutive_failures=consecutive_failures,
-                        failed_ltd_edition_slugs=recent[
-                            :MAX_REPORTED_EDITION_SLUGS
-                        ],
-                        project_id=project.id,
-                        project=project.slug,
-                        ltd_slug=ltd_slug,
-                    )
-                    raise KeeperSyncSystemicFailureError(
-                        ltd_slug=ltd_slug,
-                        consecutive_failures=consecutive_failures,
-                        failed_ltd_edition_slugs=recent,
-                    ) from exc
-                continue
-            # Only an edition that actually reached LTD counts as
-            # evidence that the fault was per-edition rather than
-            # systemic — see ``EditionSyncOutcome.contacted_ltd`` for why
-            # tombstone short-circuits and build-less editions are
-            # neutral here, exactly as the ``skip_ltd_ids`` ``continue``
-            # above is.
-            if outcome.contacted_ltd:
-                consecutive_failures = 0
-                ltd_successes += 1
-            outcomes.append(outcome)
-            if on_edition_synced is not None:
-                try:
-                    await on_edition_synced(outcome)
-                except Exception as exc:
-                    sentry_sdk.capture_exception(exc)
-                    self._logger.exception(
-                        "on_edition_synced callback raised; continuing",
-                        docverse_slug=outcome.docverse_slug,
-                    )
+            tally.record_visit(ltd_edition)
+        if tally.stopped_at_budget:
+            self._logger.info(
+                "Project sync stopped at its slice budget",
+                editions_total=walk.editions_total,
+                editions_visited=tally.editions_visited,
+                last_visited_ltd_edition_id=tally.last_visited_ltd_edition_id,
+                project_id=project.id,
+                project=project.slug,
+                ltd_slug=ltd_slug,
+            )
         self._guard_zero_import_run(
-            project=project,
-            ltd_slug=ltd_slug,
-            failures=failures,
-            ltd_successes=ltd_successes,
-            systemic_candidates=systemic_candidates,
-            last_systemic_candidate=last_systemic_candidate,
+            project=project, ltd_slug=ltd_slug, tally=tally
         )
         return ProjectSyncResult(
             docverse_project_id=project.id,
             docverse_project_slug=project.slug,
-            edition_outcomes=outcomes,
-            edition_failures=tuple(failures),
+            edition_outcomes=tally.outcomes,
+            edition_failures=tuple(tally.failures),
+            editions_total=walk.editions_total,
+            editions_visited=tally.editions_visited,
+            stopped_at_budget=tally.stopped_at_budget,
+            last_visited_ltd_edition_id=tally.last_visited_ltd_edition_id,
         )
+
+    async def _plan_edition_walk(
+        self,
+        *,
+        org_id: int,
+        ltd_slug: str,
+        sliced: bool,
+        resume_after_ltd_edition_id: int | None,
+    ) -> _EditionWalk:
+        """Fetch the LTD editions this call walks, in the order it walks.
+
+        Without a cursor that is the whole list. An unsliced call keeps
+        LTD's order exactly; a sliced one moves ``main`` to the front
+        (see :func:`_main_first`).
+
+        With a cursor, only LTD's edition URL list is fetched up front:
+        the editions up to and including the cursor in walk order are
+        dropped on the strength of their URLs alone, and only the rest
+        are fetched — a skipped edition costs no LTD call at all. See
+        :meth:`_urls_after_cursor` for how the cursor is placed.
+        """
+        if resume_after_ltd_edition_id is None:
+            ltd_editions = await self._ltd_client.list_editions_for_product(
+                ltd_slug
+            )
+            return _EditionWalk(
+                editions=_main_first(ltd_editions) if sliced else ltd_editions,
+                editions_total=len(ltd_editions),
+            )
+        edition_urls = await self._ltd_client.list_edition_urls_for_product(
+            ltd_slug
+        )
+        resume_urls = await self._urls_after_cursor(
+            org_id=org_id,
+            ltd_slug=ltd_slug,
+            edition_urls=edition_urls,
+            cursor=resume_after_ltd_edition_id,
+        )
+        ltd_editions = [
+            await self._ltd_client.get_edition_by_url(url)
+            for url in resume_urls
+        ]
+        return _EditionWalk(
+            editions=_main_first(ltd_editions),
+            editions_total=len(edition_urls),
+        )
+
+    async def _urls_after_cursor(
+        self,
+        *,
+        org_id: int,
+        ltd_slug: str,
+        edition_urls: Sequence[str],
+        cursor: int,
+    ) -> list[str]:
+        """Return the edition URLs a resumed walk visits, in LTD order.
+
+        The walk order is ``main`` first, then LTD's order, so the
+        cursor's position depends on which edition is ``main`` — and an
+        edition URL does not say. The ``keeper_sync_state`` row an
+        earlier visit wrote does, so ``main`` is placed from the
+        database (:meth:`_known_main_ltd_id`) rather than LTD. Once
+        placed, it sits before every cursor and is never revisited; a
+        cursor on ``main`` itself leaves every other edition to walk.
+
+        Two cases fall outside that:
+
+        * A cursor LTD no longer lists (the edition was deleted) gives
+          no position to resume from, so the walk starts from the top.
+        * With no ``main`` state row — the edition has never been
+          synced, or has no ``main`` at all — the cursor is placed in
+          LTD's own order, and a ``main`` found after it is visited
+          (first) like any edition never synced.
+
+        Editions LTD adds at the tail of its list after the cursor are
+        reached. Changes to editions before the cursor are not this
+        walk's job; the tier crons pick those up.
+        """
+        url_by_id = {parse_ltd_id(url): url for url in edition_urls}
+        if cursor not in url_by_id:
+            self._logger.info(
+                "Resume cursor is no longer in LTD's edition list;"
+                " walking from the top",
+                resume_after_ltd_edition_id=cursor,
+                ltd_slug=ltd_slug,
+            )
+            return list(edition_urls)
+        ltd_ids = list(url_by_id)
+        main_ltd_id = await self._known_main_ltd_id(
+            org_id=org_id, ltd_ids=ltd_ids
+        )
+        if main_ltd_id is not None:
+            ltd_ids = [main_ltd_id] + [
+                ltd_id for ltd_id in ltd_ids if ltd_id != main_ltd_id
+            ]
+        resume_ids = ltd_ids[ltd_ids.index(cursor) + 1 :]
+        return [url_by_id[ltd_id] for ltd_id in resume_ids]
+
+    async def _known_main_ltd_id(
+        self, *, org_id: int, ltd_ids: Sequence[int]
+    ) -> int | None:
+        """Return the LTD id of ``main`` among *ltd_ids*, if ever synced.
+
+        Read from the ``keeper_sync_state`` edition rows, which record
+        each LTD edition's slug from the visit that wrote them, so it
+        costs one query rather than an LTD fetch. Tombstoned rows count:
+        a tombstone keeps the slug.
+        """
+        async with self._session.begin():
+            state_rows = await self._state_store.list_for_org(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_ids=ltd_ids,
+                include_tombstoned=True,
+            )
+        return next(
+            (row.ltd_id for row in state_rows if _is_ltd_main(row.ltd_slug)),
+            None,
+        )
+
+    async def _visit_edition(
+        self,
+        *,
+        org: Organization,
+        project: Project,
+        ltd_slug: str,
+        ltd_edition: LtdEdition,
+        rewrite_rules: Sequence[AnySlugRewriteRule],
+        autocreation: EditionAutocreationConfig,
+        live_refs: frozenset[str] | None,
+        tally: _EditionWalkTally,
+        on_edition_synced: (
+            Callable[[EditionSyncOutcome], Awaitable[None]] | None
+        ),
+    ) -> None:
+        """Sync one edition inside its failure boundary, onto *tally*.
+
+        A raising :meth:`sync_edition` is captured, logged, and recorded
+        as an isolated failure, unless it completes a run of
+        :data:`MAX_CONSECUTIVE_EDITION_FAILURES`, which raises
+        :exc:`~docverse_server.exceptions.KeeperSyncSystemicFailureError`
+        out of :meth:`sync_project`. A returned outcome is recorded and
+        handed to ``on_edition_synced``, whose own failures are logged
+        and swallowed.
+        """
+        try:
+            outcome = await self.sync_edition(
+                org_id=org.id,
+                org_slug=org.slug,
+                project=project,
+                ltd_edition=ltd_edition,
+                rewrite_rules=rewrite_rules,
+                autocreation=autocreation,
+                live_refs=live_refs,
+            )
+        except Exception as exc:
+            sentry_sdk.capture_exception(exc)
+            self._logger.exception(
+                "Edition sync failed; skipping edition and continuing",
+                ltd_edition_id=ltd_edition.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                project_id=project.id,
+                project=project.slug,
+            )
+            tally.record_failure(ltd_edition=ltd_edition, exc=exc)
+            consecutive_failures = tally.consecutive_failures
+            if consecutive_failures >= MAX_CONSECUTIVE_EDITION_FAILURES:
+                recent = [
+                    failure.ltd_edition_slug
+                    for failure in tally.failures[-consecutive_failures:]
+                ]
+                self._logger.exception(
+                    "Aborting project sync: consecutive edition failures"
+                    " indicate a systemic outage",
+                    consecutive_failures=consecutive_failures,
+                    failed_ltd_edition_slugs=recent[
+                        :MAX_REPORTED_EDITION_SLUGS
+                    ],
+                    project_id=project.id,
+                    project=project.slug,
+                    ltd_slug=ltd_slug,
+                )
+                raise KeeperSyncSystemicFailureError(
+                    ltd_slug=ltd_slug,
+                    consecutive_failures=consecutive_failures,
+                    failed_ltd_edition_slugs=recent,
+                ) from exc
+            return
+        tally.record_outcome(outcome)
+        if on_edition_synced is None:
+            return
+        try:
+            await on_edition_synced(outcome)
+        except Exception as exc:
+            sentry_sdk.capture_exception(exc)
+            self._logger.exception(
+                "on_edition_synced callback raised; continuing",
+                docverse_slug=outcome.docverse_slug,
+            )
 
     def _guard_zero_import_run(
         self,
         *,
         project: Project,
         ltd_slug: str,
-        failures: Sequence[EditionSyncFailure],
-        ltd_successes: int,
-        systemic_candidates: int,
-        last_systemic_candidate: Exception | None,
+        tally: _EditionWalkTally,
     ) -> None:
         """Fail a run that imported nothing, unless every fault is permanent.
 
@@ -1234,16 +1507,25 @@ class KeeperSyncService:
         imported nothing, which the consecutive breaker cannot catch on
         a project smaller than its threshold.
 
-        ``systemic_candidates`` counts only failures whose type leaves an
-        outage possible — see :data:`_PERMANENT_EDITION_FAILURE_TYPES`.
-        Zero of them means the run is *degraded*, not systemic: replaying
-        it would fail exactly the same way, so raising here would hand
-        the tier cron a job it re-fails every five minutes forever
-        instead of the ``completed_with_errors`` / ``edition_failures``
-        partial-success path built for a permanently unreadable edition.
+        ``tally.systemic_candidates`` counts only failures whose type
+        leaves an outage possible — see
+        :data:`_PERMANENT_EDITION_FAILURE_TYPES`. Zero of them means the
+        run is *degraded*, not systemic: replaying it would fail exactly
+        the same way, so raising here would hand the tier cron a job it
+        re-fails every five minutes forever instead of the
+        ``completed_with_errors`` / ``edition_failures`` partial-success
+        path built for a permanently unreadable edition.
+
+        The tally is one slice's, so a sliced sync applies the guard per
+        slice. A slice that stopped at its budget before attempting any
+        edition — nothing but resume-cursor skips behind it — has no
+        failures, and reads as "nothing attempted" rather than as an
+        outage.
         """
-        if not failures or ltd_successes > 0:
+        failures = tally.failures
+        if not failures or tally.ltd_successes > 0:
             return
+        systemic_candidates = tally.systemic_candidates
         failed_slugs = [failure.ltd_edition_slug for failure in failures]
         reported_slugs = failed_slugs[:MAX_REPORTED_EDITION_SLUGS]
         if systemic_candidates == 0:
@@ -1277,7 +1559,7 @@ class KeeperSyncService:
                 " was imported — a systemic outage rather than"
                 " per-edition faults"
             ),
-        ) from last_systemic_candidate
+        ) from tally.last_systemic_candidate
 
     async def _proactive_lifecycle_pass(
         self,
@@ -3417,6 +3699,25 @@ def _retryable_transport_error(exc: BaseException) -> BaseException | None:
         seen.add(id(current))
         current = current.__cause__
     return None
+
+
+def _main_first(ltd_editions: Sequence[LtdEdition]) -> list[LtdEdition]:
+    """Return *ltd_editions* with LTD's ``main`` edition moved to the front.
+
+    The walk order of a sliced :meth:`KeeperSyncService.sync_project`.
+    LTD lists a product's editions newest-first, which puts ``main`` —
+    usually the first edition created — last, so a chain of slices
+    would otherwise publish the default edition only in its final
+    slice. Every other edition keeps LTD's relative order.
+    """
+    main = [e for e in ltd_editions if _is_ltd_main(e.slug)]
+    rest = [e for e in ltd_editions if not _is_ltd_main(e.slug)]
+    return main + rest
+
+
+def _is_ltd_main(ltd_edition_slug: str) -> bool:
+    """Return whether an LTD edition slug names the product's ``main``."""
+    return derive_edition_slug(ltd_edition_slug) == DEFAULT_EDITION_SLUG
 
 
 def _ensure_trailing_slash(prefix: str) -> str:

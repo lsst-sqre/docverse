@@ -74,6 +74,7 @@ from docverse_server.exceptions import (
 )
 from docverse_server.factory import Factory
 from docverse_server.services.default_branch import DuplicateDraftRetirer
+from docverse_server.services.keeper_sync import SliceBudget
 from docverse_server.services.keeper_sync import service as service_module
 from docverse_server.services.keeper_sync.copier import (
     BuildContentCopier,
@@ -3264,13 +3265,18 @@ async def test_sync_project_continues_when_callback_raises(
 
 
 def _seed_three_editions(
-    mock_discovery: respx.Router, *, middle_uploaded: bool = True
+    mock_discovery: respx.Router,
+    *,
+    middle_uploaded: bool = True,
+    listed_order: Sequence[int] = (1, 2, 3),
 ) -> None:
     """Stub a pipelines product with three ``git_refs`` editions.
 
     Editions 1 / 2 / 3 map to LTD builds 42 / 43 / 44. ``middle_uploaded
     =False`` makes LTD report edition 2's build as half-uploaded, which
     is what makes ``sync_build`` raise for that edition and no other.
+    ``listed_order`` is the order LTD's edition list names the three
+    editions in; edition 1 is ``main``.
     """
     main_edition = _load("edition_main_git_refs.json")
     middle_edition = _load("edition_branch_git_refs.json")
@@ -3299,9 +3305,7 @@ def _seed_three_editions(
             200,
             json={
                 "editions": [
-                    f"{LTD_BASE}/editions/1",
-                    f"{LTD_BASE}/editions/2",
-                    f"{LTD_BASE}/editions/3",
+                    f"{LTD_BASE}/editions/{ltd_id}" for ltd_id in listed_order
                 ]
             },
         )
@@ -10023,3 +10027,391 @@ async def test_finalize_synced_build_does_not_deadlock_with_delete(
     # a deadlock abort.
     assert len(finalize_error) == 1
     assert isinstance(finalize_error[0], InvalidBuildStateError)
+
+
+@dataclass
+class _SliceClock:
+    """A monotonic clock a slice-budget test moves by hand."""
+
+    now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _spend_during_copy(
+    clock: _SliceClock, seconds: float
+) -> Callable[[CopyCallable], CopyCallable]:
+    """Move *clock* on by *seconds* as each build copy starts.
+
+    The time passes while the copy is in flight, so a budget that runs
+    out here runs out mid-copy — the case the slice loop must ride out
+    rather than interrupt.
+    """
+
+    def wrap(copy: CopyCallable) -> CopyCallable:
+        async def spending(
+            source_prefix: str, dest_prefix: str, tally: CopyTally
+        ) -> CopyResult:
+            clock.now += seconds
+            return await copy(source_prefix, dest_prefix, tally)
+
+        return spending
+
+    return wrap
+
+
+def _ltd_paths_called(router: respx.Router) -> list[str]:
+    """Return the paths of every LTD API request *router* answered."""
+    return [
+        call.request.url.path
+        for call in router.calls
+        if call.request.url.host == httpx.URL(LTD_BASE).host
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_project_slice_stops_between_editions_at_deadline(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The slice budget ends the walk between editions, never mid-copy.
+
+    The first edition's copy starts inside the budget and runs well past
+    the deadline. It still finishes — its content lands and its outcome
+    is reported — and the loop stops before the next edition, without
+    so much as resolving that edition's LTD build.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-slice-deadline")
+
+    _seed_three_editions(mock_discovery)
+    clock = _SliceClock()
+    object_store = MockObjectStore()
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+        wrap_copy=_spend_during_copy(clock, 120),
+    )
+
+    result = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        budget=SliceBudget.starting_now(60, clock=clock),
+    )
+
+    assert result.stopped_at_budget
+    assert [o.docverse_slug for o in result.edition_outcomes] == ["__main"]
+    assert result.edition_failures == ()
+    stored = {obj.data for obj in object_store.objects.values()}
+    assert stored == {b"<html>main</html>"}
+    called = _ltd_paths_called(mock_discovery)
+    assert "/builds/43" not in called
+    assert "/builds/44" not in called
+    assert result.editions_total == 3
+    assert result.editions_visited == 1
+    assert result.last_visited_ltd_edition_id == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_project_slice_visits_main_first(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A sliced sync visits ``main`` first, whatever LTD's order.
+
+    LTD lists editions newest-first, so ``main`` — usually a product's
+    first edition — comes last. A sliced sync takes it out of turn so
+    the first slice of a chain always publishes the default edition,
+    then walks the rest in LTD's order.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-slice-main-first")
+
+    _seed_three_editions(mock_discovery, listed_order=(3, 2, 1))
+    clock = _SliceClock()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+    )
+
+    result = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        budget=SliceBudget.starting_now(3600, clock=clock),
+    )
+
+    assert [o.docverse_slug for o in result.edition_outcomes] == [
+        "__main",
+        "u-jsick-other",
+        "u-jsick-feature",
+    ]
+    assert not result.stopped_at_budget
+    assert result.editions_total == 3
+    assert result.editions_visited == 3
+    assert result.last_visited_ltd_edition_id == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_project_unbudgeted_walks_in_ltd_order(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Without a budget the walk keeps LTD's order and reports it all.
+
+    The unbudgeted call is the pre-slicing behaviour: no reordering, no
+    early stop, and walk fields that say the whole list was visited.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-slice-unbudgeted")
+
+    _seed_three_editions(mock_discovery, listed_order=(3, 2, 1))
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert [o.docverse_slug for o in result.edition_outcomes] == [
+        "u-jsick-other",
+        "u-jsick-feature",
+        "__main",
+    ]
+    assert not result.stopped_at_budget
+    assert result.editions_total == 3
+    assert result.editions_visited == 3
+    assert result.last_visited_ltd_edition_id == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_project_cursor_skips_without_contacting_ltd(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A resumed slice skips the visited editions without an LTD call.
+
+    Re-walking an already-synced edition costs an edition fetch and a
+    build fetch even when it short-circuits — around 6,000 calls a slice
+    on ``pipelines``. Editions up to and including the cursor are
+    skipped on the strength of the edition URL list alone, and are not
+    counted as visited.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-slice-cursor")
+
+    _seed_three_editions(mock_discovery)
+    clock = _SliceClock()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    mock_discovery.reset()
+
+    result = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        budget=SliceBudget.starting_now(3600, clock=clock),
+        resume_after_ltd_edition_id=2,
+    )
+
+    assert [o.docverse_slug for o in result.edition_outcomes] == [
+        "u-jsick-other"
+    ]
+    called = _ltd_paths_called(mock_discovery)
+    for skipped in ("/editions/1", "/editions/2", "/builds/42", "/builds/43"):
+        assert skipped not in called
+    assert "/editions/3" in called
+    assert not result.stopped_at_budget
+    assert result.editions_total == 3
+    assert result.editions_visited == 1
+    assert result.last_visited_ltd_edition_id == 3
+
+
+@pytest.mark.asyncio
+async def test_sync_project_cursor_on_main_resumes_with_every_other_edition(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A slice that stopped after ``main`` hands on the whole rest.
+
+    The common first slice of a large product: ``main`` is visited out
+    of turn from the end of LTD's list, its copy uses up the budget, and
+    the cursor lands on it. The next slice walks every other edition in
+    LTD's order and does not touch ``main`` again.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-slice-cursor-main")
+
+    _seed_three_editions(mock_discovery, listed_order=(3, 2, 1))
+    clock = _SliceClock()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+        wrap_copy=_spend_during_copy(clock, 120),
+    )
+    first = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        budget=SliceBudget.starting_now(60, clock=clock),
+    )
+    assert first.stopped_at_budget
+    assert first.last_visited_ltd_edition_id == 1
+    mock_discovery.reset()
+
+    second = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        budget=SliceBudget.starting_now(3600, clock=clock),
+        resume_after_ltd_edition_id=first.last_visited_ltd_edition_id,
+    )
+
+    assert [o.docverse_slug for o in second.edition_outcomes] == [
+        "u-jsick-other",
+        "u-jsick-feature",
+    ]
+    called = _ltd_paths_called(mock_discovery)
+    assert "/editions/1" not in called
+    assert "/builds/42" not in called
+    assert not second.stopped_at_budget
+    assert second.editions_total == 3
+    assert second.editions_visited == 2
+    assert second.last_visited_ltd_edition_id == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_project_missing_cursor_walks_from_the_top(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A cursor LTD no longer lists restarts the walk from the top.
+
+    The cursor's edition was deleted from LTD between slices, so there
+    is no position to resume from; revisiting is safe because a synced
+    edition short-circuits.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-slice-cursor-gone")
+
+    _seed_three_editions(mock_discovery)
+    clock = _SliceClock()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+    )
+
+    result = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        budget=SliceBudget.starting_now(3600, clock=clock),
+        resume_after_ltd_edition_id=999,
+    )
+
+    assert [o.docverse_slug for o in result.edition_outcomes] == [
+        "__main",
+        "u-jsick-feature",
+        "u-jsick-other",
+    ]
+    assert not result.stopped_at_budget
+    assert result.editions_total == 3
+    assert result.editions_visited == 3
+    assert result.last_visited_ltd_edition_id == 3
+
+
+@pytest.mark.asyncio
+async def test_sync_project_slice_with_no_progress_beyond_cursor(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A slice out of budget before its first edition reports no progress.
+
+    Nothing past the cursor was attempted, so the slice reports
+    ``stopped_at_budget`` with zero visits and no cursor of its own (the
+    worker's cue not to continue), and the zero-import guard reads it
+    as "nothing attempted" rather than raising for an outage.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-slice-no-progress")
+
+    _seed_three_editions(mock_discovery)
+    clock = _SliceClock()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+    )
+
+    result = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        budget=SliceBudget.starting_now(0, clock=clock),
+        resume_after_ltd_edition_id=1,
+    )
+
+    assert result.stopped_at_budget
+    assert result.edition_outcomes == []
+    assert result.edition_failures == ()
+    assert result.editions_total == 3
+    assert result.editions_visited == 0
+    assert result.last_visited_ltd_edition_id is None
+
+
+@pytest.mark.asyncio
+async def test_sync_project_cursor_visits_a_never_synced_main_first(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """With no ``main`` state row the cursor is placed in LTD's order.
+
+    Nothing has recorded which edition is ``main``, so the editions
+    after the cursor in LTD's own order are the ones left — and the
+    never-synced ``main`` among them is still visited first.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-slice-main-unknown")
+
+    _seed_three_editions(mock_discovery, listed_order=(2, 3, 1))
+    clock = _SliceClock()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+    )
+
+    result = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        budget=SliceBudget.starting_now(3600, clock=clock),
+        resume_after_ltd_edition_id=2,
+    )
+
+    assert [o.docverse_slug for o in result.edition_outcomes] == [
+        "__main",
+        "u-jsick-other",
+    ]
+    assert "/editions/2" not in _ltd_paths_called(mock_discovery)
+    assert result.editions_visited == 2
+    assert result.last_visited_ltd_edition_id == 3

@@ -18,6 +18,7 @@ __all__ = [
     "LtdEditionMode",
     "LtdProduct",
     "LtdProductsListing",
+    "parse_ltd_id",
 ]
 
 
@@ -95,14 +96,14 @@ class LtdEdition(BaseModel):
     @property
     def ltd_id(self) -> int:
         """Parse the integer LTD id from the trailing ``self_url`` segment."""
-        return _parse_trailing_id(str(self.self_url))
+        return parse_ltd_id(str(self.self_url))
 
     @property
     def build_id(self) -> int | None:
         """Parse the trailing integer id from ``build_url``, if set."""
         if self.build_url is None:
             return None
-        return _parse_trailing_id(str(self.build_url))
+        return parse_ltd_id(str(self.build_url))
 
 
 class LtdBuild(BaseModel):
@@ -132,7 +133,7 @@ class LtdBuild(BaseModel):
     @property
     def ltd_id(self) -> int:
         """Parse the integer LTD id from the trailing ``self_url`` segment."""
-        return _parse_trailing_id(str(self.self_url))
+        return parse_ltd_id(str(self.self_url))
 
 
 def _assume_utc(value: datetime | None) -> datetime | None:
@@ -149,8 +150,14 @@ def _assume_utc(value: datetime | None) -> datetime | None:
     return value
 
 
-def _parse_trailing_id(url: str) -> int:
-    """Pull the trailing integer path segment off an LTD resource URL."""
+def parse_ltd_id(url: str) -> int:
+    """Pull the trailing integer path segment off an LTD resource URL.
+
+    LTD's v1 API names a resource by URL (``.../editions/{id}``) and
+    never surfaces the integer id as a field of its own, so this is how
+    a caller holding only a URL — an entry in a product's edition list,
+    say — learns the id without fetching the resource.
+    """
     trimmed = url.rstrip("/")
     last = trimmed.rsplit("/", 1)[-1]
     return int(last)
