@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 import structlog
+from aiobotocore.session import AioSession
 
 from .._http_retry import DEFAULT_MAX_ATTEMPTS, MAX_BACKOFF_SECONDS
 from ._protocol import ObjectStore
@@ -60,6 +61,7 @@ def create_objectstore(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
     upload_limiter: asyncio.Semaphore | None = None,
+    aiobotocore_session: AioSession | None = None,
 ) -> ObjectStore:
     """Create an ObjectStore from service config and decrypted credentials.
 
@@ -92,6 +94,12 @@ def create_objectstore(
         bound); the keeper-sync worker passes its one process-wide
         semaphore, sized by ``Config.keeper_sync_upload_concurrency``.
         Like the budget arguments, it only applies with ``http_client``.
+    aiobotocore_session
+        aiobotocore session an S3-compatible store opens its client from.
+        Defaults to ``None`` (a session for that store alone); the API
+        and every worker pass their one process-lifetime session, so
+        building a store per build copy does not re-parse botocore's S3
+        service model per copy.
 
     Returns
     -------
@@ -129,6 +137,7 @@ def create_objectstore(
             max_attempts=max_attempts,
             max_backoff_seconds=max_backoff_seconds,
             upload_limiter=upload_limiter,
+            session=aiobotocore_session,
         )
     msg = f"Unsupported object store provider: {provider!r}"
     raise ValueError(msg)

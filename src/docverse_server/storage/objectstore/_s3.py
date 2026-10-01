@@ -97,6 +97,14 @@ class S3ObjectStore:
         than that cap. ``None`` (the default) leaves uploads unbounded.
         Only the presigned path honours it; the aiobotocore fallback
         manages its own connection pool.
+    session
+        aiobotocore session the store opens its S3 client from. Every
+        process that builds stores repeatedly passes its one
+        process-lifetime session: a session parses botocore's S3 service
+        model and endpoint ruleset on first use, so a session per store
+        repeats that work, and the garbage it leaves, for every build
+        copy (PRD #753). ``None`` (the default) creates a session for
+        this store alone, which suits a store built once.
     """
 
     def __init__(
@@ -113,6 +121,7 @@ class S3ObjectStore:
         base_backoff_seconds: float = DEFAULT_BASE_BACKOFF_SECONDS,
         max_backoff_seconds: float = MAX_BACKOFF_SECONDS,
         upload_limiter: asyncio.Semaphore | None = None,
+        session: AioSession | None = None,
     ) -> None:
         self._endpoint_url = endpoint_url
         self._bucket = bucket
@@ -128,7 +137,9 @@ class S3ObjectStore:
         self._base_backoff_seconds = base_backoff_seconds
         self._max_backoff_seconds = max_backoff_seconds
         self._upload_limiter = upload_limiter
-        self._session: AioSession = get_session()
+        self._session: AioSession = (
+            session if session is not None else get_session()
+        )
         self._client_cm: ClientCreatorContext | None = None
         self._client: AioBaseClient | None = None
 

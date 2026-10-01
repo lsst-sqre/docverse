@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 import structlog
+from aiobotocore.session import ClientCreatorContext, get_session
 from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import (
@@ -40,6 +41,7 @@ from docverse_server.storage.ltd import (
     LtdSourceAccessDeniedError,
     LtdSourceProtocol,
 )
+from tests.support.botocore_sessions import record_aiobotocore_sessions
 
 _ENDPOINT = "https://lsst-the-docs.s3.amazonaws.com/"
 
@@ -223,4 +225,37 @@ async def test_omitted_max_pool_connections_keeps_the_botocore_default() -> (
     assert client_config.max_pool_connections == (
         Config().max_pool_connections
     )
+    assert client_config.signature_version is UNSIGNED
+
+
+@pytest.mark.asyncio
+async def test_open_creates_the_client_from_an_injected_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source given a session opens its client from it and makes none.
+
+    The sync worker opens its one LTD source from the same
+    process-lifetime session its destination stores use, so botocore's
+    S3 service model is parsed once per process rather than once per
+    session (PRD #753).
+    """
+    shared = get_session()
+    create_calls: list[str] = []
+    original_create_client = shared.create_client
+
+    def _recording_create_client(
+        service_name: str, *args: Any, **kwargs: Any
+    ) -> ClientCreatorContext:
+        create_calls.append(service_name)
+        return original_create_client(service_name, *args, **kwargs)
+
+    monkeypatch.setattr(shared, "create_client", _recording_create_client)
+    sessions = record_aiobotocore_sessions(monkeypatch)
+    source = LtdS3Source(session=shared, logger=structlog.get_logger("test"))
+
+    async with source:
+        client_config = source._get_client().meta.config
+
+    assert create_calls == ["s3"]
+    assert sessions == []
     assert client_config.signature_version is UNSIGNED

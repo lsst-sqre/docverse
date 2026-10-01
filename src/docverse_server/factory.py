@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import structlog
+from aiobotocore.session import AioSession
 from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
 from safir.arq import ArqQueue
@@ -99,7 +100,12 @@ from .storage.ltd import (
     LtdSourceProtocol,
 )
 from .storage.membership_store import OrgMembershipStore
-from .storage.objectstore import ObjectStore, create_objectstore
+from .storage.objectstore import (
+    ObjectStore,
+    ObjectStoreCache,
+    ObjectStoreKey,
+    create_objectstore,
+)
 from .storage.organization_credential_store import OrganizationCredentialStore
 from .storage.organization_service_store import OrganizationServiceStore
 from .storage.organization_store import OrganizationStore
@@ -162,6 +168,8 @@ class Factory:
         ),
         keeper_sync_upload_limiter: asyncio.Semaphore | None = None,
         ltd_s3_source: LtdSourceProtocol | None = None,
+        aiobotocore_session: AioSession | None = None,
+        objectstore_cache: ObjectStoreCache | None = None,
     ) -> None:
         # A Factory is per-job / per-request, so an instance created here
         # coalesces nothing beyond the single publish this Factory drives
@@ -240,6 +248,28 @@ class Factory:
         # ``WorkerFactoryBuilder`` so LTD downloads reuse its connections
         # across builds and jobs.
         self._ltd_s3_source = ltd_s3_source
+        # The aiobotocore session every S3 client this factory's stores
+        # and LTD sources open is created from. A session parses
+        # botocore's S3 service model and endpoint ruleset on first use,
+        # and the keeper-sync copier builds a destination store per build
+        # copy and manifest hash, so a session per store churned that
+        # work, and its garbage, thousands of times per backfill (PRD
+        # #753). ``None`` keeps directly constructed factories (tests,
+        # scripts) building a session per store as before; the API
+        # lifespan and the arq worker's ``_startup`` each create one per
+        # process and thread it through ``ContextDependency`` and
+        # ``WorkerFactoryBuilder``.
+        self._aiobotocore_session = aiobotocore_session
+        # The process-lifetime cache every org object store this factory
+        # resolves borrows its open client from. Opening a store built an
+        # aiobotocore client, with its own aiohttp connector and CA-loaded
+        # SSL context, per build copy, manifest hash and job, and each one
+        # left RSS behind that tracemalloc never saw (#751). ``None`` keeps
+        # the API's per-request factories and directly constructed ones
+        # (tests, scripts) opening and closing a client per store as
+        # before; the arq worker's ``_startup`` creates one per process
+        # and threads it through ``WorkerFactoryBuilder``.
+        self._objectstore_cache = objectstore_cache
         # Created lazily and then shared: a service defers an enqueue on
         # it and the caller that owns the commit dispatches from the same
         # instance, so the pending list has to survive between the two.
@@ -305,6 +335,25 @@ class Factory:
         ``None`` (each copier opens and closes a source of its own).
         """
         return self._ltd_s3_source
+
+    @property
+    def aiobotocore_session(self) -> AioSession | None:
+        """Process-lifetime aiobotocore session shared by S3 clients, if any.
+
+        The API's or worker's one session when one was given, otherwise
+        ``None`` (each store and LTD source creates a session of its
+        own).
+        """
+        return self._aiobotocore_session
+
+    @property
+    def objectstore_cache(self) -> ObjectStoreCache | None:
+        """Process-lifetime cache of open org object stores, if any.
+
+        The worker's one cache when one was given, otherwise ``None``
+        (each store opens and closes a client of its own).
+        """
+        return self._objectstore_cache
 
     @property
     def queue_dispatcher(self) -> QueueDispatcher:
@@ -1123,6 +1172,18 @@ class Factory:
         ObjectStore
             An unopened ObjectStore. Caller must use as async context
             manager.
+
+        Notes
+        -----
+        With :attr:`objectstore_cache` set (the arq worker), the store
+        returned is a handle on the cache: entering it borrows the one
+        open client the process holds for this org, service and upload
+        flavour, and leaving it releases that client without closing it.
+        The service row and credential are still read on every call, and
+        their ``date_updated`` decides whether the cached client is
+        current, so a service edit or credential rotation takes effect
+        on the next use. Without a cache the store opens a client of its
+        own on entry and closes it on exit.
         """
         # Step 1: Load the service config
         service_store = self.create_service_store()
@@ -1135,24 +1196,46 @@ class Factory:
 
         # Step 2: Decrypt the credential
         credential_service = self.create_credential_service()
-        _cred, cred_payload = await credential_service.get_decrypted(
+        cred, cred_payload = await credential_service.get_decrypted(
             org_id=org_id, label=svc.credential_label
         )
 
         # Step 3: Build the ObjectStore from config + credentials
-        return create_objectstore(
-            provider=svc.provider,
-            config=svc.config,
-            credentials=cred_payload,
-            logger=self._logger,
-            http_client=(
-                upload_http_client
-                if upload_http_client is not None
-                else self._http_client
+        http_client = (
+            upload_http_client
+            if upload_http_client is not None
+            else self._http_client
+        )
+
+        def build(logger: structlog.stdlib.BoundLogger) -> ObjectStore:
+            return create_objectstore(
+                provider=svc.provider,
+                config=svc.config,
+                credentials=cred_payload,
+                logger=logger,
+                http_client=http_client,
+                max_attempts=upload_max_attempts,
+                max_backoff_seconds=upload_max_backoff_seconds,
+                upload_limiter=upload_limiter,
+                aiobotocore_session=self._aiobotocore_session,
+            )
+
+        cache = self._objectstore_cache
+        if cache is None:
+            return build(self._logger)
+        return cache.handle(
+            ObjectStoreKey.create(
+                org_id=org_id,
+                service_label=service_label,
+                provider=svc.provider,
+                config=svc.config,
+                max_attempts=upload_max_attempts,
+                max_backoff_seconds=upload_max_backoff_seconds,
+                http_client=http_client,
+                upload_limiter=upload_limiter,
             ),
-            max_attempts=upload_max_attempts,
-            max_backoff_seconds=upload_max_backoff_seconds,
-            upload_limiter=upload_limiter,
+            (svc.date_updated, cred.date_updated),
+            build,
         )
 
     def create_ltd_client(
@@ -1171,8 +1254,16 @@ class Factory:
     def create_ltd_s3_source(
         self, *, bucket: str = "lsst-the-docs"
     ) -> LtdS3Source:
-        """Create an unopened anonymous S3 source for ``bucket``."""
-        return LtdS3Source(bucket=bucket, logger=self._logger)
+        """Create an unopened anonymous S3 source for ``bucket``.
+
+        The source opens its client from :attr:`aiobotocore_session` when
+        the factory holds one.
+        """
+        return LtdS3Source(
+            bucket=bucket,
+            session=self._aiobotocore_session,
+            logger=self._logger,
+        )
 
     def create_build_content_copier_for_org(
         self,
@@ -1184,8 +1275,12 @@ class Factory:
 
         Used as ``async with factory.create_build_content_copier_for_org(
         org_id=..., service_label=...) as copier:``. The per-org
-        destination is opened on entry and closed on exit so a sync
-        slot's resource lifetime is tightly bounded.
+        destination is entered on entry and left on exit. With
+        :attr:`objectstore_cache` set (the arq worker) that borrows the
+        process's one open destination client for the org and releases
+        it without closing, so a backfill's copies and manifest hashes
+        share a client rather than building one each (#751); without a
+        cache the destination opens a client of its own and closes it.
 
         The LTD source is :attr:`ltd_s3_source` when the factory holds
         one: already open, shared by every copier in the worker process
@@ -1375,6 +1470,7 @@ class HandlerFactory(Factory):
         github_app_html_url: str | None = None,
         github_app_validated: bool = True,
         default_queue_name: str,
+        aiobotocore_session: AioSession | None = None,
     ) -> None:
         super().__init__(
             session=session,
@@ -1389,6 +1485,7 @@ class HandlerFactory(Factory):
             github_webhook_secret=github_webhook_secret,
             github_app_validated=github_app_validated,
             default_queue_name=default_queue_name,
+            aiobotocore_session=aiobotocore_session,
         )
         self._user_info_store = user_info_store
         self._github_app_html_url = github_app_html_url

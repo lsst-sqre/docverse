@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from importlib.metadata import metadata, version
 
 import structlog
+from aiobotocore.session import get_session
 from fastapi import FastAPI, status
 from fastapi.routing import APIRoute
 from rubin.gafaelfawr import GafaelfawrClient
@@ -106,6 +107,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     event_manager, events = await build_event_manager(config, logger=logger)
+    # One per process, like the worker's: every request's factory opens
+    # its S3 clients from this session, so a build upload or dashboard
+    # render does not re-parse botocore's S3 service model and endpoint
+    # ruleset per store (PRD #753).
+    aiobotocore_session = get_session()
 
     await context_dependency.initialize(
         credential_encryptor=encryptor,
@@ -118,6 +124,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         github_app_private_key=config.github_app_private_key,
         github_webhook_secret=config.github_webhook_secret,
         events=events,
+        aiobotocore_session=aiobotocore_session,
     )
     github_app_html_url = await validate_github_app(
         state=context_dependency,

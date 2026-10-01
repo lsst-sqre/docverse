@@ -332,6 +332,20 @@ A factory built without a shared source, such as one a test builds,
 falls back to the old path: each copier opens a source of its own and
 closes it on exit.
 
+### The destination client
+
+The R2 side's aiobotocore client is shared too. Each worker process
+keeps its destination clients open in one `ObjectStoreCache`
+(`ctx["objectstore_cache"]`), which `shutdown` closes, so every build
+copy and manifest hash of every job for one organization borrows the
+same open client instead of opening one each (#751). The copier's
+store, with its keeper-sync upload budget, copy client and upload
+limiter, has a client of its own, separate from the one other jobs use
+for the same organization. Presigned PUTs never use that client's
+connection pool, because the client only signs their URLs, so sharing
+it changes no connection count. See
+[Shared destination clients](memory-diagnostics.md#shared-destination-clients).
+
 ## The build-level retry
 
 When a copy fails, `KeeperSyncService.sync_build` looks at the

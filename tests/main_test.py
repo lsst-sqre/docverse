@@ -5,9 +5,10 @@ These exercise the integration of the GitHub App startup validator
 real FastAPI lifespan. The validator itself is unit-tested in
 ``tests/storage/github/startup_test.py`` — this file confirms that the
 lifespan calls it and that the resulting ``context_dependency`` state
-makes the webhook endpoint behave correctly. The last tests confirm the
+makes the webhook endpoint behave correctly. Later tests confirm the
 lifespan starts the opt-in memory sampler (PRD #753) only when
-configured, and stops it on exit.
+configured, and stops it on exit, and that it hands requests one
+aiobotocore session per process.
 
 Every test here runs the real lifespan itself, whose shutdown closes
 process-global dependencies. They therefore take the ``own_app_lifespan``
@@ -34,6 +35,7 @@ from docverse_server.config import config
 from docverse_server.dependencies.context import context_dependency
 from docverse_server.main import app as docverse_app
 from docverse_server.storage.user_info_store import StubUserInfoStore
+from tests.support.botocore_sessions import record_aiobotocore_sessions
 from tests.support.github_mock import GitHubMock
 
 
@@ -285,3 +287,24 @@ async def test_lifespan_runs_a_memory_sampler_when_enabled(
     assert "rss_peak_bytes" in sample
     assert task.done()
     assert _memory_sampler_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_lifespan_hands_one_aiobotocore_session_to_requests(
+    own_app_lifespan: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup creates one session and every request factory shares it.
+
+    Build uploads and dashboard renders open an object store per
+    request, so the API needs the one-session-per-process wiring the
+    workers have (PRD #753): the lifespan creates exactly one session
+    and hands it to ``context_dependency``.
+    """
+    sessions = record_aiobotocore_sessions(monkeypatch)
+
+    async with LifespanManager(docverse_app):
+        _override_arq_and_user_info()
+        shared = context_dependency.aiobotocore_session
+
+    assert sessions == [shared]
