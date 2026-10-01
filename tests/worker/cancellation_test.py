@@ -24,15 +24,24 @@ import pytest
 import structlog
 from arq.worker import Worker
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
 from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
-from docverse.models import JobKind, OrganizationCreate
+from docverse.models import JobKind, KeeperSyncRunStatus, OrganizationCreate
+from docverse_server.config import Configuration
+from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse_server.dbschema.queue_job import SqlQueueJob
-from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.base32id import (
+    generate_base32_id,
+    serialize_base32_id,
+    validate_base32_id,
+)
 from docverse_server.domain.queue import JobStatus, QueueJob
+from docverse_server.metrics import build_event_manager
+from docverse_server.storage.keeper_sync_run_store import KeeperSyncRunStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions import (
@@ -41,6 +50,8 @@ from docverse_server.worker.functions import (
 from docverse_server.worker.functions._cancellation import (
     ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
     JOB_TIMEOUT_MESSAGE,
+    RunFinaliser,
+    keeper_sync_run_finaliser,
     record_cancellation,
     record_handoff_cancellation,
 )
@@ -420,6 +431,7 @@ async def _cancel_running_handoff(
     *,
     queue_job_ids: Callable[[], list[int]],
     started: float,
+    finalise_run: RunFinaliser | None = None,
 ) -> None:
     """Cancel a never-ending hand-off run under the hand-off helper."""
     running = asyncio.Event()
@@ -432,6 +444,7 @@ async def _cancel_running_handoff(
             started=started,
             timeout_seconds=TIMEOUT_SECONDS,
             logger=_logger(),
+            finalise_run=finalise_run,
         ):
             running.set()
             await asyncio.Event().wait()
@@ -557,3 +570,74 @@ async def test_handoff_cleanup_failure_is_logged_and_the_cancel_propagates(
     assert failures[0]["exc_info"] is True
     untouched = await _get_job(orphan.id)
     assert untouched.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_handoff_cancel_rolls_up_the_run_of_an_orphan(
+    app: None, db_session: AsyncSession
+) -> None:
+    """Failing a run's last pending child finalises the run.
+
+    A ``keeper_sync_project`` continuation is run-attributed, and the
+    slice that created it has already completed, so once the hand-off
+    helper fails the stranded row nothing else would ever roll the run
+    up. The finaliser runs in the same transaction, and the run-completed
+    metric is published.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org = await OrganizationStore(
+            session=db_session, logger=_logger()
+        ).create(
+            OrganizationCreate(
+                slug="handoff-run-org",
+                title="Hand-off Run Org",
+                base_domain="handoff-run-org.example.com",
+            )
+        )
+        run = SqlKeeperSyncRun(
+            public_id=validate_base32_id(generate_base32_id()),
+            org_id=org.id,
+            kind="backfill",
+            status="in_progress",
+        )
+        db_session.add(run)
+        await db_session.flush()
+        store = QueueJobStore(session=db_session, logger=_logger())
+        finished = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org.id,
+            keeper_sync_run_id=run.id,
+            backend_job_id="arq-slice-0",
+        )
+        await store.start_if_queued(finished.id)
+        await store.complete(finished.id)
+        orphan = await store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org.id,
+            keeper_sync_run_id=run.id,
+        )
+        run_id = run.id
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), events=events)
+
+    await _cancel_running_handoff(
+        ctx,
+        queue_job_ids=lambda: [orphan.id],
+        started=time.monotonic(),
+        finalise_run=keeper_sync_run_finaliser(run_id),
+    )
+    await ctx["http_client"].aclose()
+
+    assert (await _get_job(orphan.id)).status == JobStatus.failed
+    async for session in db_session_dependency():
+        async with session.begin():
+            finalised = await KeeperSyncRunStore(
+                session=session, logger=_logger()
+            ).get(run_id)
+        assert finalised is not None
+        assert finalised.status == KeeperSyncRunStatus.partial_failure
+    publisher = events.keeper_sync_run_completed
+    assert isinstance(publisher, MockEventPublisher)
+    [event] = publisher.published
+    assert event.success is False
+    assert event.failed_count == 1

@@ -74,7 +74,7 @@ from docverse_server.exceptions import (
 )
 from docverse_server.factory import Factory
 from docverse_server.services.default_branch import DuplicateDraftRetirer
-from docverse_server.services.keeper_sync import SliceBudget
+from docverse_server.services.keeper_sync import SliceBudget, SliceProgress
 from docverse_server.services.keeper_sync import service as service_module
 from docverse_server.services.keeper_sync.copier import (
     BuildContentCopier,
@@ -10113,6 +10113,7 @@ async def test_sync_project_slice_stops_between_editions_at_deadline(
     assert "/builds/44" not in called
     assert result.editions_total == 3
     assert result.editions_visited == 1
+    assert result.editions_remaining == 2
     assert result.last_visited_ltd_edition_id == 1
 
 
@@ -10374,6 +10375,7 @@ async def test_sync_project_slice_with_no_progress_beyond_cursor(
     assert result.edition_failures == ()
     assert result.editions_total == 3
     assert result.editions_visited == 0
+    assert result.editions_remaining == 2
     assert result.last_visited_ltd_edition_id is None
 
 
@@ -10415,3 +10417,68 @@ async def test_sync_project_cursor_visits_a_never_synced_main_first(
     assert "/editions/2" not in _ltd_paths_called(mock_discovery)
     assert result.editions_visited == 2
     assert result.last_visited_ltd_edition_id == 3
+
+
+@pytest.mark.asyncio
+async def test_sync_project_reports_live_slice_progress(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The caller's ``SliceProgress`` follows the walk while it runs.
+
+    The worker hands the cancellation helper this object, so a job
+    cancelled part way records how far it got. Read from inside each
+    edition's copy, it already counts the editions before that one, and
+    once the walk ends it matches the result's walk fields.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-slice-live-progress")
+
+    _seed_three_editions(mock_discovery)
+    progress = SliceProgress()
+    seen: list[tuple[int | None, int, int | None, int | None]] = []
+
+    def _observe(copy: CopyCallable) -> CopyCallable:
+        async def observing(
+            source_prefix: str, dest_prefix: str, tally: CopyTally
+        ) -> CopyResult:
+            seen.append(
+                (
+                    progress.editions_total,
+                    progress.editions_visited,
+                    progress.editions_remaining,
+                    progress.last_visited_ltd_edition_id,
+                )
+            )
+            return await copy(source_prefix, dest_prefix, tally)
+
+        return observing
+
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_THREE_EDITION_SOURCE_OBJECTS),
+        wrap_copy=_observe,
+    )
+    assert progress.editions_total is None
+    assert progress.editions_remaining is None
+
+    result = await service.sync_project(
+        org_id=org_id,
+        ltd_slug="pipelines",
+        budget=SliceBudget.starting_now(3600, clock=_SliceClock()),
+        progress=progress,
+    )
+
+    assert seen == [(3, 0, 3, None), (3, 1, 2, 1), (3, 2, 1, 2)]
+    assert progress == SliceProgress(
+        editions_total=3,
+        editions_to_visit=3,
+        editions_visited=3,
+        last_visited_ltd_edition_id=3,
+    )
+    assert progress.editions_remaining == 0
+    assert result.editions_remaining == 0
+    assert result.editions_visited == progress.editions_visited

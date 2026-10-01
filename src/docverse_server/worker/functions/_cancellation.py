@@ -446,6 +446,7 @@ async def record_handoff_cancellation(
     started: float,
     timeout_seconds: float,
     logger: structlog.stdlib.BoundLogger,
+    finalise_run: RunFinaliser | None = None,
 ) -> AsyncIterator[None]:
     """Fail the child rows a cancel stranded before they reached arq.
 
@@ -465,6 +466,13 @@ async def record_handoff_cancellation(
     in flight cannot tell whether arq took the job; failing the row then
     costs at most that one job, which finds its row terminal at pickup
     and skips, and the creator's next run re-drives it.
+
+    When the stranded rows belong to a keeper-sync run, ``finalise_run``
+    rolls that run up in the same transaction, once anything was failed
+    — a ``keeper_sync_project`` continuation is run-attributed, and with
+    its predecessor already completed no other job would ever finalise
+    the run — and ``keeper_sync_run_completed`` is published when that
+    drives it terminal.
 
     The ``reason`` is inferred from ``started``, a :func:`time.monotonic`
     reading taken when the creator began: an orphaned row was never
@@ -493,6 +501,10 @@ async def record_handoff_cancellation(
         The creator's arq per-job timeout.
     logger
         The creator's bound logger.
+    finalise_run
+        Rolls up the run the stranded rows belong to (see
+        :func:`keeper_sync_run_finaliser`); ``None`` for rows outside any
+        run.
     """
     try:
         yield
@@ -505,6 +517,7 @@ async def record_handoff_cancellation(
                 elapsed=timedelta(seconds=time.monotonic() - started),
                 timeout=timedelta(seconds=timeout_seconds),
                 logger=logger,
+                finalise_run=finalise_run,
             )
             if recorded is not None:
                 _report_handoff(recorded, logger=logger)
@@ -521,8 +534,9 @@ async def _record_handoff(
     elapsed: timedelta,
     timeout: timedelta,
     logger: structlog.stdlib.BoundLogger,
+    finalise_run: RunFinaliser | None,
 ) -> _RecordedHandoffCancellation | None:
-    """Fail the stranded rows from a fresh session.
+    """Fail the stranded rows, and roll up their run, from a fresh session.
 
     Returns ``None`` when there was nothing to fail.
     """
@@ -544,9 +558,11 @@ async def _record_handoff(
     }
     orphans: list[QueueJob] = []
     async for session in db_session_dependency():
-        queue_job_store = ctx["factory_builder"](
+        factory: Factory = ctx["factory_builder"](
             session=session, logger=logger
-        ).create_queue_job_store()
+        )
+        queue_job_store = factory.create_queue_job_store()
+        completion: KeeperSyncRunWithActivity | None = None
         async with session.begin():
             for queue_job_id in ids:
                 failed = await queue_job_store.fail_if_undispatched(
@@ -554,6 +570,15 @@ async def _record_handoff(
                 )
                 if failed is not None:
                     orphans.append(failed)
+            if orphans and finalise_run is not None:
+                completion = await finalise_run(factory)
+        await publish_run_completed(
+            events=ctx.get("events"),
+            session=session,
+            org_store=factory.create_org_store(),
+            completion=completion,
+            logger=logger,
+        )
     if not orphans:
         return None
     return _RecordedHandoffCancellation(

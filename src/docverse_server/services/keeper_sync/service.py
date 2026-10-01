@@ -123,7 +123,7 @@ from docverse_server.storage.ltd import (
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 
-from .budget import SliceBudget
+from .budget import SliceBudget, SliceProgress
 from .copier import CopyResult, CopyTally
 from .mappers import (
     EditionKindDerivation,
@@ -851,7 +851,7 @@ class ProjectSyncResult:
     means the run was *partial* — those LTD editions raised and were
     skipped, every other edition still synced.
 
-    The four walk fields describe how far this call got through LTD's
+    The five walk fields describe how far this call got through LTD's
     edition list, which is what a keeper-sync job sliced by a
     :class:`~docverse_server.services.keeper_sync.budget.SliceBudget`
     continues from. An unsliced call walks the whole list, so it reports
@@ -875,6 +875,13 @@ class ProjectSyncResult:
     resume cursor on. Editions skipped for sitting at or before
     ``resume_after_ltd_edition_id`` do not: an earlier slice visited
     them.
+    """
+
+    editions_remaining: int = 0
+    """How many editions this call's walk left unvisited.
+
+    Non-zero only when :attr:`stopped_at_budget` is set: these are the
+    editions the next slice of the chain picks up.
     """
 
     stopped_at_budget: bool = False
@@ -943,8 +950,9 @@ class _EditionWalkTally:
     """
 
     last_systemic_candidate: Exception | None = None
-    editions_visited: int = 0
-    last_visited_ltd_edition_id: int | None = None
+    walk: SliceProgress = field(default_factory=SliceProgress)
+    """The walk's position, shared with the caller when it passed one."""
+
     stopped_at_budget: bool = False
 
     def record_failure(
@@ -980,8 +988,7 @@ class _EditionWalkTally:
 
     def record_visit(self, ltd_edition: LtdEdition) -> None:
         """Move the resume cursor past an edition the loop dealt with."""
-        self.editions_visited += 1
-        self.last_visited_ltd_edition_id = ltd_edition.ltd_id
+        self.walk.record_visit(ltd_edition.ltd_id)
 
 
 @dataclass(frozen=True)
@@ -1101,6 +1108,7 @@ class KeeperSyncService:
         ) = None,
         budget: SliceBudget | None = None,
         resume_after_ltd_edition_id: int | None = None,
+        progress: SliceProgress | None = None,
     ) -> ProjectSyncResult:
         """Sync one LTD product (and all its editions) into Docverse.
 
@@ -1188,6 +1196,13 @@ class KeeperSyncService:
         left at ``None`` the call walks the whole list in LTD's order,
         exactly as an unsliced sync always has.
 
+        ``progress``, when given, is kept current as the walk goes (see
+        :class:`~docverse_server.services.keeper_sync.budget.SliceProgress`),
+        so the caller can read how far the call got even if it never
+        returns — the keeper-sync worker records it on a job arq
+        cancels mid-slice. It ends up holding the same walk fields the
+        result reports.
+
         Short-circuits before the LTD product fetch when the project's
         ``keeper_sync_state`` row is tombstoned: the operator has
         deleted the project on the Docverse side and the migration
@@ -1249,7 +1264,13 @@ class KeeperSyncService:
         tracking_live_refs = await self._tracking_live_refs(
             project=project, ltd_editions=ltd_editions, cache=live_refs
         )
-        tally = _EditionWalkTally()
+        tally = _EditionWalkTally(
+            walk=progress if progress is not None else SliceProgress()
+        )
+        tally.walk.start_walk(
+            editions_total=walk.editions_total,
+            editions_to_visit=len(ltd_editions),
+        )
         for ltd_edition in ltd_editions:
             # Between editions only: an edition that starts inside the
             # budget always finishes, however long its copy runs.
@@ -1273,8 +1294,11 @@ class KeeperSyncService:
             self._logger.info(
                 "Project sync stopped at its slice budget",
                 editions_total=walk.editions_total,
-                editions_visited=tally.editions_visited,
-                last_visited_ltd_edition_id=tally.last_visited_ltd_edition_id,
+                editions_visited=tally.walk.editions_visited,
+                editions_remaining=tally.walk.editions_remaining,
+                last_visited_ltd_edition_id=(
+                    tally.walk.last_visited_ltd_edition_id
+                ),
                 project_id=project.id,
                 project=project.slug,
                 ltd_slug=ltd_slug,
@@ -1288,9 +1312,10 @@ class KeeperSyncService:
             edition_outcomes=tally.outcomes,
             edition_failures=tuple(tally.failures),
             editions_total=walk.editions_total,
-            editions_visited=tally.editions_visited,
+            editions_visited=tally.walk.editions_visited,
+            editions_remaining=len(ltd_editions) - tally.walk.editions_visited,
             stopped_at_budget=tally.stopped_at_budget,
-            last_visited_ltd_edition_id=tally.last_visited_ltd_edition_id,
+            last_visited_ltd_edition_id=tally.walk.last_visited_ltd_edition_id,
         )
 
     async def _plan_edition_walk(
