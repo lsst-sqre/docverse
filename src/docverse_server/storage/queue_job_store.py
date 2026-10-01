@@ -723,6 +723,50 @@ class QueueJobStore:
             return None
         return await self._mark_failed(row, errors)
 
+    async def fail_if_undispatched(
+        self,
+        job_id: int,
+        *,
+        errors: dict[str, Any] | None = None,
+    ) -> QueueJob | None:
+        """Fail a row its creator committed but never handed to the backend.
+
+        A creator that commits a ``queue_jobs`` row and then enqueues its
+        job — the tier crons,
+        :class:`~docverse_server.services.queue_dispatch.QueueDispatcher` —
+        leaves an orphan (``status='queued'``, ``backend_job_id IS NULL``)
+        when arq cancels it between the two. The orphan sweeps fail such a row
+        only once it has idled past their window, holding any active-job
+        mutex until then; the arq cancellation helper calls this to fail
+        it at once instead (PRD #765).
+
+        The row is locked before it is read, and failed only while it is
+        still ``queued`` with no ``backend_job_id``: a stamped row's job
+        is in the queue backend and may yet run, and a started row
+        belongs to the worker running it.
+
+        Returns
+        -------
+        QueueJob or None
+            The failed job, or ``None`` when the row was stamped, started,
+            already terminal, or does not exist — the last being a row
+            whose creating transaction the cancel rolled back.
+        """
+        stmt = (
+            select(SqlQueueJob)
+            .where(SqlQueueJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        row = (await self._session.execute(stmt)).scalar_one_or_none()
+        if (
+            row is None
+            or row.status != JobStatus.queued.value
+            or row.backend_job_id is not None
+        ):
+            return None
+        return await self._mark_failed(row, errors)
+
     async def _mark_failed(
         self, row: SqlQueueJob, errors: dict[str, Any] | None
     ) -> QueueJob:

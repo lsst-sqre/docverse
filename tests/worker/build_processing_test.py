@@ -69,10 +69,14 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+)
 from docverse_server.worker.functions.build_processing import build_processing
 from docverse_server.worker.functions.build_processing_reaper import (
     build_processing_reaper,
 )
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import (
     count_jobs_by_name,
     get_jobs_by_name,
@@ -4455,3 +4459,75 @@ async def test_failed_staging_delete_still_completes_the_build(
             job = await qjs.get_by_backend_job_id("test-staging-delete-fails")
             assert job is not None
             assert job.status == JobStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_build_processing_cancel_fails_the_job_and_the_build(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An arq cancel mid-unpack fails the job and its build at once.
+
+    The job is cancelled while it downloads the staging tarball, as arq's
+    default job timeout or a rolling deploy's SIGTERM would catch a large
+    upload. Neither row may be left for the reaper — the job
+    ``in_progress``, the build ``processing`` — up to eight hours: the
+    job fails with a ``CancelledError`` payload read against the arq
+    default timeout ``build_processing`` runs under, and the build fails
+    with it, the two writes the ``except`` branch makes for an error.
+    """
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        await QueueJobStore(session=db_session, logger=_logger()).create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id="test-arq-build-cancel",
+        )
+    mock_store = MockObjectStore()
+    hang = HangUntilCancelled()
+    monkeypatch.setattr(mock_store, "download_object", hang)
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), job_id="test-arq-build-cancel"
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    task = asyncio.create_task(build_processing(ctx, payload))
+    await cancel_when_reached(task, hang.reached)
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            job = await QueueJobStore(
+                session=session, logger=_logger()
+            ).get_by_backend_job_id("test-arq-build-cancel")
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.errors is not None
+            assert job.errors["type"] == "CancelledError"
+            assert job.errors["reason"] == "worker_shutdown"
+            assert job.errors["timeout_seconds"] == (
+                ARQ_DEFAULT_JOB_TIMEOUT_SECONDS
+            )
+            refreshed = await BuildStore(
+                session=session, logger=_logger()
+            ).get_by_id(build.id)
+            assert refreshed is not None
+            assert refreshed.status == BuildStatus.failed
+        break

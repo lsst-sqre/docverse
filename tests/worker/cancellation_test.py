@@ -13,6 +13,8 @@ worker-level wiring is covered next to each worker function's own tests
 from __future__ import annotations
 
 import asyncio
+import inspect
+import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import timedelta
 from typing import Any
@@ -20,6 +22,7 @@ from typing import Any
 import httpx
 import pytest
 import structlog
+from arq.worker import Worker
 from safir.dependencies.db_session import db_session_dependency
 from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
 from sqlalchemy import func, update
@@ -36,8 +39,15 @@ from docverse_server.worker.functions import (
     _cancellation as cancellation_module,
 )
 from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
     JOB_TIMEOUT_MESSAGE,
     record_cancellation,
+    record_handoff_cancellation,
+)
+from docverse_server.worker.main import (
+    KeeperSyncWorkerSettings,
+    MaintenanceWorkerSettings,
+    WorkerSettings,
 )
 from tests.worker.conftest import make_worker_ctx
 
@@ -353,3 +363,197 @@ async def test_cancel_merges_the_callers_progress_into_the_row(
     failed = await _get_job(job.id)
     assert failed.status == JobStatus.failed
     assert failed.progress == {"slice_index": 0, "editions_visited": 7}
+
+
+def test_arq_default_job_timeout_matches_arq() -> None:
+    """The constant is the timeout arq gives a function that sets none.
+
+    Functions registered without their own ``timeout`` pass
+    ``ARQ_DEFAULT_JOB_TIMEOUT_SECONDS`` so a cancel's ``reason`` is read
+    against the timeout arq enforces. That only holds while it matches
+    arq's ``Worker`` default and no ``WorkerSettings`` class overrides
+    that default with a ``job_timeout`` of its own.
+    """
+    default = inspect.signature(Worker).parameters["job_timeout"].default
+    assert default == ARQ_DEFAULT_JOB_TIMEOUT_SECONDS
+    for settings in (
+        WorkerSettings,
+        KeeperSyncWorkerSettings,
+        MaintenanceWorkerSettings,
+    ):
+        assert not hasattr(settings, "job_timeout"), settings.__name__
+
+
+async def _seed_handoff_rows(
+    db_session: AsyncSession, *, stamped: bool
+) -> tuple[QueueJob, QueueJob]:
+    """Seed an org and two ``queued`` rows, as a hand-off leaves them.
+
+    The first is the row the hand-off was cut short on (no
+    ``backend_job_id``); the second is stamped when ``stamped`` is set,
+    as a dispatch that had already handed it to arq leaves it.
+    """
+    async with db_session.begin():
+        org = await OrganizationStore(
+            session=db_session, logger=_logger()
+        ).create(
+            OrganizationCreate(
+                slug="handoff-org",
+                title="Hand-off Org",
+                base_domain="handoff-org.example.com",
+            )
+        )
+        store = QueueJobStore(session=db_session, logger=_logger())
+        orphan = await store.create(
+            kind=JobKind.dashboard_build, org_id=org.id
+        )
+        other = await store.create(kind=JobKind.publish_edition, org_id=org.id)
+        if stamped:
+            other = await store.set_backend_job_id(
+                other.id, "arq-handed-off", queue_name="docverse:queue"
+            )
+    return orphan, other
+
+
+async def _cancel_running_handoff(
+    ctx: dict[str, Any],
+    *,
+    queue_job_ids: Callable[[], list[int]],
+    started: float,
+) -> None:
+    """Cancel a never-ending hand-off run under the hand-off helper."""
+    running = asyncio.Event()
+
+    async def _job() -> None:
+        async with record_handoff_cancellation(
+            ctx,
+            queue_job_ids=queue_job_ids,
+            job_function="keeper_sync_tier_main",
+            started=started,
+            timeout_seconds=TIMEOUT_SECONDS,
+            logger=_logger(),
+        ):
+            running.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(_job())
+    await running.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_handoff_cancel_fails_rows_never_handed_off(
+    app: None, db_session: AsyncSession
+) -> None:
+    """A cancel mid-hand-off fails the orphan and spares the stamped row.
+
+    The ids are read at cancel time, so a row the job committed inside
+    the wrapped block is covered. Only the row never handed to arq is
+    failed — the stamped one's job is in the queue and may yet run — and
+    its payload names the job whose cancel orphaned it. The cancel lands
+    well short of the creator's timeout, measured from ``started``, so it
+    reads as a worker shutdown, and it still propagates.
+    """
+    orphan, stamped = await _seed_handoff_rows(db_session, stamped=True)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient())
+
+    with capture_logs() as logs:
+        await _cancel_running_handoff(
+            ctx,
+            queue_job_ids=lambda: [orphan.id, stamped.id],
+            started=time.monotonic(),
+        )
+    await ctx["http_client"].aclose()
+
+    failed = await _get_job(orphan.id)
+    assert failed.status == JobStatus.failed
+    assert failed.errors is not None
+    assert failed.errors["type"] == "CancelledError"
+    assert failed.errors["reason"] == "worker_shutdown"
+    assert failed.errors["job_function"] == "keeper_sync_tier_main"
+    assert failed.errors["timeout_seconds"] == TIMEOUT_SECONDS
+    assert "keeper_sync_tier_main" in failed.errors["message"]
+    kept = await _get_job(stamped.id)
+    assert kept.status == JobStatus.queued
+    warnings = [log for log in logs if log["event"] == "Queue job cancelled"]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["job_function"] == "keeper_sync_tier_main"
+    assert warnings[0]["orphaned_queue_job_ids"] == [
+        serialize_base32_id(orphan.public_id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handoff_cancel_past_the_timeout_reads_as_job_timeout(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A creator cancelled at its timeout pages Sentry, tagged as itself.
+
+    The orphaned row was never picked up, so it has no ``date_started``
+    to measure from; the creator's own ``started`` mark is the clock.
+    """
+    orphan, _other = await _seed_handoff_rows(db_session, stamped=False)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient())
+
+    with sentry_init_fixture() as init:
+        init(environment="test")
+        captured = capture_events_fixture(monkeypatch)()
+        await _cancel_running_handoff(
+            ctx,
+            queue_job_ids=lambda: [orphan.id],
+            started=time.monotonic() - (TIMEOUT_SECONDS + 60),
+        )
+    await ctx["http_client"].aclose()
+
+    failed = await _get_job(orphan.id)
+    assert failed.errors is not None
+    assert failed.errors["reason"] == "job_timeout"
+    assert failed.errors["elapsed_seconds"] >= TIMEOUT_SECONDS + 60
+    assert len(captured.errors) == 1
+    event = captured.errors[0]
+    assert event["message"] == JOB_TIMEOUT_MESSAGE
+    assert event["tags"]["job_function"] == "keeper_sync_tier_main"
+    context = event["contexts"]["queue_job_cancellation"]
+    assert context["reason"] == "job_timeout"
+    assert context["orphaned_queue_job_ids"] == [
+        serialize_base32_id(orphan.public_id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handoff_cleanup_failure_is_logged_and_the_cancel_propagates(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hand-off helper never raises out of its own cleanup either.
+
+    The orphan is left for the sweep it would have waited on anyway.
+    """
+    orphan, _other = await _seed_handoff_rows(db_session, stamped=False)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient())
+
+    def _broken_ids() -> list[int]:
+        msg = "dispatcher state unreadable"
+        raise RuntimeError(msg)
+
+    with capture_logs() as logs:
+        await _cancel_running_handoff(
+            ctx, queue_job_ids=_broken_ids, started=time.monotonic()
+        )
+    await ctx["http_client"].aclose()
+
+    failures = [
+        log
+        for log in logs
+        if log["event"] == "Failed to record the queue job's cancellation"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["exc_info"] is True
+    untouched = await _get_job(orphan.id)
+    assert untouched.status == JobStatus.queued

@@ -26,6 +26,7 @@ function has always recorded.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import gidgethub
@@ -54,6 +55,10 @@ from docverse_server.storage.github import (
     GitHubAppNotInstalledError,
     RepositoryNotAccessibleError,
     RepositoryRefFetchError,
+)
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+    record_handoff_cancellation,
 )
 
 __all__ = [
@@ -214,6 +219,13 @@ async def project_github_resolve(
         :data:`PROJECT_GITHUB_RESOLVE_MAX_TRIES`. The last attempt
         returns ``"failed"`` instead, so the terminal outcome is
         recorded exactly as it was before retries existed.
+    asyncio.CancelledError
+        When arq cancels the job — its default per-job timeout, or a
+        worker shutdown. The resolve holds no ``queue_jobs`` row of its
+        own, but the default-branch step commits rows for the jobs it
+        then hands to arq; any of those a cancel strands before its
+        backend id is stamped is failed first, by
+        :func:`~docverse_server.worker.functions._cancellation.record_handoff_cancellation`.
     """
     project_id: int = payload["project_id"]
     previous_default_branch: str | None = payload.get(
@@ -222,6 +234,7 @@ async def project_github_resolve(
     logger = structlog.get_logger(
         "docverse_server.worker.project_github_resolve"
     ).bind(project_id=project_id)
+    started = time.monotonic()
 
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
@@ -309,18 +322,31 @@ async def project_github_resolve(
             )
             return "skipped"
 
-        outcome = await _apply_default_branch(
-            ctx=ctx,
-            factory=factory,
-            session=session,
-            project_id=project_id,
-            owner=owner,
-            repo=repo,
-            repo_id=metadata.repo_id,
-            default_branch=metadata.default_branch,
-            previous_default_branch=previous_default_branch,
+        # The default-branch step commits a ``publish_edition`` row for a
+        # rewritten ``__main``, and the announce a ``dashboard_build``,
+        # each handed to arq only after its commit. A cancel in between
+        # leaves an orphan the helper fails at once rather than leaving
+        # it to the orphan sweeps (PRD #765).
+        async with record_handoff_cancellation(
+            ctx,
+            queue_job_ids=factory.queue_dispatcher.undispatched,
+            job_function="project_github_resolve",
+            started=started,
+            timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
             logger=logger,
-        )
+        ):
+            outcome = await _apply_default_branch(
+                ctx=ctx,
+                factory=factory,
+                session=session,
+                project_id=project_id,
+                owner=owner,
+                repo=repo,
+                repo_id=metadata.repo_id,
+                default_branch=metadata.default_branch,
+                previous_default_branch=previous_default_branch,
+                logger=logger,
+            )
         if outcome is None:
             # Unlike the pre-commit skip above, the ids *are* in the
             # row's history, so the outcome and the line say what was

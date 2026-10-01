@@ -16,6 +16,7 @@ triggered run's progress aggregation.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -33,6 +34,7 @@ from structlog.testing import capture_logs
 
 from docverse.models import JobKind, KeeperSyncConfig, OrganizationCreate
 from docverse_server.dbschema.queue_job import SqlQueueJob
+from docverse_server.domain.queue import JobStatus
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
@@ -44,12 +46,16 @@ from docverse_server.storage.keeper_sync import (
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+)
 from docverse_server.worker.functions.keeper_sync import (
     keeper_sync_tier_discovery,
     keeper_sync_tier_main,
     keeper_sync_tier_other,
 )
 from docverse_server.worker.main import KeeperSyncWorkerSettings
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.worker.conftest import make_worker_ctx
 
@@ -3113,3 +3119,58 @@ async def test_tier_lost_race_does_not_truncate_the_org_pass(
                 "bbb",
             ]
         break
+
+
+@pytest.mark.asyncio
+async def test_tier_cancel_mid_handoff_fails_the_orphaned_child(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier tick cancelled mid-hand-off fails the child it orphaned.
+
+    The cron is cancelled after committing a ``keeper_sync_project`` row
+    but before arq accepted the job, as a rolling deploy's SIGTERM would
+    catch it. Left alone, that ``queued`` row with no ``backend_job_id``
+    holds the slug's active-job mutex — so every tick and run skips the
+    project — until ``keeper_sync_reaper``'s orphan sweep reaches it.
+    Instead it fails at once with a ``CancelledError`` payload naming the
+    cron, read against the arq default timeout cron jobs run under, and
+    the slug is free for the next tick.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session, slug="ks-tier-cancel", project_slugs=["pipelines"]
+        )
+    _stub_products(mock_discovery, ["pipelines"])
+    ctx = _make_ctx(httpx.AsyncClient())
+    hang = HangUntilCancelled()
+    monkeypatch.setattr(ctx["arq_queue"], "enqueue", hang)
+
+    task = asyncio.create_task(keeper_sync_tier_discovery(ctx))
+    await cancel_when_reached(task, hang.reached)
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            row = (
+                await session.execute(
+                    select(SqlQueueJob).where(SqlQueueJob.org_id == org_id)
+                )
+            ).scalar_one()
+            assert row.status == JobStatus.failed.value
+            assert row.errors is not None
+            assert row.errors["type"] == "CancelledError"
+            assert row.errors["reason"] == "worker_shutdown"
+            assert row.errors["job_function"] == "keeper_sync_tier_discovery"
+            assert row.errors["timeout_seconds"] == (
+                ARQ_DEFAULT_JOB_TIMEOUT_SECONDS
+            )
+            assert not await QueueJobStore(
+                session=session, logger=_logger()
+            ).has_active_for_subject(
+                org_id=org_id,
+                kind=JobKind.keeper_sync_project,
+                subject_label="pipelines",
+            )

@@ -32,6 +32,7 @@ This module owns the ``docverse:sync-queue`` callable surface:
 
 from __future__ import annotations
 
+import time
 import traceback
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass
@@ -111,8 +112,11 @@ from docverse_server.storage.ltd import (
 from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+    discovery_run_finaliser,
     keeper_sync_run_finaliser,
     record_cancellation,
+    record_handoff_cancellation,
 )
 from docverse_server.worker.functions._reaper_log import (
     create_reaped_jobs_payload,
@@ -469,6 +473,16 @@ async def keeper_sync_run_discovery(
     str
         ``"completed"`` on a clean fan-out (including the empty case)
         or ``"failed"`` if discovery itself errored before fan-out.
+
+    Raises
+    ------
+    asyncio.CancelledError
+        When arq cancels the job — its ``keeper_sync_job_timeout_seconds``
+        timeout, or a worker shutdown. Before re-raising,
+        :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+        fails the row and drives the run ``failed`` through
+        :func:`fail_run_for_lost_discovery`, as the ``except`` branch
+        does for an error.
     """
     org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]
@@ -490,106 +504,121 @@ async def keeper_sync_run_discovery(
             # running. The discovery must not fan out a second time.
             if await queue_job_store.start_if_queued(queue_job_id) is None:
                 return "skipped"
-        await _reconcile_run_children(
-            session=session,
-            queue_job_store=queue_job_store,
-            queue_backend=factory.create_queue_backend(),
-            run_id=run_id,
+        # From here on the job holds an ``in_progress`` row. arq's
+        # timeout and a worker shutdown both cancel the job with a
+        # ``CancelledError`` that the ``except Exception`` below never
+        # sees, so the helper fails the row and the run on that path —
+        # otherwise the run 409-blocks the org until
+        # ``keeper_sync_reaper`` notices (#699).
+        async with record_cancellation(
+            ctx,
+            queue_job_id=queue_job_id,
+            timeout_seconds=config.keeper_sync_job_timeout_seconds,
             logger=logger,
-        )
-
-        try:
-            config = await _load_config_snapshot(
-                session=session,
-                factory=factory,
-                org_slug=org_slug,
-            )
-            if not config.enabled:
-                msg = (
-                    f"Keeper sync is disabled for organization "
-                    f"{org_slug!r}; aborting discovery"
-                )
-                raise RuntimeError(msg)
-
-            ltd_slugs = await _fetch_ltd_product_slugs(
-                factory=factory, config=config, logger=logger
-            )
-            in_scope, excluded_count = _resolve_scope(ltd_slugs, config)
-            # Drop tombstoned project slugs from the fan-out so we do
-            # not enqueue ``keeper_sync_project`` children that
-            # ``sync_project`` would only short-circuit on its own
-            # tombstone check (PRD #332 / user story 17). The empty-
-            # fan-out finalisation path below covers the case where
-            # tombstones consume the entire in-scope set.
-            state_store = factory.create_keeper_sync_state_store()
-            tombstoned_slugs = await _fetch_tombstoned_project_slugs(
-                state_store=state_store, session=session, org_id=org_id
-            )
-            fan_out, counts = _subtract_tombstones(
-                ltd_slugs=ltd_slugs,
-                in_scope=in_scope,
-                excluded_count=excluded_count,
-                tombstoned_slugs=tombstoned_slugs,
-            )
-            logger.info(
-                "Resolved keeper-sync run scope", **counts.as_log_fields()
-            )
-
-            enqueued_count = await _enqueue_children(
-                ctx=ctx,
+            finalise_run=discovery_run_finaliser(run_id),
+        ):
+            await _reconcile_run_children(
                 session=session,
                 queue_job_store=queue_job_store,
-                run_store=run_store,
-                org_id=org_id,
-                org_slug=org_slug,
+                queue_backend=factory.create_queue_backend(),
                 run_id=run_id,
-                ltd_base_url=str(config.ltd_base_url),
-                ltd_slugs=fan_out,
                 logger=logger,
             )
 
-            async with session.begin():
-                await queue_job_store.update_phase(
-                    queue_job_id,
-                    "complete",
-                    progress={
-                        "message": "Discovery complete",
-                        "in_scope_count": counts.in_scope_count,
-                        "fan_out_count": counts.fan_out_count,
-                        "enqueued_count": enqueued_count,
-                    },
+            try:
+                sync_config = await _load_config_snapshot(
+                    session=session,
+                    factory=factory,
+                    org_slug=org_slug,
                 )
-                await queue_job_store.complete(queue_job_id)
-                # Empty fan-out OR all-skipped fan-out: no children
-                # attributed to this run, so the parent will never
-                # finalise on a child terminal. Terminate it here.
-                if enqueued_count == 0:
+                if not sync_config.enabled:
+                    msg = (
+                        f"Keeper sync is disabled for organization "
+                        f"{org_slug!r}; aborting discovery"
+                    )
+                    raise RuntimeError(msg)
+
+                ltd_slugs = await _fetch_ltd_product_slugs(
+                    factory=factory, config=sync_config, logger=logger
+                )
+                in_scope, excluded_count = _resolve_scope(
+                    ltd_slugs, sync_config
+                )
+                # Drop tombstoned project slugs from the fan-out so we do
+                # not enqueue ``keeper_sync_project`` children that
+                # ``sync_project`` would only short-circuit on its own
+                # tombstone check (PRD #332 / user story 17). The empty-
+                # fan-out finalisation path below covers the case where
+                # tombstones consume the entire in-scope set.
+                state_store = factory.create_keeper_sync_state_store()
+                tombstoned_slugs = await _fetch_tombstoned_project_slugs(
+                    state_store=state_store, session=session, org_id=org_id
+                )
+                fan_out, counts = _subtract_tombstones(
+                    ltd_slugs=ltd_slugs,
+                    in_scope=in_scope,
+                    excluded_count=excluded_count,
+                    tombstoned_slugs=tombstoned_slugs,
+                )
+                logger.info(
+                    "Resolved keeper-sync run scope", **counts.as_log_fields()
+                )
+
+                enqueued_count = await _enqueue_children(
+                    ctx=ctx,
+                    session=session,
+                    queue_job_store=queue_job_store,
+                    run_store=run_store,
+                    org_id=org_id,
+                    org_slug=org_slug,
+                    run_id=run_id,
+                    ltd_base_url=str(sync_config.ltd_base_url),
+                    ltd_slugs=fan_out,
+                    logger=logger,
+                )
+
+                async with session.begin():
+                    await queue_job_store.update_phase(
+                        queue_job_id,
+                        "complete",
+                        progress={
+                            "message": "Discovery complete",
+                            "in_scope_count": counts.in_scope_count,
+                            "fan_out_count": counts.fan_out_count,
+                            "enqueued_count": enqueued_count,
+                        },
+                    )
+                    await queue_job_store.complete(queue_job_id)
+                    # Empty fan-out OR all-skipped fan-out: no children
+                    # attributed to this run, so the parent will never
+                    # finalise on a child terminal. Terminate it here.
+                    if enqueued_count == 0:
+                        await run_store.transition_status(
+                            run_id=run_id,
+                            new_status=KeeperSyncRunStatus.succeeded,
+                        )
+                logger.info(
+                    "Keeper-sync discovery completed",
+                    in_scope_count=counts.in_scope_count,
+                    fan_out_count=counts.fan_out_count,
+                )
+            except Exception as exc:
+                sentry_sdk.capture_exception(exc)
+                logger.exception("Keeper-sync discovery failed")
+                async with session.begin():
+                    await queue_job_store.fail(
+                        queue_job_id,
+                        errors={
+                            "message": str(exc),
+                            "type": type(exc).__name__,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
                     await run_store.transition_status(
                         run_id=run_id,
-                        new_status=KeeperSyncRunStatus.succeeded,
+                        new_status=KeeperSyncRunStatus.failed,
                     )
-            logger.info(
-                "Keeper-sync discovery completed",
-                in_scope_count=counts.in_scope_count,
-                fan_out_count=counts.fan_out_count,
-            )
-        except Exception as exc:
-            sentry_sdk.capture_exception(exc)
-            logger.exception("Keeper-sync discovery failed")
-            async with session.begin():
-                await queue_job_store.fail(
-                    queue_job_id,
-                    errors={
-                        "message": str(exc),
-                        "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(),
-                    },
-                )
-                await run_store.transition_status(
-                    run_id=run_id,
-                    new_status=KeeperSyncRunStatus.failed,
-                )
-            return "failed"
+                return "failed"
         return "completed"
 
     msg = "No database session available"
@@ -2161,7 +2190,14 @@ async def _run_tier(
     incident (LTD down, malformed config, transient DB error). The
     failure is logged with structured context for follow-up; the next
     tick will retry naturally.
+
+    The tick's start is read off :func:`time.monotonic` before anything
+    else and handed to every processor as ``started``: a processor that
+    is cancelled while handing a child row to arq records the cancel
+    against the time the cron job has run for (see
+    :func:`_enqueue_tier_project_sync`).
     """
+    started = time.monotonic()
     enqueued_total = 0
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
@@ -2182,6 +2218,7 @@ async def _run_tier(
                     factory=factory,
                     org=org,
                     logger=logger,
+                    started=started,
                 )
             except Exception as exc:
                 sentry_sdk.capture_exception(exc)
@@ -2208,6 +2245,8 @@ class TierOrgProcessor(Protocol):
     Each tier cron (``main`` / ``discovery`` / ``other``) supplies a
     function matching this signature; it returns the number of
     ``keeper_sync_project`` children it enqueued for the org.
+    ``started`` is the :func:`time.monotonic` reading the tick began at,
+    passed through to :func:`_enqueue_tier_project_sync`.
     """
 
     async def __call__(
@@ -2218,6 +2257,7 @@ class TierOrgProcessor(Protocol):
         factory: Factory,
         org: Organization,
         logger: structlog.stdlib.BoundLogger,
+        started: float,
     ) -> int: ...
 
 
@@ -2228,6 +2268,7 @@ async def _tier_main_for_org(
     factory: Factory,
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
+    started: float,
 ) -> int:
     """Run one tier_main pass for a single enabled org.
 
@@ -2316,6 +2357,8 @@ async def _tier_main_for_org(
         ):
             continue
         if await _enqueue_tier_project_sync(
+            ctx=ctx,
+            started=started,
             session=session,
             queue_job_store=queue_job_store,
             arq_queue=arq_queue,
@@ -2337,6 +2380,7 @@ async def _tier_discovery_for_org(
     factory: Factory,
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
+    started: float,
 ) -> int:
     """Run one tier_discovery pass for a single enabled org.
 
@@ -2430,6 +2474,8 @@ async def _tier_discovery_for_org(
             )
             continue
         if should_enqueue and await _enqueue_tier_project_sync(
+            ctx=ctx,
+            started=started,
             session=session,
             queue_job_store=queue_job_store,
             arq_queue=arq_queue,
@@ -2464,6 +2510,7 @@ async def _tier_other_for_org(
     factory: Factory,
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
+    started: float,
 ) -> int:
     """Run one tier_other pass for a single enabled org.
 
@@ -2541,6 +2588,8 @@ async def _tier_other_for_org(
             ltd_editions=ltd_editions,
             now=now,
         ) and await _enqueue_tier_project_sync(
+            ctx=ctx,
+            started=started,
             session=session,
             queue_job_store=queue_job_store,
             arq_queue=arq_queue,
@@ -2924,6 +2973,8 @@ async def _has_stale_non_main_edition(
 
 async def _enqueue_tier_project_sync(
     *,
+    ctx: dict[str, Any],
+    started: float,
     session: AsyncSession,
     queue_job_store: QueueJobStore,
     arq_queue: ArqQueue,
@@ -2968,6 +3019,17 @@ async def _enqueue_tier_project_sync(
     ``IntegrityError`` escape instead would unwind the caller's per-slug
     loop and — because ``_run_tier`` catches per *org* — silently drop
     every remaining project in that org for the tick.
+
+    Between the row's commit and the backend id's stamp the cron holds a
+    row arq does not know about yet. A cancel there — the cron's arq
+    timeout, or a worker shutdown — would leave it an orphan holding the
+    slug's active-job mutex, so every tick and run skips the project
+    until ``keeper_sync_reaper``'s orphan sweep reaches it.
+    :func:`~docverse_server.worker.functions._cancellation.record_handoff_cancellation`
+    fails it at once instead, unless its backend id was already stamped.
+    ``started`` is the tick's :func:`time.monotonic` start, against which
+    that cancel is read: cron jobs run under arq's default per-job
+    timeout.
     """
     async with session.begin():
         if await queue_job_store.has_active_for_subject(
@@ -2998,19 +3060,27 @@ async def _enqueue_tier_project_sync(
                 tier=tier,
             )
             return False
-    metadata = await arq_queue.enqueue(
-        "keeper_sync_project",
-        _queue_name=KEEPER_SYNC_QUEUE_NAME,
-        payload={
-            "org_id": org_id,
-            "org_slug": org_slug,
-            "queue_job_id": queue_job.id,
-            "ltd_slug": ltd_slug,
-            "ltd_base_url": ltd_base_url,
-        },
-    )
-    async with session.begin():
-        await queue_job_store.set_backend_job_id(
-            queue_job.id, metadata.id, queue_name=metadata.queue_name
+    async with record_handoff_cancellation(
+        ctx,
+        queue_job_ids=lambda: (queue_job.id,),
+        job_function=f"keeper_sync_tier_{tier}",
+        started=started,
+        timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+        logger=logger,
+    ):
+        metadata = await arq_queue.enqueue(
+            "keeper_sync_project",
+            _queue_name=KEEPER_SYNC_QUEUE_NAME,
+            payload={
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "queue_job_id": queue_job.id,
+                "ltd_slug": ltd_slug,
+                "ltd_base_url": ltd_base_url,
+            },
         )
+        async with session.begin():
+            await queue_job_store.set_backend_job_id(
+                queue_job.id, metadata.id, queue_name=metadata.queue_name
+            )
     return True

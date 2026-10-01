@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -35,7 +36,9 @@ from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.project import SqlProject
+from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
+from docverse_server.domain.queue import JobKind, JobStatus
 from docverse_server.metrics import (
     DocverseEvents,
     LifecycleAction,
@@ -48,11 +51,15 @@ from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+)
 from docverse_server.worker.functions.project_github_resolve import (
     PROJECT_GITHUB_RESOLVE_MAX_TRIES,
     project_github_resolve,
 )
 from tests.conftest import seed_org_with_admin
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import count_jobs_by_name
 from tests.support.github_mock import GitHubMock
 from tests.worker.conftest import make_worker_ctx
@@ -1426,3 +1433,70 @@ _METADATA_ONLY_MESSAGE = (
     "Recorded GitHub ids but skipped default branch: project rebound or "
     "deleted after the ids were committed"
 )
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_cancel_mid_dispatch_fails_the_orphan(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolve cancelled mid-dispatch fails the publish it orphaned.
+
+    The resolve holds no ``queue_jobs`` row of its own; the rewrite of
+    ``__main`` commits a ``publish_edition`` row and defers its enqueue.
+    Cancelled while handing that job to arq, as a rolling deploy's
+    SIGTERM would catch it, the resolve leaves the row ``queued`` with no
+    ``backend_job_id`` — so it is failed at once, with a
+    ``CancelledError`` payload naming the resolve and read against the
+    arq default timeout it runs under, rather than waiting for
+    ``publish_edition_reaper``'s orphan sweep.
+    """
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-cancel",
+        stored_default_branch="master",
+        main_ref="master",
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme", "templates", repo_id=12345, owner_id=111, default_branch="main"
+    )
+    hang = HangUntilCancelled()
+    monkeypatch.setattr(arq_queue, "enqueue", hang)
+
+    async with httpx.AsyncClient() as http_client:
+        ctx = make_worker_ctx(
+            http_client=http_client,
+            arq_queue=arq_queue,
+            github_app_id=mock_github.app_id,
+            github_app_private_key=SecretStr(mock_github.private_key_pem),
+            github_webhook_secret=SecretStr("webhook-secret"),
+        )
+        task = asyncio.create_task(
+            project_github_resolve(ctx, {"project_id": seeded.project_id})
+        )
+        await cancel_when_reached(task, hang.reached)
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            row = (
+                await session.execute(
+                    select(SqlQueueJob).where(
+                        SqlQueueJob.kind == JobKind.publish_edition.value,
+                        SqlQueueJob.edition_id == seeded.main_id,
+                    )
+                )
+            ).scalar_one()
+            assert row.status == JobStatus.failed.value
+            assert row.errors is not None
+            assert row.errors["type"] == "CancelledError"
+            assert row.errors["reason"] == "worker_shutdown"
+            assert row.errors["job_function"] == "project_github_resolve"
+            assert row.errors["timeout_seconds"] == (
+                ARQ_DEFAULT_JOB_TIMEOUT_SECONDS
+            )

@@ -13,7 +13,9 @@ import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 
+from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.exceptions import NotFoundError
+from docverse_server.factory import Factory
 from docverse_server.services.dashboard_templates._sync_failure import (
     mark_dashboard_sync_failed,
 )
@@ -21,6 +23,21 @@ from docverse_server.services.dashboard_templates.sync import (
     DashboardSyncStatus,
 )
 from docverse_server.services.lock_service import LockKey
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+    RunFinaliser,
+    record_cancellation,
+)
+
+CANCELLED_SYNC_ERROR = (
+    "CancelledError: arq cancelled the sync before it finished"
+)
+"""``last_sync_error`` a cancelled sync leaves on its binding.
+
+The binding-side counterpart of the cancelled row's ``errors``: arq's
+timeout or a worker shutdown cancelled the job mid-sync. The row's
+``errors["reason"]`` says which.
+"""
 
 
 async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -39,6 +56,15 @@ async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     -------
     str
         ``"completed"`` on success or ``"failed"`` if the sync raised.
+
+    Raises
+    ------
+    asyncio.CancelledError
+        When arq cancels the job — its default per-job timeout, or a
+        worker shutdown — after
+        :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+        has failed the row and flipped the binding to ``failed`` with
+        :data:`CANCELLED_SYNC_ERROR`.
     """
     logger = structlog.get_logger(
         "docverse_server.worker.dashboard_sync"
@@ -104,87 +130,127 @@ async def dashboard_sync(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     progress={"message": "Fetching template tree from GitHub"},
                 )
 
-            try:
+            # From here on the job holds an ``in_progress`` row, which
+            # arq's timeout or a worker shutdown would otherwise strand
+            # for ``dashboard_sync_reaper``: their ``CancelledError``
+            # bypasses the ``except Exception`` below. The helper fails
+            # the row and, as that branch does, the binding (PRD #765).
+            async with record_cancellation(
+                ctx,
+                queue_job_id=queue_job_id,
+                timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+                logger=logger,
+                finalise_run=_binding_failure_finaliser(binding_id),
+            ):
+                try:
+                    async with session.begin():
+                        await queue_job_store.update_phase(
+                            queue_job_id,
+                            "writing",
+                            progress={
+                                "message": (
+                                    "Writing template content to the database"
+                                )
+                            },
+                        )
+                        syncer = factory.create_dashboard_template_syncer()
+                        sync_result = await syncer.sync(binding_id)
+                except Exception as exc:
+                    sentry_sdk.capture_exception(exc)
+                    logger.exception("Dashboard sync failed unexpectedly")
+                    await mark_dashboard_sync_failed(
+                        session=session,
+                        binding_store=binding_store,
+                        binding_id=binding_id,
+                        exc=exc,
+                        error_message=f"{type(exc).__name__}: {exc}",
+                        queue_job_store=queue_job_store,
+                        queue_job_id=queue_job_id,
+                    )
+                    return "failed"
+
+                if sync_result.status is DashboardSyncStatus.failed:
+                    logger.warning(
+                        "Dashboard sync marked binding failed",
+                        reason=sync_result.error,
+                    )
+                    async with session.begin():
+                        await queue_job_store.fail(
+                            queue_job_id,
+                            errors={
+                                "message": sync_result.error or "Sync failed",
+                                "type": "dashboard_sync_failed",
+                            },
+                        )
+                    return "failed"
+
+                fan_out_count = 0
+                template_id = sync_result.github_template_id
+                if sync_result.changed and template_id is not None:
+                    async with session.begin():
+                        await queue_job_store.update_phase(
+                            queue_job_id,
+                            "fanning_out",
+                            progress={
+                                "message": (
+                                    "Fanning out dashboard rebuilds for"
+                                    " dependent projects"
+                                ),
+                            },
+                        )
+                        fanout = factory.create_dashboard_rebuild_fanout()
+                        jobs = await fanout.fan_out(template_id)
+                        fan_out_count = len(jobs)
+                    # The fan-out's rows are committed above; only now may
+                    # arq learn about them (task #550).
+                    await factory.queue_dispatcher.dispatch()
+
                 async with session.begin():
                     await queue_job_store.update_phase(
                         queue_job_id,
-                        "writing",
+                        "complete",
                         progress={
-                            "message": (
-                                "Writing template content to the database"
-                            )
-                        },
-                    )
-                    syncer = factory.create_dashboard_template_syncer()
-                    sync_result = await syncer.sync(binding_id)
-            except Exception as exc:
-                sentry_sdk.capture_exception(exc)
-                logger.exception("Dashboard sync failed unexpectedly")
-                await mark_dashboard_sync_failed(
-                    session=session,
-                    binding_store=binding_store,
-                    binding_id=binding_id,
-                    exc=exc,
-                    error_message=f"{type(exc).__name__}: {exc}",
-                    queue_job_store=queue_job_store,
-                    queue_job_id=queue_job_id,
-                )
-                return "failed"
-
-            if sync_result.status is DashboardSyncStatus.failed:
-                logger.warning(
-                    "Dashboard sync marked binding failed",
-                    reason=sync_result.error,
-                )
-                async with session.begin():
-                    await queue_job_store.fail(
-                        queue_job_id,
-                        errors={
-                            "message": sync_result.error or "Sync failed",
-                            "type": "dashboard_sync_failed",
-                        },
-                    )
-                return "failed"
-
-            fan_out_count = 0
-            template_id = sync_result.github_template_id
-            if sync_result.changed and template_id is not None:
-                async with session.begin():
-                    await queue_job_store.update_phase(
-                        queue_job_id,
-                        "fanning_out",
-                        progress={
-                            "message": (
-                                "Fanning out dashboard rebuilds for dependent "
-                                "projects"
+                            "message": "Dashboard sync complete",
+                            "changed": sync_result.changed,
+                            "github_template_id": (
+                                sync_result.github_template_id
                             ),
+                            "fan_out_count": fan_out_count,
                         },
                     )
-                    fanout = factory.create_dashboard_rebuild_fanout()
-                    jobs = await fanout.fan_out(template_id)
-                    fan_out_count = len(jobs)
-                # The fan-out's rows are committed above; only now may
-                # arq learn about them (task #550).
-                await factory.queue_dispatcher.dispatch()
-
-            async with session.begin():
-                await queue_job_store.update_phase(
-                    queue_job_id,
-                    "complete",
-                    progress={
-                        "message": "Dashboard sync complete",
-                        "changed": sync_result.changed,
-                        "github_template_id": (sync_result.github_template_id),
-                        "fan_out_count": fan_out_count,
-                    },
+                    await queue_job_store.complete(queue_job_id)
+                logger.info(
+                    "Dashboard sync completed",
+                    changed=sync_result.changed,
+                    fan_out_count=fan_out_count,
                 )
-                await queue_job_store.complete(queue_job_id)
-            logger.info(
-                "Dashboard sync completed",
-                changed=sync_result.changed,
-                fan_out_count=fan_out_count,
-            )
-            return "completed"
+                return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+def _binding_failure_finaliser(binding_id: int) -> RunFinaliser:
+    """Build the cancel-path close-out for the binding being synced.
+
+    Flips the binding to ``last_sync_status="failed"`` with
+    :data:`CANCELLED_SYNC_ERROR`, as :func:`mark_dashboard_sync_failed`
+    does for an unhandled syncer error, so a cancelled sync does not
+    leave the binding reporting whatever status it started from. Runs in
+    the cancellation helper's transaction, after the row is failed; a
+    ``dashboard_sync`` belongs to no keeper-sync run, so it returns
+    ``None``.
+    """
+
+    async def finalise(factory: Factory) -> KeeperSyncRunWithActivity | None:
+        binding_store = (
+            factory.create_dashboard_github_template_binding_store()
+        )
+        await binding_store.update_sync_state(
+            binding_id=binding_id,
+            last_sync_status="failed",
+            last_sync_error=CANCELLED_SYNC_ERROR,
+        )
+        return None
+
+    return finalise

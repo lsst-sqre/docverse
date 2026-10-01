@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import timedelta
 from typing import Any
@@ -44,7 +45,11 @@ from docverse_server.storage.queue_job_store import (
     LATE_DELIVERY_IN_PROGRESS_MESSAGE,
     QueueJobStore,
 )
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+)
 from docverse_server.worker.functions.dashboard_build import dashboard_build
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.worker.conftest import make_worker_ctx
 
@@ -761,3 +766,61 @@ async def test_dashboard_build_uses_github_template_when_bound(
     # Built-in template's <main> element must not appear — if it does
     # we resolved to BuiltInTemplateSource, which would be a regression.
     assert "<main>" not in html_text
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_cancel_fails_the_row(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An arq cancel mid-build fails the row instead of stranding it.
+
+    The job is cancelled while it resolves the org's object store, as a
+    rolling deploy's SIGTERM would catch it. Left ``in_progress``, the
+    row would hold the project's active-dashboard-build slot until
+    ``dashboard_build_reaper`` noticed; instead it fails with a
+    ``CancelledError`` payload read against arq's default job timeout,
+    which ``dashboard_build`` runs under, and the cancel re-raises.
+    """
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        queue_job = await QueueJobStore(
+            session=db_session, logger=_logger()
+        ).create(
+            kind=JobKind.dashboard_build,
+            org_id=org.id,
+            project_id=project.id,
+            backend_job_id="test-arq-dash-cancel",
+        )
+    hang = HangUntilCancelled()
+    monkeypatch.setattr(Factory, "create_objectstore_for_org", hang)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), job_id="test-arq-dash-cancel"
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+    }
+
+    task = asyncio.create_task(dashboard_build(ctx, payload))
+    await cancel_when_reached(task, hang.reached)
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            job = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job.id
+            )
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.errors is not None
+            assert job.errors["type"] == "CancelledError"
+            assert job.errors["reason"] == "worker_shutdown"
+            assert job.errors["timeout_seconds"] == (
+                ARQ_DEFAULT_JOB_TIMEOUT_SECONDS
+            )

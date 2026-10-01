@@ -20,6 +20,7 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models.queue_enums import PublishStatus
+from docverse_server.config import config
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
@@ -43,7 +44,12 @@ from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
 from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions._cancellation import (
+    RunFinaliser,
+    record_cancellation,
+)
 
 
 @dataclass(slots=True)
@@ -101,6 +107,17 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         :func:`_skip_reason`'s guards refused the job, a skip rather
         than a failure — ``"failed"`` if the publish attempt raised, or
         ``"skipped"`` for a row the late-delivery guard refuses.
+
+    Raises
+    ------
+    asyncio.CancelledError
+        When arq cancels the job — its
+        ``publish_edition_job_timeout_seconds`` timeout, or a worker
+        shutdown. Before re-raising,
+        :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+        fails the row if it is still active and rolls up the keeper-sync
+        run it belongs to; a cancel during the CDN purge, after the row
+        completed, leaves the row and run as they are.
     """
     logger = structlog.get_logger(
         "docverse_server.worker.publish_edition"
@@ -137,81 +154,128 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             if await queue_job_store.start_if_queued(queue_job_id) is None:
                 return "skipped"
 
-        # Pre-lock: resolve project_id from the payload's project_slug so
-        # the EDITION_UPDATE lock key can be computed. The arq payload
-        # carries project_slug rather than project_id, so a small SELECT
-        # is required before the lock is acquired.
-        async with session.begin():
-            project = await project_store.get_by_slug(
-                org_id=payload["org_id"], slug=payload["project_slug"]
-            )
-            if project is None:
-                msg = (
-                    f"Project {payload['project_slug']!r} not found "
-                    f"for org {payload['org_id']}"
-                )
-                raise NotFoundError(msg)
-
-        lock_key = LockKey.for_edition_update(
-            org_id=payload["org_id"],
-            project_id=project.id,
-            edition_id=payload["edition_id"],
-        )
-        async with lock_service.acquire(lock_key):
-            async with session.begin():
-                resources = await _load_resources(
-                    factory=factory, payload=payload
-                )
-                # Every pickup guard, read under EDITION_UPDATE and
-                # ahead of every write. See :func:`_skip_reason`.
-                skip = _skip_reason(resources)
-                if skip is None:
-                    await _mark_publishing(
-                        queue_job_store=queue_job_store,
-                        edition_store=edition_store,
-                        history_store=history_store,
-                        resources=resources,
-                        queue_job_id=queue_job_id,
-                    )
-            if skip is not None:
-                await _retire_skipped_publish(
-                    ctx=ctx,
+        # From here on the job holds an ``in_progress`` row. arq's
+        # timeout and a worker shutdown both cancel the job with a
+        # ``CancelledError`` that the ``except Exception`` below never
+        # sees, so the helper fails the row and rolls up the job's
+        # keeper-sync run on that path instead of leaving both to
+        # ``publish_edition_reaper`` (PRD #765). A cancel during the CDN
+        # purge finds the row already completed and changes nothing.
+        async with record_cancellation(
+            ctx,
+            queue_job_id=queue_job_id,
+            timeout_seconds=config.publish_edition_job_timeout_seconds,
+            logger=logger,
+            finalise_run=_keeper_sync_run_finaliser(queue_job_id),
+        ):
+            lock_key = LockKey.for_edition_update(
+                org_id=payload["org_id"],
+                project_id=await _resolve_project_id(
                     session=session,
-                    factory=factory,
-                    queue_job_store=queue_job_store,
-                    queue_job_id=queue_job_id,
-                    resources=resources,
-                    skip=skip,
-                    logger=logger,
-                )
-                return "completed"
-
-            publishing_service = factory.create_edition_publishing_service()
-            try:
+                    project_store=project_store,
+                    payload=payload,
+                ),
+                edition_id=payload["edition_id"],
+            )
+            async with lock_service.acquire(lock_key):
                 async with session.begin():
-                    pending_purge = await publishing_service.publish(
-                        org_id=payload["org_id"],
-                        project_slug=payload["project_slug"],
-                        edition=resources.edition,
-                        build=resources.build,
-                        history_entry=resources.history_entry,
+                    resources = await _load_resources(
+                        factory=factory, payload=payload
                     )
-            except Exception as exc:
-                sentry_sdk.capture_exception(exc)
-                logger.exception("Edition publish failed")
-                completion: KeeperSyncRunWithActivity | None = None
-                async with session.begin():
-                    await _mark_failed(
-                        edition_store=edition_store,
-                        history_store=history_store,
+                    # Every pickup guard, read under EDITION_UPDATE and
+                    # ahead of every write. See :func:`_skip_reason`.
+                    skip = _skip_reason(resources)
+                    if skip is None:
+                        await _mark_publishing(
+                            queue_job_store=queue_job_store,
+                            edition_store=edition_store,
+                            history_store=history_store,
+                            resources=resources,
+                            queue_job_id=queue_job_id,
+                        )
+                if skip is not None:
+                    await _retire_skipped_publish(
+                        ctx=ctx,
+                        session=session,
+                        factory=factory,
                         queue_job_store=queue_job_store,
-                        resources=resources,
                         queue_job_id=queue_job_id,
-                        exc=exc,
+                        resources=resources,
+                        skip=skip,
+                        logger=logger,
                     )
+                    return "completed"
+
+                publishing_service = (
+                    factory.create_edition_publishing_service()
+                )
+                try:
+                    async with session.begin():
+                        pending_purge = await publishing_service.publish(
+                            org_id=payload["org_id"],
+                            project_slug=payload["project_slug"],
+                            edition=resources.edition,
+                            build=resources.build,
+                            history_entry=resources.history_entry,
+                        )
+                except Exception as exc:
+                    sentry_sdk.capture_exception(exc)
+                    logger.exception("Edition publish failed")
+                    completion: KeeperSyncRunWithActivity | None = None
+                    async with session.begin():
+                        await _mark_failed(
+                            edition_store=edition_store,
+                            history_store=history_store,
+                            queue_job_store=queue_job_store,
+                            resources=resources,
+                            queue_job_id=queue_job_id,
+                            exc=exc,
+                        )
+                        completion = await _maybe_finalise_keeper_sync_run(
+                            factory=factory, queue_job_id=queue_job_id
+                        )
+                    await publish_run_completed(
+                        events=ctx.get("events"),
+                        session=session,
+                        org_store=factory.create_org_store(),
+                        completion=completion,
+                        logger=logger,
+                    )
+                    return "failed"
+
+                # Record the terminal success *before* the purge. The purge
+                # is the one step long enough to be cancelled by the arq
+                # per-job timeout, and ``CancelledError`` is a
+                # ``BaseException`` that escapes ``purge_cdn_cache``'s
+                # best-effort ``except Exception``. Completing first means a
+                # cancellation there costs only the (best-effort) purge
+                # instead of stranding a committed publish ``in_progress``
+                # until ``publish_edition_reaper`` fails it hours later.
+                completion = None
+                async with session.begin():
+                    await queue_job_store.complete(queue_job_id)
                     completion = await _maybe_finalise_keeper_sync_run(
                         factory=factory, queue_job_id=queue_job_id
                     )
+                logger.info("Edition publish completed")
+                # Emit the post-commit metrics after the success transition
+                # commits. Both emitters are fully best-effort: they swallow
+                # and log any error (a metrics outage *or* a DB hiccup during
+                # their own post-commit reads), so neither can fail or retry
+                # an edition whose publish has already committed.
+                await _publish_edition_published(
+                    ctx=ctx,
+                    session=session,
+                    factory=factory,
+                    logger=logger,
+                    org_id=payload["org_id"],
+                    project_slug=payload["project_slug"],
+                    edition=resources.edition,
+                    queue_job_id=queue_job_id,
+                    started=started,
+                    trigger_override=payload.get("trigger"),
+                    ltd_date_rebuilt=payload.get("ltd_date_rebuilt"),
+                )
                 await publish_run_completed(
                     events=ctx.get("events"),
                     session=session,
@@ -219,75 +283,58 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     completion=completion,
                     logger=logger,
                 )
-                return "failed"
-
-            # Record the terminal success *before* the purge. The purge
-            # is the one step long enough to be cancelled by the arq
-            # per-job timeout, and ``CancelledError`` is a
-            # ``BaseException`` that escapes ``purge_cdn_cache``'s
-            # best-effort ``except Exception``. Completing first means a
-            # cancellation there costs only the (best-effort) purge
-            # instead of stranding a committed publish ``in_progress``
-            # until ``publish_edition_reaper`` fails it hours later.
-            completion = None
-            async with session.begin():
-                await queue_job_store.complete(queue_job_id)
-                completion = await _maybe_finalise_keeper_sync_run(
-                    factory=factory, queue_job_id=queue_job_id
+                await try_enqueue_dashboard_build_by_id(
+                    factory=factory,
+                    session=session,
+                    logger=logger,
+                    org_id=payload["org_id"],
+                    project_id=resources.edition.project_id,
                 )
-            logger.info("Edition publish completed")
-            # Emit the post-commit metrics after the success transition
-            # commits. Both emitters are fully best-effort: they swallow
-            # and log any error (a metrics outage *or* a DB hiccup during
-            # their own post-commit reads), so neither can fail or retry
-            # an edition whose publish has already committed.
-            await _publish_edition_published(
-                ctx=ctx,
-                session=session,
-                factory=factory,
-                logger=logger,
-                org_id=payload["org_id"],
-                project_slug=payload["project_slug"],
-                edition=resources.edition,
-                queue_job_id=queue_job_id,
-                started=started,
-                trigger_override=payload.get("trigger"),
-                ltd_date_rebuilt=payload.get("ltd_date_rebuilt"),
-            )
-            await publish_run_completed(
-                events=ctx.get("events"),
-                session=session,
-                org_store=factory.create_org_store(),
-                completion=completion,
-                logger=logger,
-            )
-            await try_enqueue_dashboard_build_by_id(
-                factory=factory,
-                session=session,
-                logger=logger,
-                org_id=payload["org_id"],
-                project_id=resources.edition.project_id,
-            )
 
-        # EDITION_UPDATE released. Purge the CDN edge cache only now:
-        # after the publish transaction committed, outside every
-        # ``session.begin()`` block, *and* outside the advisory lock.
-        # The purge queues on the process-wide per-hostname coalescer
-        # and can then sit in the purger's rate-limit backoff for tens
-        # of seconds. ``LockService.acquire`` pins a dedicated
-        # ``engine.connect()`` for its whole block, so purging inside it
-        # would hold a pool connection the purge does not touch — and,
-        # because keeper-sync takes the same ``for_edition_update`` key
-        # in ``sync_build`` and ``_ensure_aggregate_edition``, would
-        # also park the sync worker's next import of this edition behind
-        # a Cloudflare 429. The purge is best-effort and cannot undo the
-        # committed publish.
-        if pending_purge is not None:
-            await publishing_service.purge_cdn_cache(pending_purge)
-        return "completed"
+            # EDITION_UPDATE released. Purge the CDN edge cache only now:
+            # after the publish transaction committed, outside every
+            # ``session.begin()`` block, *and* outside the advisory lock.
+            # The purge queues on the process-wide per-hostname coalescer
+            # and can then sit in the purger's rate-limit backoff for tens
+            # of seconds. ``LockService.acquire`` pins a dedicated
+            # ``engine.connect()`` for its whole block, so purging inside it
+            # would hold a pool connection the purge does not touch — and,
+            # because keeper-sync takes the same ``for_edition_update`` key
+            # in ``sync_build`` and ``_ensure_aggregate_edition``, would
+            # also park the sync worker's next import of this edition behind
+            # a Cloudflare 429. The purge is best-effort and cannot undo the
+            # committed publish.
+            if pending_purge is not None:
+                await publishing_service.purge_cdn_cache(pending_purge)
+            return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+async def _resolve_project_id(
+    *,
+    session: AsyncSession,
+    project_store: ProjectStore,
+    payload: dict[str, Any],
+) -> int:
+    """Resolve the payload's ``project_slug`` for the lock key, pre-lock.
+
+    The ``EDITION_UPDATE`` lock key needs the project's id, but the arq
+    payload carries ``project_slug`` rather than ``project_id``, so a
+    small SELECT is required before the lock is acquired.
+    """
+    async with session.begin():
+        project = await project_store.get_by_slug(
+            org_id=payload["org_id"], slug=payload["project_slug"]
+        )
+        if project is None:
+            msg = (
+                f"Project {payload['project_slug']!r} not found "
+                f"for org {payload['org_id']}"
+            )
+            raise NotFoundError(msg)
+    return project.id
 
 
 def _skip_reason(resources: _PublishResources) -> _PublishSkip | None:
@@ -562,6 +609,24 @@ async def _mark_failed(
             "traceback": traceback.format_exc(),
         },
     )
+
+
+def _keeper_sync_run_finaliser(queue_job_id: int) -> RunFinaliser:
+    """Build the cancel-path roll-up for this publish's keeper-sync run.
+
+    Runs :func:`_maybe_finalise_keeper_sync_run` against the factory
+    :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+    hands it, so a cancelled run child finalises its run just as the
+    success and failure paths do; a publish outside any run touches
+    none.
+    """
+
+    async def finalise(factory: Factory) -> KeeperSyncRunWithActivity | None:
+        return await _maybe_finalise_keeper_sync_run(
+            factory=factory, queue_job_id=queue_job_id
+        )
+
+    return finalise
 
 
 async def _maybe_finalise_keeper_sync_run(

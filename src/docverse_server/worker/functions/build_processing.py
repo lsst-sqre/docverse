@@ -14,6 +14,7 @@ import mimetypes
 import tarfile
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum, auto
@@ -36,6 +37,7 @@ from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import hash_manifest_pairs
 from docverse_server.domain.edition_tracking import EditionTrackingResult
+from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.domain.queue import JobStatus
 from docverse_server.exceptions import InvalidBuildStateError, NotFoundError
 from docverse_server.factory import Factory
@@ -48,6 +50,11 @@ from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.objectstore import ObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+    RunFinaliser,
+    record_cancellation,
+)
 
 #: Maximum number of concurrent upload tasks.
 _UPLOAD_CONCURRENCY = 50
@@ -254,6 +261,14 @@ async def build_processing(
     -------
     str
         A status message.
+
+    Raises
+    ------
+    asyncio.CancelledError
+        When arq cancels the job — its default per-job timeout, or a
+        worker shutdown. Once the job holds its ``in_progress`` row,
+        :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+        first fails that row and the ``processing`` build with it.
     """
     logger = structlog.get_logger("docverse_server.worker.build_processing")
     org_id: int = payload["org_id"]
@@ -557,114 +572,163 @@ async def _process_build_locked(
                 },
             )
 
-    # Phase 2: Upload files and mark build complete
-    try:
-        async with object_store:
+    # From here on the job holds an ``in_progress`` row and its build is
+    # ``processing``. arq's timeout and a worker shutdown both cancel the
+    # job with a ``CancelledError`` that the ``except Exception`` below
+    # never sees, so the helper fails both on that path, as that branch
+    # does, instead of leaving them to ``build_processing_reaper``
+    # (PRD #765). A legacy delivery that resolved no row has nothing to
+    # record.
+    cancellation: AbstractAsyncContextManager[None] = (
+        record_cancellation(
+            ctx,
+            queue_job_id=queue_job_id,
+            timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+            logger=logger,
+            finalise_run=_build_failure_finaliser(
+                build_id=build_id,
+                org_slug=org_slug,
+                project_slug=project_slug,
+            ),
+        )
+        if queue_job_id is not None
+        else nullcontext()
+    )
+    async with cancellation:
+        # Phase 2: Upload files and mark build complete
+        try:
+            async with object_store:
+                async with session.begin():
+                    upload = await _process_build(
+                        object_store=object_store,
+                        build=build,
+                        build_store=build_store,
+                        org_slug=org_slug,
+                        project_slug=project_slug,
+                        logger=logger,
+                    )
+                # Outside the transaction above on purpose: the delete is a
+                # network call to the object store (botocore defaults to 60 s
+                # connect and read timeouts), and inside that block it would
+                # be made while still holding the ``builds`` row lock the
+                # completion took. Every ``SELECT ... FOR UPDATE`` reader
+                # PRD #577 added — a DELETE request, the stranded-build
+                # sweep, a racing worker's mid-upload guard — would park
+                # behind a call that has nothing to do with the row. The
+                # tarball is dead weight the moment the build is completed,
+                # so dropping it is bookkeeping the commit does not need.
+                if not isinstance(upload, _MidUploadRetirement):
+                    await _delete_staging_tarball(
+                        object_store=object_store, build=build, logger=logger
+                    )
+        except Exception as exc:
+            # Phase 3a: Mark queue job and build as failed.
+            #
+            # Both writes are idempotent, because either row may have gone
+            # terminal underneath this worker while the files were
+            # uploading: a DELETE cancels the build, the silent reaper fails
+            # an idle job, and the stranded sweep fails the build behind it.
+            # A strict ``fail`` on either one would raise from inside the
+            # ``except`` handler, and that second exception would mask the
+            # upload error, roll back the very transaction that has to close
+            # the run out, and leave the run stranded — exactly the failure
+            # mode this change set removes. ``exc`` stays the exception that
+            # is captured and logged.
+            #
+            # The queue job goes first so this path takes ``queue_jobs``
+            # before ``builds``, matching the reaper (which fails jobs in
+            # ``fail_silent_jobs`` before locking builds in
+            # ``fail_stranded_processing``) and the sibling worker paths
+            # (``_mark_stale_skipped``, ``_mark_deleted_skipped``,
+            # ``_close_out_retired_build``). Taking the two in the opposite
+            # order is a lock-order inversion PostgreSQL resolves by
+            # aborting one side.
+            sentry_sdk.capture_exception(exc)
+            logger.exception("Build processing failed")
             async with session.begin():
-                upload = await _process_build(
-                    object_store=object_store,
-                    build=build,
-                    build_store=build_store,
+                if queue_job_id is not None:
+                    await queue_job_store.fail_if_active(queue_job_id)
+                build_service = factory.create_build_service()
+                await build_service.fail_if_unfinished(
+                    build_id=build_id,
                     org_slug=org_slug,
                     project_slug=project_slug,
+                )
+            return "failed", _BuildProcessedOutcome(
+                success=False,
+                object_count=None,
+                total_size_bytes=None,
+                editions_updated=0,
+                editions_skipped=0,
+                stale_skipped=False,
+            )
+        else:
+            # Something retired the build while its files were uploading, so
+            # it is already terminal (or gone) and must not be completed.
+            if isinstance(upload, _MidUploadRetirement):
+                return await _close_out_retired_build(
+                    session=session,
+                    factory=factory,
+                    queue_job_store=queue_job_store,
+                    queue_job_id=queue_job_id,
+                    build_id=build_id,
+                    org_slug=org_slug,
+                    project_slug=project_slug,
+                    status=upload.status,
+                    deleted=upload.deleted,
                     logger=logger,
                 )
-            # Outside the transaction above on purpose: the delete is a
-            # network call to the object store (botocore defaults to 60 s
-            # connect and read timeouts), and inside that block it would
-            # be made while still holding the ``builds`` row lock the
-            # completion took. Every ``SELECT ... FOR UPDATE`` reader
-            # PRD #577 added — a DELETE request, the stranded-build
-            # sweep, a racing worker's mid-upload guard — would park
-            # behind a call that has nothing to do with the row. The
-            # tarball is dead weight the moment the build is completed,
-            # so dropping it is bookkeeping the commit does not need.
-            if not isinstance(upload, _MidUploadRetirement):
-                await _delete_staging_tarball(
-                    object_store=object_store, build=build, logger=logger
-                )
-    except Exception as exc:
-        # Phase 3a: Mark queue job and build as failed.
-        #
-        # Both writes are idempotent, because either row may have gone
-        # terminal underneath this worker while the files were
-        # uploading: a DELETE cancels the build, the silent reaper fails
-        # an idle job, and the stranded sweep fails the build behind it.
-        # A strict ``fail`` on either one would raise from inside the
-        # ``except`` handler, and that second exception would mask the
-        # upload error, roll back the very transaction that has to close
-        # the run out, and leave the run stranded — exactly the failure
-        # mode this change set removes. ``exc`` stays the exception that
-        # is captured and logged.
-        #
-        # The queue job goes first so this path takes ``queue_jobs``
-        # before ``builds``, matching the reaper (which fails jobs in
-        # ``fail_silent_jobs`` before locking builds in
-        # ``fail_stranded_processing``) and the sibling worker paths
-        # (``_mark_stale_skipped``, ``_mark_deleted_skipped``,
-        # ``_close_out_retired_build``). Taking the two in the opposite
-        # order is a lock-order inversion PostgreSQL resolves by
-        # aborting one side.
-        sentry_sdk.capture_exception(exc)
-        logger.exception("Build processing failed")
-        async with session.begin():
-            if queue_job_id is not None:
-                await queue_job_store.fail_if_active(queue_job_id)
-            build_service = factory.create_build_service()
-            await build_service.fail_if_unfinished(
-                build_id=build_id,
-                org_slug=org_slug,
-                project_slug=project_slug,
-            )
-        return "failed", _BuildProcessedOutcome(
-            success=False,
-            object_count=None,
-            total_size_bytes=None,
-            editions_updated=0,
-            editions_skipped=0,
-            stale_skipped=False,
-        )
-    else:
-        # Something retired the build while its files were uploading, so
-        # it is already terminal (or gone) and must not be completed.
-        if isinstance(upload, _MidUploadRetirement):
-            return await _close_out_retired_build(
+            object_count, total_size_bytes = upload
+            editions_updated, editions_skipped = await _finalize_success(
                 session=session,
                 factory=factory,
+                build_store=build_store,
                 queue_job_store=queue_job_store,
-                queue_job_id=queue_job_id,
-                build_id=build_id,
+                org_id=org_id,
                 org_slug=org_slug,
+                project_id=build.project_id,
                 project_slug=project_slug,
-                status=upload.status,
-                deleted=upload.deleted,
+                build_id=build_id,
+                build_public_id=build_public_id,
+                queue_job_id=queue_job_id,
+                object_count=object_count,
+                total_size_bytes=total_size_bytes,
                 logger=logger,
             )
-        object_count, total_size_bytes = upload
-        editions_updated, editions_skipped = await _finalize_success(
-            session=session,
-            factory=factory,
-            build_store=build_store,
-            queue_job_store=queue_job_store,
-            org_id=org_id,
-            org_slug=org_slug,
-            project_id=build.project_id,
-            project_slug=project_slug,
-            build_id=build_id,
-            build_public_id=build_public_id,
-            queue_job_id=queue_job_id,
-            object_count=object_count,
-            total_size_bytes=total_size_bytes,
-            logger=logger,
+            return "completed", _BuildProcessedOutcome(
+                success=True,
+                object_count=object_count,
+                total_size_bytes=total_size_bytes,
+                editions_updated=editions_updated,
+                editions_skipped=editions_skipped,
+                stale_skipped=False,
+            )
+
+
+def _build_failure_finaliser(
+    *, build_id: int, org_slug: str, project_slug: str
+) -> RunFinaliser:
+    """Build the cancel-path close-out for the build being processed.
+
+    Fails the build through
+    :meth:`~docverse_server.services.build.BuildService.fail_if_unfinished`,
+    the write :func:`_process_build_locked`'s ``except`` branch makes
+    beside failing the job, so a cancelled job does not leave its build
+    reading ``processing`` until the stranded-build sweep. It runs in
+    the cancellation helper's transaction after the job is failed, which
+    keeps the ``queue_jobs``-then-``builds`` lock order every other path
+    uses, and leaves a build that already went terminal as it stands. A
+    ``build_processing`` job belongs to no keeper-sync run, so it
+    returns ``None``.
+    """
+
+    async def finalise(factory: Factory) -> KeeperSyncRunWithActivity | None:
+        await factory.create_build_service().fail_if_unfinished(
+            build_id=build_id, org_slug=org_slug, project_slug=project_slug
         )
-        return "completed", _BuildProcessedOutcome(
-            success=True,
-            object_count=object_count,
-            total_size_bytes=total_size_bytes,
-            editions_updated=editions_updated,
-            editions_skipped=editions_skipped,
-            stale_skipped=False,
-        )
+        return None
+
+    return finalise
 
 
 async def _delete_staging_tarball(

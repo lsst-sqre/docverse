@@ -436,6 +436,73 @@ async def test_fail_if_active_raises_for_missing_row(
 
 
 @pytest.mark.asyncio
+async def test_fail_if_undispatched_fails_a_row_never_handed_off(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """A committed row its creator never stamped is failed outright.
+
+    The shape a cancel inside a commit-then-enqueue hand-off leaves:
+    ``queued`` with no ``backend_job_id``. The orphan sweeps fail it
+    only once it has idled past their window; a creator that knows its
+    hand-off was cut short fails it at once.
+    """
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.keeper_sync_project, org_id=1)
+        failed = await store.fail_if_undispatched(
+            job.id, errors={"type": "CancelledError"}
+        )
+        await db_session.commit()
+    assert failed is not None
+    assert failed.status == JobStatus.failed
+    assert failed.date_completed is not None
+    assert failed.errors == {"type": "CancelledError"}
+
+
+@pytest.mark.parametrize(
+    "state", ["stamped", "started", "missing"], ids=lambda state: state
+)
+@pytest.mark.asyncio
+async def test_fail_if_undispatched_leaves_a_handed_off_row_alone(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+    state: str,
+) -> None:
+    """Only a row nobody has taken over is failed; anything else is kept.
+
+    A stamped row's job is in the queue backend and may yet run, and a
+    started row belongs to the worker running it, so neither is the
+    creator's to fail. A missing row is the one whose creating
+    transaction rolled back under the cancel: nothing to do, and — unlike
+    :meth:`QueueJobStore.fail_if_active` — no error either, because the
+    hand-off cannot tell that case from a committed one in advance.
+    """
+    async with db_session.begin():
+        job = await store.create(kind=JobKind.keeper_sync_project, org_id=1)
+        if state == "stamped":
+            await store.set_backend_job_id(
+                job.id, "arq-123", queue_name=MAINTENANCE_QUEUE_NAME
+            )
+        elif state == "started":
+            await store.start_if_queued(job.id)
+        await db_session.commit()
+    job_id = -1 if state == "missing" else job.id
+
+    async with db_session.begin():
+        result = await store.fail_if_undispatched(
+            job_id, errors={"type": "CancelledError"}
+        )
+        await db_session.commit()
+    assert result is None
+
+    async with db_session.begin():
+        kept = await store.get(job.id)
+    assert kept is not None
+    assert kept.status != JobStatus.failed
+    assert kept.errors is None
+
+
+@pytest.mark.asyncio
 async def test_get_elapsed_since_start_reads_the_database_clock(
     db_session: AsyncSession,
     store: QueueJobStore,

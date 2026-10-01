@@ -110,6 +110,7 @@ from docverse_server.worker.functions import (
 from docverse_server.worker.functions.dashboard_build import dashboard_build
 from docverse_server.worker.functions.keeper_sync import keeper_sync_project
 from docverse_server.worker.functions.publish_edition import publish_edition
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.support.objectstore import ScriptedUploadStore
@@ -3892,16 +3893,9 @@ def _hang_route(route: respx.Route) -> asyncio.Event:
     ``keeper_sync_project`` exactly while it is awaiting LTD — the way
     arq's timeout or a worker shutdown catches a job mid-sync.
     """
-    reached = asyncio.Event()
-
-    async def _hang(request: httpx.Request) -> httpx.Response:
-        reached.set()
-        await asyncio.Event().wait()
-        msg = "unreachable: the request is cancelled while it hangs"
-        raise AssertionError(msg)
-
-    route.mock(side_effect=_hang)
-    return reached
+    hang = HangUntilCancelled()
+    route.mock(side_effect=hang)
+    return hang.reached
 
 
 async def _cancel_when_reached(
@@ -3914,17 +3908,12 @@ async def _cancel_when_reached(
     """Cancel ``task`` once it reaches the hanging route.
 
     ``started_ago`` backdates the job's ``date_started`` first, putting
-    the cancel past the pool timeout without waiting for it. The
-    ``CancelledError`` must come back out of the task, as arq needs it
-    to record the job as failed.
+    the cancel past the pool timeout without waiting for it.
     """
-    waiter = asyncio.create_task(reached.wait())
-    await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
-    waiter.cancel()
-    if task.done():
-        await task
-        pytest.fail("keeper_sync_project returned before it was cancelled")
-    if started_ago is not None:
+
+    async def _backdate() -> None:
+        if started_ago is None:
+            return
         assert queue_job_id is not None
         async for session in db_session_dependency():
             async with session.begin():
@@ -3933,9 +3922,8 @@ async def _cancel_when_reached(
                     .where(SqlQueueJob.id == queue_job_id)
                     .values(date_started=func.now() - started_ago)
                 )
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+
+    await cancel_when_reached(task, reached, before_cancel=_backdate)
 
 
 @pytest.mark.parametrize(

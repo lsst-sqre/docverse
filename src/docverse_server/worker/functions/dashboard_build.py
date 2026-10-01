@@ -18,6 +18,10 @@ from safir.dependencies.db_session import db_session_dependency
 from docverse_server.exceptions import NotFoundError
 from docverse_server.metrics import DashboardBuiltEvent
 from docverse_server.services.lock_service import LockKey
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+    record_cancellation,
+)
 
 
 async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -36,6 +40,14 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     -------
     str
         ``"completed"`` on success or ``"failed"`` if rendering raised.
+
+    Raises
+    ------
+    asyncio.CancelledError
+        When arq cancels the job — its default per-job timeout, or a
+        worker shutdown — after
+        :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+        has failed the row.
     """
     logger = structlog.get_logger(
         "docverse_server.worker.dashboard_build"
@@ -70,104 +82,116 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     progress={"message": "Rendering dashboard artifacts"},
                 )
 
-            try:
-                async with session.begin():
-                    org = await org_store.get_by_id(org_id)
-                    if org is None:
-                        msg = f"Organization {org_id} not found"
-                        raise NotFoundError(msg)
-                    service_label = org.resolved_staging_store_label
-                    if service_label is None:
-                        msg = (
-                            f"No object store service configured for "
-                            f"org {org_id}"
-                        )
-                        raise RuntimeError(msg)
+            # From here on the job holds an ``in_progress`` row, which
+            # arq's timeout or a worker shutdown would otherwise strand
+            # for ``dashboard_build_reaper``: their ``CancelledError``
+            # bypasses the ``except Exception`` below (PRD #765).
+            async with record_cancellation(
+                ctx,
+                queue_job_id=queue_job_id,
+                timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+                logger=logger,
+            ):
+                try:
+                    async with session.begin():
+                        org = await org_store.get_by_id(org_id)
+                        if org is None:
+                            msg = f"Organization {org_id} not found"
+                            raise NotFoundError(msg)
+                        service_label = org.resolved_staging_store_label
+                        if service_label is None:
+                            msg = (
+                                f"No object store service configured for "
+                                f"org {org_id}"
+                            )
+                            raise RuntimeError(msg)
 
-                    publisher = factory.create_dashboard_publisher()
-                    rendered_at = datetime.now(tz=UTC)
-                    context = await publisher.build_context(
-                        org_id=org_id,
-                        project_id=project_id,
-                        rendered_at=rendered_at,
+                        publisher = factory.create_dashboard_publisher()
+                        rendered_at = datetime.now(tz=UTC)
+                        context = await publisher.build_context(
+                            org_id=org_id,
+                            project_id=project_id,
+                            rendered_at=rendered_at,
+                        )
+                        object_store = (
+                            await factory.create_objectstore_for_org(
+                                org_id=org_id, service_label=service_label
+                            )
+                        )
+                        # Preload the template source in the same short
+                        # transaction so the upload loop below runs with no
+                        # open DB transaction — GitHub-backed sources cache
+                        # their bytes at resolve time.
+                        resolved = await publisher.resolve_template(
+                            org_id=org_id, project_id=project_id
+                        )
+
+                    async with session.begin():
+                        await queue_job_store.update_phase(
+                            queue_job_id,
+                            "uploading",
+                            progress={
+                                "message": "Uploading dashboard artifacts",
+                                "object_count": 0,
+                            },
+                        )
+                    async with object_store:
+                        progress = await publisher.render_and_upload(
+                            context=context,
+                            object_store=object_store,
+                            resolved=resolved,
+                        )
+                except Exception as exc:
+                    sentry_sdk.capture_exception(exc)
+                    logger.exception("Dashboard build failed")
+                    async with session.begin():
+                        await queue_job_store.fail(
+                            queue_job_id,
+                            errors={
+                                "message": str(exc),
+                                "type": type(exc).__name__,
+                                "traceback": traceback.format_exc(),
+                            },
+                        )
+                    # Publish after the failed transition commits. Best-effort:
+                    # production runs raise_on_error=False so a metrics outage
+                    # never fails the build (no defensive try/except).
+                    await _publish_dashboard_built(
+                        ctx=ctx,
+                        org_slug=payload["org_slug"],
+                        project_slug=payload["project_slug"],
+                        success=False,
+                        object_count=None,
+                        total_size_bytes=None,
+                        started=started,
                     )
-                    object_store = await factory.create_objectstore_for_org(
-                        org_id=org_id, service_label=service_label
-                    )
-                    # Preload the template source in the same short
-                    # transaction so the upload loop below runs with no
-                    # open DB transaction — GitHub-backed sources cache
-                    # their bytes at resolve time.
-                    resolved = await publisher.resolve_template(
-                        org_id=org_id, project_id=project_id
-                    )
+                    return "failed"
 
                 async with session.begin():
                     await queue_job_store.update_phase(
                         queue_job_id,
-                        "uploading",
+                        "complete",
                         progress={
-                            "message": "Uploading dashboard artifacts",
-                            "object_count": 0,
+                            "message": "Dashboard build complete",
+                            "object_count": progress.object_count,
+                            "total_size_bytes": progress.total_size_bytes,
+                            "rendered_at": context.rendered_at.isoformat(),
                         },
                     )
-                async with object_store:
-                    progress = await publisher.render_and_upload(
-                        context=context,
-                        object_store=object_store,
-                        resolved=resolved,
-                    )
-            except Exception as exc:
-                sentry_sdk.capture_exception(exc)
-                logger.exception("Dashboard build failed")
-                async with session.begin():
-                    await queue_job_store.fail(
-                        queue_job_id,
-                        errors={
-                            "message": str(exc),
-                            "type": type(exc).__name__,
-                            "traceback": traceback.format_exc(),
-                        },
-                    )
-                # Publish after the failed transition commits. Best-effort:
-                # production runs raise_on_error=False so a metrics outage
-                # never fails the build (no defensive try/except).
+                    await queue_job_store.complete(queue_job_id)
+                logger.info("Dashboard build completed")
+                # Publish after the terminal transition commits (same
+                # best-effort rationale as the failure branch above).
                 await _publish_dashboard_built(
                     ctx=ctx,
                     org_slug=payload["org_slug"],
                     project_slug=payload["project_slug"],
-                    success=False,
-                    object_count=None,
-                    total_size_bytes=None,
+                    success=True,
+                    object_count=progress.object_count,
+                    total_size_bytes=progress.total_size_bytes,
                     started=started,
                 )
-                return "failed"
-
-            async with session.begin():
-                await queue_job_store.update_phase(
-                    queue_job_id,
-                    "complete",
-                    progress={
-                        "message": "Dashboard build complete",
-                        "object_count": progress.object_count,
-                        "total_size_bytes": progress.total_size_bytes,
-                        "rendered_at": context.rendered_at.isoformat(),
-                    },
-                )
-                await queue_job_store.complete(queue_job_id)
-            logger.info("Dashboard build completed")
-            # Publish after the terminal transition commits (same
-            # best-effort rationale as the failure branch above).
-            await _publish_dashboard_built(
-                ctx=ctx,
-                org_slug=payload["org_slug"],
-                project_slug=payload["project_slug"],
-                success=True,
-                object_count=progress.object_count,
-                total_size_bytes=progress.total_size_bytes,
-                started=started,
-            )
-            return "completed"
+                return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
