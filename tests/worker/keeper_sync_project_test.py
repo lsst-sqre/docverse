@@ -11,6 +11,7 @@ failing paths — without depending on real S3 or R2.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ import pytest
 import respx
 import sentry_sdk
 import structlog
-from safir.arq import MockArqQueue
+from safir.arq import JobMetadata, MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from safir.testing.sentry import (
@@ -50,6 +51,7 @@ from docverse.models import (
 )
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
+from docverse_server.config import config as worker_config
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.edition_build_history import (
     SqlEditionBuildHistory,
@@ -61,12 +63,14 @@ from docverse_server.dbschema.project import SqlProject
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
     generate_base32_id,
+    serialize_base32_id,
     validate_base32_id,
 )
 from docverse_server.domain.dashboard_context import DashboardContext
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
-from docverse_server.domain.queue import JobStatus
+from docverse_server.domain.keeper_sync_run import KeeperSyncRunActivity
+from docverse_server.domain.queue import JobStatus, QueueJob
 from docverse_server.exceptions import KeeperSyncSystemicFailureError
 from docverse_server.factory import Factory
 from docverse_server.metrics import (
@@ -80,6 +84,7 @@ from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
 )
 from docverse_server.services.dashboard.publisher import DashboardPublisher
+from docverse_server.services.keeper_sync import SliceBudget
 from docverse_server.services.keeper_sync import service as service_module
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.services.lock_service import LockClass, LockKey
@@ -106,8 +111,12 @@ from docverse_server.worker.functions import (
     keeper_sync as keeper_sync_worker_module,
 )
 from docverse_server.worker.functions.dashboard_build import dashboard_build
-from docverse_server.worker.functions.keeper_sync import keeper_sync_project
+from docverse_server.worker.functions.keeper_sync import (
+    keeper_sync_project,
+    keeper_sync_tier_discovery,
+)
 from docverse_server.worker.functions.publish_edition import publish_edition
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.support.objectstore import ScriptedUploadStore
@@ -133,6 +142,10 @@ class _FakeLtdSource:
     the prefix are listable but every ``GetObject`` answers
     ``AccessDenied``, because those objects were written without a
     public-read ACL and this source is anonymous.
+
+    ``on_download`` runs as each ``GetObject`` starts, denied or not —
+    the seam the slice tests use to spend a budget while a build is
+    being read.
     """
 
     def __init__(
@@ -140,9 +153,11 @@ class _FakeLtdSource:
         objects: dict[str, bytes],
         *,
         denied_prefixes: frozenset[str] = frozenset(),
+        on_download: Callable[[], None] | None = None,
     ) -> None:
         self._objects = objects
         self._denied_prefixes = denied_prefixes
+        self._on_download = on_download
 
     async def __aenter__(self) -> Self:
         return self
@@ -159,6 +174,8 @@ class _FakeLtdSource:
         return [k for k in self._objects if k.startswith(prefix)]
 
     async def download_object(self, *, key: str) -> bytes:
+        if self._on_download is not None:
+            self._on_download()
         if any(key.startswith(prefix) for prefix in self._denied_prefixes):
             raise LtdSourceAccessDeniedError(
                 bucket="lsst-the-docs", key=key, operation="GetObject"
@@ -172,6 +189,7 @@ def _patch_factory_io(
     object_store: MockObjectStore,
     source_objects: dict[str, bytes],
     denied_prefixes: frozenset[str] = frozenset(),
+    on_download: Callable[[], None] | None = None,
 ) -> None:
     """Route the factory's S3/objectstore wiring through in-memory doubles."""
 
@@ -183,7 +201,11 @@ def _patch_factory_io(
     def _create_ltd_s3_source(
         self: Factory, *, bucket: str = "lsst-the-docs"
     ) -> _FakeLtdSource:
-        return _FakeLtdSource(source_objects, denied_prefixes=denied_prefixes)
+        return _FakeLtdSource(
+            source_objects,
+            denied_prefixes=denied_prefixes,
+            on_download=on_download,
+        )
 
     monkeypatch.setattr(
         Factory, "create_objectstore_for_org", _create_objectstore_for_org
@@ -3881,3 +3903,999 @@ async def test_keeper_sync_project_rebuilt_release_reports_lag_on_aggregates(
         "15.2": "2026-05-03T09:00:00+00:00",
         "15": "2026-05-03T09:00:00+00:00",
     }
+
+
+def _hang_route(route: respx.Route) -> asyncio.Event:
+    """Make ``route`` hang until its caller is cancelled.
+
+    Returns an event set once the request arrives, so a test can cancel
+    ``keeper_sync_project`` exactly while it is awaiting LTD — the way
+    arq's timeout or a worker shutdown catches a job mid-sync.
+    """
+    hang = HangUntilCancelled()
+    route.mock(side_effect=hang)
+    return hang.reached
+
+
+async def _cancel_when_reached(
+    task: asyncio.Task[str],
+    reached: asyncio.Event,
+    *,
+    started_ago: timedelta | None = None,
+    queue_job_id: int | None = None,
+) -> None:
+    """Cancel ``task`` once it reaches the hanging route.
+
+    ``started_ago`` backdates the job's ``date_started`` first, putting
+    the cancel past the pool timeout without waiting for it.
+    """
+
+    async def _backdate() -> None:
+        if started_ago is None:
+            return
+        assert queue_job_id is not None
+        async for session in db_session_dependency():
+            async with session.begin():
+                await session.execute(
+                    update(SqlQueueJob)
+                    .where(SqlQueueJob.id == queue_job_id)
+                    .values(date_started=func.now() - started_ago)
+                )
+
+    await cancel_when_reached(task, reached, before_cancel=_backdate)
+
+
+@pytest.mark.parametrize(
+    ("started_ago", "expected_reason"),
+    [
+        pytest.param(None, "worker_shutdown", id="worker_shutdown"),
+        pytest.param(
+            timedelta(seconds=worker_config.keeper_sync_job_timeout_seconds)
+            + timedelta(minutes=1),
+            "job_timeout",
+            id="job_timeout",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_keeper_sync_project_cancel_fails_row_and_finalises_run(
+    *,
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    started_ago: timedelta | None,
+    expected_reason: str,
+) -> None:
+    """An arq cancel mid-sync fails the row and finalises its run (#699).
+
+    The job is cancelled while ``sync_project`` awaits LTD for the main
+    edition's build, as arq's timeout or a rolling deploy's SIGTERM
+    would catch it. The row must not be left ``in_progress`` for the
+    reaper: it fails with a ``CancelledError`` payload whose ``reason``
+    follows the elapsed time, records how far the sync got, rolls the
+    parent run (whose only child it is) up to ``partial_failure`` with
+    ``keeper_sync_run_completed`` published, and the cancel re-raises
+    so arq records the job as failed.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+    _seed_ltd(mock_discovery)
+    reached = _hang_route(mock_discovery.get(f"{LTD_BASE}/builds/42"))
+    _patch_factory_io(
+        monkeypatch, object_store=MockObjectStore(), source_objects={}
+    )
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), arq_queue=mock_arq, events=events
+    )
+
+    task = asyncio.create_task(
+        keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
+    )
+    await _cancel_when_reached(
+        task, reached, started_ago=started_ago, queue_job_id=queue_job_id
+    )
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            qj = await queue_job_store.get(queue_job_id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["type"] == "CancelledError"
+            assert qj.errors["reason"] == expected_reason
+            assert qj.errors["timeout_seconds"] == (
+                worker_config.keeper_sync_job_timeout_seconds
+            )
+            # Cancelled on the main edition's build: the walk is planned
+            # but no edition has been dealt with yet.
+            assert qj.progress == {
+                "slice_index": 0,
+                "editions_total": 1,
+                "editions_visited": 0,
+                "editions_remaining": 1,
+                "last_visited_ltd_edition_id": None,
+            }
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.partial_failure
+
+    publisher = events.keeper_sync_run_completed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == org_slug
+    assert event.success is False
+    assert event.failed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_cancelled_tier_cron_job_touches_no_run(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled tier-cron job fails its row and leaves every run alone.
+
+    Tier crons enqueue ``keeper_sync_project`` with no ``run_id``, so
+    the cancel path has no run to roll up — an in-flight run of the same
+    org must not be finalised on its behalf. The job is cancelled on the
+    second edition's build, after the main edition synced, so the row's
+    progress records the one edition the sync got through.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        unrelated_run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job = await QueueJobStore(
+            session=db_session, logger=_logger()
+        ).create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            backend_job_id="test-arq-tier-project",
+        )
+    _seed_two_edition_ltd(mock_discovery)
+    reached = _hang_route(mock_discovery.get(f"{LTD_BASE}/builds/43"))
+    _patch_factory_io(
+        monkeypatch,
+        object_store=MockObjectStore(),
+        source_objects={
+            "pipelines/builds/42/index.html": b"<html>main</html>"
+        },
+    )
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), arq_queue=mock_arq, events=events
+    )
+
+    task = asyncio.create_task(
+        keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "queue_job_id": queue_job.id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
+    )
+    await _cancel_when_reached(task, reached)
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_store = QueueJobStore(session=session, logger=_logger())
+            qj = await queue_job_store.get(queue_job.id)
+            assert qj is not None
+            assert qj.status == JobStatus.failed
+            assert qj.errors is not None
+            assert qj.errors["reason"] == "worker_shutdown"
+            assert qj.progress == {
+                "slice_index": 0,
+                "editions_total": 2,
+                "editions_visited": 1,
+                "editions_remaining": 1,
+                "last_visited_ltd_edition_id": 1,
+            }
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            unrelated_run = await run_store.get(unrelated_run_id)
+            assert unrelated_run is not None
+            assert unrelated_run.status == KeeperSyncRunStatus.in_progress
+
+    publisher = events.keeper_sync_run_completed
+    assert isinstance(publisher, MockEventPublisher)
+    assert publisher.published == []
+
+
+# ---------------------------------------------------------------------------
+# Sliced syncs: a project walked across a chain of jobs (PRD #765)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SliceClock:
+    """The monotonic clock the slice tests move by hand."""
+
+    now: float = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def spend_budget(self) -> None:
+        """Move past the deadline of any slice budget started so far."""
+        self.now += worker_config.keeper_sync_slice_budget_seconds
+
+
+def _slice_by_clock(monkeypatch: pytest.MonkeyPatch) -> _SliceClock:
+    """Read every job's slice budget against a hand-moved clock.
+
+    Paired with ``on_download=clock.spend_budget``, each build read
+    spends a whole budget, so a slice syncs exactly one edition and stops
+    before the next — the shape of a project whose editions each take
+    longer to copy than a slice allows.
+    """
+    clock = _SliceClock()
+
+    def _budget() -> SliceBudget:
+        return SliceBudget.starting_now(
+            worker_config.keeper_sync_slice_budget_seconds, clock=clock
+        )
+
+    monkeypatch.setattr(
+        keeper_sync_worker_module, "_start_slice_budget", _budget
+    )
+    return clock
+
+
+_SLICED_BRANCH_BUILD_OFFSET = 50
+"""LTD build id of branch edition ``n`` is ``n`` plus this."""
+
+
+def _seed_sliced_ltd(
+    mock_discovery: respx.Router, *, edition_count: int
+) -> dict[str, bytes]:
+    """Stub a ``pipelines`` product with ``main`` plus branch editions.
+
+    Edition 1 is ``main`` (build 42); editions ``2..edition_count`` each
+    track their own ``u/jsick/featureN`` branch and build ``50 + N``.
+    LTD lists them newest-first, as it does in production, so a sliced
+    walk visits ``main`` and then ``edition_count`` down to 2. Returns
+    the LTD bucket objects every build's copy reads.
+    """
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+        return_value=httpx.Response(200, json=_load("product_pipelines.json"))
+    )
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/{ltd_id}"
+                    for ltd_id in range(edition_count, 0, -1)
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200, json=_load("edition_main_git_refs.json")
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/builds/42").mock(
+        return_value=httpx.Response(200, json=_load("build.json"))
+    )
+    source_objects = {"pipelines/builds/42/index.html": b"<html>main</html>"}
+    for ltd_id in range(2, edition_count + 1):
+        build_id = _SLICED_BRANCH_BUILD_OFFSET + ltd_id
+        edition = _load("edition_branch_git_refs.json")
+        edition["self_url"] = f"{LTD_BASE}/editions/{ltd_id}"
+        edition["build_url"] = f"{LTD_BASE}/builds/{build_id}"
+        edition["slug"] = f"u-jsick-feature{ltd_id}"
+        edition["title"] = f"u/jsick/feature{ltd_id}"
+        edition["tracked_refs"] = [f"u/jsick/feature{ltd_id}"]
+        build = _load("build.json")
+        build["self_url"] = f"{LTD_BASE}/builds/{build_id}"
+        build["slug"] = str(build_id)
+        build["bucket_root_dir"] = f"pipelines/builds/{build_id}"
+        build["git_refs"] = [f"u/jsick/feature{ltd_id}"]
+        mock_discovery.get(f"{LTD_BASE}/editions/{ltd_id}").mock(
+            return_value=httpx.Response(200, json=edition)
+        )
+        mock_discovery.get(f"{LTD_BASE}/builds/{build_id}").mock(
+            return_value=httpx.Response(200, json=build)
+        )
+        source_objects[f"pipelines/builds/{build_id}/index.html"] = (
+            f"<html>feature{ltd_id}</html>".encode()
+        )
+    return source_objects
+
+
+@dataclass
+class _SliceChain:
+    """A ``pipelines`` product synced as a chain of one-edition slices."""
+
+    ctx: dict[str, Any]
+    mock_arq: MockArqQueue
+    events: DocverseEvents
+    org_id: int
+    org_slug: str
+    run_id: int | None
+    first_payload: dict[str, Any]
+    """The payload of the chain's first job, as its creator enqueued it."""
+
+    def continuation_payloads(self) -> list[dict[str, Any]]:
+        """Return the payloads of the continuations enqueued so far."""
+        return [
+            job.kwargs["payload"]
+            for job in get_jobs_by_name(
+                self.mock_arq,
+                "keeper_sync_project",
+                queue_name=KEEPER_SYNC_QUEUE_NAME,
+            )
+        ]
+
+    def run_completed_count(self) -> int:
+        """Count the ``keeper_sync_run_completed`` events published."""
+        publisher = self.events.keeper_sync_run_completed
+        assert isinstance(publisher, MockEventPublisher)
+        return len(publisher.published)
+
+
+async def _prepare_slice_chain(
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    edition_count: int,
+    with_run: bool,
+    denied_ltd_ids: frozenset[int] = frozenset(),
+) -> _SliceChain:
+    """Seed a project whose sync takes one slice per edition.
+
+    The chain's first ``queue_jobs`` row is seeded as its creator leaves
+    it: claimed for ``pipelines`` (``subject_label``) and, when
+    ``with_run`` is set, attributed to a fresh run, as a discovery
+    fan-out does; otherwise unattributed, as a tier cron or ``POST
+    …/refresh`` leaves it. ``denied_ltd_ids`` names branch editions whose
+    LTD build answers ``AccessDenied`` — a permanent per-edition failure.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = (
+            await _seed_run(db_session, org_id=org_id) if with_run else None
+        )
+        first = await QueueJobStore(
+            session=db_session, logger=_logger()
+        ).create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=run_id,
+            subject_label="pipelines",
+            backend_job_id="test-arq-slice-0",
+        )
+    clock = _slice_by_clock(monkeypatch)
+    _patch_factory_io(
+        monkeypatch,
+        object_store=MockObjectStore(),
+        source_objects=_seed_sliced_ltd(
+            mock_discovery, edition_count=edition_count
+        ),
+        denied_prefixes=frozenset(
+            f"pipelines/builds/{_SLICED_BRANCH_BUILD_OFFSET + ltd_id}/"
+            for ltd_id in denied_ltd_ids
+        ),
+        on_download=clock.spend_budget,
+    )
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), arq_queue=mock_arq, events=events
+    )
+    first_payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org_slug,
+        "queue_job_id": first.id,
+        "ltd_slug": "pipelines",
+        "ltd_base_url": LTD_BASE,
+    }
+    if run_id is not None:
+        first_payload["run_id"] = run_id
+    return _SliceChain(
+        ctx=ctx,
+        mock_arq=mock_arq,
+        events=events,
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        first_payload=first_payload,
+    )
+
+
+async def _get_queue_job(queue_job_id: int) -> QueueJob:
+    """Read one ``queue_jobs`` row back from a fresh session."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            job = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job_id
+            )
+        assert job is not None
+        return job
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_tier_slice_continues_without_a_run(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier-cron slice out of budget hands the rest to a new job.
+
+    The first slice syncs ``main`` and stops before the branch edition.
+    Its row completes with its position and the continuation's public id
+    on ``progress``, and a continuation row — still unattributed, like
+    the tier-cron job it follows, and holding the project's slot — is
+    enqueued with the cursor and the next slice index. Running that job
+    finishes the walk and ends the chain without enqueueing another.
+    """
+    chain = await _prepare_slice_chain(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        edition_count=2,
+        with_run=False,
+    )
+
+    with capture_logs() as logs:
+        result = await keeper_sync_project(chain.ctx, chain.first_payload)
+
+    assert result == "completed"
+    [continuation_payload] = chain.continuation_payloads()
+    assert "run_id" not in continuation_payload
+    assert continuation_payload["resume_after_ltd_edition_id"] == 1
+    assert continuation_payload["slice_index"] == 1
+    assert continuation_payload["ltd_slug"] == "pipelines"
+    assert continuation_payload["ltd_base_url"] == LTD_BASE
+    continuation = await _get_queue_job(continuation_payload["queue_job_id"])
+    continuation_job_id = serialize_base32_id(continuation.public_id)
+    assert continuation_payload["queue_job_public_id"] == continuation_job_id
+    assert continuation.status == JobStatus.queued
+    assert continuation.keeper_sync_run_id is None
+    assert continuation.subject_label == "pipelines"
+    [enqueued] = get_jobs_by_name(
+        chain.mock_arq,
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert continuation.backend_job_id == enqueued.id
+
+    first = await _get_queue_job(chain.first_payload["queue_job_id"])
+    assert first.status == JobStatus.completed
+    assert first.progress == {
+        "slice_index": 0,
+        "editions_total": 2,
+        "editions_visited": 1,
+        "editions_remaining": 1,
+        "last_visited_ltd_edition_id": 1,
+        "continued": True,
+        "continuation_job_id": continuation_job_id,
+    }
+    [handoff_log] = [
+        log
+        for log in logs
+        if log["event"]
+        == "Keeper-sync slice budget reached; continuing in a new job"
+    ]
+    assert handoff_log["slice_index"] == 0
+    assert handoff_log["editions_visited"] == 1
+    assert handoff_log["editions_remaining"] == 1
+    assert handoff_log["continuation_job_id"] == continuation_job_id
+
+    with capture_logs() as logs:
+        result = await keeper_sync_project(chain.ctx, continuation_payload)
+    await chain.ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert len(chain.continuation_payloads()) == 1
+    last = await _get_queue_job(continuation.id)
+    assert last.status == JobStatus.completed
+    assert last.progress == {
+        "slice_index": 1,
+        "editions_total": 2,
+        "editions_visited": 1,
+        "editions_remaining": 0,
+        "last_visited_ltd_edition_id": 2,
+        "continued": False,
+    }
+    [completion_log] = [
+        log for log in logs if log["event"] == "Keeper-sync project completed"
+    ]
+    assert completion_log["slice_index"] == 1
+
+
+async def _drain_publishes(chain: _SliceChain, *, done: set[str]) -> None:
+    """Run every ``publish_edition`` job not yet in ``done``, as arq would.
+
+    Each publish is a child of the run, so it rolls the run up as it
+    completes; draining them between slices leaves the chain's own
+    continuation as the only thing that can hold the run open.
+    """
+    for job in get_jobs_by_name(
+        chain.mock_arq, "publish_edition", queue_name="docverse:queue"
+    ):
+        if job.id in done:
+            continue
+        done.add(job.id)
+        assert await publish_edition(chain.ctx, job.kwargs["payload"]) == (
+            "completed"
+        )
+
+
+async def _run_snapshot(
+    run_id: int,
+) -> tuple[KeeperSyncRunStatus, KeeperSyncRunActivity, int]:
+    """Read a run's status, its counters, and its keeper-sync job count."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            run_store = KeeperSyncRunStore(session=session, logger=_logger())
+            run = await run_store.get(run_id)
+            assert run is not None
+            activity = await run_store.aggregate_activity(run_id=run_id)
+            project_jobs = (
+                await session.execute(
+                    select(func.count(SqlQueueJob.id)).where(
+                        SqlQueueJob.keeper_sync_run_id == run_id,
+                        SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+                    )
+                )
+            ).scalar_one()
+        return run.status, activity, project_jobs
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_run_converges_over_a_chain_of_slices(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A five-edition project converges over five one-edition slices.
+
+    Each slice before the last completes with ``continued: true`` and the
+    next job's id, and its continuation joins the run in the transaction
+    that completes it: the run's keeper-sync job count grows by one per
+    slice and, with every publish child already drained, its pending
+    count never reaches zero until the chain ends. The last slice ends
+    the chain, its publish finalises the run ``succeeded``, and the
+    run-completed event fires exactly once.
+    """
+    chain = await _prepare_slice_chain(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        edition_count=5,
+        with_run=True,
+    )
+    assert chain.run_id is not None
+    published: set[str] = set()
+    payload = chain.first_payload
+    visit_order = [1, 5, 4, 3, 2]
+
+    for slice_index, ltd_id in enumerate(visit_order):
+        assert payload.get("slice_index", 0) == slice_index
+        result = await keeper_sync_project(chain.ctx, payload)
+        assert result == "completed"
+        row = await _get_queue_job(payload["queue_job_id"])
+        assert row.status == JobStatus.completed
+        assert row.keeper_sync_run_id == chain.run_id
+        assert row.progress is not None
+        assert row.progress["slice_index"] == slice_index
+        assert row.progress["editions_total"] == 5
+        assert row.progress["editions_visited"] == 1
+        assert row.progress["last_visited_ltd_edition_id"] == ltd_id
+        await _drain_publishes(chain, done=published)
+        status, activity, project_jobs = await _run_snapshot(chain.run_id)
+        if slice_index == len(visit_order) - 1:
+            break
+        assert row.progress["continued"] is True
+        assert row.progress["editions_remaining"] == 4 - slice_index
+        payload = chain.continuation_payloads()[-1]
+        continuation = await _get_queue_job(payload["queue_job_id"])
+        assert row.progress["continuation_job_id"] == serialize_base32_id(
+            continuation.public_id
+        )
+        assert continuation.keeper_sync_run_id == chain.run_id
+        assert project_jobs == slice_index + 2
+        assert activity.pending_count == 1
+        assert activity.total_count == project_jobs + len(published)
+        assert status == KeeperSyncRunStatus.in_progress
+        assert chain.run_completed_count() == 0
+    await chain.ctx["http_client"].aclose()
+
+    assert row.progress is not None
+    assert row.progress["continued"] is False
+    assert "continuation_job_id" not in row.progress
+    assert row.progress["editions_remaining"] == 0
+    assert len(chain.continuation_payloads()) == 4
+    assert project_jobs == 5
+    assert activity.pending_count == 0
+    assert activity.total_count == 10
+    assert activity.succeeded_count == 10
+    assert status == KeeperSyncRunStatus.succeeded
+    assert chain.run_completed_count() == 1
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            project = await ProjectStore(
+                session=session, logger=_logger()
+            ).get_by_slug(org_id=chain.org_id, slug="pipelines")
+            assert project is not None
+            slugs = await session.execute(
+                select(SqlEdition.slug).where(
+                    SqlEdition.project_id == project.id
+                )
+            )
+            assert set(slugs.scalars()) == {
+                "__main",
+                "u-jsick-feature2",
+                "u-jsick-feature3",
+                "u-jsick-feature4",
+                "u-jsick-feature5",
+            }
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_chain_keeps_the_project_slot_taken(
+    app: None,
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Between two slices the project's active-job slot stays taken.
+
+    The continuation claims the slot in the transaction that frees it, so
+    a tier cron ticking mid-chain — here ``tier_discovery``, which wants
+    the project for its never-synced branch edition — finds an active job
+    and skips the slug, and ``POST …/refresh`` answers 409, instead of
+    either racing a second sync through the same editions.
+    """
+    chain = await _prepare_slice_chain(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        edition_count=2,
+        with_run=True,
+    )
+    assert await keeper_sync_project(chain.ctx, chain.first_payload) == (
+        "completed"
+    )
+    [continuation_payload] = chain.continuation_payloads()
+    mock_discovery.get(f"{LTD_BASE}/products/").mock(
+        return_value=httpx.Response(
+            200, json={"products": [f"{LTD_BASE}/products/pipelines/"]}
+        )
+    )
+
+    with capture_logs() as logs:
+        assert await keeper_sync_tier_discovery(chain.ctx) == "completed"
+    await chain.ctx["http_client"].aclose()
+
+    skips = [
+        log
+        for log in logs
+        if log["event"] == "Skipping keeper_sync_project enqueue: "
+        "an active job for this project already exists"
+    ]
+    assert [log["tier"] for log in skips] == ["discovery"]
+    assert chain.continuation_payloads() == [continuation_payload]
+
+    response = await client.post(
+        f"/docverse/orgs/{chain.org_slug}/keeper-sync/projects/pipelines"
+        "/refresh",
+        headers={"X-Auth-Request-User": "superadmin"},
+    )
+    assert response.status_code == 409
+    continuation = await _get_queue_job(continuation_payload["queue_job_id"])
+    assert continuation.status == JobStatus.queued
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_slice_with_edition_failure_continues(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slice that isolated an edition failure still hands off.
+
+    The second slice's only edition is permanently denied: the slice
+    completes ``completed_with_errors`` with the failure on its
+    ``progress``, yet the walk moved past that edition, so it continues
+    like any other slice. The last slice syncs the remaining edition,
+    and the run — one of whose children finished with errors — rolls up
+    ``partial_failure``.
+    """
+    chain = await _prepare_slice_chain(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        edition_count=3,
+        with_run=True,
+        denied_ltd_ids=frozenset({3}),
+    )
+    assert chain.run_id is not None
+    published: set[str] = set()
+    assert await keeper_sync_project(chain.ctx, chain.first_payload) == (
+        "completed"
+    )
+    await _drain_publishes(chain, done=published)
+    [denied_payload] = chain.continuation_payloads()
+
+    result = await keeper_sync_project(chain.ctx, denied_payload)
+
+    assert result == "completed_with_errors"
+    denied = await _get_queue_job(denied_payload["queue_job_id"])
+    assert denied.status == JobStatus.completed_with_errors
+    assert denied.progress is not None
+    assert denied.progress["continued"] is True
+    assert denied.progress["last_visited_ltd_edition_id"] == 3
+    assert denied.progress["edition_failure_count"] == 1
+    [failure] = denied.progress["edition_failures"]
+    assert failure["ltd_edition_id"] == 3
+    assert failure["error_type"] == "LtdSourceAccessDeniedError"
+    last_payload = chain.continuation_payloads()[-1]
+    assert last_payload["resume_after_ltd_edition_id"] == 3
+    assert last_payload["slice_index"] == 2
+    status, _activity, _project_jobs = await _run_snapshot(chain.run_id)
+    assert status == KeeperSyncRunStatus.in_progress
+
+    assert await keeper_sync_project(chain.ctx, last_payload) == "completed"
+    await _drain_publishes(chain, done=published)
+    await chain.ctx["http_client"].aclose()
+
+    status, activity, project_jobs = await _run_snapshot(chain.run_id)
+    assert project_jobs == 3
+    assert activity.failed_count == 1
+    assert activity.pending_count == 0
+    assert status == KeeperSyncRunStatus.partial_failure
+    assert chain.run_completed_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_no_progress_slice_ends_the_chain(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slice out of budget before its first edition does not continue.
+
+    Re-enqueueing it would only stop at the same place, so the no-progress
+    guard completes the row with errors, records why on its
+    ``progress``, warns, and enqueues nothing; the run, whose only child
+    this was, rolls up ``partial_failure``.
+    """
+    chain = await _prepare_slice_chain(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        edition_count=2,
+        with_run=True,
+    )
+    assert chain.run_id is not None
+    exhausted = SliceBudget(deadline=0.0, clock=lambda: 1.0)
+    monkeypatch.setattr(
+        keeper_sync_worker_module, "_start_slice_budget", lambda: exhausted
+    )
+
+    with capture_logs() as logs:
+        result = await keeper_sync_project(chain.ctx, chain.first_payload)
+    await chain.ctx["http_client"].aclose()
+
+    assert result == "completed_with_errors"
+    assert chain.continuation_payloads() == []
+    assert not get_jobs_by_name(
+        chain.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    row = await _get_queue_job(chain.first_payload["queue_job_id"])
+    assert row.status == JobStatus.completed_with_errors
+    assert row.progress == {
+        "slice_index": 0,
+        "editions_total": 2,
+        "editions_visited": 0,
+        "editions_remaining": 2,
+        "last_visited_ltd_edition_id": None,
+        "continued": False,
+        "reason": "no_progress",
+    }
+    [warning] = [
+        log
+        for log in logs
+        if log["event"]
+        == "Keeper-sync slice made no progress within its budget;"
+        " not continuing"
+    ]
+    assert warning["log_level"] == "warning"
+    assert warning["slice_index"] == 0
+    assert warning["editions_remaining"] == 2
+    status, _activity, project_jobs = await _run_snapshot(chain.run_id)
+    assert project_jobs == 1
+    assert status == KeeperSyncRunStatus.partial_failure
+    assert chain.run_completed_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_cancel_mid_handoff_fails_the_continuation(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel between a slice's commit and its enqueue fails the orphan.
+
+    The slice has completed its row and created the continuation's, but
+    arq has not taken the continuation's job when a rolling deploy's
+    SIGTERM lands. Left alone, that ``queued`` row with no backend id
+    would hold both the project's slot and — as the run's last pending
+    child — the run itself until a sweep found it. Instead it fails at
+    once with a ``CancelledError`` payload naming ``keeper_sync_project``,
+    and the run, with nothing left to wait on, rolls up
+    ``partial_failure`` and publishes its completion.
+    """
+    chain = await _prepare_slice_chain(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        edition_count=2,
+        with_run=True,
+    )
+    assert chain.run_id is not None
+    hang = HangUntilCancelled()
+    enqueue = chain.mock_arq.enqueue
+
+    async def _hang_on_continuation(
+        task_name: str, *args: Any, **kwargs: Any
+    ) -> JobMetadata:
+        if task_name == "keeper_sync_project":
+            await hang()
+        return await enqueue(task_name, *args, **kwargs)
+
+    monkeypatch.setattr(chain.mock_arq, "enqueue", _hang_on_continuation)
+    published: set[str] = set()
+
+    async def _drain() -> None:
+        await _drain_publishes(chain, done=published)
+
+    task = asyncio.create_task(
+        keeper_sync_project(chain.ctx, chain.first_payload)
+    )
+    await cancel_when_reached(task, hang.reached, before_cancel=_drain)
+    await chain.ctx["http_client"].aclose()
+
+    first = await _get_queue_job(chain.first_payload["queue_job_id"])
+    assert first.status == JobStatus.completed
+    assert first.progress is not None
+    assert first.progress["continued"] is True
+    async for session in db_session_dependency():
+        async with session.begin():
+            continuation_row = (
+                await session.execute(
+                    select(SqlQueueJob).where(
+                        SqlQueueJob.kind == JobKind.keeper_sync_project.value,
+                        SqlQueueJob.id != first.id,
+                    )
+                )
+            ).scalar_one()
+            assert continuation_row.status == JobStatus.failed.value
+            assert continuation_row.errors is not None
+            assert continuation_row.errors["type"] == "CancelledError"
+            assert continuation_row.errors["reason"] == "worker_shutdown"
+            assert continuation_row.errors["job_function"] == (
+                "keeper_sync_project"
+            )
+            assert continuation_row.errors["timeout_seconds"] == (
+                worker_config.keeper_sync_job_timeout_seconds
+            )
+            assert first.progress["continuation_job_id"] == (
+                serialize_base32_id(continuation_row.public_id)
+            )
+            assert not await QueueJobStore(
+                session=session, logger=_logger()
+            ).has_active_for_subject(
+                org_id=chain.org_id,
+                kind=JobKind.keeper_sync_project,
+                subject_label="pipelines",
+            )
+    status, activity, _project_jobs = await _run_snapshot(chain.run_id)
+    assert activity.pending_count == 0
+    assert status == KeeperSyncRunStatus.partial_failure
+    assert chain.run_completed_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_cancelled_continuation_records_its_slice(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A continuation cancelled mid-slice records where in the chain it was.
+
+    Cancelled on the second slice's only edition, the row's ``progress``
+    carries that slice's index and its own walk — the editions left after
+    the cursor, not the product's whole list — read live from the
+    service, since a cancelled ``sync_project`` returns nothing.
+    """
+    chain = await _prepare_slice_chain(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        edition_count=2,
+        with_run=False,
+    )
+    assert await keeper_sync_project(chain.ctx, chain.first_payload) == (
+        "completed"
+    )
+    [continuation_payload] = chain.continuation_payloads()
+    reached = _hang_route(
+        mock_discovery.get(
+            f"{LTD_BASE}/builds/{_SLICED_BRANCH_BUILD_OFFSET + 2}"
+        )
+    )
+
+    task = asyncio.create_task(
+        keeper_sync_project(chain.ctx, continuation_payload)
+    )
+    await _cancel_when_reached(task, reached)
+    await chain.ctx["http_client"].aclose()
+
+    cancelled = await _get_queue_job(continuation_payload["queue_job_id"])
+    assert cancelled.status == JobStatus.failed
+    assert cancelled.progress == {
+        "slice_index": 1,
+        "editions_total": 2,
+        "editions_visited": 0,
+        "editions_remaining": 1,
+        "last_visited_ltd_edition_id": None,
+    }
+
+
+def test_keeper_sync_project_slice_budget_follows_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each job's budget is ``keeper_sync_slice_budget_seconds`` from now."""
+    monkeypatch.setattr(worker_config, "keeper_sync_slice_budget_seconds", 120)
+
+    budget = keeper_sync_worker_module._start_slice_budget()
+
+    assert 119 < budget.remaining() <= 120
+    assert not budget.exhausted()

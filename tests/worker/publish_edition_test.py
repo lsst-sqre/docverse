@@ -17,7 +17,7 @@ from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
@@ -33,6 +33,7 @@ from docverse.models import (
 )
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
+from docverse_server.config import config as worker_config
 from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.queue_job import SqlQueueJob
@@ -75,6 +76,7 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.publish_edition import publish_edition
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import get_jobs_by_name
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.worker.conftest import make_worker_ctx
@@ -2508,3 +2510,251 @@ async def test_publish_edition_legacy_payload_skips_build_the_edition_left(
             assert job.status == JobStatus.completed
             assert job.progress is not None
             assert job.progress["superseded_skipped"] is True
+
+
+class _HangingPublisher(_FailingPublisher):
+    """An EditionPublisher whose ``publish`` hangs until it is cancelled.
+
+    Stands in for a publish arq cancels mid-flight — its per-job timeout,
+    or a rolling deploy's SIGTERM — while the edge write is in progress.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(RuntimeError("unused"))
+        self.hang = HangUntilCancelled()
+
+    async def publish(
+        self,
+        *,
+        project_slug: str,
+        edition_slug: str,
+        build_public_id: str,
+        object_key_prefix: str,
+        cache_profile: CacheProfile,
+    ) -> None:
+        await self.hang(
+            project_slug,
+            edition_slug,
+            build_public_id,
+            object_key_prefix,
+            cache_profile,
+        )
+
+
+@pytest.mark.parametrize(
+    ("started_ago", "expected_reason"),
+    [
+        pytest.param(None, "worker_shutdown", id="worker_shutdown"),
+        pytest.param(
+            timedelta(
+                seconds=worker_config.publish_edition_job_timeout_seconds
+            )
+            + timedelta(minutes=1),
+            "job_timeout",
+            id="job_timeout",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_publish_edition_cancel_fails_row_and_finalises_run(
+    *,
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    started_ago: timedelta | None,
+    expected_reason: str,
+) -> None:
+    """An arq cancel mid-publish fails the row and finalises its run.
+
+    The publish is a keeper-sync run's only child, cancelled while the
+    edge write is in flight. Its row must not sit ``in_progress`` until
+    ``publish_edition_reaper``: it fails with a ``CancelledError``
+    payload whose ``reason`` follows the elapsed time against the
+    default pool's ``publish_edition_job_timeout_seconds``, the run
+    rolls up to ``partial_failure`` with ``keeper_sync_run_completed``
+    published, and the cancel re-raises so arq records the job failed.
+    """
+    publisher = _HangingPublisher()
+    _manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_store = OrganizationStore(session=db_session, logger=_logger())
+        run_org = await org_store.create(
+            OrganizationCreate(
+                slug="pub-cancel-run-org",
+                title="Run Org",
+                base_domain="pub-cancel-run-org.example.com",
+            )
+        )
+        run_id = await _seed_keeper_sync_run(db_session, org_id=run_org.id)
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-cancel-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-cancel",
+            keeper_sync_run_id=run_id,
+        )
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(publisher),
+    )
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-cancel",
+        events=events,
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    async def _backdate() -> None:
+        if started_ago is None:
+            return
+        async for session in db_session_dependency():
+            async with session.begin():
+                await session.execute(
+                    update(SqlQueueJob)
+                    .where(SqlQueueJob.id == queue_job.id)
+                    .values(date_started=func.now() - started_ago)
+                )
+
+    task = asyncio.create_task(publish_edition(ctx, payload))
+    await cancel_when_reached(
+        task, publisher.hang.reached, before_cancel=_backdate
+    )
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            job = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job.id
+            )
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.errors is not None
+            assert job.errors["type"] == "CancelledError"
+            assert job.errors["reason"] == expected_reason
+            assert job.errors["timeout_seconds"] == (
+                worker_config.publish_edition_job_timeout_seconds
+            )
+            run = await KeeperSyncRunStore(
+                session=session, logger=_logger()
+            ).get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.partial_failure
+
+    run_completed = events.keeper_sync_run_completed
+    assert isinstance(run_completed, MockEventPublisher)
+    assert len(run_completed.published) == 1
+    event = run_completed.published[0]
+    assert event.success is False
+    assert event.failed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_edition_cancel_during_purge_keeps_completed_run(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel after the row completed leaves the publish and its run be.
+
+    ``publish_edition`` completes its row — and so finalises a run whose
+    last child it is — *before* the best-effort CDN purge, precisely so a
+    cancel during the purge costs only the purge. Recording that cancel
+    must not then fail the completed row, move the ``succeeded`` run, or
+    publish a second ``keeper_sync_run_completed``.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_store = OrganizationStore(session=db_session, logger=_logger())
+        run_org = await org_store.create(
+            OrganizationCreate(
+                slug="pub-purge-run-org",
+                title="Run Org",
+                base_domain="pub-purge-run-org.example.com",
+            )
+        )
+        run_id = await _seed_keeper_sync_run(db_session, org_id=run_org.id)
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            _history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-purge-run-cancel-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-purge-run-cancel",
+            keeper_sync_run_id=run_id,
+        )
+
+    async def _create_purger(
+        self: Factory,
+        *,
+        org_id: int,
+        service_label: str,
+    ) -> Any:
+        _ = (self, org_id, service_label)
+        return _CancellingCdnCachePurger()
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(MockEditionPublisher()),
+    )
+    monkeypatch.setattr(
+        Factory, "create_cdn_cache_purger_for_org", _create_purger
+    )
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-purge-run-cancel",
+        cdn_purge_enabled=True,
+        events=events,
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    with capture_logs() as logs, pytest.raises(asyncio.CancelledError):
+        await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert not [log for log in logs if log["event"] == "Queue job cancelled"]
+    async for session in db_session_dependency():
+        async with session.begin():
+            job = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job.id
+            )
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.errors is None
+            run = await KeeperSyncRunStore(
+                session=session, logger=_logger()
+            ).get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.succeeded
+
+    run_completed = events.keeper_sync_run_completed
+    assert isinstance(run_completed, MockEventPublisher)
+    assert len(run_completed.published) == 1
+    assert run_completed.published[0].success is True

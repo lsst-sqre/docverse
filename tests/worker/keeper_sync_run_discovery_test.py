@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -28,6 +29,7 @@ from docverse.models import (
     KeeperSyncRunStatus,
     OrganizationCreate,
 )
+from docverse_server.config import config as worker_config
 from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import (
@@ -56,6 +58,7 @@ from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.keeper_sync import (
     keeper_sync_run_discovery,
 )
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.worker.conftest import make_worker_ctx
 
@@ -1571,3 +1574,71 @@ async def test_preview_and_run_report_the_same_scope_counts(
     assert fanned_out == [
         s for s in preview.in_scope_slugs if s not in preview.tombstoned_slugs
     ]
+
+
+@pytest.mark.asyncio
+async def test_discovery_cancel_fails_row_and_run(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An arq cancel mid-discovery fails the row and the run (#699).
+
+    The job is cancelled while it waits on LTD's product list, as arq's
+    timeout or a rolling deploy's SIGTERM would catch it. The row fails
+    with a ``CancelledError`` payload measured against the sync pool's
+    ``keeper_sync_job_timeout_seconds``, and the run — which has no
+    children and never will — goes ``failed`` through
+    ``fail_run_for_lost_discovery``, the same verdict discovery's own
+    error path and the reaper's abandoned-discovery sweep reach. The
+    org's run mutex is therefore free at once rather than 409-blocking
+    the next run until ``keeper_sync_reaper`` notices.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(
+            db_session, project_slugs=["dmtn-001"]
+        )
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_discovery_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+    hang = HangUntilCancelled()
+    mock_discovery.get("https://keeper.lsst.codes/products/").mock(
+        side_effect=hang
+    )
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+
+    task = asyncio.create_task(
+        keeper_sync_run_discovery(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+            },
+        )
+    )
+    await cancel_when_reached(task, hang.reached)
+    await ctx["http_client"].aclose()
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            disc = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job_id
+            )
+            assert disc is not None
+            assert disc.status == JobStatus.failed
+            assert disc.errors is not None
+            assert disc.errors["type"] == "CancelledError"
+            assert disc.errors["reason"] == "worker_shutdown"
+            assert disc.errors["timeout_seconds"] == (
+                worker_config.keeper_sync_job_timeout_seconds
+            )
+            run = await KeeperSyncRunStore(
+                session=session, logger=_logger()
+            ).get(run_id)
+            assert run is not None
+            assert run.status == KeeperSyncRunStatus.failed

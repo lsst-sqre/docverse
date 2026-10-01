@@ -57,6 +57,10 @@ from docverse_server.exceptions import NotFoundError
 from docverse_server.metrics import EditionReconcileCompletedEvent
 from docverse_server.sentry import capture_warning
 from docverse_server.services.edition_reconcile import EditionReconcileOutcome
+from docverse_server.worker.functions._cancellation import (
+    cancellation_recorded,
+    record_cancellation,
+)
 
 __all__ = ["RECONCILED_DRIFT_MESSAGE", "edition_reconcile"]
 
@@ -69,6 +73,7 @@ tick lands in one issue whose events an operator filters by the
 """
 
 
+@cancellation_recorded
 async def edition_reconcile(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
@@ -90,6 +95,14 @@ async def edition_reconcile(
         ``"completed_with_errors"`` when at least one action failed. A
         failure that makes the whole tick impossible marks the queue job
         ``failed`` and re-raises so arq logs the job as failed.
+
+    Raises
+    ------
+    asyncio.CancelledError
+        When arq cancels the job — the maintenance pool's per-job
+        timeout, or a worker shutdown — after
+        :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+        has failed the row.
     """
     org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]
@@ -110,44 +123,58 @@ async def edition_reconcile(
             if await queue_job_store.start_if_queued(queue_job_id) is None:
                 return "skipped"
 
-        try:
-            async with session.begin():
-                org = await factory.create_org_store().get_by_id(org_id)
-            if org is None:
-                msg = f"Organization {org_id} not found"
-                raise NotFoundError(msg)
-            service = factory.create_edition_reconcile_service()
-            outcome = await service.reconcile_org(
-                org, limit=config.edition_reconcile_max_actions_per_job
-            )
-        except Exception as exc:
-            logger.exception("Edition reconciliation failed for org")
-            async with session.begin():
-                await queue_job_store.fail(
-                    queue_job_id,
-                    errors={
-                        "message": str(exc),
-                        "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(),
-                    },
-                )
-            raise
-
-        async with session.begin():
-            await queue_job_store.update_progress(
-                queue_job_id, outcome.as_progress()
-            )
-            await queue_job_store.complete(
-                queue_job_id, has_errors=outcome.has_errors
-            )
-        await _report_tick(
-            ctx=ctx,
-            org_slug=org_slug,
-            outcome=outcome,
-            started=started,
+        # From here on the tick holds an ``in_progress`` row — and with it
+        # the org's reconcile mutex — which arq's timeout or a worker
+        # shutdown would otherwise strand for ``edition_reconcile_reaper``:
+        # their ``CancelledError`` bypasses the ``except Exception`` below
+        # (PRD #765). There is no run to roll up; the row is the tick's
+        # whole record.
+        async with record_cancellation(
+            ctx,
+            queue_job_id=queue_job_id,
+            timeout_seconds=config.maintenance_job_timeout_seconds,
             logger=logger,
-        )
-        return "completed_with_errors" if outcome.has_errors else "completed"
+        ):
+            try:
+                async with session.begin():
+                    org = await factory.create_org_store().get_by_id(org_id)
+                if org is None:
+                    msg = f"Organization {org_id} not found"
+                    raise NotFoundError(msg)
+                service = factory.create_edition_reconcile_service()
+                outcome = await service.reconcile_org(
+                    org, limit=config.edition_reconcile_max_actions_per_job
+                )
+            except Exception as exc:
+                logger.exception("Edition reconciliation failed for org")
+                async with session.begin():
+                    await queue_job_store.fail(
+                        queue_job_id,
+                        errors={
+                            "message": str(exc),
+                            "type": type(exc).__name__,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                raise
+
+            async with session.begin():
+                await queue_job_store.update_progress(
+                    queue_job_id, outcome.as_progress()
+                )
+                await queue_job_store.complete(
+                    queue_job_id, has_errors=outcome.has_errors
+                )
+            await _report_tick(
+                ctx=ctx,
+                org_slug=org_slug,
+                outcome=outcome,
+                started=started,
+                logger=logger,
+            )
+            return (
+                "completed_with_errors" if outcome.has_errors else "completed"
+            )
 
     msg = "No database session available"
     raise RuntimeError(msg)

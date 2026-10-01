@@ -9,7 +9,15 @@ from typing import Any
 import structlog
 from redis.exceptions import RedisError
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import ColumnExpressionArgument, and_, or_, select, update
+from sqlalchemy import (
+    ColumnExpressionArgument,
+    Interval,
+    and_,
+    or_,
+    select,
+    type_coerce,
+    update,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
@@ -392,6 +400,32 @@ class QueueJobStore:
             return None
         return QueueJob.model_validate(row, from_attributes=True)
 
+    async def get_elapsed_since_start(self, job_id: int) -> timedelta | None:
+        """Return how long a job has been running, on the database's clock.
+
+        Computes ``now() - date_started`` in SQL. ``date_started`` is
+        stamped with the database's ``now()`` at pickup, so measuring
+        against the same clock keeps any skew between a worker pod and
+        the database out of the result — which matters to the arq
+        cancellation helper, whose ``job_timeout`` / ``worker_shutdown``
+        verdict compares this against the pool timeout. ``now()`` is the
+        current transaction's start time, so call this early in a short
+        transaction.
+
+        Returns
+        -------
+        datetime.timedelta or None
+            The running time, or ``None`` when the row does not exist or
+            has not been picked up (``date_started`` is ``NULL``).
+        """
+        # ``timestamptz - timestamptz`` is an ``interval`` in PostgreSQL;
+        # ``type_coerce`` only tells SQLAlchemy (and mypy) so.
+        elapsed = type_coerce(func.now() - SqlQueueJob.date_started, Interval)
+        result = await self._session.execute(
+            select(elapsed).where(SqlQueueJob.id == job_id)
+        )
+        return result.scalar_one_or_none()
+
     async def get_by_public_id(self, public_id: int) -> QueueJob | None:
         """Fetch a QueueJob by public Base32 id (int form)."""
         result = await self._session.execute(
@@ -686,6 +720,50 @@ class QueueJobStore:
                 queue_job_kind=row.kind,
                 queue_job_status=row.status,
             )
+            return None
+        return await self._mark_failed(row, errors)
+
+    async def fail_if_undispatched(
+        self,
+        job_id: int,
+        *,
+        errors: dict[str, Any] | None = None,
+    ) -> QueueJob | None:
+        """Fail a row its creator committed but never handed to the backend.
+
+        A creator that commits a ``queue_jobs`` row and then enqueues its
+        job — the tier crons,
+        :class:`~docverse_server.services.queue_dispatch.QueueDispatcher` —
+        leaves an orphan (``status='queued'``, ``backend_job_id IS NULL``)
+        when arq cancels it between the two. The orphan sweeps fail such a row
+        only once it has idled past their window, holding any active-job
+        mutex until then; the arq cancellation helper calls this to fail
+        it at once instead (PRD #765).
+
+        The row is locked before it is read, and failed only while it is
+        still ``queued`` with no ``backend_job_id``: a stamped row's job
+        is in the queue backend and may yet run, and a started row
+        belongs to the worker running it.
+
+        Returns
+        -------
+        QueueJob or None
+            The failed job, or ``None`` when the row was stamped, started,
+            already terminal, or does not exist — the last being a row
+            whose creating transaction the cancel rolled back.
+        """
+        stmt = (
+            select(SqlQueueJob)
+            .where(SqlQueueJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        row = (await self._session.execute(stmt)).scalar_one_or_none()
+        if (
+            row is None
+            or row.status != JobStatus.queued.value
+            or row.backend_job_id is not None
+        ):
             return None
         return await self._mark_failed(row, errors)
 

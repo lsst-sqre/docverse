@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from docverse_server.config import (
     EDITION_RECONCILE_REAPER_MARGIN_SECONDS,
     KEEPER_SYNC_REAPER_MARGIN_SECONDS,
+    KEEPER_SYNC_SLICE_MARGIN_SECONDS,
     Configuration,
 )
 from docverse_server.services.keeper_sync.copier import (
@@ -76,6 +77,8 @@ def test_keeper_sync_timeout_defaults() -> None:
     # 1 h timeout, so waiting another five hours parks the project
     # behind the partial unique index for nothing.
     assert config.keeper_sync_reaper_threshold_seconds != 21600
+    # The derived value sits exactly on the cap, so it is never capped.
+    assert config.keeper_sync_reaper_threshold_requested_seconds is None
 
 
 def test_keeper_sync_reaper_threshold_follows_job_timeout(
@@ -109,13 +112,46 @@ def test_keeper_sync_timeout_env_var_override(
 def test_keeper_sync_reaper_threshold_override_beats_derivation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An explicit threshold wins even when the job timeout is default."""
+    """An explicit threshold below the cap wins as it is."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_REAPER_THRESHOLD_SECONDS", "4000")
+    config = Configuration()
+    assert config.keeper_sync_job_timeout_seconds == 3600
+    assert config.keeper_sync_reaper_threshold_seconds == 4000
+    assert config.keeper_sync_reaper_threshold_requested_seconds is None
+
+
+def test_keeper_sync_reaper_threshold_capped_at_timeout_plus_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit threshold above timeout + margin is capped (PRD #765).
+
+    Phalanx pinned 21600 s, so a keeper-sync row cancelled at the 1 h
+    timeout sat ``in_progress`` for six hours and 409-blocked the org's
+    next run (#699). arq has already cancelled any job at its timeout,
+    so waiting past timeout + margin buys nothing whatever the operator
+    asked for. The requested value is kept so startup can warn about it.
+    """
     monkeypatch.setenv(
         "DOCVERSE_KEEPER_SYNC_REAPER_THRESHOLD_SECONDS", "21600"
     )
     config = Configuration()
-    assert config.keeper_sync_job_timeout_seconds == 3600
-    assert config.keeper_sync_reaper_threshold_seconds == 21600
+    assert config.keeper_sync_reaper_threshold_seconds == 5400
+    assert config.keeper_sync_reaper_threshold_requested_seconds == 21600
+
+
+def test_keeper_sync_reaper_threshold_cap_follows_job_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap is the configured timeout + margin, not a stock literal."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_JOB_TIMEOUT_SECONDS", "900")
+    monkeypatch.setenv(
+        "DOCVERSE_KEEPER_SYNC_REAPER_THRESHOLD_SECONDS", "21600"
+    )
+    config = Configuration()
+    assert config.keeper_sync_reaper_threshold_seconds == (
+        900 + KEEPER_SYNC_REAPER_MARGIN_SECONDS
+    )
+    assert config.keeper_sync_reaper_threshold_requested_seconds == 21600
 
 
 def test_keeper_sync_reaper_margin_clears_one_cron_gap() -> None:
@@ -131,6 +167,120 @@ def test_keeper_sync_reaper_margin_clears_one_cron_gap() -> None:
     assert config.keeper_sync_reaper_threshold_seconds > (
         config.keeper_sync_job_timeout_seconds + _REAPER_CRON_GAP_SECONDS - 1
     )
+
+
+def test_keeper_sync_slice_budget_default() -> None:
+    """The slice budget derives to the timeout less a 10-minute margin.
+
+    ``keeper_sync_project`` checks the budget only between editions, so
+    the margin is what the last edition a slice starts has to finish its
+    copy in before arq's timeout cancels the job (PRD #765).
+    """
+    config = Configuration()
+    assert KEEPER_SYNC_SLICE_MARGIN_SECONDS == 600
+    assert config.keeper_sync_slice_budget_seconds == (
+        config.keeper_sync_job_timeout_seconds
+        - KEEPER_SYNC_SLICE_MARGIN_SECONDS
+    )
+    assert config.keeper_sync_slice_budget_seconds == 3000
+
+
+def test_keeper_sync_slice_budget_follows_job_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lowering the job timeout alone drags the derived budget down."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_JOB_TIMEOUT_SECONDS", "900")
+    config = Configuration()
+    assert config.keeper_sync_slice_budget_seconds == 300
+
+
+def test_keeper_sync_slice_budget_floor_under_short_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A seconds-long test timeout still derives a usable budget.
+
+    Test/staging environments drive the job timeout down to seconds to
+    watch stuck-run handling; the timeout less the 600 s margin would be
+    negative there and refuse to start. Below a 900 s timeout the budget
+    is a third of the timeout instead, where the two rules meet.
+    """
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_JOB_TIMEOUT_SECONDS", "30")
+    config = Configuration()
+    assert config.keeper_sync_slice_budget_seconds == 10
+
+
+def test_keeper_sync_slice_budget_env_var_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit budget wins over the derivation.
+
+    Dev QA drives the budget down to minutes (PRD #765: 300 s) to watch a
+    mid-size project sync as a chain of slices, without touching the
+    timeout or the reaper threshold derived from it.
+    """
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_SLICE_BUDGET_SECONDS", "300")
+    config = Configuration()
+    assert config.keeper_sync_job_timeout_seconds == 3600
+    assert config.keeper_sync_slice_budget_seconds == 300
+
+
+@pytest.mark.parametrize("budget", ["0", "-60", "3600", "7200"])
+def test_keeper_sync_slice_budget_refuses_out_of_range(
+    monkeypatch: pytest.MonkeyPatch, budget: str
+) -> None:
+    """A budget outside ``(0, timeout)`` is refused, naming both fields.
+
+    At zero or below every slice stops before its first edition, so the
+    chain never makes progress; at or past the timeout arq cancels the
+    slice before its budget elapses, so it fails instead of continuing.
+    """
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_SLICE_BUDGET_SECONDS", budget)
+    with pytest.raises(ValidationError) as excinfo:
+        Configuration()
+    message = str(excinfo.value)
+    assert "keeper_sync_slice_budget_seconds" in message
+    assert "keeper_sync_job_timeout_seconds" in message
+
+
+@pytest.mark.parametrize(
+    ("name", "others"),
+    [
+        (
+            "keeper_sync_slice_budget_seconds",
+            (
+                "keeper_sync_job_timeout_seconds",
+                "keeper_sync_reaper_threshold_seconds",
+            ),
+        ),
+        (
+            "keeper_sync_job_timeout_seconds",
+            (
+                "keeper_sync_slice_budget_seconds",
+                "keeper_sync_reaper_threshold_seconds",
+            ),
+        ),
+        (
+            "keeper_sync_reaper_threshold_seconds",
+            (
+                "keeper_sync_slice_budget_seconds",
+                "keeper_sync_job_timeout_seconds",
+            ),
+        ),
+    ],
+)
+def test_keeper_sync_time_ladder_descriptions_cross_reference(
+    name: str, others: tuple[str, str]
+) -> None:
+    """Budget, timeout and reaper threshold read as one ladder.
+
+    The three numbers only make sense together (budget < timeout <
+    reaper threshold), and the descriptions are the operator-facing
+    documentation of each knob, so each one names the other two.
+    """
+    description = Configuration.model_fields[name].description
+    assert description is not None
+    for other in others:
+        assert f"``{other}``" in description
 
 
 def test_keeper_sync_copy_concurrency_default() -> None:

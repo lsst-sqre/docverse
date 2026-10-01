@@ -22,7 +22,10 @@ This module owns the ``docverse:sync-queue`` callable surface:
   are recorded on the job's ``progress`` and leave its status
   ``completed_with_errors``; a whole-project failure — including the
   service's systemic-outage abort after too many consecutive edition
-  failures — fails the job.
+  failures — fails the job. Each job is one *slice* of the project: it
+  stops walking editions once ``keeper_sync_slice_budget_seconds`` runs
+  out and hands the rest to a continuation job it enqueues itself, so a
+  project of any size converges across a chain of sub-timeout jobs.
 
 * ``keeper_sync_tier_main`` / ``_tier_discovery`` / ``_tier_other`` —
   cron-driven steady-state reconcilers that enqueue ``keeper_sync_
@@ -32,9 +35,10 @@ This module owns the ``docverse:sync-queue`` callable surface:
 
 from __future__ import annotations
 
+import time
 import traceback
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -56,10 +60,15 @@ from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
 from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.domain.organization import Organization
+from docverse_server.domain.queue import QueueJob
 from docverse_server.factory import Factory
 from docverse_server.metrics import BuildContentCopiedEvent, DocverseEvents
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
+)
+from docverse_server.services.keeper_sync.budget import (
+    SliceBudget,
+    SliceProgress,
 )
 from docverse_server.services.keeper_sync.scheduler import (
     _TIER_ANNOTATION_KEYS,
@@ -108,8 +117,17 @@ from docverse_server.storage.ltd import (
     LtdNotFoundError,
     LtdProductsError,
 )
+from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+    cancellation_recorded,
+    discovery_run_finaliser,
+    keeper_sync_run_finaliser,
+    record_cancellation,
+    record_handoff_cancellation,
+)
 from docverse_server.worker.functions._reaper_log import (
     create_reaped_jobs_payload,
 )
@@ -434,6 +452,7 @@ async def keeper_sync_reaper(ctx: dict[str, Any]) -> str:
     raise RuntimeError(msg)
 
 
+@cancellation_recorded
 async def keeper_sync_run_discovery(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
@@ -465,6 +484,16 @@ async def keeper_sync_run_discovery(
     str
         ``"completed"`` on a clean fan-out (including the empty case)
         or ``"failed"`` if discovery itself errored before fan-out.
+
+    Raises
+    ------
+    asyncio.CancelledError
+        When arq cancels the job — its ``keeper_sync_job_timeout_seconds``
+        timeout, or a worker shutdown. Before re-raising,
+        :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+        fails the row and drives the run ``failed`` through
+        :func:`fail_run_for_lost_discovery`, as the ``except`` branch
+        does for an error.
     """
     org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]
@@ -486,112 +515,128 @@ async def keeper_sync_run_discovery(
             # running. The discovery must not fan out a second time.
             if await queue_job_store.start_if_queued(queue_job_id) is None:
                 return "skipped"
-        await _reconcile_run_children(
-            session=session,
-            queue_job_store=queue_job_store,
-            queue_backend=factory.create_queue_backend(),
-            run_id=run_id,
+        # From here on the job holds an ``in_progress`` row. arq's
+        # timeout and a worker shutdown both cancel the job with a
+        # ``CancelledError`` that the ``except Exception`` below never
+        # sees, so the helper fails the row and the run on that path —
+        # otherwise the run 409-blocks the org until
+        # ``keeper_sync_reaper`` notices (#699).
+        async with record_cancellation(
+            ctx,
+            queue_job_id=queue_job_id,
+            timeout_seconds=config.keeper_sync_job_timeout_seconds,
             logger=logger,
-        )
-
-        try:
-            config = await _load_config_snapshot(
-                session=session,
-                factory=factory,
-                org_slug=org_slug,
-            )
-            if not config.enabled:
-                msg = (
-                    f"Keeper sync is disabled for organization "
-                    f"{org_slug!r}; aborting discovery"
-                )
-                raise RuntimeError(msg)
-
-            ltd_slugs = await _fetch_ltd_product_slugs(
-                factory=factory, config=config, logger=logger
-            )
-            in_scope, excluded_count = _resolve_scope(ltd_slugs, config)
-            # Drop tombstoned project slugs from the fan-out so we do
-            # not enqueue ``keeper_sync_project`` children that
-            # ``sync_project`` would only short-circuit on its own
-            # tombstone check (PRD #332 / user story 17). The empty-
-            # fan-out finalisation path below covers the case where
-            # tombstones consume the entire in-scope set.
-            state_store = factory.create_keeper_sync_state_store()
-            tombstoned_slugs = await _fetch_tombstoned_project_slugs(
-                state_store=state_store, session=session, org_id=org_id
-            )
-            fan_out, counts = _subtract_tombstones(
-                ltd_slugs=ltd_slugs,
-                in_scope=in_scope,
-                excluded_count=excluded_count,
-                tombstoned_slugs=tombstoned_slugs,
-            )
-            logger.info(
-                "Resolved keeper-sync run scope", **counts.as_log_fields()
-            )
-
-            enqueued_count = await _enqueue_children(
-                ctx=ctx,
+            finalise_run=discovery_run_finaliser(run_id),
+        ):
+            await _reconcile_run_children(
                 session=session,
                 queue_job_store=queue_job_store,
-                run_store=run_store,
-                org_id=org_id,
-                org_slug=org_slug,
+                queue_backend=factory.create_queue_backend(),
                 run_id=run_id,
-                ltd_base_url=str(config.ltd_base_url),
-                ltd_slugs=fan_out,
                 logger=logger,
             )
 
-            async with session.begin():
-                await queue_job_store.update_phase(
-                    queue_job_id,
-                    "complete",
-                    progress={
-                        "message": "Discovery complete",
-                        "in_scope_count": counts.in_scope_count,
-                        "fan_out_count": counts.fan_out_count,
-                        "enqueued_count": enqueued_count,
-                    },
+            try:
+                sync_config = await _load_config_snapshot(
+                    session=session,
+                    factory=factory,
+                    org_slug=org_slug,
                 )
-                await queue_job_store.complete(queue_job_id)
-                # Empty fan-out OR all-skipped fan-out: no children
-                # attributed to this run, so the parent will never
-                # finalise on a child terminal. Terminate it here.
-                if enqueued_count == 0:
+                if not sync_config.enabled:
+                    msg = (
+                        f"Keeper sync is disabled for organization "
+                        f"{org_slug!r}; aborting discovery"
+                    )
+                    raise RuntimeError(msg)
+
+                ltd_slugs = await _fetch_ltd_product_slugs(
+                    factory=factory, config=sync_config, logger=logger
+                )
+                in_scope, excluded_count = _resolve_scope(
+                    ltd_slugs, sync_config
+                )
+                # Drop tombstoned project slugs from the fan-out so we do
+                # not enqueue ``keeper_sync_project`` children that
+                # ``sync_project`` would only short-circuit on its own
+                # tombstone check (PRD #332 / user story 17). The empty-
+                # fan-out finalisation path below covers the case where
+                # tombstones consume the entire in-scope set.
+                state_store = factory.create_keeper_sync_state_store()
+                tombstoned_slugs = await _fetch_tombstoned_project_slugs(
+                    state_store=state_store, session=session, org_id=org_id
+                )
+                fan_out, counts = _subtract_tombstones(
+                    ltd_slugs=ltd_slugs,
+                    in_scope=in_scope,
+                    excluded_count=excluded_count,
+                    tombstoned_slugs=tombstoned_slugs,
+                )
+                logger.info(
+                    "Resolved keeper-sync run scope", **counts.as_log_fields()
+                )
+
+                enqueued_count = await _enqueue_children(
+                    ctx=ctx,
+                    session=session,
+                    queue_job_store=queue_job_store,
+                    run_store=run_store,
+                    org_id=org_id,
+                    org_slug=org_slug,
+                    run_id=run_id,
+                    ltd_base_url=str(sync_config.ltd_base_url),
+                    ltd_slugs=fan_out,
+                    logger=logger,
+                )
+
+                async with session.begin():
+                    await queue_job_store.update_phase(
+                        queue_job_id,
+                        "complete",
+                        progress={
+                            "message": "Discovery complete",
+                            "in_scope_count": counts.in_scope_count,
+                            "fan_out_count": counts.fan_out_count,
+                            "enqueued_count": enqueued_count,
+                        },
+                    )
+                    await queue_job_store.complete(queue_job_id)
+                    # Empty fan-out OR all-skipped fan-out: no children
+                    # attributed to this run, so the parent will never
+                    # finalise on a child terminal. Terminate it here.
+                    if enqueued_count == 0:
+                        await run_store.transition_status(
+                            run_id=run_id,
+                            new_status=KeeperSyncRunStatus.succeeded,
+                        )
+                logger.info(
+                    "Keeper-sync discovery completed",
+                    in_scope_count=counts.in_scope_count,
+                    fan_out_count=counts.fan_out_count,
+                )
+            except Exception as exc:
+                sentry_sdk.capture_exception(exc)
+                logger.exception("Keeper-sync discovery failed")
+                async with session.begin():
+                    await queue_job_store.fail(
+                        queue_job_id,
+                        errors={
+                            "message": str(exc),
+                            "type": type(exc).__name__,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
                     await run_store.transition_status(
                         run_id=run_id,
-                        new_status=KeeperSyncRunStatus.succeeded,
+                        new_status=KeeperSyncRunStatus.failed,
                     )
-            logger.info(
-                "Keeper-sync discovery completed",
-                in_scope_count=counts.in_scope_count,
-                fan_out_count=counts.fan_out_count,
-            )
-        except Exception as exc:
-            sentry_sdk.capture_exception(exc)
-            logger.exception("Keeper-sync discovery failed")
-            async with session.begin():
-                await queue_job_store.fail(
-                    queue_job_id,
-                    errors={
-                        "message": str(exc),
-                        "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(),
-                    },
-                )
-                await run_store.transition_status(
-                    run_id=run_id,
-                    new_status=KeeperSyncRunStatus.failed,
-                )
-            return "failed"
+                return "failed"
         return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
 
 
+@cancellation_recorded
 async def keeper_sync_project(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
@@ -636,6 +681,29 @@ async def keeper_sync_project(
        as failed. Both branches call :func:`maybe_finalise_run` so a
        terminal child cannot leave the parent run stuck in
        ``in_progress``.
+    5. If arq cancels the job instead — its
+       ``keeper_sync_job_timeout_seconds`` timeout, or a worker shutdown
+       — the ``CancelledError`` bypasses that ``except Exception``, so
+       :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+       fails the row from a fresh session (``errors["reason"]`` tells
+       ``job_timeout`` from ``worker_shutdown``), records the slice's
+       live position (see :class:`_ProjectSyncProgress`), finalises the
+       parent run when there is one, and re-raises. Without it the row
+       sat ``in_progress`` and the run 409-blocked the org until
+       ``keeper_sync_reaper`` noticed (#699).
+
+    Each job is one *slice* of the project's sync (PRD #765). The service
+    walks editions under a :class:`SliceBudget` of
+    ``keeper_sync_slice_budget_seconds``, resuming after the payload's
+    ``resume_after_ltd_edition_id`` cursor, and stops between editions
+    once the budget runs out. A slice that stopped there hands the rest
+    of the walk to a continuation job (see :func:`_continue_in_new_job`);
+    one that stopped before visiting any edition does not continue (the
+    no-progress guard), so a chain can never loop on an edition too big
+    for a slice. Every slice records its position on its row's
+    ``progress``: ``slice_index``, ``editions_total``,
+    ``editions_visited``, ``editions_remaining``,
+    ``last_visited_ltd_edition_id``, and ``continued``.
 
     :meth:`~KeeperSyncService.sync_project` gives each edition its own
     failure boundary, so an unreadable LTD build no longer reaches the
@@ -669,9 +737,21 @@ async def keeper_sync_project(
     queue_job_id: int = payload["queue_job_id"]
     ltd_slug: str = payload["ltd_slug"]
     ltd_base_url: str = payload["ltd_base_url"]
+    # Set only on a continuation job, which an earlier slice of the same
+    # project enqueued; the first slice of a chain starts from the top.
+    resume_after_ltd_edition_id: int | None = payload.get(
+        "resume_after_ltd_edition_id"
+    )
+    slice_index: int = payload.get("slice_index", 0)
+    started = time.monotonic()
     logger = structlog.get_logger(
         "docverse_server.worker.keeper_sync_project"
-    ).bind(org=org_slug, run_id=run_id, ltd_slug=ltd_slug)
+    ).bind(
+        org=org_slug,
+        run_id=run_id,
+        ltd_slug=ltd_slug,
+        slice_index=slice_index,
+    )
 
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
@@ -684,113 +764,221 @@ async def keeper_sync_project(
             # failed this row and, for a run child, rolled the parent run
             # up on its behalf — or arq may have re-delivered a job
             # another worker is still running.
-            if await queue_job_store.start_if_queued(queue_job_id) is None:
+            queue_job = await queue_job_store.start_if_queued(queue_job_id)
+            if queue_job is None:
                 return "skipped"
             org = await org_store.get_by_id(org_id)
 
-        try:
-            if org is None:
-                msg = f"Organization {org_id} not found"
-                raise RuntimeError(msg)
-            publishing_store_label = org.publishing_store_label
-            if publishing_store_label is None:
-                msg = (
-                    f"Org {org_id} has no publishing_store_label "
-                    "configured; keeper-sync requires a publishing "
-                    "object store"
+        # From here on the job holds an ``in_progress`` row. arq's
+        # timeout and a worker shutdown both cancel the job with a
+        # ``CancelledError`` that the ``except Exception`` below never
+        # sees, so the helper fails the row and rolls the run up on that
+        # path instead of leaving both to the reaper (#699).
+        progress = _ProjectSyncProgress(slice_index=slice_index)
+        async with record_cancellation(
+            ctx,
+            queue_job_id=queue_job_id,
+            timeout_seconds=config.keeper_sync_job_timeout_seconds,
+            logger=logger,
+            progress=progress.snapshot,
+            finalise_run=keeper_sync_run_finaliser(run_id),
+        ):
+            try:
+                if org is None:
+                    msg = f"Organization {org_id} not found"
+                    raise RuntimeError(msg)
+                publishing_store_label = org.publishing_store_label
+                if publishing_store_label is None:
+                    msg = (
+                        f"Org {org_id} has no publishing_store_label "
+                        "configured; keeper-sync requires a publishing "
+                        "object store"
+                    )
+                    raise RuntimeError(msg)
+
+                service = factory.create_keeper_sync_service(
+                    org_id=org_id,
+                    service_label=publishing_store_label,
+                    ltd_base_url=ltd_base_url,
+                    on_build_copied=_build_on_build_copied(
+                        events=ctx.get("events"),
+                        org_slug=org_slug,
+                        ltd_slug=ltd_slug,
+                    ),
                 )
-                raise RuntimeError(msg)
 
-            service = factory.create_keeper_sync_service(
-                org_id=org_id,
-                service_label=publishing_store_label,
-                ltd_base_url=ltd_base_url,
-                on_build_copied=_build_on_build_copied(
-                    events=ctx.get("events"),
-                    org_slug=org_slug,
+                restamp_only_project_ids: set[int] = set()
+                on_edition_synced = _build_on_edition_synced(
+                    factory=factory,
+                    session=session,
+                    queue_job_store=queue_job_store,
+                    org_id=org_id,
+                    run_id=run_id,
+                    logger=logger,
+                    restamp_only_project_ids=restamp_only_project_ids,
+                )
+
+                sync_result = await service.sync_project(
+                    org_id=org_id,
                     ltd_slug=ltd_slug,
-                ),
-            )
+                    on_edition_synced=on_edition_synced,
+                    budget=_start_slice_budget(),
+                    resume_after_ltd_edition_id=resume_after_ltd_edition_id,
+                    progress=progress.walk,
+                )
+                await _self_heal_unpublished_editions(
+                    factory=factory,
+                    session=session,
+                    queue_job_store=queue_job_store,
+                    org_id=org_id,
+                    run_id=run_id,
+                    sync_result=sync_result,
+                    logger=logger,
+                )
+                await _enqueue_dashboard_for_restamps(
+                    factory=factory,
+                    session=session,
+                    org_id=org_id,
+                    project_ids=restamp_only_project_ids,
+                    logger=logger,
+                )
+            except Exception as exc:
+                sentry_sdk.capture_exception(exc)
+                logger.exception("Keeper-sync project failed")
+                completion: KeeperSyncRunWithActivity | None = None
+                async with session.begin():
+                    await queue_job_store.fail(
+                        queue_job_id,
+                        errors={
+                            "message": str(exc),
+                            "type": type(exc).__name__,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                    if run_id is not None:
+                        completion = await maybe_finalise_run(
+                            run_store=run_store, run_id=run_id
+                        )
+                await publish_run_completed(
+                    events=ctx.get("events"),
+                    session=session,
+                    org_store=org_store,
+                    completion=completion,
+                    logger=logger,
+                )
+                raise
 
-            restamp_only_project_ids: set[int] = set()
-            on_edition_synced = _build_on_edition_synced(
-                factory=factory,
+            if sync_result.stopped_at_budget and sync_result.editions_visited:
+                return await _continue_in_new_job(
+                    ctx=ctx,
+                    session=session,
+                    queue_job_store=queue_job_store,
+                    run_store=run_store,
+                    org_store=org_store,
+                    queue_job=queue_job,
+                    payload=payload,
+                    run_id=run_id,
+                    sync_result=sync_result,
+                    progress=progress,
+                    started=started,
+                    logger=logger,
+                )
+            return await _end_chain(
+                ctx=ctx,
                 session=session,
                 queue_job_store=queue_job_store,
-                org_id=org_id,
-                run_id=run_id,
-                logger=logger,
-                restamp_only_project_ids=restamp_only_project_ids,
-            )
-
-            sync_result = await service.sync_project(
-                org_id=org_id,
-                ltd_slug=ltd_slug,
-                on_edition_synced=on_edition_synced,
-            )
-            await _self_heal_unpublished_editions(
-                factory=factory,
-                session=session,
-                queue_job_store=queue_job_store,
-                org_id=org_id,
+                run_store=run_store,
+                org_store=org_store,
+                queue_job_id=queue_job_id,
                 run_id=run_id,
                 sync_result=sync_result,
+                progress=progress,
+                resume_after_ltd_edition_id=resume_after_ltd_edition_id,
                 logger=logger,
             )
-            await _enqueue_dashboard_for_restamps(
-                factory=factory,
-                session=session,
-                org_id=org_id,
-                project_ids=restamp_only_project_ids,
-                logger=logger,
-            )
-        except Exception as exc:
-            sentry_sdk.capture_exception(exc)
-            logger.exception("Keeper-sync project failed")
-            completion: KeeperSyncRunWithActivity | None = None
-            async with session.begin():
-                await queue_job_store.fail(
-                    queue_job_id,
-                    errors={
-                        "message": str(exc),
-                        "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(),
-                    },
-                )
-                if run_id is not None:
-                    completion = await maybe_finalise_run(
-                        run_store=run_store, run_id=run_id
-                    )
-            await publish_run_completed(
-                events=ctx.get("events"),
-                session=session,
-                org_store=org_store,
-                completion=completion,
-                logger=logger,
-            )
-            raise
-
-        edition_failures = sync_result.edition_failures
-        completion = await _finalise_project_job(
-            session=session,
-            queue_job_store=queue_job_store,
-            run_store=run_store,
-            queue_job_id=queue_job_id,
-            run_id=run_id,
-            edition_failures=edition_failures,
-        )
-        await publish_run_completed(
-            events=ctx.get("events"),
-            session=session,
-            org_store=org_store,
-            completion=completion,
-            logger=logger,
-        )
-        _log_project_completion(logger=logger, sync_result=sync_result)
-        return "completed_with_errors" if edition_failures else "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+def _start_slice_budget() -> SliceBudget:
+    """Start this job's slice budget of ``keeper_sync_slice_budget_seconds``.
+
+    A module-level seam so tests can substitute a budget read against a
+    clock they move by hand.
+    """
+    return SliceBudget.starting_now(config.keeper_sync_slice_budget_seconds)
+
+
+async def _end_chain(
+    *,
+    ctx: dict[str, Any],
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    run_store: KeeperSyncRunStore,
+    org_store: OrganizationStore,
+    queue_job_id: int,
+    run_id: int | None,
+    sync_result: ProjectSyncResult,
+    progress: _ProjectSyncProgress,
+    resume_after_ltd_edition_id: int | None,
+    logger: structlog.stdlib.BoundLogger,
+) -> str:
+    """Close a slice that ends its project's chain of jobs.
+
+    Either the walk reached the end of LTD's edition list, or the budget
+    ran out before the slice visited a single edition. The second is the
+    no-progress guard: re-enqueueing would only stop at the same place,
+    so the chain ends with the row ``completed_with_errors``, its
+    ``progress`` saying why (``"reason": "no_progress"``), and a
+    warning. Either way the row records ``"continued": false``, and the
+    parent run rolls up as for any finished child.
+    """
+    no_progress = sync_result.stopped_at_budget
+    edition_failures = sync_result.edition_failures
+    slice_record = progress.snapshot() | {"continued": False}
+    if no_progress:
+        slice_record["reason"] = "no_progress"
+    completion = await _finalise_project_job(
+        session=session,
+        queue_job_store=queue_job_store,
+        run_store=run_store,
+        queue_job_id=queue_job_id,
+        run_id=run_id,
+        edition_failures=edition_failures,
+        slice_record=slice_record,
+        has_errors=bool(edition_failures) or no_progress,
+    )
+    await publish_run_completed(
+        events=ctx.get("events"),
+        session=session,
+        org_store=org_store,
+        completion=completion,
+        logger=logger,
+    )
+    if no_progress:
+        logger.warning(
+            "Keeper-sync slice made no progress within its budget;"
+            " not continuing",
+            editions_total=progress.walk.editions_total,
+            editions_remaining=progress.walk.editions_remaining,
+            resume_after_ltd_edition_id=resume_after_ltd_edition_id,
+            slice_budget_seconds=config.keeper_sync_slice_budget_seconds,
+        )
+        return "completed_with_errors"
+    _log_project_completion(logger=logger, sync_result=sync_result)
+    return "completed_with_errors" if edition_failures else "completed"
+
+
+def _job_progress(
+    slice_record: Mapping[str, Any],
+    edition_failures: Sequence[EditionSyncFailure],
+) -> dict[str, Any]:
+    """Merge a slice's position and its edition failures into one record."""
+    record = dict(slice_record)
+    if edition_failures:
+        record |= _edition_failure_progress(edition_failures)
+    return record
 
 
 async def _finalise_project_job(
@@ -801,16 +989,19 @@ async def _finalise_project_job(
     queue_job_id: int,
     run_id: int | None,
     edition_failures: Sequence[EditionSyncFailure],
+    slice_record: Mapping[str, Any],
+    has_errors: bool,
 ) -> KeeperSyncRunWithActivity | None:
-    """Close out a ``keeper_sync_project`` job that reached its end.
+    """Close out a ``keeper_sync_project`` job whose chain ends with it.
 
-    Records any per-edition failures the service isolated on the job's
-    ``progress`` and marks the job terminal in the *same* transaction
-    that rolls the parent run, so the job record and its terminal
-    status can never disagree. Returns whatever
-    :func:`maybe_finalise_run` returned (always ``None`` for a
-    tier-cron job, which carries no ``run_id``) for the caller to
-    publish after the transaction commits.
+    Records the slice's position (``slice_record``) and any per-edition
+    failures the service isolated on the job's ``progress`` and marks
+    the job terminal in the *same* transaction that rolls the parent
+    run, so the job record and its terminal status can never disagree.
+    ``has_errors`` picks ``completed_with_errors`` over ``completed``.
+    Returns whatever :func:`maybe_finalise_run` returned (always
+    ``None`` for a tier-cron job, which carries no ``run_id``) for the
+    caller to publish after the transaction commits.
 
     A job with isolated per-edition failures completes
     ``completed_with_errors`` rather than plain ``completed`` — the same
@@ -826,16 +1017,130 @@ async def _finalise_project_job(
     status is needed.
     """
     async with session.begin():
-        if edition_failures:
-            await queue_job_store.update_progress(
-                queue_job_id, _edition_failure_progress(edition_failures)
-            )
-        await queue_job_store.complete(
-            queue_job_id, has_errors=bool(edition_failures)
+        await queue_job_store.update_progress(
+            queue_job_id, _job_progress(slice_record, edition_failures)
         )
+        await queue_job_store.complete(queue_job_id, has_errors=has_errors)
         if run_id is None:
             return None
         return await maybe_finalise_run(run_store=run_store, run_id=run_id)
+
+
+async def _continue_in_new_job(
+    *,
+    ctx: dict[str, Any],
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    run_store: KeeperSyncRunStore,
+    org_store: OrganizationStore,
+    queue_job: QueueJob,
+    payload: Mapping[str, Any],
+    run_id: int | None,
+    sync_result: ProjectSyncResult,
+    progress: _ProjectSyncProgress,
+    started: float,
+    logger: structlog.stdlib.BoundLogger,
+) -> str:
+    """Close a slice that ran out of budget and enqueue the next one.
+
+    One transaction completes this job's row — ``completed_with_errors``
+    when the slice isolated edition failures, as for any job — with the
+    slice's position and the continuation's public id on its
+    ``progress``, creates the continuation's ``queue_jobs`` row, and
+    rolls up the parent run. Completing *before* creating is what lets
+    the new row pass ``idx_queue_jobs_keeper_sync_project_active_uq``:
+    this row held the project's active-job slot until then. Doing both
+    in one transaction means the project never shows a free slot (a
+    tier cron or ``POST …/refresh`` mid-chain still finds it taken) and
+    a run never sees its pending count touch zero between slices, so
+    :func:`maybe_finalise_run` finds the pending continuation and leaves
+    the run ``in_progress``. The continuation carries this row's org,
+    kind, and ``subject_label``, and the payload's ``run_id`` — so a
+    run's chain keeps growing the run's ``total_count``, while a tier
+    cron's or a refresh's chain stays unattributed.
+
+    The arq enqueue then follows with no transaction open, and the
+    backend job id is stamped after it: the same commit-then-enqueue
+    recipe as :func:`_enqueue_children` and
+    :func:`_enqueue_tier_project_sync`, which leaves a crash in between
+    to the existing orphan sweeps. A *cancel* in that window is
+    recorded by
+    :func:`~docverse_server.worker.functions._cancellation.record_handoff_cancellation`,
+    which fails the stranded continuation and rolls the run up, rather
+    than holding the project's slot (and the run) until a sweep.
+
+    The continuation's payload is this job's with its own queue job ids,
+    ``resume_after_ltd_edition_id`` set to the last edition this slice
+    visited, and ``slice_index`` advanced by one.
+    """
+    edition_failures = sync_result.edition_failures
+    has_errors = bool(edition_failures)
+    async with session.begin():
+        await queue_job_store.complete(queue_job.id, has_errors=has_errors)
+        continuation = await queue_job_store.create(
+            kind=JobKind.keeper_sync_project,
+            org_id=queue_job.org_id,
+            keeper_sync_run_id=run_id,
+            subject_label=queue_job.subject_label,
+        )
+        continuation_job_id = serialize_base32_id(continuation.public_id)
+        slice_record = progress.snapshot() | {
+            "continued": True,
+            "continuation_job_id": continuation_job_id,
+        }
+        await queue_job_store.update_progress(
+            queue_job.id, _job_progress(slice_record, edition_failures)
+        )
+        completion = (
+            await maybe_finalise_run(run_store=run_store, run_id=run_id)
+            if run_id is not None
+            else None
+        )
+    # From the commit on, the continuation's row exists and arq has no
+    # job for it yet: everything up to the backend id's stamp is the
+    # hand-off window.
+    async with record_handoff_cancellation(
+        ctx,
+        queue_job_ids=lambda: (continuation.id,),
+        job_function="keeper_sync_project",
+        started=started,
+        timeout_seconds=config.keeper_sync_job_timeout_seconds,
+        logger=logger,
+        finalise_run=keeper_sync_run_finaliser(run_id),
+    ):
+        await publish_run_completed(
+            events=ctx.get("events"),
+            session=session,
+            org_store=org_store,
+            completion=completion,
+            logger=logger,
+        )
+        metadata = await ctx["arq_queue"].enqueue(
+            "keeper_sync_project",
+            _queue_name=KEEPER_SYNC_QUEUE_NAME,
+            payload={
+                **payload,
+                "queue_job_id": continuation.id,
+                "queue_job_public_id": continuation_job_id,
+                "resume_after_ltd_edition_id": (
+                    sync_result.last_visited_ltd_edition_id
+                ),
+                "slice_index": progress.slice_index + 1,
+            },
+        )
+        async with session.begin():
+            await queue_job_store.set_backend_job_id(
+                continuation.id, metadata.id, queue_name=metadata.queue_name
+            )
+    logger.info(
+        "Keeper-sync slice budget reached; continuing in a new job",
+        editions_visited=sync_result.editions_visited,
+        editions_remaining=sync_result.editions_remaining,
+        continuation_job_id=continuation_job_id,
+        restamped_edition_count=sync_result.restamped_edition_count,
+        edition_failure_count=len(edition_failures),
+    )
+    return "completed_with_errors" if has_errors else "completed"
 
 
 def _log_project_completion(
@@ -897,6 +1202,40 @@ def _edition_failure_progress(
             for failure in failures[:_MAX_RECORDED_EDITION_FAILURES]
         ],
     }
+
+
+@dataclass
+class _ProjectSyncProgress:
+    """Live position of a running ``keeper_sync_project`` slice.
+
+    ``walk`` is handed to :meth:`KeeperSyncService.sync_project`, which
+    keeps it current as it walks LTD's edition list. :meth:`snapshot`
+    is what the job records on its row's ``progress`` when the slice
+    ends, and what :func:`record_cancellation` records if arq cancels
+    the job part way, so even a cancelled row shows how far it got.
+    """
+
+    slice_index: int
+    """Position of this job in its project's chain of slices, from 0."""
+
+    walk: SliceProgress = field(default_factory=SliceProgress)
+    """The service's live walk counters."""
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return the slice's position as a ``progress`` payload.
+
+        ``editions_total`` and ``editions_remaining`` are ``None`` until
+        the service has fetched LTD's edition list.
+        """
+        return {
+            "slice_index": self.slice_index,
+            "editions_total": self.walk.editions_total,
+            "editions_visited": self.walk.editions_visited,
+            "editions_remaining": self.walk.editions_remaining,
+            "last_visited_ltd_edition_id": (
+                self.walk.last_visited_ltd_edition_id
+            ),
+        }
 
 
 def _build_on_edition_synced(
@@ -2017,6 +2356,7 @@ async def _reconcile_run_children(
         )
 
 
+@cancellation_recorded
 async def keeper_sync_tier_main(ctx: dict[str, Any]) -> str:
     """Cron (every 5 min): refresh ``main`` editions whose LTD rebuilt.
 
@@ -2044,6 +2384,7 @@ async def keeper_sync_tier_main(ctx: dict[str, Any]) -> str:
     )
 
 
+@cancellation_recorded
 async def keeper_sync_tier_discovery(ctx: dict[str, Any]) -> str:
     """Cron (every 30 min): enqueue projects with unseen LTD resources.
 
@@ -2067,6 +2408,7 @@ async def keeper_sync_tier_discovery(ctx: dict[str, Any]) -> str:
     )
 
 
+@cancellation_recorded
 async def keeper_sync_tier_other(ctx: dict[str, Any]) -> str:
     """Cron (hourly): refresh non-``main`` editions older than the threshold.
 
@@ -2104,7 +2446,14 @@ async def _run_tier(
     incident (LTD down, malformed config, transient DB error). The
     failure is logged with structured context for follow-up; the next
     tick will retry naturally.
+
+    The tick's start is read off :func:`time.monotonic` before anything
+    else and handed to every processor as ``started``: a processor that
+    is cancelled while handing a child row to arq records the cancel
+    against the time the cron job has run for (see
+    :func:`_enqueue_tier_project_sync`).
     """
+    started = time.monotonic()
     enqueued_total = 0
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
@@ -2125,6 +2474,7 @@ async def _run_tier(
                     factory=factory,
                     org=org,
                     logger=logger,
+                    started=started,
                 )
             except Exception as exc:
                 sentry_sdk.capture_exception(exc)
@@ -2151,6 +2501,8 @@ class TierOrgProcessor(Protocol):
     Each tier cron (``main`` / ``discovery`` / ``other``) supplies a
     function matching this signature; it returns the number of
     ``keeper_sync_project`` children it enqueued for the org.
+    ``started`` is the :func:`time.monotonic` reading the tick began at,
+    passed through to :func:`_enqueue_tier_project_sync`.
     """
 
     async def __call__(
@@ -2161,6 +2513,7 @@ class TierOrgProcessor(Protocol):
         factory: Factory,
         org: Organization,
         logger: structlog.stdlib.BoundLogger,
+        started: float,
     ) -> int: ...
 
 
@@ -2171,6 +2524,7 @@ async def _tier_main_for_org(
     factory: Factory,
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
+    started: float,
 ) -> int:
     """Run one tier_main pass for a single enabled org.
 
@@ -2259,6 +2613,8 @@ async def _tier_main_for_org(
         ):
             continue
         if await _enqueue_tier_project_sync(
+            ctx=ctx,
+            started=started,
             session=session,
             queue_job_store=queue_job_store,
             arq_queue=arq_queue,
@@ -2280,6 +2636,7 @@ async def _tier_discovery_for_org(
     factory: Factory,
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
+    started: float,
 ) -> int:
     """Run one tier_discovery pass for a single enabled org.
 
@@ -2373,6 +2730,8 @@ async def _tier_discovery_for_org(
             )
             continue
         if should_enqueue and await _enqueue_tier_project_sync(
+            ctx=ctx,
+            started=started,
             session=session,
             queue_job_store=queue_job_store,
             arq_queue=arq_queue,
@@ -2407,6 +2766,7 @@ async def _tier_other_for_org(
     factory: Factory,
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
+    started: float,
 ) -> int:
     """Run one tier_other pass for a single enabled org.
 
@@ -2484,6 +2844,8 @@ async def _tier_other_for_org(
             ltd_editions=ltd_editions,
             now=now,
         ) and await _enqueue_tier_project_sync(
+            ctx=ctx,
+            started=started,
             session=session,
             queue_job_store=queue_job_store,
             arq_queue=arq_queue,
@@ -2867,6 +3229,8 @@ async def _has_stale_non_main_edition(
 
 async def _enqueue_tier_project_sync(
     *,
+    ctx: dict[str, Any],
+    started: float,
     session: AsyncSession,
     queue_job_store: QueueJobStore,
     arq_queue: ArqQueue,
@@ -2911,6 +3275,17 @@ async def _enqueue_tier_project_sync(
     ``IntegrityError`` escape instead would unwind the caller's per-slug
     loop and — because ``_run_tier`` catches per *org* — silently drop
     every remaining project in that org for the tick.
+
+    Between the row's commit and the backend id's stamp the cron holds a
+    row arq does not know about yet. A cancel there — the cron's arq
+    timeout, or a worker shutdown — would leave it an orphan holding the
+    slug's active-job mutex, so every tick and run skips the project
+    until ``keeper_sync_reaper``'s orphan sweep reaches it.
+    :func:`~docverse_server.worker.functions._cancellation.record_handoff_cancellation`
+    fails it at once instead, unless its backend id was already stamped.
+    ``started`` is the tick's :func:`time.monotonic` start, against which
+    that cancel is read: cron jobs run under arq's default per-job
+    timeout.
     """
     async with session.begin():
         if await queue_job_store.has_active_for_subject(
@@ -2941,19 +3316,27 @@ async def _enqueue_tier_project_sync(
                 tier=tier,
             )
             return False
-    metadata = await arq_queue.enqueue(
-        "keeper_sync_project",
-        _queue_name=KEEPER_SYNC_QUEUE_NAME,
-        payload={
-            "org_id": org_id,
-            "org_slug": org_slug,
-            "queue_job_id": queue_job.id,
-            "ltd_slug": ltd_slug,
-            "ltd_base_url": ltd_base_url,
-        },
-    )
-    async with session.begin():
-        await queue_job_store.set_backend_job_id(
-            queue_job.id, metadata.id, queue_name=metadata.queue_name
+    async with record_handoff_cancellation(
+        ctx,
+        queue_job_ids=lambda: (queue_job.id,),
+        job_function=f"keeper_sync_tier_{tier}",
+        started=started,
+        timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+        logger=logger,
+    ):
+        metadata = await arq_queue.enqueue(
+            "keeper_sync_project",
+            _queue_name=KEEPER_SYNC_QUEUE_NAME,
+            payload={
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "queue_job_id": queue_job.id,
+                "ltd_slug": ltd_slug,
+                "ltd_base_url": ltd_base_url,
+            },
         )
+        async with session.begin():
+            await queue_job_store.set_backend_job_id(
+                queue_job.id, metadata.id, queue_name=metadata.queue_name
+            )
     return True

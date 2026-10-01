@@ -11,6 +11,7 @@ content agreeing with each other.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -59,6 +60,7 @@ from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.purgatory_cleanup import (
     purgatory_cleanup,
 )
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.worker.conftest import make_worker_ctx
 
 _HASH = "sha256:" + "f" * 64
@@ -783,6 +785,54 @@ async def test_purgatory_cleanup_fails_when_no_staging_store_is_configured(
     assert row.status == JobStatus.failed.value
     assert row.errors is not None
     assert row.errors["type"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_purgatory_cleanup_cancel_fails_the_row(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An arq cancel mid-sweep fails the row instead of stranding it.
+
+    The sweep is cancelled while it opens the org's staging store, as a
+    rolling deploy's SIGTERM would catch it. Left ``in_progress``, the
+    row would hold the org's per-org mutex — and with it every nightly
+    sweep of the org — until ``purgatory_cleanup_reaper`` noticed;
+    instead it fails with a ``CancelledError`` payload read against the
+    maintenance pool's timeout, and the cancel re-raises. Nothing was
+    reclaimed, so the build stays unstamped for the next tick.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(db_session)
+        build = await _seed_deleted_build(
+            db_session,
+            project_id=project_id,
+            git_ref="cancelled",
+            deleted_days_ago=30,
+        )
+        queue_job_id = await _seed_queue_job(db_session, org_id=org_id)
+    hang = HangUntilCancelled()
+    monkeypatch.setattr(Factory, "create_objectstore_for_org", hang)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient())
+
+    task = asyncio.create_task(
+        purgatory_cleanup(
+            ctx, _payload(org_id=org_id, queue_job_id=queue_job_id)
+        )
+    )
+    await cancel_when_reached(task, hang.reached)
+    await ctx["http_client"].aclose()
+
+    row = await _read_queue_job(queue_job_id)
+    assert row.status == JobStatus.failed.value
+    assert row.errors is not None
+    assert row.errors["type"] == "CancelledError"
+    assert row.errors["reason"] == "worker_shutdown"
+    assert row.errors["timeout_seconds"] == (
+        runtime_config.maintenance_job_timeout_seconds
+    )
+    assert (await _read_build(build.id)).date_purged is None
 
 
 @pytest.mark.asyncio

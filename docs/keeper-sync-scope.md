@@ -312,10 +312,13 @@ first wave's patterns alongside the new one:
 Preview it, `PATCH` it, and launch another backfill. What the backfill
 then fans out is the preview's `in_scope_count` less its
 `tombstoned_slugs` — the identity spelled out under
-[Observability](#observability) — and the run's `total_count` is that
-plus one, because the discovery job attributes itself to its own run.
-A slug whose per-project job is already running is skipped as well, so
-`total_count` can come in lower still.
+[Observability](#observability) — and the run's `total_count` starts
+at that plus one, because the discovery job attributes itself to its
+own run. A slug whose per-project job is already running is skipped as
+well, so `total_count` can start lower still. It then grows as the run
+goes: every `publish_edition` job a project sync enqueues is attributed
+to the run, and so is each continuation of a project too large for one
+job (see [Keeper-sync time budget](keeper-sync-budget.md#on-the-run)).
 
 ### Wave 3 — everything, minus the strays
 
@@ -457,13 +460,14 @@ by eye:
   tombstoned projects the org has: a tombstone on a slug the config
   never admitted is not this scope's shortfall to explain.
 - `fan_out_count` is what is left — the `keeper_sync_project` children
-  the pass actually enqueues, and on a run, its `total_count` less the
-  one discovery job (less, too, any slug skipped because a per-project
-  job for it was already running).
+  the pass actually enqueues, and on a run, its `total_count` at
+  fan-out less the one discovery job (less, too, any slug skipped
+  because a per-project job for it was already running).
 
 So a preview reading `in_scope_count=3` with one entry in
 `tombstoned_slugs` predicts a run logging `in_scope_count=3`,
-`tombstoned_count=1`, `fan_out_count=2` — and a `total_count` of 3.
+`tombstoned_count=1`, `fan_out_count=2` — and a `total_count` of 3
+at fan-out.
 If the two disagree, the LTD listing or the tombstones changed between
 the preview and the run; the counts themselves do not drift.
 
@@ -745,6 +749,9 @@ row:
   LTD bucket (with a per-object budget for R2 uploads only), what
   happens to an edition whose copy still fails, and how to read the
   `build_content_copied` event each copy publishes.
+- [Keeper-sync time budget](keeper-sync-budget.md) — how a wave's
+  largest products sync across a chain of sliced jobs, and what a job
+  records when arq cancels it.
 - `client/src/docverse/models/keeper_sync.py` — `KeeperSyncConfig`,
   where the scope rule and its validation are defined once,
   `KeeperSyncScopePreviewRequest` (the preview body, which is a

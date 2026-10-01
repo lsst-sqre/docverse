@@ -17,6 +17,7 @@ purpose, so the fixtures have to be able to produce it the same way.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -30,7 +31,7 @@ from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
@@ -46,6 +47,7 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.config import Configuration
+from docverse_server.config import config as worker_config
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.edition_build_history import (
     SqlEditionBuildHistory,
@@ -57,6 +59,7 @@ from docverse_server.domain.edition_pointer import EditionPointer
 from docverse_server.domain.queue import JobStatus
 from docverse_server.factory import Factory
 from docverse_server.metrics import build_event_manager
+from docverse_server.services.edition_reconcile import EditionReconcileService
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -72,6 +75,7 @@ from docverse_server.worker.functions.edition_reconcile import (
     edition_reconcile,
 )
 from docverse_server.worker.functions.publish_edition import publish_edition
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import get_jobs_by_name
 from tests.worker.conftest import make_worker_ctx
 
@@ -1382,3 +1386,71 @@ async def test_edition_reconcile_pages_nobody_for_a_clean_org(
     await ctx["http_client"].aclose()
 
     assert captured.errors == []
+
+
+@pytest.mark.parametrize(
+    ("started_ago", "expected_reason"),
+    [
+        pytest.param(None, "worker_shutdown", id="worker_shutdown"),
+        pytest.param(
+            timedelta(seconds=worker_config.maintenance_job_timeout_seconds)
+            + timedelta(minutes=1),
+            "job_timeout",
+            id="job_timeout",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_edition_reconcile_cancel_fails_the_row(
+    *,
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    started_ago: timedelta | None,
+    expected_reason: str,
+) -> None:
+    """An arq cancel mid-tick fails the row instead of stranding it.
+
+    The tick is cancelled while it plans the org. Left ``in_progress``,
+    the row would hold the org's reconcile mutex until
+    ``edition_reconcile_reaper`` noticed, so every tick in between would
+    step over the org; instead it fails with a ``CancelledError``
+    payload whose ``reason`` follows the elapsed time against the
+    maintenance pool's ``maintenance_job_timeout_seconds``, and the
+    cancel re-raises so arq records the job failed.
+    """
+    async with db_session.begin():
+        org_id, _, _, _ = await _seed_lost_phase_b(db_session)
+        queue_job_id = await _seed_reconcile_job(db_session, org_id=org_id)
+    hang = HangUntilCancelled()
+    monkeypatch.setattr(EditionReconcileService, "reconcile_org", hang)
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+
+    async def _backdate() -> None:
+        if started_ago is None:
+            return
+        async for session in db_session_dependency():
+            async with session.begin():
+                await session.execute(
+                    update(SqlQueueJob)
+                    .where(SqlQueueJob.id == queue_job_id)
+                    .values(date_started=func.now() - started_ago)
+                )
+
+    task = asyncio.create_task(
+        edition_reconcile(
+            ctx, _payload(org_id=org_id, queue_job_id=queue_job_id)
+        )
+    )
+    await cancel_when_reached(task, hang.reached, before_cancel=_backdate)
+    await ctx["http_client"].aclose()
+
+    row = await _read_queue_job(queue_job_id)
+    assert row.status == JobStatus.failed.value
+    assert row.errors is not None
+    assert row.errors["type"] == "CancelledError"
+    assert row.errors["reason"] == expected_reason
+    assert row.errors["timeout_seconds"] == (
+        worker_config.maintenance_job_timeout_seconds
+    )

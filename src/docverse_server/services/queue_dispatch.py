@@ -113,11 +113,27 @@ class QueueDispatcher:
         self._queue_job_store = queue_job_store
         self._logger = logger
         self._pending: list[PendingEnqueue] = []
+        self._in_flight: list[PendingEnqueue] = []
 
     @property
     def pending(self) -> tuple[PendingEnqueue, ...]:
         """Enqueues deferred so far and not yet dispatched."""
         return tuple(self._pending)
+
+    def undispatched(self) -> tuple[int, ...]:
+        """Return the ids of deferred rows not yet stamped with a job id.
+
+        :attr:`pending` plus the rows a :meth:`dispatch` has taken but
+        not yet stamped — those it is enqueueing now, or whose enqueue
+        raised. A worker job cancelled mid-hand-off reads this to find
+        the rows it may have left orphaned (see
+        :func:`~docverse_server.worker.functions._cancellation.record_handoff_cancellation`);
+        a row whose own transaction then rolled back is listed too, and
+        simply no longer exists.
+        """
+        return tuple(
+            item.queue_job_id for item in (*self._in_flight, *self._pending)
+        )
 
     def defer(
         self,
@@ -198,6 +214,7 @@ class QueueDispatcher:
             deferred, which makes the call safe to make unconditionally.
         """
         pending, self._pending = self._pending, []
+        self._in_flight.extend(pending)
         dispatched: list[QueueJob] = []
         for item in pending:
             enqueued = await self._queue_backend.enqueue(
@@ -212,6 +229,7 @@ class QueueDispatcher:
                     )
                 )
                 await self._session.commit()
+            self._in_flight.remove(item)
             self._logger.debug(
                 "Dispatched queue job",
                 dispatched_queue_job_id=item.queue_job_public_id,

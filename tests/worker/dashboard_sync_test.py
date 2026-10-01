@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 import structlog
@@ -24,7 +26,11 @@ from docverse_server.storage.dashboard_templates.github import (
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+)
 from docverse_server.worker.functions.dashboard_sync import dashboard_sync
+from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import count_jobs_by_name, get_jobs_by_name
 from tests.support.github_mock import GitHubMock
 from tests.support.lock_service_spy import install_recording_lock_service
@@ -517,3 +523,77 @@ async def test_dashboard_sync_missing_binding_fails_the_job(
             job = await qjs.get(queue_job.id)
             assert job is not None
             assert job.status == JobStatus.failed
+
+
+@pytest.mark.asyncio
+async def test_dashboard_sync_cancel_fails_the_row_and_binding(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An arq cancel mid-sync fails the row and the binding's sync state.
+
+    The job is cancelled while the syncer runs, as a rolling deploy's
+    SIGTERM would catch it. The row fails with a ``CancelledError``
+    payload read against arq's default job timeout, which
+    ``dashboard_sync`` runs under, rather than waiting for
+    ``dashboard_sync_reaper``; and, as for an unhandled syncer error,
+    the binding is flipped to ``failed`` so it does not keep reporting
+    the ``pending`` it started from.
+    """
+    async with db_session.begin():
+        org_id, _ = await _setup_org_and_projects(
+            db_session, org_slug="sync-cancel", project_slugs=("alpha",)
+        )
+        binding_id = await _create_binding(db_session, org_id=org_id)
+        queue_job = await QueueJobStore(
+            session=db_session, logger=_logger()
+        ).create(
+            kind=JobKind.dashboard_sync,
+            org_id=org_id,
+            backend_job_id="arq-sync-cancel",
+        )
+    hang = HangUntilCancelled()
+    monkeypatch.setattr(
+        "docverse_server.services.dashboard_templates.sync."
+        "DashboardTemplateSyncer.sync",
+        hang,
+    )
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(
+            arq_queue=arq_queue,
+            http_client=http_client,
+            mock_github=mock_github,
+        )
+        payload = {
+            "binding_id": binding_id,
+            "queue_job_id": queue_job.id,
+            "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+        }
+        task = asyncio.create_task(dashboard_sync(ctx, payload))
+        await cancel_when_reached(task, hang.reached)
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            job = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job.id
+            )
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.errors is not None
+            assert job.errors["type"] == "CancelledError"
+            assert job.errors["reason"] == "worker_shutdown"
+            assert job.errors["timeout_seconds"] == (
+                ARQ_DEFAULT_JOB_TIMEOUT_SECONDS
+            )
+            binding = await DashboardGitHubTemplateBindingStore(
+                session=session, logger=_logger()
+            ).get_by_id(binding_id)
+            assert binding is not None
+            assert binding.last_sync_status == "failed"
+            assert binding.last_sync_error is not None
+            assert "CancelledError" in binding.last_sync_error
+
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 0

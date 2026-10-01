@@ -32,9 +32,11 @@ import structlog
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse_server.config import config
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.edition_build_history import EditionBuildHistory
+from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.domain.lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
@@ -67,6 +69,11 @@ from docverse_server.services.lifecycle_finalisation import (
     maybe_finalise_lifecycle_run,
 )
 from docverse_server.storage.keeper_sync import TombstoneReason
+from docverse_server.worker.functions._cancellation import (
+    RunFinaliser,
+    cancellation_recorded,
+    record_cancellation,
+)
 
 __all__ = ["lifecycle_eval"]
 
@@ -84,6 +91,7 @@ def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
 
+@cancellation_recorded
 async def lifecycle_eval(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     """Evaluate lifecycle rules for one org's projects and soft-delete matches.
 
@@ -103,6 +111,14 @@ async def lifecycle_eval(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         no-op case). Raises on failure after marking the queue job
         failed and rolling the parent run, mirroring ``keeper_sync_
         project``'s contract so arq logs the job as failed.
+
+    Raises
+    ------
+    asyncio.CancelledError
+        When arq cancels the job — the maintenance pool's per-job
+        timeout, or a worker shutdown — after
+        :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+        has failed the row and rolled up the parent run.
     """
     org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]
@@ -126,54 +142,87 @@ async def lifecycle_eval(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             if await queue_job_store.start_if_queued(queue_job_id) is None:
                 return "skipped"
 
-        # Collected inside the soft-delete transaction and published only
-        # after it commits below: one (project_slug, action) per reaped
-        # row. On the failure path ``_evaluate_org`` raises before its
-        # transaction commits, so the partially-filled list is discarded
-        # without ever being published (no phantom events for rolled-back
-        # reaps).
-        reaps: list[tuple[str, LifecycleReapAction]] = []
-        try:
-            await _evaluate_org(
-                session=session,
-                factory=factory,
-                org_id=org_id,
-                org_slug=org_slug,
-                reaps=reaps,
-                logger=logger,
-            )
-        except Exception as exc:
-            logger.exception("Lifecycle evaluation failed for org")
-            async with session.begin():
-                await queue_job_store.fail(
-                    queue_job_id,
-                    errors={
-                        "message": str(exc),
-                        "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(),
-                    },
+        # From here on the pass holds an ``in_progress`` row, which arq's
+        # timeout or a worker shutdown would otherwise strand for
+        # ``lifecycle_reaper`` — and with it the parent run, which cannot
+        # finalise while a child is pending: their ``CancelledError``
+        # bypasses the ``except Exception`` below (PRD #765).
+        async with record_cancellation(
+            ctx,
+            queue_job_id=queue_job_id,
+            timeout_seconds=config.maintenance_job_timeout_seconds,
+            logger=logger,
+            finalise_run=_lifecycle_run_finaliser(run_id),
+        ):
+            # Collected inside the soft-delete transaction and published
+            # only after it commits below: one (project_slug, action) per
+            # reaped row. On the failure path ``_evaluate_org`` raises before
+            # its transaction commits, so the partially-filled list is
+            # discarded without ever being published (no phantom events for
+            # rolled-back reaps).
+            reaps: list[tuple[str, LifecycleReapAction]] = []
+            try:
+                await _evaluate_org(
+                    session=session,
+                    factory=factory,
+                    org_id=org_id,
+                    org_slug=org_slug,
+                    reaps=reaps,
+                    logger=logger,
                 )
+            except Exception as exc:
+                logger.exception("Lifecycle evaluation failed for org")
+                async with session.begin():
+                    await queue_job_store.fail(
+                        queue_job_id,
+                        errors={
+                            "message": str(exc),
+                            "type": type(exc).__name__,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                    await maybe_finalise_lifecycle_run(
+                        run_store=run_store, run_id=run_id
+                    )
+                raise
+
+            async with session.begin():
+                await queue_job_store.complete(queue_job_id)
                 await maybe_finalise_lifecycle_run(
                     run_store=run_store, run_id=run_id
                 )
-            raise
-
-        async with session.begin():
-            await queue_job_store.complete(queue_job_id)
-            await maybe_finalise_lifecycle_run(
-                run_store=run_store, run_id=run_id
+            logger.info("Lifecycle evaluation completed for org")
+            # Publish one lifecycle_action per reaped row after the commit.
+            # Best-effort: production runs raise_on_error=False so a metrics
+            # outage never fails the pass (no defensive try/except).
+            await _publish_lifecycle_actions(
+                ctx=ctx, org_slug=org_slug, reaps=reaps
             )
-        logger.info("Lifecycle evaluation completed for org")
-        # Publish one lifecycle_action per reaped row after the commit.
-        # Best-effort: production runs raise_on_error=False so a metrics
-        # outage never fails the pass (no defensive try/except).
-        await _publish_lifecycle_actions(
-            ctx=ctx, org_slug=org_slug, reaps=reaps
-        )
-        return "completed"
+            return "completed"
 
     msg = "No database session available"
     raise RuntimeError(msg)
+
+
+def _lifecycle_run_finaliser(run_id: int) -> RunFinaliser:
+    """Build the cancel-path roll-up of the parent ``lifecycle_eval`` run.
+
+    Runs :func:`maybe_finalise_lifecycle_run` in the cancellation
+    helper's transaction, after the row is failed — the roll-up this
+    worker's own ``except Exception`` branch runs — so a cancelled pass
+    that was the run's last pending child finalises it to
+    ``partial_failure`` instead of leaving it to the reaper. A
+    ``lifecycle_eval`` run is not a keeper-sync run, so it returns
+    ``None`` and no ``keeper_sync_run_completed`` metric is published.
+    """
+
+    async def finalise(factory: Factory) -> KeeperSyncRunWithActivity | None:
+        await maybe_finalise_lifecycle_run(
+            run_store=factory.create_lifecycle_eval_run_store(), run_id=run_id
+        )
+        return None
+
+    return finalise
 
 
 async def _evaluate_org(

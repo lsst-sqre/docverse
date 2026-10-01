@@ -47,6 +47,15 @@ that back each of them up.
   budget, the build-level retry that re-runs a copy after a transport
   error on either end, what happens to an edition that still fails, and
   how to read the `build_content_copied` metrics event.
+- [Keeper-sync time budget](keeper-sync-budget.md) — how a large LTD
+  product syncs across a chain of sliced `keeper_sync_project` jobs,
+  and what every worker job records when arq cancels it: the slice
+  budget, job timeout and reaper threshold ladder and how the three
+  derive from each other, how a chain reads in `GET /jobs` and on its
+  run's counters, the cursor a continuation resumes from and what it
+  misses, the cancellation `errors` payload and how to tell a timeout
+  from a deploy, the no-progress guard and the timeout escape hatch,
+  and the cap on the reaper threshold with its startup warning.
 - [GitHub integration](github-integration.md) — what each GitHub App
   webhook delivery does (`push`, `delete`, `repository` renamed,
   transferred and edited, `organization` renamed, and the

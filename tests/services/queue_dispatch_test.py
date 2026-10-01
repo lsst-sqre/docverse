@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -16,6 +17,7 @@ from docverse_server.services.queue_dispatch import QueueDispatcher
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_backend import EnqueuedJob
 from docverse_server.storage.queue_job_store import QueueJobStore
+from tests.support.arq_cancel import HangUntilCancelled
 from tests.support.arq_testing import get_jobs_by_name
 from tests.support.queue_dispatch import make_dispatcher
 
@@ -171,3 +173,71 @@ async def test_discard_drops_pending_without_enqueueing(
     assert dispatcher.pending == ()
     assert await dispatcher.dispatch() == []
     assert get_jobs_by_name(arq_queue, "dashboard_build") == []
+
+
+@pytest.mark.asyncio
+async def test_undispatched_tracks_rows_until_they_are_stamped(
+    app: None, db_session: AsyncSession
+) -> None:
+    """A deferred row is undispatched until ``dispatch`` stamps it."""
+    arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    _, job = await _seed_job(db_session, slug="qd-undispatched")
+    dispatcher = make_dispatcher(db_session, arq_queue=arq_queue)
+
+    dispatcher.defer(
+        queue_job=job, job_type="dashboard_build", payload={"org_id": 1}
+    )
+    assert dispatcher.undispatched() == (job.id,)
+
+    await dispatcher.dispatch()
+    assert dispatcher.undispatched() == ()
+
+
+@pytest.mark.asyncio
+async def test_undispatched_covers_a_row_mid_dispatch(
+    app: None, db_session: AsyncSession
+) -> None:
+    """A row ``dispatch`` has taken but not yet stamped is still listed.
+
+    ``dispatch`` empties :attr:`QueueDispatcher.pending` before it starts
+    enqueueing, so a job cancelled mid-dispatch — the window the arq
+    cancellation helper's hand-off variant covers — would otherwise have
+    no record of the row it left an orphan. A row whose enqueue failed
+    stays listed for the same reason.
+    """
+    store, job = await _seed_job(db_session, slug="qd-in-flight")
+    hang = HangUntilCancelled()
+    dispatcher = QueueDispatcher(
+        session=db_session,
+        queue_backend=_HangingQueueBackend(hang),
+        queue_job_store=store,
+        logger=_logger(),
+    )
+    dispatcher.defer(
+        queue_job=job, job_type="dashboard_build", payload={"org_id": 1}
+    )
+
+    task = asyncio.create_task(dispatcher.dispatch())
+    await hang.reached.wait()
+    assert dispatcher.pending == ()
+    assert dispatcher.undispatched() == (job.id,)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert dispatcher.undispatched() == (job.id,)
+
+
+class _HangingQueueBackend(_RaisingQueueBackend):
+    """Queue backend whose ``enqueue`` hangs until it is cancelled."""
+
+    def __init__(self, hang: HangUntilCancelled) -> None:
+        self._hang = hang
+
+    async def enqueue(
+        self,
+        job_type: str,
+        payload: dict[str, Any],
+        *,
+        queue_name: str | None = None,
+    ) -> EnqueuedJob:
+        return await self._hang(job_type, payload, queue_name)

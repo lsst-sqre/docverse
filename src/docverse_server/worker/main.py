@@ -29,7 +29,10 @@ from safir.metrics.arq import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse_server.config import Configuration
+from docverse_server.config import (
+    KEEPER_SYNC_REAPER_MARGIN_SECONDS,
+    Configuration,
+)
 from docverse_server.database import get_current_revision
 from docverse_server.diagnostics.memory import (
     start_memory_sampler,
@@ -420,6 +423,42 @@ async def start_worker_memory_sampler(
         ctx["memory_sampler"] = sampler
 
 
+def log_keeper_sync_time_ladder(
+    settings: Configuration, *, logger: structlog.stdlib.BoundLogger
+) -> None:
+    """Log the keeper-sync budget, timeout and reaper threshold in force.
+
+    The three read as one ladder (slice budget < job timeout < reaper
+    threshold, PRD #765), and the sync pool is where all three apply:
+    its jobs spend the budget, arq enforces the timeout on them, and
+    ``keeper_sync_reaper`` runs on its cron. When
+    :class:`~docverse_server.config.Configuration` capped an explicit
+    reaper threshold at the timeout plus
+    :data:`~docverse_server.config.KEEPER_SYNC_REAPER_MARGIN_SECONDS`,
+    one warning names the requested and effective values, so an
+    operator whose deployment value no longer applies learns it from
+    the pod log rather than from a reaper firing sooner than expected.
+    """
+    logger.info(
+        "Keeper-sync time ladder",
+        slice_budget_seconds=settings.keeper_sync_slice_budget_seconds,
+        job_timeout_seconds=settings.keeper_sync_job_timeout_seconds,
+        reaper_threshold_seconds=(
+            settings.keeper_sync_reaper_threshold_seconds
+        ),
+    )
+    requested = settings.keeper_sync_reaper_threshold_requested_seconds
+    if requested is not None:
+        logger.warning(
+            "Keeper-sync reaper threshold capped at the job timeout plus"
+            " margin",
+            requested_seconds=requested,
+            effective_seconds=settings.keeper_sync_reaper_threshold_seconds,
+            job_timeout_seconds=settings.keeper_sync_job_timeout_seconds,
+            margin_seconds=KEEPER_SYNC_REAPER_MARGIN_SECONDS,
+        )
+
+
 _QUEUE_STATS_CRON_MINUTES = set(range(0, 60, 5))
 """Five-minute cadence for the ``arq_queue_stats`` gauge.
 
@@ -779,6 +818,9 @@ async def startup_keeper_sync(ctx: dict[str, Any]) -> None:
         component="worker-keeper-sync",
         queue_name=KEEPER_SYNC_QUEUE_NAME,
         max_jobs=config.keeper_sync_max_jobs,
+    )
+    log_keeper_sync_time_ladder(
+        config, logger=structlog.get_logger("docverse_server.worker")
     )
 
 
