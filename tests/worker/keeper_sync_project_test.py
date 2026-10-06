@@ -3600,7 +3600,7 @@ async def _edition_clocks(*, org_id: int) -> dict[str, datetime]:
                     SqlProject.slug == "pipelines",
                 )
             )
-            return dict(rows.tuples().all())
+            return dict(rows.all())
     msg = "No database session available"
     raise RuntimeError(msg)
 

@@ -118,16 +118,16 @@ class ProjectSlugCursor(PaginationCursor[Project]):
     @override
     @classmethod
     def apply_order(
-        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
-    ) -> Select[tuple[Any, ...]]:
+        cls, stmt: Select[*tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[*tuple[Any, ...]]:
         if reverse:
             return stmt.order_by(SqlProject.slug.desc())
         return stmt.order_by(SqlProject.slug)
 
     @override
     def apply_cursor(
-        self, stmt: Select[tuple[Any, ...]]
-    ) -> Select[tuple[Any, ...]]:
+        self, stmt: Select[*tuple[Any, ...]]
+    ) -> Select[*tuple[Any, ...]]:
         if self.previous:
             return stmt.where(SqlProject.slug < self.slug)
         return stmt.where(SqlProject.slug >= self.slug)
@@ -162,16 +162,16 @@ class EditionSlugCursor(PaginationCursor[Edition]):
     @override
     @classmethod
     def apply_order(
-        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
-    ) -> Select[tuple[Any, ...]]:
+        cls, stmt: Select[*tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[*tuple[Any, ...]]:
         if reverse:
             return stmt.order_by(SqlEdition.slug.desc())
         return stmt.order_by(SqlEdition.slug)
 
     @override
     def apply_cursor(
-        self, stmt: Select[tuple[Any, ...]]
-    ) -> Select[tuple[Any, ...]]:
+        self, stmt: Select[*tuple[Any, ...]]
+    ) -> Select[*tuple[Any, ...]]:
         if self.previous:
             return stmt.where(SqlEdition.slug < self.slug)
         return stmt.where(SqlEdition.slug >= self.slug)
@@ -220,16 +220,16 @@ class KeeperSyncProjectStateIdCursor(PaginationCursor[KeeperSyncState]):
     @override
     @classmethod
     def apply_order(
-        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
-    ) -> Select[tuple[Any, ...]]:
+        cls, stmt: Select[*tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[*tuple[Any, ...]]:
         if reverse:
             return stmt.order_by(SqlKeeperSyncState.id.asc())
         return stmt.order_by(SqlKeeperSyncState.id.desc())
 
     @override
     def apply_cursor(
-        self, stmt: Select[tuple[Any, ...]]
-    ) -> Select[tuple[Any, ...]]:
+        self, stmt: Select[*tuple[Any, ...]]
+    ) -> Select[*tuple[Any, ...]]:
         if self.previous:
             return stmt.where(SqlKeeperSyncState.id > self.id)
         return stmt.where(SqlKeeperSyncState.id <= self.id)
@@ -279,16 +279,16 @@ class KeeperSyncEditionSlugCursor(PaginationCursor[Edition]):
     @override
     @classmethod
     def apply_order(
-        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
-    ) -> Select[tuple[Any, ...]]:
+        cls, stmt: Select[*tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[*tuple[Any, ...]]:
         if reverse:
             return stmt.order_by(SqlEdition.slug.desc(), SqlEdition.id.desc())
         return stmt.order_by(SqlEdition.slug, SqlEdition.id)
 
     @override
     def apply_cursor(
-        self, stmt: Select[tuple[Any, ...]]
-    ) -> Select[tuple[Any, ...]]:
+        self, stmt: Select[*tuple[Any, ...]]
+    ) -> Select[*tuple[Any, ...]]:
         if self.previous:
             return stmt.where(
                 or_(
@@ -340,8 +340,8 @@ class _TzAwareDatetimeIdCursor[E: Any](DatetimeIdCursor[E]):
 
     @override
     def apply_cursor(
-        self, stmt: Select[tuple[Any, ...]]
-    ) -> Select[tuple[Any, ...]]:
+        self, stmt: Select[*tuple[Any, ...]]
+    ) -> Select[*tuple[Any, ...]]:
         time_column = self.time_column()
         id_column = self.id_column()
         if self.previous:
@@ -592,15 +592,15 @@ class ProjectSearchCursor(PaginationCursor[Project]):
     @override
     @classmethod
     def apply_order(
-        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
-    ) -> Select[tuple[Any, ...]]:
+        cls, stmt: Select[*tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[*tuple[Any, ...]]:
         # Ordering is applied manually in search_by_org.
         return stmt
 
     @override
     def apply_cursor(
-        self, stmt: Select[tuple[Any, ...]]
-    ) -> Select[tuple[Any, ...]]:
+        self, stmt: Select[*tuple[Any, ...]]
+    ) -> Select[*tuple[Any, ...]]:
         # Filtering is applied manually in search_by_org.
         return stmt
 
@@ -695,16 +695,16 @@ class EditionBuildHistoryPositionCursor(
     @override
     @classmethod
     def apply_order(
-        cls, stmt: Select[tuple[Any, ...]], *, reverse: bool = False
-    ) -> Select[tuple[Any, ...]]:
+        cls, stmt: Select[*tuple[Any, ...]], *, reverse: bool = False
+    ) -> Select[*tuple[Any, ...]]:
         if reverse:
             return stmt.order_by(SqlEditionBuildHistory.position.desc())
         return stmt.order_by(SqlEditionBuildHistory.position)
 
     @override
     def apply_cursor(
-        self, stmt: Select[tuple[Any, ...]]
-    ) -> Select[tuple[Any, ...]]:
+        self, stmt: Select[*tuple[Any, ...]]
+    ) -> Select[*tuple[Any, ...]]:
         if self.previous:
             return stmt.where(SqlEditionBuildHistory.position < self.position)
         return stmt.where(SqlEditionBuildHistory.position >= self.position)

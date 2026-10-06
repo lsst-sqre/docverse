@@ -125,15 +125,15 @@ class EditionStore:
         self._session = session
         self._logger = logger
 
-    def _base_query(self) -> Select[tuple[SqlEdition, int | None, str | None]]:
+    def _base_query(self) -> Select[SqlEdition, int | None, str | None]:
         """Build the base query with optional build public_id + git_ref."""
-        return select(  # type: ignore[return-value]
+        return select(
             SqlEdition,
             SqlBuild.public_id.label("current_build_public_id"),
             SqlBuild.git_ref.label("current_build_git_ref"),
         ).outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
 
-    def _column_query(self) -> Select[tuple[Any, ...]]:
+    def _column_query(self) -> Select[*tuple[Any, ...]]:
         """Build a column-based query for paginated results.
 
         Returns all Edition domain fields as flat columns, including

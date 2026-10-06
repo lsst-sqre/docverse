@@ -276,6 +276,10 @@ class KeeperSyncRunStore:
         )
         rows = await self._session.execute(stmt)
         for run_id, status_value, count, max_ts in rows.all():
+            if run_id is None:
+                # ``in_`` already excludes NULL; this narrows the
+                # nullable column for the type checker.
+                continue
             bucket = result[run_id]
             bucket["total"] += count
             if status_value in (
