@@ -2858,9 +2858,11 @@ async def _tier_discovery_for_org(
         try:
             should_enqueue = await _project_needs_discovery(
                 ltd_client=ltd_client,
+                org_slug=org.slug,
                 ltd_slug=ltd_slug,
                 project_state=project_state,
                 edition_state_by_ltd_id=edition_state_by_ltd_id,
+                logger=logger,
             )
         except LtdClientError as exc:
             sentry_sdk.capture_exception(exc)
@@ -2933,7 +2935,9 @@ async def _tier_other_for_org(
     The listing is the only LTD call per polled project: the check
     needs each edition's LTD id, which the URL carries, and which id is
     ``main``, which tier_main caches on the project's state row, so no
-    edition payload is fetched.
+    edition payload is fetched. A listed URL with no id to read is
+    skipped with a warning (:func:`_list_edition_ltd_ids`); the project
+    is still checked on the rest and still stamped polled.
     """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
@@ -2977,8 +2981,12 @@ async def _tier_other_for_org(
         ):
             continue
         try:
-            edition_urls = await ltd_client.list_edition_urls_for_product(
-                ltd_slug
+            ltd_edition_ids = await _list_edition_ltd_ids(
+                ltd_client=ltd_client,
+                org_slug=org.slug,
+                ltd_slug=ltd_slug,
+                tier=Tier.other,
+                logger=logger,
             )
         except LtdClientError as exc:
             sentry_sdk.capture_exception(exc)
@@ -3000,7 +3008,7 @@ async def _tier_other_for_org(
             session=session,
             state_store=state_store,
             org_id=org.id,
-            ltd_edition_ids=[parse_ltd_id(url) for url in edition_urls],
+            ltd_edition_ids=ltd_edition_ids,
             main_edition_ltd_id=_cached_main_edition_ltd_id(project_state),
             now=now,
         ) and await _enqueue_tier_project_sync(
@@ -3336,12 +3344,71 @@ async def _record_tier_polled(
         )
 
 
+def _split_listed_edition_urls(
+    edition_urls: Sequence[str],
+) -> tuple[list[int], list[str]]:
+    """Split a product's edition URLs into LTD ids and unreadable URLs.
+
+    Returns the ids :func:`parse_ltd_id` reads off the URLs, in listing
+    order, and the URLs it could not read one from (no trailing integer
+    path segment), also in listing order. ``parse_ltd_id`` itself keeps
+    raising on such a URL; this is where the tier crons choose to skip
+    it instead.
+    """
+    ltd_ids: list[int] = []
+    unparsable: list[str] = []
+    for url in edition_urls:
+        try:
+            ltd_ids.append(parse_ltd_id(url))
+        except ValueError:
+            unparsable.append(url)
+    return ltd_ids, unparsable
+
+
+async def _list_edition_ltd_ids(
+    *,
+    ltd_client: LtdClient,
+    org_slug: str,
+    ltd_slug: str,
+    tier: Tier,
+    logger: structlog.stdlib.BoundLogger,
+) -> list[int]:
+    """List a product's editions and return the LTD ids their URLs carry.
+
+    One ``GET /products/<slug>/editions/``; no edition is followed. The
+    discovery and other tiers call this inside their per-project
+    ``except LtdClientError``, so a listing failure still costs only
+    that project. A listed URL with no trailing integer id is skipped
+    rather than raised: a ``ValueError`` would escape that handler, skip
+    the project's polled stamp, and reach :func:`_run_tier_pass`'s
+    per-org handler, dropping every remaining project of the org for
+    the tick. The skip is logged as one warning per project naming the
+    org, slug and URLs, and the ids that did parse are returned for the
+    tier to decide on.
+    """
+    edition_urls = await ltd_client.list_edition_urls_for_product(ltd_slug)
+    ltd_ids, unparsable = _split_listed_edition_urls(edition_urls)
+    if unparsable:
+        logger.warning(
+            "Keeper-sync tier skipped unparsable LTD edition URLs",
+            tier=tier.value,
+            org=org_slug,
+            ltd_slug=ltd_slug,
+            unparsable_urls=unparsable,
+            skipped_count=len(unparsable),
+            parsed_count=len(ltd_ids),
+        )
+    return ltd_ids
+
+
 async def _project_needs_discovery(
     *,
     ltd_client: LtdClient,
+    org_slug: str,
     ltd_slug: str,
     project_state: Any,
     edition_state_by_ltd_id: dict[int, Any],
+    logger: structlog.stdlib.BoundLogger,
 ) -> bool:
     """Return True when an in-scope project has any unseen LTD resource.
 
@@ -3357,7 +3424,9 @@ async def _project_needs_discovery(
     The id is all this check needs, so it never follows the URLs: one
     ``GET /products/<slug>/editions/`` per project, rather than one
     more ``GET /editions/<id>`` per edition, which on ``pipelines``
-    (2,938 editions) pushed the cron past arq's cron timeout.
+    (2,938 editions) pushed the cron past arq's cron timeout. A listed
+    URL with no id to read is skipped with a warning
+    (:func:`_list_edition_ltd_ids`) and the check runs on the rest.
 
     ``project_state`` is the state row already fetched by the caller
     (so the dormancy planner and this helper share one read). Pass
@@ -3366,10 +3435,16 @@ async def _project_needs_discovery(
     """
     if is_unknown_resource(project_state):
         return True
-    edition_urls = await ltd_client.list_edition_urls_for_product(ltd_slug)
+    ltd_edition_ids = await _list_edition_ltd_ids(
+        ltd_client=ltd_client,
+        org_slug=org_slug,
+        ltd_slug=ltd_slug,
+        tier=Tier.discovery,
+        logger=logger,
+    )
     return any(
-        is_unknown_resource(edition_state_by_ltd_id.get(parse_ltd_id(url)))
-        for url in edition_urls
+        is_unknown_resource(edition_state_by_ltd_id.get(ltd_id))
+        for ltd_id in ltd_edition_ids
     )
 
 

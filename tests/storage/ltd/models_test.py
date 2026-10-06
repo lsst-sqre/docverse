@@ -19,6 +19,7 @@ from docverse_server.storage.ltd import (
     LtdEditionMode,
     LtdProduct,
     LtdProductsListing,
+    parse_ltd_id,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -154,3 +155,14 @@ def test_build_ltd_id_parses_from_self_url() -> None:
     payload = _load("build.json")
     payload["self_url"] = "https://keeper.lsst.codes/builds/777/"
     assert LtdBuild.model_validate(payload).ltd_id == 777
+
+
+def test_parse_ltd_id_raises_on_url_without_trailing_id() -> None:
+    """A URL with no trailing integer path segment raises ``ValueError``.
+
+    The keeper-sync tier crons skip such a URL in a product's edition
+    listing themselves, so the raise stays here for every caller that
+    needs the id.
+    """
+    with pytest.raises(ValueError, match="invalid literal"):
+        parse_ltd_id("https://keeper.lsst.codes/editions/latest")

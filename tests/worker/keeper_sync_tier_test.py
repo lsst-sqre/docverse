@@ -248,6 +248,50 @@ def _assert_no_edition_fetches(mock_discovery: respx.Router) -> None:
     assert fetched == []
 
 
+#: An edition URL whose last path segment is no integer id, so
+#: :func:`~docverse_server.storage.ltd.models.parse_ltd_id` raises on it.
+_UNPARSABLE_EDITION_URL = f"{LTD_BASE}/editions/latest"
+
+#: The warning the discovery and other tiers log for a project whose
+#: edition listing carries URLs they cannot read an id from.
+_UNPARSABLE_URLS_EVENT = "Keeper-sync tier skipped unparsable LTD edition URLs"
+
+
+def _stub_edition_url_listing(
+    mock_discovery: respx.Router, *, product_slug: str, urls: list[str]
+) -> None:
+    """Stub ``GET /products/<slug>/editions/`` to list ``urls`` verbatim.
+
+    Unlike :func:`_stub_editions_listing`, which builds well-formed URLs
+    from ids, this lets a test list a URL with no trailing id.
+    """
+    mock_discovery.get(f"{LTD_BASE}/products/{product_slug}/editions/").mock(
+        return_value=httpx.Response(200, json={"editions": urls})
+    )
+
+
+async def _read_polled_annotation(
+    *, org_id: int, ltd_slug: str, key: str
+) -> datetime:
+    """Return a project's ``date_<tier>_last_polled`` annotation."""
+    stamped: datetime | None = None
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = KeeperSyncStateStore(session=session, logger=_logger())
+            row = await store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug=ltd_slug,
+            )
+        assert row is not None
+        assert row.annotations is not None
+        raw = row.annotations[key]
+        assert isinstance(raw, str)
+        stamped = datetime.fromisoformat(raw)
+    assert stamped is not None
+    return stamped
+
+
 def _make_ctx(http_client: httpx.AsyncClient) -> dict[str, Any]:
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
@@ -2355,6 +2399,93 @@ async def test_tier_discovery_honours_scope_patterns_and_excludes(
     assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["sqr-100"]
 
 
+@pytest.mark.asyncio
+async def test_tier_discovery_skips_unparsable_edition_url(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An edition URL with no trailing id costs that URL, not the org's tick.
+
+    ``aaa`` lists a URL :func:`parse_ltd_id` cannot read ahead of two
+    well-formed ones. The tick logs one warning naming the org, the slug
+    and the URL, still decides ``aaa`` from the ids that did parse —
+    edition 2 has no state row, so it enqueues — and still stamps its
+    polled annotation. ``bbb``, later in the same scope, is still
+    visited: a raise on the URL would have dropped it for the tick.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-badurl",
+            project_slugs=["aaa", "bbb"],
+        )
+        for slug in ("aaa", "bbb"):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+            )
+        for ltd_id in (1, 3):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug="main",
+            )
+
+    _stub_products(mock_discovery, ["aaa", "bbb"])
+    _stub_edition_url_listing(
+        mock_discovery,
+        product_slug="aaa",
+        urls=[
+            _UNPARSABLE_EDITION_URL,
+            f"{LTD_BASE}/editions/2",
+            f"{LTD_BASE}/editions/1",
+        ],
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="bbb", edition_ids=[4, 3]
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == [
+        "aaa",
+        "bbb",
+    ]
+
+    warnings = [e for e in captured if e["event"] == _UNPARSABLE_URLS_EVENT]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["tier"] == "discovery"
+    assert warnings[0]["org"] == "ks-tier-disc-badurl"
+    assert warnings[0]["ltd_slug"] == "aaa"
+    assert warnings[0]["unparsable_urls"] == [_UNPARSABLE_EDITION_URL]
+
+    stamped = await _read_polled_annotation(
+        org_id=org_id, ltd_slug="aaa", key="date_discovery_last_polled"
+    )
+    assert (now - stamped) < timedelta(minutes=5)
+
+
 # ---------------------------------------------------------------------------
 # tier_other
 # ---------------------------------------------------------------------------
@@ -3116,6 +3247,96 @@ async def test_tier_other_honours_scope_patterns_and_excludes(
         queue_name=KEEPER_SYNC_QUEUE_NAME,
     )
     assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["sqr-100"]
+
+
+@pytest.mark.asyncio
+async def test_tier_other_skips_unparsable_edition_url(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An edition URL with no trailing id costs that URL, not the org's tick.
+
+    ``aaa`` lists a URL :func:`parse_ltd_id` cannot read alongside two
+    well-formed ones. The tick logs one warning naming the org, the slug
+    and the URL, still scans the ids that did parse — branch edition 2
+    is stale, so ``aaa`` enqueues — and still stamps its polled
+    annotation. ``bbb``, later in the same scope, is still visited: a
+    raise on the URL would have dropped it for the tick.
+    """
+    now = datetime.now(tz=UTC)
+    stale = now - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-badurl",
+            project_slugs=["aaa", "bbb"],
+        )
+        for slug, main_id in (("aaa", 1), ("bbb", 3)):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+                annotations={"main_edition_ltd_id": main_id},
+            )
+        for ltd_id in (2, 4):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug="u-jsick-feature",
+                date_last_synced=stale,
+            )
+
+    _stub_products(mock_discovery, ["aaa", "bbb"])
+    _stub_edition_url_listing(
+        mock_discovery,
+        product_slug="aaa",
+        urls=[
+            f"{LTD_BASE}/editions/2",
+            _UNPARSABLE_EDITION_URL,
+            f"{LTD_BASE}/editions/1",
+        ],
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="bbb", edition_ids=[4, 3]
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == [
+        "aaa",
+        "bbb",
+    ]
+
+    warnings = [e for e in captured if e["event"] == _UNPARSABLE_URLS_EVENT]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["tier"] == "other"
+    assert warnings[0]["org"] == "ks-tier-other-badurl"
+    assert warnings[0]["ltd_slug"] == "aaa"
+    assert warnings[0]["unparsable_urls"] == [_UNPARSABLE_EDITION_URL]
+
+    stamped = await _read_polled_annotation(
+        org_id=org_id, ltd_slug="aaa", key="date_other_last_polled"
+    )
+    assert (now - stamped) < timedelta(minutes=5)
 
 
 # ---------------------------------------------------------------------------
