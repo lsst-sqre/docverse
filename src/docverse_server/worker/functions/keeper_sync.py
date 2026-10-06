@@ -106,6 +106,7 @@ from docverse_server.storage.edition_build_history_store import (
 )
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
+    KeeperSyncState,
     KeeperSyncStateStore,
     ResourceType,
 )
@@ -116,6 +117,7 @@ from docverse_server.storage.ltd import (
     LtdEdition,
     LtdNotFoundError,
     LtdProductsError,
+    parse_ltd_id,
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_backend import QueueBackend
@@ -149,7 +151,9 @@ __all__ = [
 ]
 
 #: Slug LTD assigns to every product's primary edition. Tier_main owns
-#: refreshes for this slug; tier_other explicitly skips it.
+#: refreshes for this slug; tier_other skips it, recognising it by the
+#: id cached under :data:`_MAIN_EDITION_LTD_ID_KEY` because it never
+#: fetches the edition payload that carries the slug.
 _LTD_MAIN_SLUG = "main"
 
 #: ``keeper_sync_state.annotations`` key on a project-resource state row
@@ -161,8 +165,9 @@ _MAIN_EDITION_URL_KEY = "main_edition_url"
 
 #: Companion to :data:`_MAIN_EDITION_URL_KEY`: the integer LTD edition
 #: id that ``main_edition_url`` resolves to. Stored alongside the URL
-#: so log lines and future reverse lookups have the id without needing
-#: to re-parse the URL.
+#: so log lines and reverse lookups have the id without needing to
+#: re-parse the URL. ``_tier_other_for_org`` reads it to leave ``main``
+#: out of its staleness scan, which sees only edition URLs, never slugs.
 _MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
 
 #: Cap on the number of per-edition failure detail entries written into
@@ -2646,6 +2651,11 @@ async def _tier_discovery_for_org(
     projects (LTD ``main`` rebuilt within ``TIER_DISCOVERY_HOT_WINDOW``)
     keep the 30-min cadence; dormant projects fall back to one pass per
     ``TIER_DISCOVERY_DORMANT_INTERVAL``.
+
+    A polled project with a state row costs one LTD call, its edition
+    URL listing; :func:`_project_needs_discovery` reads the edition ids
+    off the URLs and fetches no edition payload. One without a state
+    row costs none.
     """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
@@ -2774,9 +2784,14 @@ async def _tier_other_for_org(
     skip dormant projects before the per-project
     ``GET /products/<slug>/editions/`` listing, so a project whose
     branches haven't been touched in months stops driving an hourly
-    LTD fetch. Hot and dormant-due projects continue to fetch the
-    edition list and re-enqueue when state lags past
+    LTD fetch. Hot and dormant-due projects continue to list their
+    edition URLs and re-enqueue when state lags past
     :data:`TIER_OTHER_REFRESH_THRESHOLD`.
+
+    The listing is the only LTD call per polled project: the check
+    needs each edition's LTD id, which the URL carries, and which id is
+    ``main``, which tier_main caches on the project's state row, so no
+    edition payload is fetched.
     """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
@@ -2820,7 +2835,9 @@ async def _tier_other_for_org(
         ):
             continue
         try:
-            ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
+            edition_urls = await ltd_client.list_edition_urls_for_product(
+                ltd_slug
+            )
         except LtdClientError as exc:
             sentry_sdk.capture_exception(exc)
             logger.exception(
@@ -2841,7 +2858,8 @@ async def _tier_other_for_org(
             session=session,
             state_store=state_store,
             org_id=org.id,
-            ltd_editions=ltd_editions,
+            ltd_edition_ids=[parse_ltd_id(url) for url in edition_urls],
+            main_edition_ltd_id=_cached_main_edition_ltd_id(project_state),
             now=now,
         ) and await _enqueue_tier_project_sync(
             ctx=ctx,
@@ -3054,6 +3072,24 @@ async def _cached_main_edition_url(
     return cached if isinstance(cached, str) else None
 
 
+def _cached_main_edition_ltd_id(
+    project_state: KeeperSyncState | None,
+) -> int | None:
+    """Return the LTD ``main`` edition id tier_main cached, if any.
+
+    Reads :data:`_MAIN_EDITION_LTD_ID_KEY` off a project state row the
+    caller already holds, so it costs no query. ``None`` when there is
+    no row, no annotation, or a value that is not an integer id.
+    """
+    if project_state is None or project_state.annotations is None:
+        return None
+    cached = project_state.annotations.get(_MAIN_EDITION_LTD_ID_KEY)
+    # ``bool`` is an ``int`` subclass, but a JSON ``true`` is no edition id.
+    if isinstance(cached, bool) or not isinstance(cached, int):
+        return None
+    return cached
+
+
 async def _record_main_polled(
     *,
     session: AsyncSession,
@@ -3168,13 +3204,18 @@ async def _project_needs_discovery(
     """Return True when an in-scope project has any unseen LTD resource.
 
     The cheap check first: if the project itself has no state row,
-    enqueue immediately and skip the per-edition walk. Otherwise
-    consult the pre-loaded org-wide edition-state map and walk LTD's
-    edition list checking presence in memory. The caller hoists the
-    ``list_for_org(resource_type=edition)`` read out of the per-slug
-    loop and passes the resulting map in: with 1500 in-scope projects
-    that flips ~1500 ``list_for_org`` round-trips per discovery tick
-    into one.
+    enqueue immediately without touching LTD. Otherwise list the
+    project's edition URLs and look each one's LTD id, parsed from the
+    URL, up in the pre-loaded org-wide edition-state map. The caller
+    hoists the ``list_for_org(resource_type=edition)`` read out of the
+    per-slug loop and passes the resulting map in: with 1500 in-scope
+    projects that flips ~1500 ``list_for_org`` round-trips per
+    discovery tick into one.
+
+    The id is all this check needs, so it never follows the URLs: one
+    ``GET /products/<slug>/editions/`` per project, rather than one
+    more ``GET /editions/<id>`` per edition, which on ``pipelines``
+    (2,938 editions) pushed the cron past arq's cron timeout.
 
     ``project_state`` is the state row already fetched by the caller
     (so the dormancy planner and this helper share one read). Pass
@@ -3183,13 +3224,11 @@ async def _project_needs_discovery(
     """
     if is_unknown_resource(project_state):
         return True
-    ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
-    for ltd_edition in ltd_editions:
-        if is_unknown_resource(
-            edition_state_by_ltd_id.get(ltd_edition.ltd_id)
-        ):
-            return True
-    return False
+    edition_urls = await ltd_client.list_edition_urls_for_product(ltd_slug)
+    return any(
+        is_unknown_resource(edition_state_by_ltd_id.get(parse_ltd_id(url)))
+        for url in edition_urls
+    )
 
 
 async def _has_stale_non_main_edition(
@@ -3197,10 +3236,31 @@ async def _has_stale_non_main_edition(
     session: AsyncSession,
     state_store: KeeperSyncStateStore,
     org_id: int,
-    ltd_editions: list[LtdEdition],
+    ltd_edition_ids: Sequence[int],
+    main_edition_ltd_id: int | None,
     now: datetime,
 ) -> bool:
     """Return True when any non-``main`` edition's state is past threshold.
+
+    ``ltd_edition_ids`` are the LTD ids of the editions LTD lists for
+    the project, parsed from its edition URLs; no edition payload is
+    fetched, so the ``main`` slug is not available here. ``main`` is
+    instead recognised by ``main_edition_ltd_id``, the id
+    ``tier_main`` caches on the project's state row
+    (:data:`_MAIN_EDITION_LTD_ID_KEY`, read by
+    :func:`_cached_main_edition_ltd_id`), and left out of the scan.
+
+    When that annotation is missing (``None``) — ``tier_main`` has not
+    yet resolved this project's ``main``, say because the project only
+    just came into scope — every listed id is scanned, ``main``'s
+    included. The overlap is harmless: ``tier_main`` owns the ``main``
+    edition's row and keeps refreshing it on its own cadence, so at
+    worst this tier enqueues a project sync ``tier_main`` might also
+    have, through the same per-slug active-job mutex
+    (:func:`_enqueue_tier_project_sync`), and ``keeper_sync_project``
+    short-circuits every edition whose LTD rebuild it has already seen.
+    The next ``tier_main`` poll writes the annotation and the overlap
+    ends.
 
     Editions without a state row are deliberately ignored — they are
     ``tier_discovery``'s job. This decoupling keeps the two cron
@@ -3214,7 +3274,7 @@ async def _has_stale_non_main_edition(
     capped by LTD's edition count for the project.
     """
     non_main_ltd_ids = [
-        e.ltd_id for e in ltd_editions if e.slug != _LTD_MAIN_SLUG
+        ltd_id for ltd_id in ltd_edition_ids if ltd_id != main_edition_ltd_id
     ]
     if not non_main_ltd_ids:
         return False

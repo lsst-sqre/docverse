@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -64,6 +65,11 @@ LTD_BASE = "https://keeper.lsst.codes"
 #: ``date_rebuilt`` for the canonical ``main`` edition fixture. Used by
 #: tests that need to compare LTD's published timestamp against state.
 _FIXTURE_MAIN_DATE_REBUILT = datetime(2026, 4, 30, 18, 30, tzinfo=UTC)
+
+#: Path of one LTD edition resource, ``GET /editions/<id>``: the
+#: per-edition payload fetch the discovery and other tiers must never
+#: make.
+_EDITION_RESOURCE_PATH = re.compile(r"/editions/\d+/?")
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -211,6 +217,36 @@ def _stub_edition(
     )
 
 
+def _ltd_request_paths(mock_discovery: respx.Router) -> list[str]:
+    """Return the path of every request the tick sent to LTD, in order.
+
+    ``respx`` records every call on the router, matched or not, so a
+    request to an unstubbed LTD URL shows up here too.
+    """
+    return [
+        call.request.url.path
+        for call in mock_discovery.calls
+        if str(call.request.url).startswith(LTD_BASE)
+    ]
+
+
+def _assert_no_edition_fetches(mock_discovery: respx.Router) -> None:
+    """Fail when the tick fetched any edition payload from LTD.
+
+    ``tier_discovery`` and ``tier_other`` decide from each listed
+    edition's LTD id alone, which the edition URL carries, so they list
+    a product's edition URLs and never follow them: following them is
+    one ``GET /editions/<id>`` per edition, which on ``pipelines``
+    (2,938 editions) pushed both crons past arq's cron timeout.
+    """
+    fetched = [
+        path
+        for path in _ltd_request_paths(mock_discovery)
+        if _EDITION_RESOURCE_PATH.fullmatch(path)
+    ]
+    assert fetched == []
+
+
 def _make_ctx(http_client: httpx.AsyncClient) -> dict[str, Any]:
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
@@ -227,6 +263,7 @@ async def _seed_state(
     docverse_id: int | None = 99,
     date_last_synced: datetime | None = None,
     date_rebuilt_seen: datetime | None = None,
+    annotations: dict[str, Any] | None = None,
 ) -> None:
     state_store = KeeperSyncStateStore(session=db_session, logger=_logger())
     await state_store.upsert(
@@ -237,6 +274,7 @@ async def _seed_state(
         docverse_id=docverse_id,
         date_last_synced=date_last_synced,
         date_rebuilt_seen=date_rebuilt_seen,
+        annotations=annotations,
     )
 
 
@@ -1570,6 +1608,7 @@ async def test_tier_discovery_enqueues_when_project_state_missing(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -1621,17 +1660,78 @@ async def test_tier_discovery_enqueues_when_edition_state_missing(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+
+    # Single enqueue covers the project; the unseen edition gets
+    # imported as a side effect of ``KeeperSyncService.sync_project``.
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    assert len(children) == 1
+
+
+@pytest.mark.asyncio
+async def test_tier_discovery_reads_only_the_edition_url_listing(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """One LTD call per project with a state row: its edition URL list.
+
+    Discovery needs only each listed edition's LTD id, which the URL
+    carries, so it compares the parsed ids against the edition-state
+    map and never fetches an edition payload. ``sqr-001`` lists an id
+    with no state row and enqueues; every id ``pipelines`` lists is
+    known, so it does not. No edition resource is stubbed, so a
+    regression to following the URLs also shows up as an
+    ``/editions/<id>`` request.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-urls",
+            project_slugs=["pipelines", "sqr-001"],
+        )
+        for slug in ("pipelines", "sqr-001"):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+            )
+        for ltd_id, slug in ((1, "main"), (2, "branch-a"), (3, "branch-b")):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug=slug,
+            )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=10,
+            ltd_slug="main",
+        )
+
+    _stub_products(mock_discovery, ["pipelines", "sqr-001"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[3, 2, 1]
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="sqr-001", edition_ids=[11, 10]
     )
 
     http_client = httpx.AsyncClient()
@@ -1642,14 +1742,18 @@ async def test_tier_discovery_enqueues_when_edition_state_missing(
         await ctx["http_client"].aclose()
     assert result == "completed"
 
-    # Single enqueue covers the project; the unseen edition gets
-    # imported as a side effect of ``KeeperSyncService.sync_project``.
     children = get_jobs_by_name(
         ctx["arq_queue"],
         "keeper_sync_project",
         queue_name=KEEPER_SYNC_QUEUE_NAME,
     )
-    assert len(children) == 1
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["sqr-001"]
+    _assert_no_edition_fetches(mock_discovery)
+    assert sorted(_ltd_request_paths(mock_discovery)) == [
+        "/products/",
+        "/products/pipelines/editions/",
+        "/products/sqr-001/editions/",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1700,24 +1804,6 @@ async def test_tier_discovery_batches_edition_state_lookups(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[5, 4, 3, 2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    for edition_id, slug in (
-        (2, "branch-a"),
-        (3, "branch-b"),
-        (4, "branch-c"),
-        (5, "branch-d"),
-    ):
-        _stub_edition(
-            mock_discovery,
-            edition_id=edition_id,
-            slug=slug,
-            date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-        )
 
     recorder = _install_state_store_recorder(monkeypatch)
     http_client = httpx.AsyncClient()
@@ -1727,6 +1813,7 @@ async def test_tier_discovery_batches_edition_state_lookups(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     # Fully-known project — no enqueue.
     assert (
@@ -1808,12 +1895,6 @@ async def test_tier_discovery_batches_edition_state_lookups_across_slugs(
         _stub_editions_listing(
             mock_discovery, product_slug=slug, edition_ids=[edition_id]
         )
-        _stub_edition(
-            mock_discovery,
-            edition_id=edition_id,
-            slug=f"main-{slug[-1]}",
-            date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-        )
 
     recorder = _install_state_store_recorder(monkeypatch)
     http_client = httpx.AsyncClient()
@@ -1823,6 +1904,7 @@ async def test_tier_discovery_batches_edition_state_lookups_across_slugs(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     # Fully-known: no enqueues across all three slugs.
     assert (
@@ -1869,12 +1951,6 @@ async def test_tier_discovery_skips_fully_known_project(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -1883,6 +1959,7 @@ async def test_tier_discovery_skips_fully_known_project(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
     assert (
         get_jobs_by_name(
             ctx["arq_queue"],
@@ -1987,24 +2064,6 @@ async def test_tier_discovery_polls_only_hot_and_due_dormant_projects(
             200, json={"editions": [f"{LTD_BASE}/editions/3"]}
         )
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=3,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2013,6 +2072,7 @@ async def test_tier_discovery_polls_only_hot_and_due_dormant_projects(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     # Acceptance: LTD HTTP fired exactly for the polled cohort.
     assert hot_listing.call_count == 1
@@ -2106,6 +2166,7 @@ async def test_tier_discovery_records_polled_annotation_on_ltd_error(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -2162,6 +2223,7 @@ async def test_tier_discovery_skips_tombstoned_project_slug(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -2228,18 +2290,6 @@ async def test_tier_discovery_does_not_treat_tombstoned_edition_as_unknown(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2248,6 +2298,7 @@ async def test_tier_discovery_does_not_treat_tombstoned_edition_as_unknown(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     assert (
         get_jobs_by_name(
@@ -2293,6 +2344,7 @@ async def test_tier_discovery_honours_scope_patterns_and_excludes(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -2315,13 +2367,24 @@ async def test_tier_other_enqueues_for_stale_non_main_edition(
 ) -> None:
     """A non-main edition past the threshold — enqueue refresh.
 
-    Also asserts the queue_jobs row carries ``keeper_sync_run_id IS
-    NULL`` and the payload lacks ``run_id``.
+    ``main`` is stale too, but tier_main has cached its LTD id on the
+    project's state row, so tier_other leaves it out and the enqueue
+    comes from the branch edition alone. Also asserts the queue_jobs
+    row carries ``keeper_sync_run_id IS NULL`` and the payload lacks
+    ``run_id``.
     """
     stale = datetime.now(tz=UTC) - timedelta(hours=2)
     async with db_session.begin():
         org_id, _ = await _seed_org(
             db_session, slug="ks-tier-other-1", project_slugs=["pipelines"]
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+            annotations={"main_edition_ltd_id": 1},
         )
         # Branch edition (ltd_id=2): stale.
         await _seed_state(
@@ -2346,18 +2409,6 @@ async def test_tier_other_enqueues_for_stale_non_main_edition(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2366,6 +2417,7 @@ async def test_tier_other_enqueues_for_stale_non_main_edition(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -2392,11 +2444,24 @@ async def test_tier_other_skips_when_only_main_is_stale(
     db_session: AsyncSession,
     mock_discovery: respx.Router,
 ) -> None:
-    """``main`` editions belong to tier_main; tier_other ignores them."""
+    """``main`` editions belong to tier_main; tier_other ignores them.
+
+    tier_other never fetches an edition payload, so it cannot see the
+    ``main`` slug. It recognises ``main`` by the LTD id tier_main caches
+    on the project's state row (``main_edition_ltd_id``) instead.
+    """
     stale = datetime.now(tz=UTC) - timedelta(hours=4)
     async with db_session.begin():
         org_id, _ = await _seed_org(
             db_session, slug="ks-tier-other-2", project_slugs=["pipelines"]
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+            annotations={"main_edition_ltd_id": 1},
         )
         # Only main is stale.
         await _seed_state(
@@ -2421,17 +2486,74 @@ async def test_tier_other_skips_when_only_main_is_stale(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 5, 7, tzinfo=UTC),
+
+
+@pytest.mark.asyncio
+async def test_tier_other_checks_main_when_its_id_is_not_cached(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """Without tier_main's cached id, ``main`` is checked like any edition.
+
+    The project's state row has no ``main_edition_ltd_id`` annotation
+    (tier_main has not resolved this project's ``main`` yet), so
+    tier_other cannot tell ``main`` apart in the URL list and includes
+    every listed id. ``main`` is the only stale edition here, so the
+    tick enqueues: the documented, harmless overlap with tier_main,
+    which owns the ``main`` row.
+    """
+    stale = datetime.now(tz=UTC) - timedelta(hours=4)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-no-main-id",
+            project_slugs=["pipelines"],
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_last_synced=stale,
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="u-jsick-feature",
+            date_last_synced=datetime.now(tz=UTC),
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
 
     http_client = httpx.AsyncClient()
@@ -2441,14 +2563,93 @@ async def test_tier_other_skips_when_only_main_is_stale(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
-    assert (
-        get_jobs_by_name(
-            ctx["arq_queue"],
-            "keeper_sync_project",
-            queue_name=KEEPER_SYNC_QUEUE_NAME,
-        )
-        == []
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
     )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["pipelines"]
+    _assert_no_edition_fetches(mock_discovery)
+
+
+@pytest.mark.asyncio
+async def test_tier_other_reads_only_the_edition_url_listing(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """One LTD call per polled project: its edition URL list.
+
+    tier_other needs only each listed edition's LTD id (to read its
+    state row) and which one is ``main`` (from tier_main's cached id),
+    so it never fetches an edition payload. ``pipelines`` has a stale
+    branch edition and enqueues; every edition ``sqr-001`` lists is
+    fresh, so it does not. No edition resource is stubbed, so a
+    regression to following the URLs also shows up as an
+    ``/editions/<id>`` request.
+    """
+    now = datetime.now(tz=UTC)
+    stale = now - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-urls",
+            project_slugs=["pipelines", "sqr-001"],
+        )
+        for slug, main_id in (("pipelines", 1), ("sqr-001", 10)):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+                annotations={"main_edition_ltd_id": main_id},
+            )
+        for ltd_id, slug, synced in (
+            (1, "main", now),
+            (2, "branch-a", now),
+            (3, "branch-b", stale),
+            (10, "main", now),
+            (11, "branch-c", now),
+        ):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug=slug,
+                date_last_synced=synced,
+            )
+
+    _stub_products(mock_discovery, ["pipelines", "sqr-001"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[3, 2, 1]
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="sqr-001", edition_ids=[11, 10]
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["pipelines"]
+    _assert_no_edition_fetches(mock_discovery)
+    assert sorted(_ltd_request_paths(mock_discovery)) == [
+        "/products/",
+        "/products/pipelines/editions/",
+        "/products/sqr-001/editions/",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2481,18 +2682,6 @@ async def test_tier_other_skips_edition_with_no_state(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2501,6 +2690,7 @@ async def test_tier_other_skips_edition_with_no_state(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
     assert (
         get_jobs_by_name(
             ctx["arq_queue"],
@@ -2563,25 +2753,6 @@ async def test_tier_other_batches_edition_state_lookups(
         product_slug="pipelines",
         edition_ids=[6, 5, 4, 3, 2, 1],
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    for edition_id, slug in (
-        (2, "branch-a"),
-        (3, "branch-b"),
-        (4, "branch-c"),
-        (5, "branch-d"),
-        (6, "branch-e"),
-    ):
-        _stub_edition(
-            mock_discovery,
-            edition_id=edition_id,
-            slug=slug,
-            date_rebuilt=datetime(2026, 5, 7, tzinfo=UTC),
-        )
 
     recorder = _install_state_store_recorder(monkeypatch)
     http_client = httpx.AsyncClient()
@@ -2591,6 +2762,7 @@ async def test_tier_other_batches_edition_state_lookups(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     assert (
         get_jobs_by_name(
@@ -2712,24 +2884,6 @@ async def test_tier_other_polls_only_hot_and_due_dormant_projects(
             200, json={"editions": [f"{LTD_BASE}/editions/30"]}
         )
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=10,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=20,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=30,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2738,6 +2892,7 @@ async def test_tier_other_polls_only_hot_and_due_dormant_projects(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     # Acceptance: LTD HTTP fired exactly for the polled cohort.
     assert hot_listing.call_count == 1
@@ -2827,6 +2982,7 @@ async def test_tier_other_records_polled_annotation_on_ltd_error(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -2890,18 +3046,6 @@ async def test_tier_other_skips_tombstoned_project_slug(
     _stub_editions_listing(
         mock_discovery, product_slug="live-proj", edition_ids=[20, 10]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=10,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=20,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2910,6 +3054,7 @@ async def test_tier_other_skips_tombstoned_project_slug(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -2954,18 +3099,6 @@ async def test_tier_other_honours_scope_patterns_and_excludes(
     _stub_editions_listing(
         mock_discovery, product_slug="sqr-100", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2974,6 +3107,7 @@ async def test_tier_other_honours_scope_patterns_and_excludes(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],

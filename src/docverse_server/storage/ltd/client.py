@@ -268,10 +268,13 @@ class LtdClient:
 
         The cheap variant of :meth:`list_editions_for_product`: one HTTP
         call returns every edition's resource URL, but this helper does
-        not follow them. Used by ``keeper_sync_tier_main`` where we
-        want to walk the URL list looking for the ``main`` edition
-        without paying a round-trip per non-``main`` edition along the
-        way.
+        not follow them. Each URL carries its edition's LTD id
+        (:func:`~docverse_server.storage.ltd.models.parse_ltd_id`), so a
+        caller that needs only ids should list URLs, not editions.
+        ``keeper_sync_tier_main`` walks the URL list looking for the
+        ``main`` edition without paying a round-trip per non-``main``
+        edition along the way, and ``keeper_sync_tier_discovery`` and
+        ``keeper_sync_tier_other`` decide from the ids alone.
         """
         payload = await self._get_json(
             self._url(f"/products/{product_slug}/editions/")
