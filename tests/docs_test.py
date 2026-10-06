@@ -2133,7 +2133,8 @@ def test_budget_tier_cron_timeouts_documented() -> None:
     timeout that moves with its interval, is a row the page has to
     change. Each row names the cadence constant the interval comes from,
     and the section names the helper and the constants the timeout
-    derives through, and the line a cancelled pass logs.
+    derives through, the floor it never falls below, and the line a
+    cancelled pass logs.
     """
     section = _subsection(_budget_section("The ladder"), "Tier-cron timeouts")
     rows = {cells[0].strip("`"): cells for cells in _code_rows(section)}
@@ -2155,6 +2156,7 @@ def test_budget_tier_cron_timeouts_documented() -> None:
             "tier_cron_timeout",
             "TIER_CRON_TIMEOUT_MARGIN_DIVISOR",
             "TIER_CRON_TIMEOUT_MIN_MARGIN",
+            "ARQ_DEFAULT_JOB_TIMEOUT",
             "Keeper-sync tier pass cancelled",
         },
         section,

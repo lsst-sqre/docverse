@@ -115,12 +115,14 @@ sit outside the ladder: they sync nothing themselves and hold no
 pass still runs under an arq timeout of its own, which
 `tier_cron_timeout` derives from the tier's cron interval: the interval
 less a margin of one `TIER_CRON_TIMEOUT_MARGIN_DIVISOR` (6)th of it,
-and never less than `TIER_CRON_TIMEOUT_MIN_MARGIN` (one minute). None of
-the three is a setting; each follows its cadence constant.
+and never less than `TIER_CRON_TIMEOUT_MIN_MARGIN` (one minute). The
+result is floored at arq's default, `ARQ_DEFAULT_JOB_TIMEOUT` (300 s),
+and capped at the interval itself. None of the three is a setting; each
+follows its cadence constant.
 
 | Cron | Interval | Timeout |
 | --- | --- | --- |
-| `keeper_sync_tier_main` | 5 min (`TIER_MAIN_CRON_INTERVAL`) | 240 s |
+| `keeper_sync_tier_main` | 5 min (`TIER_MAIN_CRON_INTERVAL`) | 300 s |
 | `keeper_sync_tier_discovery` | 30 min (`TIER_DISCOVERY_CRON_INTERVAL`) | 1500 s |
 | `keeper_sync_tier_other` | 60 min (`TIER_OTHER_CRON_INTERVAL`) | 3000 s |
 
@@ -132,11 +134,27 @@ and `keeper_sync_tier_other` reached it on every tick. A cancelled pass
 starts again from the top of the scope on its next tick, so the
 projects at the tail of the scope were never visited.
 
-Each timeout is strictly shorter than its interval, so arq cancels a
-pass before the same tier's next tick fires, and two passes of one tier
-never overlap. The margin covers a pass that started late, because the
-pool's job slots were all busy at the tick, and the cleanup a cancelled
-pass runs on its way out. The sync worker registers each tier's cron
+The floor is for `keeper_sync_tier_main`, the one tier whose cadence is
+no longer than arq's default. Its interval less the one-minute margin
+would leave 240 s, a fifth less than the 300 s it ran under before, and
+a pass that needed the difference would be cancelled, and start again
+from the top of its scope, on every tick. The cap keeps a tier whose
+cadence is shorter than the floor, should one be added, from running a
+pass that started on time into its own next tick.
+
+The timeout bounds a pass. For `keeper_sync_tier_discovery` and
+`keeper_sync_tier_other` the margin also keeps a pass that started a
+little late, because the pool's job slots were all busy at the tick,
+from running into the same tier's next tick in the common case, with
+room for the cleanup a cancelled pass runs on its way out. It cannot
+rule an overlap out: arq measures the timeout from when a pass starts,
+not from its tick, so a pass that started late on a saturated pool can
+still be running when the next tick's pass starts, and
+`keeper_sync_tier_main`, held at the floor, has no margin at all. Two
+passes that overlap can each try to enqueue the same project's sync;
+the per-project active-job slot lets only one `keeper_sync_project` job
+be active, and the other pass logs that it skipped the project (see
+[Log lines](#log-lines)). The sync worker registers each tier's cron
 job, and the same function on the pool's `functions` list, with the
 derived value.
 
@@ -439,7 +457,7 @@ tier's `tier_cron_timeout` instead (see
 | `publish_edition` | default | `publish_edition_job_timeout_seconds` | `record_cancellation` | Rolls up its keeper-sync run, if it has one. |
 | `keeper_sync_project` | keeper-sync | `keeper_sync_job_timeout_seconds` | both | Records its slice position and rolls up its run, if it has one; the hand-off covers its continuation. |
 | `keeper_sync_run_discovery` | keeper-sync | `keeper_sync_job_timeout_seconds` | `record_cancellation` | Fails its run outright, since a part-finished fan-out has no counters to roll up. |
-| `keeper_sync_tier_main` | keeper-sync | `tier_cron_timeout` (240 s) | `record_handoff_cancellation` | The project jobs it enqueues. |
+| `keeper_sync_tier_main` | keeper-sync | `tier_cron_timeout` (300 s) | `record_handoff_cancellation` | The project jobs it enqueues. |
 | `keeper_sync_tier_discovery` | keeper-sync | `tier_cron_timeout` (1500 s) | `record_handoff_cancellation` | The project jobs it enqueues. |
 | `keeper_sync_tier_other` | keeper-sync | `tier_cron_timeout` (3000 s) | `record_handoff_cancellation` | The project jobs it enqueues. |
 | `edition_reconcile` | maintenance | `maintenance_job_timeout_seconds` | `record_cancellation` | Nothing; the row is the tick's whole record. |

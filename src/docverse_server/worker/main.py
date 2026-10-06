@@ -1001,9 +1001,9 @@ class KeeperSyncWorkerSettings:
     # ``services/keeper_sync/scheduler.py`` so the planner's next-tick
     # math (``explain_tier_status``) and the cron's actual firing
     # schedule cannot drift. Each tier's ``timeout`` derives from the
-    # same interval (``tier_cron_timeout``), strictly inside it, so arq
-    # cancels a pass before the tier's next tick rather than at its 300 s
-    # default, which a large scope outgrows.
+    # same interval (``tier_cron_timeout``), at most the interval and
+    # never below arq's 300 s default, so a large scope's pass is not cut
+    # off at that default and no tier gets less time than it had.
     cron_jobs = [
         cron(
             instrument_arq_task(keeper_sync_reaper),

@@ -119,7 +119,9 @@ and ``dashboard_sync`` on the default pool, and
 the ``reason`` is inferred against the timeout arq actually enforces on
 them, not their pool's longest one. The keeper-sync tier crons carry a
 timeout of their own, derived from each tier's cron interval by
-:func:`~docverse_server.services.keeper_sync.scheduler.tier_cron_timeout`.
+:func:`~docverse_server.services.keeper_sync.scheduler.tier_cron_timeout`
+and floored at this value, which the scheduler holds as
+:data:`~docverse_server.services.keeper_sync.scheduler.ARQ_DEFAULT_JOB_TIMEOUT`.
 """
 
 JOB_TIMEOUT_MESSAGE = "Queue job cancelled at its arq timeout"
