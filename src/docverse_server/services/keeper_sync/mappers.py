@@ -39,6 +39,7 @@ __all__ = [
     "derive_edition_source_prefix",
     "derive_synced_build_git_ref",
     "derive_tracking_source",
+    "is_ltd_main",
     "map_edition_tracking",
     "tracking_reads_live_refs",
 ]
@@ -279,6 +280,18 @@ def derive_edition_slug(ltd_slug: str) -> str:
     if ltd_slug == LTD_MAIN_SLUG:
         return DOCVERSE_MAIN_SLUG
     return ltd_slug
+
+
+def is_ltd_main(ltd_edition_slug: str) -> bool:
+    """Return whether an LTD edition slug names the product's ``main``.
+
+    True exactly when :func:`derive_edition_slug` folds the slug onto
+    Docverse's default edition. Shared by the keeper-sync service (its
+    ``main``-first walk order and its state-row lookup of ``main``'s
+    LTD id) and the ``tier_other`` cron, which reads the slug off the
+    ``keeper_sync_state`` rows it already fetches.
+    """
+    return derive_edition_slug(ltd_edition_slug) == DOCVERSE_MAIN_SLUG
 
 
 def derive_edition_dates(ltd_edition: LtdEdition) -> tuple[datetime, datetime]:

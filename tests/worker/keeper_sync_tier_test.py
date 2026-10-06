@@ -2500,11 +2500,10 @@ async def test_tier_other_enqueues_for_stale_non_main_edition(
 ) -> None:
     """A non-main edition past the threshold — enqueue refresh.
 
-    ``main`` is stale too, but tier_main has cached its LTD id on the
-    project's state row, so tier_other leaves it out and the enqueue
-    comes from the branch edition alone. Also asserts the queue_jobs
-    row carries ``keeper_sync_run_id IS NULL`` and the payload lacks
-    ``run_id``.
+    ``main`` is stale too, but its state row records the ``main`` slug,
+    so tier_other leaves it out and the enqueue comes from the branch
+    edition alone. Also asserts the queue_jobs row carries
+    ``keeper_sync_run_id IS NULL`` and the payload lacks ``run_id``.
     """
     stale = datetime.now(tz=UTC) - timedelta(hours=2)
     async with db_session.begin():
@@ -2517,7 +2516,6 @@ async def test_tier_other_enqueues_for_stale_non_main_edition(
             resource_type=ResourceType.project,
             ltd_id=None,
             ltd_slug="pipelines",
-            annotations={"main_edition_ltd_id": 1},
         )
         # Branch edition (ltd_id=2): stale.
         await _seed_state(
@@ -2572,16 +2570,28 @@ async def test_tier_other_enqueues_for_stale_non_main_edition(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "project_annotations",
+    [
+        pytest.param({"main_edition_ltd_id": 1}, id="annotation-current"),
+        pytest.param(None, id="annotation-missing"),
+        pytest.param({"main_edition_ltd_id": 99}, id="annotation-stale"),
+    ],
+)
 async def test_tier_other_skips_when_only_main_is_stale(
     app: None,
     db_session: AsyncSession,
     mock_discovery: respx.Router,
+    project_annotations: dict[str, Any] | None,
 ) -> None:
     """``main`` editions belong to tier_main; tier_other ignores them.
 
-    tier_other never fetches an edition payload, so it cannot see the
-    ``main`` slug. It recognises ``main`` by the LTD id tier_main caches
-    on the project's state row (``main_edition_ltd_id``) instead.
+    tier_other never fetches an edition payload, so it recognises
+    ``main`` by the LTD slug its ``keeper_sync_state`` row records.
+    The ``main_edition_ltd_id`` annotation tier_main caches on the
+    project's state row plays no part: whether it is current, missing
+    (tier_main has not resolved ``main`` yet), or stale (it names an id
+    LTD no longer lists), an old ``main`` alone never enqueues.
     """
     stale = datetime.now(tz=UTC) - timedelta(hours=4)
     async with db_session.begin():
@@ -2594,7 +2604,7 @@ async def test_tier_other_skips_when_only_main_is_stale(
             resource_type=ResourceType.project,
             ltd_id=None,
             ltd_slug="pipelines",
-            annotations={"main_edition_ltd_id": 1},
+            annotations=project_annotations,
         )
         # Only main is stale.
         await _seed_state(
@@ -2639,74 +2649,6 @@ async def test_tier_other_skips_when_only_main_is_stale(
 
 
 @pytest.mark.asyncio
-async def test_tier_other_checks_main_when_its_id_is_not_cached(
-    app: None,
-    db_session: AsyncSession,
-    mock_discovery: respx.Router,
-) -> None:
-    """Without tier_main's cached id, ``main`` is checked like any edition.
-
-    The project's state row has no ``main_edition_ltd_id`` annotation
-    (tier_main has not resolved this project's ``main`` yet), so
-    tier_other cannot tell ``main`` apart in the URL list and includes
-    every listed id. ``main`` is the only stale edition here, so the
-    tick enqueues: the documented, harmless overlap with tier_main,
-    which owns the ``main`` row.
-    """
-    stale = datetime.now(tz=UTC) - timedelta(hours=4)
-    async with db_session.begin():
-        org_id, _ = await _seed_org(
-            db_session,
-            slug="ks-tier-other-no-main-id",
-            project_slugs=["pipelines"],
-        )
-        await _seed_state(
-            db_session,
-            org_id=org_id,
-            resource_type=ResourceType.project,
-            ltd_id=None,
-            ltd_slug="pipelines",
-        )
-        await _seed_state(
-            db_session,
-            org_id=org_id,
-            resource_type=ResourceType.edition,
-            ltd_id=1,
-            ltd_slug="main",
-            date_last_synced=stale,
-        )
-        await _seed_state(
-            db_session,
-            org_id=org_id,
-            resource_type=ResourceType.edition,
-            ltd_id=2,
-            ltd_slug="u-jsick-feature",
-            date_last_synced=datetime.now(tz=UTC),
-        )
-
-    _stub_products(mock_discovery, ["pipelines"])
-    _stub_editions_listing(
-        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
-    )
-
-    http_client = httpx.AsyncClient()
-    ctx = _make_ctx(http_client)
-    try:
-        result = await keeper_sync_tier_other(ctx)
-    finally:
-        await ctx["http_client"].aclose()
-    assert result == "completed"
-
-    children = get_jobs_by_name(
-        ctx["arq_queue"],
-        "keeper_sync_project",
-        queue_name=KEEPER_SYNC_QUEUE_NAME,
-    )
-    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["pipelines"]
-    _assert_no_edition_fetches(mock_discovery)
-
-
-@pytest.mark.asyncio
 async def test_tier_other_reads_only_the_edition_url_listing(
     app: None,
     db_session: AsyncSession,
@@ -2715,8 +2657,8 @@ async def test_tier_other_reads_only_the_edition_url_listing(
     """One LTD call per polled project: its edition URL list.
 
     tier_other needs only each listed edition's LTD id (to read its
-    state row) and which one is ``main`` (from tier_main's cached id),
-    so it never fetches an edition payload. ``pipelines`` has a stale
+    state row, which also names ``main`` by its LTD slug), so it never
+    fetches an edition payload. ``pipelines`` has a stale
     branch edition and enqueues; every edition ``sqr-001`` lists is
     fresh, so it does not. No edition resource is stubbed, so a
     regression to following the URLs also shows up as an
@@ -2730,14 +2672,13 @@ async def test_tier_other_reads_only_the_edition_url_listing(
             slug="ks-tier-other-urls",
             project_slugs=["pipelines", "sqr-001"],
         )
-        for slug, main_id in (("pipelines", 1), ("sqr-001", 10)):
+        for slug in ("pipelines", "sqr-001"):
             await _seed_state(
                 db_session,
                 org_id=org_id,
                 resource_type=ResourceType.project,
                 ltd_id=None,
                 ltd_slug=slug,
-                annotations={"main_edition_ltd_id": main_id},
             )
         for ltd_id, slug, synced in (
             (1, "main", now),
@@ -3273,14 +3214,13 @@ async def test_tier_other_skips_unparsable_edition_url(
             slug="ks-tier-other-badurl",
             project_slugs=["aaa", "bbb"],
         )
-        for slug, main_id in (("aaa", 1), ("bbb", 3)):
+        for slug in ("aaa", "bbb"):
             await _seed_state(
                 db_session,
                 org_id=org_id,
                 resource_type=ResourceType.project,
                 ltd_id=None,
                 ltd_slug=slug,
-                annotations={"main_edition_ltd_id": main_id},
             )
         for ltd_id in (2, 4):
             await _seed_state(

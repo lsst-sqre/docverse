@@ -134,6 +134,7 @@ from .mappers import (
     derive_edition_slug,
     derive_edition_source_prefix,
     derive_synced_build_git_ref,
+    is_ltd_main,
     map_edition_tracking,
     tracking_reads_live_refs,
 )
@@ -1433,7 +1434,7 @@ class KeeperSyncService:
                 include_tombstoned=True,
             )
         return next(
-            (row.ltd_id for row in state_rows if _is_ltd_main(row.ltd_slug)),
+            (row.ltd_id for row in state_rows if is_ltd_main(row.ltd_slug)),
             None,
         )
 
@@ -3735,14 +3736,9 @@ def _main_first(ltd_editions: Sequence[LtdEdition]) -> list[LtdEdition]:
     would otherwise publish the default edition only in its final
     slice. Every other edition keeps LTD's relative order.
     """
-    main = [e for e in ltd_editions if _is_ltd_main(e.slug)]
-    rest = [e for e in ltd_editions if not _is_ltd_main(e.slug)]
+    main = [e for e in ltd_editions if is_ltd_main(e.slug)]
+    rest = [e for e in ltd_editions if not is_ltd_main(e.slug)]
     return main + rest
-
-
-def _is_ltd_main(ltd_edition_slug: str) -> bool:
-    """Return whether an LTD edition slug names the product's ``main``."""
-    return derive_edition_slug(ltd_edition_slug) == DEFAULT_EDITION_SLUG
 
 
 def _ensure_trailing_slash(prefix: str) -> str:
