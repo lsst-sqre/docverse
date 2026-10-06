@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from pathlib import Path
 
 import httpx
@@ -19,7 +19,10 @@ from docverse_server.storage.ltd import (
     LtdClientError,
     LtdNotFoundError,
 )
-from docverse_server.storage.ltd.client import _MAX_BACKOFF_SECONDS
+from docverse_server.storage.ltd.client import (
+    _EDITION_FETCH_CONCURRENCY,
+    _MAX_BACKOFF_SECONDS,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 LTD_BASE = "https://keeper.lsst.codes"
@@ -128,6 +131,163 @@ async def test_list_editions_for_product_follows_each_url(
         "pipelines"
     )
     assert [e.slug for e in editions] == ["main", "u-jsick-feature"]
+
+
+def _edition_payload(index: int) -> dict[str, object]:
+    """Return an edition payload whose slug and URL carry ``index``."""
+    payload = _load("edition_branch_git_refs.json")
+    payload["self_url"] = f"{LTD_BASE}/editions/{index}"
+    payload["slug"] = f"edition-{index}"
+    return payload
+
+
+class _FakeEditionServer:
+    """A fake LTD serving one product's edition list and its editions.
+
+    Records how many edition GETs are in flight at once (and the peak),
+    the order edition responses complete in, which editions were ever
+    requested, and how many in-flight edition GETs were cancelled, so
+    the fan-out in ``list_editions_for_product`` can be asserted on
+    directly. ``respond`` produces the response for the edition at an
+    index in the URL list, so each test picks its own timing and
+    failures.
+    """
+
+    def __init__(
+        self,
+        count: int,
+        respond: Callable[[int], Awaitable[httpx.Response]],
+    ) -> None:
+        self.urls = [f"{LTD_BASE}/editions/{i}" for i in range(count)]
+        self._respond = respond
+        self.in_flight = 0
+        self.peak = 0
+        self.completed: list[int] = []
+        self.cancelled = 0
+        self.started: set[int] = set()
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/products/pipelines/editions/":
+            return httpx.Response(200, json={"editions": self.urls})
+        index = int(request.url.path.rsplit("/", 1)[-1])
+        self.started.add(index)
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            response = await self._respond(index)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        finally:
+            self.in_flight -= 1
+        self.completed.append(index)
+        return response
+
+
+@pytest.mark.asyncio
+async def test_list_editions_for_product_bounds_concurrent_gets() -> None:
+    """Edition GETs run concurrently, but never more than the bound.
+
+    ``pipelines`` lists thousands of editions; following them one at a
+    time cost about two minutes per call, which pushed the keeper-sync
+    tier crons past arq's cron timeout. Following all of them at once
+    would instead open thousands of requests against LTD.
+    """
+
+    async def respond(index: int) -> httpx.Response:
+        await asyncio.sleep(0.02)
+        return httpx.Response(200, json=_edition_payload(index))
+
+    server = _FakeEditionServer(3 * _EDITION_FETCH_CONCURRENCY, respond)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server.handler)
+    ) as http_client:
+        editions = await _make_client(http_client).list_editions_for_product(
+            "pipelines"
+        )
+
+    assert len(editions) == 3 * _EDITION_FETCH_CONCURRENCY
+    assert server.peak == _EDITION_FETCH_CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_list_editions_for_product_preserves_url_list_order() -> None:
+    """The result follows LTD's URL list, not the order GETs complete in.
+
+    Each edition answers more slowly than the one after it, so within a
+    batch the GETs complete in the reverse of the URL-list order.
+    """
+    count = 2 * _EDITION_FETCH_CONCURRENCY
+
+    async def respond(index: int) -> httpx.Response:
+        await asyncio.sleep(0.002 * (count - index))
+        return httpx.Response(200, json=_edition_payload(index))
+
+    server = _FakeEditionServer(count, respond)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server.handler)
+    ) as http_client:
+        editions = await _make_client(http_client).list_editions_for_product(
+            "pipelines"
+        )
+
+    assert server.completed != sorted(server.completed)
+    assert [e.slug for e in editions] == [f"edition-{i}" for i in range(count)]
+
+
+def _connect_error(index: int) -> httpx.Response:
+    request = httpx.Request("GET", f"{LTD_BASE}/editions/{index}")
+    raise httpx.ConnectError("connection refused", request=request)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (lambda _: httpx.Response(404), LtdNotFoundError),
+        (lambda _: httpx.Response(401), LtdClientError),
+        (lambda _: httpx.Response(503), LtdClientError),
+        (_connect_error, LtdClientError),
+    ],
+    ids=["not-found", "non-retryable", "retries-exhausted", "transport"],
+)
+@pytest.mark.asyncio
+async def test_list_editions_for_product_failure_cancels_the_rest(
+    failure: Callable[[int], httpx.Response],
+    expected: type[LtdClientError],
+) -> None:
+    """A failing edition GET raises as before and cancels its siblings.
+
+    The failure surfaces as the same ``LtdClientError`` subclass the
+    one-at-a-time walk raised, never wrapped in an exception group, and
+    every sibling GET still in flight is cancelled rather than left
+    running after the call has already failed.
+    """
+    failing_index = 2
+    never = asyncio.Event()
+
+    async def respond(index: int) -> httpx.Response:
+        if index == failing_index:
+            return failure(index)
+        await never.wait()
+        return httpx.Response(200, json=_edition_payload(index))
+
+    server = _FakeEditionServer(3 * _EDITION_FETCH_CONCURRENCY, respond)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(server.handler)
+    ) as http_client:
+        with pytest.raises(LtdClientError) as excinfo:
+            await asyncio.wait_for(
+                _make_client(http_client).list_editions_for_product(
+                    "pipelines"
+                ),
+                timeout=5,
+            )
+
+    assert type(excinfo.value) is expected
+    assert excinfo.value.url == f"{LTD_BASE}/editions/{failing_index}"
+    assert server.in_flight == 0
+    assert server.cancelled == len(server.started) - 1
+    assert len(server.started) < len(server.urls)
 
 
 @pytest.mark.asyncio
