@@ -73,6 +73,7 @@ __all__ = [
     "RunFinaliser",
     "cancellation_recorded",
     "discovery_run_finaliser",
+    "infer_cancellation_reason",
     "keeper_sync_run_finaliser",
     "record_cancellation",
     "record_handoff_cancellation",
@@ -110,13 +111,15 @@ ARQ_DEFAULT_JOB_TIMEOUT_SECONDS = 300
 arq's ``Worker`` defaults ``job_timeout`` to this, and none of the three
 ``WorkerSettings`` classes overrides it, so it is the timeout every
 function registered without its own ``func(..., timeout=...)`` — and
-every ``cron(...)`` job, whose timeout defaults to the worker's — runs
-under: ``build_processing``, ``dashboard_build`` and ``dashboard_sync``
-on the default pool, the keeper-sync tier crons, and
+every ``cron(...)`` job registered without a ``timeout``, which defaults
+to the worker's — runs under: ``build_processing``, ``dashboard_build``
+and ``dashboard_sync`` on the default pool, and
 ``project_github_resolve``. Those functions pass it to
 :func:`record_cancellation` or :func:`record_handoff_cancellation` so
 the ``reason`` is inferred against the timeout arq actually enforces on
-them, not their pool's longest one.
+them, not their pool's longest one. The keeper-sync tier crons carry a
+timeout of their own, derived from each tier's cron interval by
+:func:`~docverse_server.services.keeper_sync.scheduler.tier_cron_timeout`.
 """
 
 JOB_TIMEOUT_MESSAGE = "Queue job cancelled at its arq timeout"
@@ -355,7 +358,7 @@ async def _fail_cancelled_job(
     progress merge follows only once the fail has landed.
     """
     elapsed = await queue_job_store.get_elapsed_since_start(queue_job_id)
-    reason = _infer_reason(elapsed, timeout=timeout)
+    reason = infer_cancellation_reason(elapsed, timeout=timeout)
     elapsed_seconds = (
         round(elapsed.total_seconds(), 1) if elapsed is not None else None
     )
@@ -429,14 +432,15 @@ def _report(
     )
 
 
-def _infer_reason(
+def infer_cancellation_reason(
     elapsed: timedelta | None, *, timeout: timedelta
 ) -> CancellationReason:
     """Tell arq's timeout from a worker shutdown by how long the job ran.
 
     ``elapsed`` within :data:`TIMEOUT_REASON_SLACK` of ``timeout`` (or
     past it) is the timeout; anything shorter, or an unknown running
-    time, is a shutdown.
+    time, is a shutdown. Public so a job that holds no row of its own,
+    such as a keeper-sync tier pass, can log its cancel the same way.
     """
     if elapsed is not None and elapsed + TIMEOUT_REASON_SLACK >= timeout:
         return "job_timeout"
@@ -571,7 +575,7 @@ async def _record_handoff(
     ids = list(dict.fromkeys(queue_job_ids()))
     if not ids:
         return None
-    reason = _infer_reason(elapsed, timeout=timeout)
+    reason = infer_cancellation_reason(elapsed, timeout=timeout)
     elapsed_seconds = round(elapsed.total_seconds(), 1)
     timeout_seconds = timeout.total_seconds()
     errors = {

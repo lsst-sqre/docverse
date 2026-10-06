@@ -25,6 +25,8 @@ __all__ = [
     "ANNOTATION_DATE_DISCOVERY_LAST_POLLED",
     "ANNOTATION_DATE_MAIN_LAST_POLLED",
     "ANNOTATION_DATE_OTHER_LAST_POLLED",
+    "TIER_CRON_TIMEOUT_MARGIN_DIVISOR",
+    "TIER_CRON_TIMEOUT_MIN_MARGIN",
     "TIER_DISCOVERY_CRON_INTERVAL",
     "TIER_DISCOVERY_DORMANT_INTERVAL",
     "TIER_DISCOVERY_DORMANT_JITTER",
@@ -49,6 +51,8 @@ __all__ = [
     "should_refresh_main_edition",
     "should_refresh_other_edition",
     "stable_hash_fraction",
+    "tier_cron_interval",
+    "tier_cron_timeout",
 ]
 
 
@@ -85,6 +89,15 @@ TIER_DISCOVERY_CRON_INTERVAL = timedelta(minutes=30)
 #: :data:`TIER_OTHER_REFRESH_THRESHOLD`; the SLO is also hourly so the
 #: cron and the threshold are intentionally identical.
 TIER_OTHER_CRON_INTERVAL = timedelta(hours=1)
+
+#: A tier cron's arq timeout holds back this fraction (one part in
+#: this many) of the tier's cron interval; see :func:`tier_cron_timeout`.
+TIER_CRON_TIMEOUT_MARGIN_DIVISOR = 6
+
+#: The least a tier cron's arq timeout holds back from its interval, so
+#: the 5-minute ``tier_main`` keeps a whole minute in hand rather than
+#: the 50 s :data:`TIER_CRON_TIMEOUT_MARGIN_DIVISOR` alone would leave.
+TIER_CRON_TIMEOUT_MIN_MARGIN = timedelta(minutes=1)
 
 #: Window after a project's last observed LTD ``main`` rebuild during
 #: which ``keeper_sync_tier_main`` always polls on its 5-minute cadence.
@@ -186,6 +199,61 @@ class Tier(StrEnum):
     main = "main"
     discovery = "discovery"
     other = "other"
+
+
+_TIER_CRON_INTERVALS: dict[Tier, timedelta] = {
+    Tier.main: TIER_MAIN_CRON_INTERVAL,
+    Tier.discovery: TIER_DISCOVERY_CRON_INTERVAL,
+    Tier.other: TIER_OTHER_CRON_INTERVAL,
+}
+
+
+def tier_cron_interval(tier: Tier) -> timedelta:
+    """Return the wall-clock cadence ``tier``'s cron fires on."""
+    return _TIER_CRON_INTERVALS[tier]
+
+
+def tier_cron_timeout(tier: Tier) -> timedelta:
+    """Return the arq timeout for one pass of ``tier``'s cron.
+
+    The tier's cron interval less a margin of one
+    :data:`TIER_CRON_TIMEOUT_MARGIN_DIVISOR`-th of it, and never less
+    than :data:`TIER_CRON_TIMEOUT_MIN_MARGIN`: 240 s for ``tier_main``,
+    1500 s for ``tier_discovery`` and 3000 s for ``tier_other``. A
+    ``cron(...)`` registered without a ``timeout`` runs under arq's
+    300 s default instead, which a large scope outgrows — on prod
+    (2026-10-06) the discovery and other passes were cancelled mid-scope
+    on every tick, and the tail of the scope starved.
+
+    Keeping the timeout strictly inside the interval means arq cancels
+    a pass before the same tier's next tick fires, so two passes of one
+    tier never overlap. The margin covers a pass that started late,
+    because the pool's job slots were all busy at the tick, and the
+    cleanup a cancelled pass runs on its way out.
+    :mod:`docverse_server.worker.main` registers each tier's
+    ``cron(...)`` with this value and the tier crons read their
+    cancellations against it, so the cadence constants and the
+    registration cannot drift.
+
+    Raises
+    ------
+    ValueError
+        If the interval leaves no positive timeout once the margin is
+        held back.
+    """
+    interval = tier_cron_interval(tier)
+    margin = max(
+        interval // TIER_CRON_TIMEOUT_MARGIN_DIVISOR,
+        TIER_CRON_TIMEOUT_MIN_MARGIN,
+    )
+    timeout = interval - margin
+    if timeout <= timedelta(0):
+        msg = (
+            f"The {tier.value} tier cron interval {interval!r} leaves no"
+            f" timeout after its {margin!r} margin"
+        )
+        raise ValueError(msg)
+    return timeout
 
 
 _TIER_ANNOTATION_KEYS: dict[Tier, str] = {

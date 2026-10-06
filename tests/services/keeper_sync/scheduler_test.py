@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from docverse_server.services.keeper_sync import scheduler
 from docverse_server.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
@@ -41,6 +42,8 @@ from docverse_server.services.keeper_sync.scheduler import (
     should_refresh_main_edition,
     should_refresh_other_edition,
     stable_hash_fraction,
+    tier_cron_interval,
+    tier_cron_timeout,
 )
 from docverse_server.storage.keeper_sync import KeeperSyncState
 
@@ -1342,6 +1345,54 @@ def test_tier_cron_interval_constants_match_documented_cadence() -> None:
     assert timedelta(minutes=5) == TIER_MAIN_CRON_INTERVAL
     assert timedelta(minutes=30) == TIER_DISCOVERY_CRON_INTERVAL
     assert timedelta(hours=1) == TIER_OTHER_CRON_INTERVAL
+
+
+def test_tier_cron_interval_reads_each_tiers_cadence_constant() -> None:
+    """Each tier's interval is the constant its ``cron(...)`` fires on."""
+    assert tier_cron_interval(Tier.main) == TIER_MAIN_CRON_INTERVAL
+    assert tier_cron_interval(Tier.discovery) == TIER_DISCOVERY_CRON_INTERVAL
+    assert tier_cron_interval(Tier.other) == TIER_OTHER_CRON_INTERVAL
+
+
+@pytest.mark.parametrize("tier", list(Tier))
+def test_tier_cron_timeout_is_strictly_inside_the_interval(tier: Tier) -> None:
+    """A tier pass is cancelled before the same tier's next tick fires.
+
+    Without an explicit timeout arq applied its 300 s default to every
+    tier cron, so a pass that outgrew it was cancelled mid-scope on
+    every tick (prod, 2026-10-06), and a timeout at or past the interval
+    would let two passes of one tier overlap.
+    """
+    timeout = tier_cron_timeout(tier)
+    assert timedelta(0) < timeout < tier_cron_interval(tier)
+
+
+def test_tier_cron_timeouts_at_the_stock_cadences() -> None:
+    """Lock the stock timeouts: 240 s, 1500 s and 3000 s.
+
+    Each is the interval less a sixth of it, and never less than a
+    minute short: the 5-minute tier_main keeps a minute in hand rather
+    than 50 s.
+    """
+    assert tier_cron_timeout(Tier.main) == timedelta(seconds=240)
+    assert tier_cron_timeout(Tier.discovery) == timedelta(seconds=1500)
+    assert tier_cron_timeout(Tier.other) == timedelta(seconds=3000)
+
+
+def test_tier_cron_timeout_rejects_an_interval_with_no_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interval no longer than the minimum margin derives no timeout.
+
+    A one-minute cadence would leave a zero timeout, under which arq
+    would cancel every pass the moment it started, so the derivation
+    fails loudly instead.
+    """
+    monkeypatch.setitem(
+        scheduler._TIER_CRON_INTERVALS, Tier.main, timedelta(minutes=1)
+    )
+    with pytest.raises(ValueError, match="interval"):
+        tier_cron_timeout(Tier.main)
 
 
 @pytest.mark.parametrize(

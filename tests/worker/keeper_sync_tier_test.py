@@ -36,6 +36,10 @@ from structlog.testing import capture_logs
 from docverse.models import JobKind, KeeperSyncConfig, OrganizationCreate
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.queue import JobStatus
+from docverse_server.services.keeper_sync.scheduler import (
+    Tier,
+    tier_cron_timeout,
+)
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
@@ -47,9 +51,6 @@ from docverse_server.storage.keeper_sync import (
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
-from docverse_server.worker.functions._cancellation import (
-    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
-)
 from docverse_server.worker.functions.keeper_sync import (
     keeper_sync_tier_discovery,
     keeper_sync_tier_main,
@@ -3270,8 +3271,8 @@ async def test_tier_cancel_mid_handoff_fails_the_orphaned_child(
     holds the slug's active-job mutex — so every tick and run skips the
     project — until ``keeper_sync_reaper``'s orphan sweep reaches it.
     Instead it fails at once with a ``CancelledError`` payload naming the
-    cron, read against the arq default timeout cron jobs run under, and
-    the slug is free for the next tick.
+    cron, read against the timeout the cron is registered with, and the
+    slug is free for the next tick.
     """
     async with db_session.begin():
         org_id, _ = await _seed_org(
@@ -3299,7 +3300,7 @@ async def test_tier_cancel_mid_handoff_fails_the_orphaned_child(
             assert row.errors["reason"] == "worker_shutdown"
             assert row.errors["job_function"] == "keeper_sync_tier_discovery"
             assert row.errors["timeout_seconds"] == (
-                ARQ_DEFAULT_JOB_TIMEOUT_SECONDS
+                tier_cron_timeout(Tier.discovery).total_seconds()
             )
             assert not await QueueJobStore(
                 session=session, logger=_logger()
@@ -3308,3 +3309,64 @@ async def test_tier_cancel_mid_handoff_fails_the_orphaned_child(
                 kind=JobKind.keeper_sync_project,
                 subject_label="pipelines",
             )
+
+
+@pytest.mark.asyncio
+async def test_tier_pass_cancelled_mid_scope_logs_how_far_it_got(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tier pass arq cancels logs one warning saying how far it got.
+
+    The pass holds no ``queue_jobs`` row of its own, so the log line is
+    its whole record. The first org finishes its one project; the second
+    is cancelled while LTD lists the editions of its second of three
+    projects, as a timeout or a rolling deploy would catch it. The
+    warning names the tier, the time the pass ran, the orgs it finished,
+    and the in-flight org's position in its scope, and the cancel still
+    reaches arq.
+    """
+    async with db_session.begin():
+        await _seed_org(
+            db_session, slug="ks-tier-cut-a", project_slugs=["aaa"]
+        )
+        await _seed_org(
+            db_session,
+            slug="ks-tier-cut-b",
+            project_slugs=["aaa", "bbb", "ccc"],
+        )
+    _stub_products(mock_discovery, ["aaa", "bbb", "ccc"])
+    _stub_editions_listing(mock_discovery, product_slug="aaa", edition_ids=[1])
+    hang = HangUntilCancelled()
+    mock_discovery.get(f"{LTD_BASE}/products/bbb/editions/").mock(
+        side_effect=hang
+    )
+    ctx = _make_ctx(httpx.AsyncClient())
+
+    with capture_logs() as captured:
+        task = asyncio.create_task(keeper_sync_tier_other(ctx))
+        await cancel_when_reached(task, hang.reached)
+    await ctx["http_client"].aclose()
+
+    cancelled = [
+        e for e in captured if e["event"] == "Keeper-sync tier pass cancelled"
+    ]
+    assert len(cancelled) == 1
+    event = cancelled[0]
+    assert event["log_level"] == "warning"
+    assert event["tier"] == "other"
+    assert event["reason"] == "worker_shutdown"
+    assert event["elapsed_seconds"] >= 0
+    assert event["timeout_seconds"] == (
+        tier_cron_timeout(Tier.other).total_seconds()
+    )
+    assert event["orgs_completed"] == 1
+    assert event["orgs_total"] == 2
+    assert event["org"] == "ks-tier-cut-b"
+    assert event["projects_visited"] == 1
+    assert event["projects_total"] == 3
+    assert event["ltd_slug"] == "bbb"
+    assert not any(
+        e["event"] == "Keeper-sync tier pass complete" for e in captured
+    )

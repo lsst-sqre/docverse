@@ -35,9 +35,10 @@ This module owns the ``docverse:sync-queue`` callable surface:
 
 from __future__ import annotations
 
+import asyncio
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -85,6 +86,7 @@ from docverse_server.services.keeper_sync.scheduler import (
     should_poll_main_for_project,
     should_refresh_main_edition,
     should_refresh_other_edition,
+    tier_cron_timeout,
 )
 from docverse_server.services.keeper_sync.service import (
     BuildCopiedCallback,
@@ -123,9 +125,9 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions._cancellation import (
-    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
     cancellation_recorded,
     discovery_run_finaliser,
+    infer_cancellation_reason,
     keeper_sync_run_finaliser,
     record_cancellation,
     record_handoff_cancellation,
@@ -2457,8 +2459,49 @@ async def _run_tier(
     is cancelled while handing a child row to arq records the cancel
     against the time the cron job has run for (see
     :func:`_enqueue_tier_project_sync`).
+
+    A pass holds no ``queue_jobs`` row of its own, so when arq cancels
+    it — at the tier's
+    :func:`~docverse_server.services.keeper_sync.scheduler.tier_cron_timeout`,
+    or on a worker shutdown — the ``CancelledError`` (which the per-org
+    ``except Exception`` never sees) is caught here only to log how far
+    the pass got, from the :class:`_TierPassProgress` every processor
+    advances, and is then re-raised so arq records the job as failed.
     """
     started = time.monotonic()
+    progress = _TierPassProgress()
+    try:
+        return await _run_tier_pass(
+            ctx=ctx,
+            logger=logger,
+            processor=processor,
+            tier_name=tier_name,
+            started=started,
+            progress=progress,
+        )
+    except asyncio.CancelledError:
+        _log_tier_cancellation(
+            logger=logger,
+            tier_name=tier_name,
+            started=started,
+            progress=progress,
+        )
+        raise
+
+
+async def _run_tier_pass(
+    *,
+    ctx: dict[str, Any],
+    logger: structlog.stdlib.BoundLogger,
+    processor: TierOrgProcessor,
+    tier_name: str,
+    started: float,
+    progress: _TierPassProgress,
+) -> str:
+    """Run one pass of a tier over every enabled org.
+
+    The body of :func:`_run_tier`, which wraps it to log a cancellation.
+    """
     enqueued_total = 0
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
@@ -2471,7 +2514,9 @@ async def _run_tier(
             if o.keeper_sync_config is not None
             and o.keeper_sync_config.enabled
         ]
+        progress.orgs_total = len(candidates)
         for org in candidates:
+            progress.begin_org(org.slug)
             try:
                 enqueued_total += await processor(
                     ctx=ctx,
@@ -2480,6 +2525,7 @@ async def _run_tier(
                     org=org,
                     logger=logger,
                     started=started,
+                    progress=progress,
                 )
             except Exception as exc:
                 sentry_sdk.capture_exception(exc)
@@ -2488,6 +2534,7 @@ async def _run_tier(
                     tier=tier_name,
                     org=org.slug,
                 )
+            progress.end_org()
         logger.info(
             "Keeper-sync tier pass complete",
             tier=tier_name,
@@ -2500,6 +2547,95 @@ async def _run_tier(
     raise RuntimeError(msg)
 
 
+def _log_tier_cancellation(
+    *,
+    logger: structlog.stdlib.BoundLogger,
+    tier_name: str,
+    started: float,
+    progress: _TierPassProgress,
+) -> None:
+    """Log one warning saying how far a cancelled tier pass got.
+
+    The same reading as
+    :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+    gives a job's row: the ``reason`` is inferred from how long the pass
+    ran against the tier's arq timeout. ``org``, ``projects_visited``,
+    ``projects_total`` and ``ltd_slug`` describe the org in flight when
+    the cancel landed: ``projects_visited`` counts the slugs of its
+    scope the pass had finished, and ``ltd_slug`` is the one it was on.
+    """
+    elapsed = time.monotonic() - started
+    timeout = tier_cron_timeout(Tier(tier_name))
+    logger.warning(
+        "Keeper-sync tier pass cancelled",
+        tier=tier_name,
+        reason=infer_cancellation_reason(
+            timedelta(seconds=elapsed), timeout=timeout
+        ),
+        elapsed_seconds=round(elapsed, 1),
+        timeout_seconds=timeout.total_seconds(),
+        orgs_completed=progress.orgs_completed,
+        orgs_total=progress.orgs_total,
+        org=progress.org,
+        projects_visited=progress.projects_visited,
+        projects_total=progress.projects_total,
+        ltd_slug=progress.ltd_slug,
+    )
+
+
+@dataclass(slots=True)
+class _TierPassProgress:
+    """How far one tier pass has got through its orgs and their scopes.
+
+    :func:`_run_tier` advances the org counters around each processor
+    call, and each processor walks its scope through :meth:`walk`, so a
+    cancelled pass can log where arq cut it off.
+    """
+
+    orgs_total: int | None = None
+    """Enabled orgs the pass will visit; ``None`` until they are listed."""
+
+    orgs_completed: int = 0
+    """Orgs the pass has finished, whether or not their processor failed."""
+
+    org: str | None = None
+    """Slug of the org in flight, or ``None`` between orgs."""
+
+    projects_total: int | None = None
+    """Size of the in-flight org's scope; ``None`` until it is resolved."""
+
+    projects_visited: int = 0
+    """Slugs of the in-flight org's scope the pass has finished."""
+
+    ltd_slug: str | None = None
+    """The in-scope slug the pass is working on, if any."""
+
+    def begin_org(self, org_slug: str) -> None:
+        """Start counting a new org's scope."""
+        self.org = org_slug
+        self.projects_total = None
+        self.projects_visited = 0
+        self.ltd_slug = None
+
+    def end_org(self) -> None:
+        """Count the in-flight org as finished."""
+        self.orgs_completed += 1
+        self.org = None
+        self.projects_total = None
+        self.projects_visited = 0
+        self.ltd_slug = None
+
+    def walk(self, slugs: Sequence[str]) -> Iterator[str]:
+        """Yield each in-scope slug, counting those finished before it."""
+        self.projects_total = len(slugs)
+        for index, slug in enumerate(slugs):
+            self.projects_visited = index
+            self.ltd_slug = slug
+            yield slug
+        self.projects_visited = len(slugs)
+        self.ltd_slug = None
+
+
 class TierOrgProcessor(Protocol):
     """Per-org tier processor callable shared by ``_run_tier``.
 
@@ -2507,7 +2643,9 @@ class TierOrgProcessor(Protocol):
     function matching this signature; it returns the number of
     ``keeper_sync_project`` children it enqueued for the org.
     ``started`` is the :func:`time.monotonic` reading the tick began at,
-    passed through to :func:`_enqueue_tier_project_sync`.
+    passed through to :func:`_enqueue_tier_project_sync`. ``progress``
+    is the pass's position, whose :meth:`_TierPassProgress.walk` the
+    processor iterates its scope through.
     """
 
     async def __call__(
@@ -2519,6 +2657,7 @@ class TierOrgProcessor(Protocol):
         org: Organization,
         logger: structlog.stdlib.BoundLogger,
         started: float,
+        progress: _TierPassProgress,
     ) -> int: ...
 
 
@@ -2530,6 +2669,7 @@ async def _tier_main_for_org(
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
     started: float,
+    progress: _TierPassProgress,
 ) -> int:
     """Run one tier_main pass for a single enabled org.
 
@@ -2559,7 +2699,7 @@ async def _tier_main_for_org(
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
     enqueued = 0
-    for ltd_slug in in_scope:
+    for ltd_slug in progress.walk(in_scope):
         async with session.begin():
             project_state = await state_store.get(
                 org_id=org.id,
@@ -2642,6 +2782,7 @@ async def _tier_discovery_for_org(
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
     started: float,
+    progress: _TierPassProgress,
 ) -> int:
     """Run one tier_discovery pass for a single enabled org.
 
@@ -2698,7 +2839,7 @@ async def _tier_discovery_for_org(
         s.ltd_id: s for s in edition_states if s.ltd_id is not None
     }
     enqueued = 0
-    for ltd_slug in in_scope:
+    for ltd_slug in progress.walk(in_scope):
         async with session.begin():
             project_state = await state_store.get(
                 org_id=org.id,
@@ -2777,6 +2918,7 @@ async def _tier_other_for_org(
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
     started: float,
+    progress: _TierPassProgress,
 ) -> int:
     """Run one tier_other pass for a single enabled org.
 
@@ -2818,7 +2960,7 @@ async def _tier_other_for_org(
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
     enqueued = 0
-    for ltd_slug in in_scope:
+    for ltd_slug in progress.walk(in_scope):
         async with session.begin():
             project_state = await state_store.get(
                 org_id=org.id,
@@ -3344,8 +3486,9 @@ async def _enqueue_tier_project_sync(
     :func:`~docverse_server.worker.functions._cancellation.record_handoff_cancellation`
     fails it at once instead, unless its backend id was already stamped.
     ``started`` is the tick's :func:`time.monotonic` start, against which
-    that cancel is read: cron jobs run under arq's default per-job
-    timeout.
+    that cancel is read, together with the timeout the tier's cron is
+    registered with: the tier's
+    :func:`~docverse_server.services.keeper_sync.scheduler.tier_cron_timeout`.
     """
     async with session.begin():
         if await queue_job_store.has_active_for_subject(
@@ -3381,7 +3524,7 @@ async def _enqueue_tier_project_sync(
         queue_job_ids=lambda: (queue_job.id,),
         job_function=f"keeper_sync_tier_{tier}",
         started=started,
-        timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+        timeout_seconds=tier_cron_timeout(Tier(tier)).total_seconds(),
         logger=logger,
     ):
         metadata = await arq_queue.enqueue(

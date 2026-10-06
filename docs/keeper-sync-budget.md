@@ -12,7 +12,8 @@ instead of leaving both for a reaper.
 
 This page is for operators syncing a large product, or reading a
 cancelled job. It covers the budget, timeout and reaper ladder and how
-the three numbers derive from each other, how a chain of slices reads
+the three numbers derive from each other, the tier crons' own timeouts,
+how a chain of slices reads
 in `GET /jobs` and on a run, the cursor a chain resumes from and what
 the cursor misses, what a cancelled job records and how to tell a
 timeout from a deploy, the no-progress guard and the timeout escape
@@ -105,6 +106,49 @@ explicit budget well below the timeout, such as
 its first edition (see
 [The no-progress guard](#the-no-progress-guard)), and remove the
 override afterwards.
+
+### Tier-cron timeouts
+
+The three tier crons that keep projects in step with LTD between runs
+sit outside the ladder: they sync nothing themselves and hold no
+`queue_jobs` row, they only enqueue `keeper_sync_project` jobs. Each
+pass still runs under an arq timeout of its own, which
+`tier_cron_timeout` derives from the tier's cron interval: the interval
+less a margin of one `TIER_CRON_TIMEOUT_MARGIN_DIVISOR` (6)th of it,
+and never less than `TIER_CRON_TIMEOUT_MIN_MARGIN` (one minute). None of
+the three is a setting; each follows its cadence constant.
+
+| Cron | Interval | Timeout |
+| --- | --- | --- |
+| `keeper_sync_tier_main` | 5 min (`TIER_MAIN_CRON_INTERVAL`) | 240 s |
+| `keeper_sync_tier_discovery` | 30 min (`TIER_DISCOVERY_CRON_INTERVAL`) | 1500 s |
+| `keeper_sync_tier_other` | 60 min (`TIER_OTHER_CRON_INTERVAL`) | 3000 s |
+
+Until these timeouts, the crons were registered without one and ran
+under arq's default, `ARQ_DEFAULT_JOB_TIMEOUT_SECONDS` (300 s). On
+2026-10-06, once `pipelines` (2,938 LTD editions) entered the `rubin`
+organization's scope on roundtable-prod, `keeper_sync_tier_discovery`
+and `keeper_sync_tier_other` reached it on every tick. A cancelled pass
+starts again from the top of the scope on its next tick, so the
+projects at the tail of the scope were never visited.
+
+Each timeout is strictly shorter than its interval, so arq cancels a
+pass before the same tier's next tick fires, and two passes of one tier
+never overlap. The margin covers a pass that started late, because the
+pool's job slots were all busy at the tick, and the cleanup a cancelled
+pass runs on its way out. The sync worker registers each tier's cron
+job, and the same function on the pool's `functions` list, with the
+derived value.
+
+A cancelled pass has no row to fail, so it logs one warning,
+`Keeper-sync tier pass cancelled` (see [Log lines](#log-lines)). The
+line names the tier, the `reason` (inferred the way a job's row is; see
+[Timeout or deploy](#timeout-or-deploy)), how long the pass ran, and
+how many orgs it finished. For the org in flight it gives
+`projects_visited` of `projects_total` and the `ltd_slug` the pass was
+on. A cancel that lands while a pass is handing a project job to arq
+also fails that job's row (see
+[Which jobs record their cancellation](#which-jobs-record-their-cancellation)).
 
 ## How a project syncs in slices
 
@@ -383,7 +427,9 @@ stamping the child's arq job id. It fails each such child still
 instead of leaving it, and any active-job slot it holds, to the orphan
 sweeps. A function the arq settings register without a timeout of its
 own runs under arq's default, `ARQ_DEFAULT_JOB_TIMEOUT_SECONDS` (300 s),
-and its reason is read against that.
+and its reason is read against that. The tier crons run under their
+tier's `tier_cron_timeout` instead (see
+[Tier-cron timeouts](#tier-cron-timeouts)).
 
 | Function | Pool | Timeout | Helper | Also closes out |
 | --- | --- | --- | --- | --- |
@@ -393,9 +439,9 @@ and its reason is read against that.
 | `publish_edition` | default | `publish_edition_job_timeout_seconds` | `record_cancellation` | Rolls up its keeper-sync run, if it has one. |
 | `keeper_sync_project` | keeper-sync | `keeper_sync_job_timeout_seconds` | both | Records its slice position and rolls up its run, if it has one; the hand-off covers its continuation. |
 | `keeper_sync_run_discovery` | keeper-sync | `keeper_sync_job_timeout_seconds` | `record_cancellation` | Fails its run outright, since a part-finished fan-out has no counters to roll up. |
-| `keeper_sync_tier_main` | keeper-sync | `ARQ_DEFAULT_JOB_TIMEOUT_SECONDS` | `record_handoff_cancellation` | The project jobs it enqueues. |
-| `keeper_sync_tier_discovery` | keeper-sync | `ARQ_DEFAULT_JOB_TIMEOUT_SECONDS` | `record_handoff_cancellation` | The project jobs it enqueues. |
-| `keeper_sync_tier_other` | keeper-sync | `ARQ_DEFAULT_JOB_TIMEOUT_SECONDS` | `record_handoff_cancellation` | The project jobs it enqueues. |
+| `keeper_sync_tier_main` | keeper-sync | `tier_cron_timeout` (240 s) | `record_handoff_cancellation` | The project jobs it enqueues. |
+| `keeper_sync_tier_discovery` | keeper-sync | `tier_cron_timeout` (1500 s) | `record_handoff_cancellation` | The project jobs it enqueues. |
+| `keeper_sync_tier_other` | keeper-sync | `tier_cron_timeout` (3000 s) | `record_handoff_cancellation` | The project jobs it enqueues. |
 | `edition_reconcile` | maintenance | `maintenance_job_timeout_seconds` | `record_cancellation` | Nothing; the row is the tick's whole record. |
 | `git_ref_audit` | maintenance | `maintenance_job_timeout_seconds` | `record_cancellation` | Rolls up its audit run. |
 | `lifecycle_eval` | maintenance | `maintenance_job_timeout_seconds` | `record_cancellation` | Rolls up its lifecycle run. |
@@ -489,7 +535,7 @@ reapers keep their own.
 ## Log lines
 
 The lines this page refers to, from the slice budget, the chain, the
-cap and the cancellation helpers. Every line a `keeper_sync_project`
+cap, the cancellation helpers and the tier crons. Every line a `keeper_sync_project`
 slice writes, `Queue job cancelled` included, also carries the
 `slice_index` the job binds on its logger, along with `org`, `run_id`
 and `ltd_slug`.
@@ -509,6 +555,7 @@ and `ltd_slug`.
 | `Queue job cancelled` | warning | `queue_job_id`, `queue_job_kind`, `reason`, `elapsed_seconds`, `timeout_seconds`, `progress` |
 | `Queue job cancelled` | warning | `job_function`, `reason`, `elapsed_seconds`, `timeout_seconds`, `orphaned_queue_job_ids`, `orphaned_queue_job_kinds` |
 | `Failed to record the queue job's cancellation` | error | `exception` |
+| `Keeper-sync tier pass cancelled` | warning | `tier`, `reason`, `elapsed_seconds`, `timeout_seconds`, `orgs_completed`, `orgs_total`, `org`, `projects_visited`, `projects_total`, `ltd_slug` |
 
 - `Keeper-sync time ladder` and the cap warning are logged once, at the
   sync worker's startup.
@@ -526,6 +573,11 @@ and `ltd_slug`.
   their way to arq (see [Cancellation](#cancellation)).
 - `exception` is the traceback that Safir's production log profile
   renders from `logger.exception`.
+- `Keeper-sync tier pass cancelled` is a tier cron's whole record of a
+  cancel (see [Tier-cron timeouts](#tier-cron-timeouts)). `orgs_total`
+  and `projects_total` are null if the cancel landed before the pass
+  listed its orgs, or resolved the in-flight org's scope, and `org` and
+  `ltd_slug` are null between orgs.
 
 ## What the slicing deliberately does not do
 
@@ -554,6 +606,8 @@ and `ltd_slug`.
   and `SliceProgress`.
 - `src/docverse_server/services/keeper_sync/service.py`:
   `sync_project`'s budget and cursor, and how a resumed walk is planned.
+- `src/docverse_server/services/keeper_sync/scheduler.py`: the tier
+  cron intervals and `tier_cron_timeout`.
 - `src/docverse_server/worker/functions/keeper_sync.py`:
   `keeper_sync_project`, the continuation hand-off and the no-progress
   guard.
@@ -562,7 +616,7 @@ and `ltd_slug`.
 - `src/docverse_server/worker/main.py`: the startup ladder line and the
   cap warning.
 - `tests/docs_test.py`: fails when this page stops matching the ladder's
-  settings and defaults, the progress keys a slice records, the errors
-  payload, the functions that record their cancellation, or the log
-  lines tabulated above.
+  settings and defaults, the tier-cron timeouts, the progress keys a
+  slice records, the errors payload, the functions that record their
+  cancellation, or the log lines tabulated above.
 - SQR-112, PRD #765 and #699.
