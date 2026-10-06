@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 import structlog
+from aiobotocore.session import AioSession, get_session
 from arq import cron, func
 from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
@@ -28,8 +29,15 @@ from safir.metrics.arq import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from docverse_server.config import Configuration
+from docverse_server.config import (
+    KEEPER_SYNC_REAPER_MARGIN_SECONDS,
+    Configuration,
+)
 from docverse_server.database import get_current_revision
+from docverse_server.diagnostics.memory import (
+    start_memory_sampler,
+    stop_memory_sampler,
+)
 from docverse_server.factory import Factory
 from docverse_server.metrics import build_event_manager
 from docverse_server.sentry import (
@@ -46,6 +54,7 @@ from docverse_server.services.keeper_sync.scheduler import (
 )
 from docverse_server.storage.github import validate_github_app
 from docverse_server.storage.ltd import LtdS3Source
+from docverse_server.storage.objectstore import ObjectStoreCache
 
 from .functions import (
     build_processing,
@@ -331,7 +340,10 @@ def initialize_worker_http_clients(
 
 
 async def initialize_worker_ltd_s3_source(
-    ctx: dict[str, Any], *, logger: structlog.stdlib.BoundLogger
+    ctx: dict[str, Any],
+    *,
+    session: AioSession,
+    logger: structlog.stdlib.BoundLogger,
 ) -> LtdS3Source:
     """Open this worker process's LTD source and record it in ctx.
 
@@ -350,14 +362,101 @@ async def initialize_worker_ltd_s3_source(
     client it is opened whichever pool is starting, and opens no
     connection until a copy uses it. ``ctx["ltd_s3_source"]`` records it
     and :func:`shutdown` closes it.
+
+    ``session`` is the process's one aiobotocore session, the one the
+    worker's destination stores open their clients from too, so the
+    source's client costs no service-model parse of its own (PRD #753).
     """
     source = LtdS3Source(
         max_pool_connections=config.keeper_sync_upload_concurrency,
+        session=session,
         logger=logger,
     )
     await source.open()
     ctx["ltd_s3_source"] = source
     return source
+
+
+def initialize_worker_objectstore_cache(
+    ctx: dict[str, Any],
+    *,
+    logger: structlog.stdlib.BoundLogger,
+) -> ObjectStoreCache:
+    """Create this worker process's object-store client cache.
+
+    Every job's factory resolves its org object stores through this one
+    cache, so the process holds one open destination client per org,
+    service and upload flavour rather than opening one per build copy,
+    manifest hash and job. Each client built an aiohttp connector and an
+    ``ssl.SSLContext`` loaded with the full CA store, and left about
+    2.7 MB of RSS behind that tracemalloc never saw (#751).
+    ``ctx["objectstore_cache"]`` records it and :func:`shutdown` closes
+    every client it holds. Like the copy client and the LTD source,
+    every pool creates one, and it opens nothing until a job uses a
+    store.
+    """
+    cache = ObjectStoreCache(logger=logger)
+    ctx["objectstore_cache"] = cache
+    return cache
+
+
+async def start_worker_memory_sampler(
+    ctx: dict[str, Any],
+    *,
+    settings: Configuration,
+    component: DocverseSentryComponent,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Start this worker process's memory sampler, if configured.
+
+    ``settings.memory_diagnostics_enabled`` gates it (PRD #753). A
+    running sampler is recorded as ``ctx["memory_sampler"]``, which
+    :func:`shutdown` stops; with diagnostics off, or if the sampler
+    fails to start, the key is left unset and startup carries on.
+    ``component`` is the pool's Sentry label, so each pool's samples can
+    be told apart in the logs.
+    """
+    sampler = await start_memory_sampler(
+        settings, component=component, logger=logger
+    )
+    if sampler is not None:
+        ctx["memory_sampler"] = sampler
+
+
+def log_keeper_sync_time_ladder(
+    settings: Configuration, *, logger: structlog.stdlib.BoundLogger
+) -> None:
+    """Log the keeper-sync budget, timeout and reaper threshold in force.
+
+    The three read as one ladder (slice budget < job timeout < reaper
+    threshold, PRD #765), and the sync pool is where all three apply:
+    its jobs spend the budget, arq enforces the timeout on them, and
+    ``keeper_sync_reaper`` runs on its cron. When
+    :class:`~docverse_server.config.Configuration` capped an explicit
+    reaper threshold at the timeout plus
+    :data:`~docverse_server.config.KEEPER_SYNC_REAPER_MARGIN_SECONDS`,
+    one warning names the requested and effective values, so an
+    operator whose deployment value no longer applies learns it from
+    the pod log rather than from a reaper firing sooner than expected.
+    """
+    logger.info(
+        "Keeper-sync time ladder",
+        slice_budget_seconds=settings.keeper_sync_slice_budget_seconds,
+        job_timeout_seconds=settings.keeper_sync_job_timeout_seconds,
+        reaper_threshold_seconds=(
+            settings.keeper_sync_reaper_threshold_seconds
+        ),
+    )
+    requested = settings.keeper_sync_reaper_threshold_requested_seconds
+    if requested is not None:
+        logger.warning(
+            "Keeper-sync reaper threshold capped at the job timeout plus"
+            " margin",
+            requested_seconds=requested,
+            effective_seconds=settings.keeper_sync_reaper_threshold_seconds,
+            job_timeout_seconds=settings.keeper_sync_job_timeout_seconds,
+            margin_seconds=KEEPER_SYNC_REAPER_MARGIN_SECONDS,
+        )
 
 
 _QUEUE_STATS_CRON_MINUTES = set(range(0, 60, 5))
@@ -420,6 +519,8 @@ class WorkerFactoryBuilder:
         keeper_sync_copy_retry_delay_seconds: float,
         keeper_sync_upload_limiter: asyncio.Semaphore,
         ltd_s3_source: LtdS3Source | None = None,
+        aiobotocore_session: AioSession | None = None,
+        objectstore_cache: ObjectStoreCache | None = None,
     ) -> None:
         # Process-lifetime, like ``http_client``: keeper-sync enqueues one
         # ``publish_edition`` job per synced edition, so folding a publish
@@ -468,6 +569,23 @@ class WorkerFactoryBuilder:
         # ctxs that never download from LTD need not open one, and their
         # per-job factories then open a source per copier instead.
         self._ltd_s3_source = ltd_s3_source
+        # Process-lifetime like ``ltd_s3_source``, which is opened from
+        # it, and optional for the same reason: test ctxs need not create
+        # one, and their per-job factories' stores then create a session
+        # each. Nothing to close: a session holds no connections, only
+        # the clients opened from it do.
+        self._aiobotocore_session = aiobotocore_session
+        # Process-lifetime and owned by ``shutdown``, like
+        # ``ltd_s3_source``, and optional for the same reason: test ctxs
+        # need not create one, and their per-job factories' stores then
+        # open and close a client each. Shared so that every job's copies
+        # and stores for one org borrow the same open client (#751).
+        self._objectstore_cache = objectstore_cache
+
+    @property
+    def objectstore_cache(self) -> ObjectStoreCache | None:
+        """Process-lifetime cache of open org object stores, if any."""
+        return self._objectstore_cache
 
     @property
     def github_app_enabled(self) -> bool:
@@ -525,6 +643,8 @@ class WorkerFactoryBuilder:
             ),
             keeper_sync_upload_limiter=self._keeper_sync_upload_limiter,
             ltd_s3_source=self._ltd_s3_source,
+            aiobotocore_session=self._aiobotocore_session,
+            objectstore_cache=self._objectstore_cache,
         )
 
 
@@ -567,6 +687,11 @@ async def _startup(
         db_revision=db_revision,
         queue_name=queue_name,
     )
+    # Started before the pools, clients and LTD source below so that,
+    # with tracemalloc on, their allocations are traced too.
+    await start_worker_memory_sampler(
+        ctx, settings=config, component=component, logger=logger
+    )
 
     await initialize_worker_db_pool(max_jobs=max_jobs)
 
@@ -581,7 +706,17 @@ async def _startup(
     )
 
     http_client, copy_http_client = initialize_worker_http_clients(ctx)
-    ltd_s3_source = await initialize_worker_ltd_s3_source(ctx, logger=logger)
+    # One per worker process, like the LTD source opened from it: every
+    # S3 client the process opens — the LTD source's and each build
+    # copy's destination store's — comes from this session, so botocore
+    # parses the S3 service model and endpoint ruleset once per process
+    # rather than once per copy (PRD #753). A session holds no
+    # connections, so ``shutdown`` has nothing of its own to close.
+    aiobotocore_session = get_session()
+    ltd_s3_source = await initialize_worker_ltd_s3_source(
+        ctx, session=aiobotocore_session, logger=logger
+    )
+    objectstore_cache = initialize_worker_objectstore_cache(ctx, logger=logger)
     discovery = DiscoveryClient(
         http_client,
         base_url=str(config.repertoire_base_url),
@@ -596,10 +731,10 @@ async def _startup(
         default_queue_name=config.arq_queue_name,
     )
 
-    # ``arq_queue``, the two HTTP clients and the LTD source stay in ctx
-    # because ``shutdown`` owns their teardown. The factory builder
-    # captures them by reference, so worker functions never need to look
-    # them up directly.
+    # ``arq_queue``, the two HTTP clients, the LTD source and the object
+    # store cache stay in ctx because ``shutdown`` owns their teardown.
+    # The factory builder captures them by reference, so worker functions
+    # never need to look them up directly.
     ctx["arq_queue"] = arq_queue
     factory_builder = WorkerFactoryBuilder(
         encryptor=encryptor,
@@ -632,6 +767,8 @@ async def _startup(
             config.keeper_sync_upload_concurrency
         ),
         ltd_s3_source=ltd_s3_source,
+        aiobotocore_session=aiobotocore_session,
+        objectstore_cache=objectstore_cache,
     )
     await validate_github_app(
         state=factory_builder,
@@ -682,6 +819,9 @@ async def startup_keeper_sync(ctx: dict[str, Any]) -> None:
         queue_name=KEEPER_SYNC_QUEUE_NAME,
         max_jobs=config.keeper_sync_max_jobs,
     )
+    log_keeper_sync_time_ladder(
+        config, logger=structlog.get_logger("docverse_server.worker")
+    )
 
 
 async def startup_maintenance(ctx: dict[str, Any]) -> None:
@@ -696,6 +836,12 @@ async def startup_maintenance(ctx: dict[str, Any]) -> None:
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     """Clean up resources for the arq worker process."""
+    logger = structlog.get_logger("docverse_server.worker")
+    # First, so the sampler stops even if a later close fails, or if
+    # startup failed before the resources closed below were opened.
+    memory_sampler = ctx.pop("memory_sampler", None)
+    if memory_sampler is not None:
+        await stop_memory_sampler(memory_sampler, logger=logger)
     arq_queue = ctx.get("arq_queue")
     if arq_queue is not None:
         # Private-attribute access until safir adds a public shutdown API;
@@ -704,13 +850,18 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     event_manager = ctx.get("event_manager")
     if event_manager is not None:
         await event_manager.aclose()
+    # arq runs ``shutdown`` after the jobs stop, so no job still holds
+    # one of the cached clients; closing them before the HTTP clients
+    # keeps the teardown in the reverse of the order a store uses them.
+    objectstore_cache = ctx.get("objectstore_cache")
+    if objectstore_cache is not None:
+        await objectstore_cache.aclose()
     await ctx["http_client"].aclose()
     await ctx["copy_http_client"].aclose()
     ltd_s3_source = ctx.get("ltd_s3_source")
     if ltd_s3_source is not None:
         await ltd_s3_source.close()
     await db_session_dependency.aclose()
-    logger = structlog.get_logger("docverse_server.worker")
     logger.info("Worker shutdown complete")
 
 

@@ -14,6 +14,7 @@ from .models import (
     LtdEditionMode,
     LtdProduct,
     LtdProductsListing,
+    parse_ltd_id,
 )
 from .products_client import LtdProductsClient
 from .s3_source import (
@@ -38,4 +39,5 @@ __all__ = [
     "LtdS3Source",
     "LtdSourceAccessDeniedError",
     "LtdSourceProtocol",
+    "parse_ltd_id",
 ]

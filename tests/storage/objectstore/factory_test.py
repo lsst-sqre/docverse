@@ -19,12 +19,14 @@ import asyncio
 import httpx
 import pytest
 import structlog
+from aiobotocore.session import get_session
 
 from docverse_server.storage._http_retry import (
     DEFAULT_MAX_ATTEMPTS,
     MAX_BACKOFF_SECONDS,
 )
 from docverse_server.storage.objectstore import create_objectstore
+from tests.support.botocore_sessions import record_aiobotocore_sessions
 
 _CONFIG = {"endpoint_url": "https://minio.example.com", "bucket": "docs"}
 _CREDENTIALS = {"access_key_id": "key-id", "secret_access_key": "secret"}
@@ -153,3 +155,29 @@ async def test_create_objectstore_threads_the_upload_limiter() -> None:
 
     assert locked_while_putting == [True]
     assert not limiter.locked()
+
+
+@pytest.mark.asyncio
+async def test_create_objectstore_threads_the_aiobotocore_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The store opens its client from the session handed to the factory.
+
+    Processes that build a store per build copy pass their one
+    process-lifetime session here, so opening the store must construct
+    no session of its own (PRD #753).
+    """
+    shared = get_session()
+    sessions = record_aiobotocore_sessions(monkeypatch)
+
+    store = create_objectstore(
+        provider="minio",
+        config=_CONFIG,
+        credentials=_CREDENTIALS,
+        logger=structlog.get_logger("test"),
+        aiobotocore_session=shared,
+    )
+    async with store:
+        pass
+
+    assert sessions == []

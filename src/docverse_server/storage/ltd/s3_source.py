@@ -165,6 +165,12 @@ class LtdS3Source:
         keeps botocore's default (10), which suits a source that serves
         one copier; a source shared by every copier in the sync worker
         is sized to the worker's upload cap instead.
+    session
+        aiobotocore session the source opens its client from. The sync
+        worker passes its one process-lifetime session, the same one its
+        destination stores open their clients from, so botocore's S3
+        service model is parsed once per process (PRD #753). ``None``
+        (the default) creates a session for this source alone.
     logger
         Logger for the source.
     """
@@ -175,13 +181,16 @@ class LtdS3Source:
         bucket: str = "lsst-the-docs",
         region: str = _DEFAULT_REGION,
         max_pool_connections: int | None = None,
+        session: AioSession | None = None,
         logger: structlog.stdlib.BoundLogger,
     ) -> None:
         self._bucket = bucket
         self._region = region
         self._max_pool_connections = max_pool_connections
         self._logger = logger
-        self._session: AioSession = get_session()
+        self._session: AioSession = (
+            session if session is not None else get_session()
+        )
         self._client_cm: ClientCreatorContext | None = None
         self._client: AioBaseClient | None = None
 

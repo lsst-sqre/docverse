@@ -14,6 +14,7 @@ import asyncio
 import httpx
 import pytest
 import structlog
+from aiobotocore.session import AioSession, get_session
 from cryptography.fernet import Fernet
 from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
@@ -28,6 +29,7 @@ from docverse_server.storage.github import (
     validate_github_app,
 )
 from docverse_server.storage.ltd import LtdS3Source
+from docverse_server.storage.objectstore import ObjectStoreCache
 from docverse_server.worker.main import WorkerFactoryBuilder
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
@@ -51,6 +53,8 @@ def _make_builder(
     keeper_sync_copy_retry_delay_seconds: float | None = None,
     keeper_sync_upload_limiter: asyncio.Semaphore | None = None,
     ltd_s3_source: LtdS3Source | None = None,
+    aiobotocore_session: AioSession | None = None,
+    objectstore_cache: ObjectStoreCache | None = None,
 ) -> WorkerFactoryBuilder:
     return WorkerFactoryBuilder(
         encryptor=CredentialEncryptor(
@@ -90,6 +94,8 @@ def _make_builder(
             else asyncio.Semaphore(_config.keeper_sync_upload_concurrency)
         ),
         ltd_s3_source=ltd_s3_source,
+        aiobotocore_session=aiobotocore_session,
+        objectstore_cache=objectstore_cache,
     )
 
 
@@ -418,3 +424,49 @@ async def test_builder_without_ltd_source_leaves_copiers_their_own(
         factory = builder(session=db_session, logger=_logger())
 
     assert factory.ltd_s3_source is None
+
+
+@pytest.mark.asyncio
+async def test_worker_factory_builder_shares_one_aiobotocore_session(
+    db_session: AsyncSession,
+) -> None:
+    """Per-job factories share the builder's process-lifetime session.
+
+    Every ``keeper_sync_project`` job builds a destination store per
+    build copy and manifest hash; only if each job's factory holds the
+    one session ``_startup`` created do those stores stop re-parsing
+    botocore's S3 service model per copy (PRD #753).
+    """
+    session = get_session()
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(
+            http_client=http_client, aiobotocore_session=session
+        )
+        first = builder(session=db_session, logger=_logger())
+        second = builder(session=db_session, logger=_logger())
+
+    assert first.aiobotocore_session is session
+    assert second.aiobotocore_session is session
+
+
+@pytest.mark.asyncio
+async def test_worker_factory_builder_shares_one_objectstore_cache(
+    db_session: AsyncSession,
+) -> None:
+    """Per-job factories borrow destination clients from one cache.
+
+    The sync worker only stops building a client per copy if every job's
+    factory resolves its org stores through the one cache ``_startup``
+    created, so a backfill's copies across jobs share a client (#751).
+    """
+    cache = ObjectStoreCache(logger=_logger())
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(
+            http_client=http_client, objectstore_cache=cache
+        )
+        first = builder(session=db_session, logger=_logger())
+        second = builder(session=db_session, logger=_logger())
+
+    assert builder.objectstore_cache is cache
+    assert first.objectstore_cache is cache
+    assert second.objectstore_cache is cache

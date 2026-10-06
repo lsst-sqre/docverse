@@ -23,6 +23,7 @@ import httpx
 import pytest
 import structlog
 from aiobotocore.client import AioBaseClient
+from aiobotocore.session import ClientCreatorContext, get_session
 from structlog.testing import capture_logs
 
 from docverse_server.storage import _http_retry
@@ -32,6 +33,7 @@ from docverse_server.storage.objectstore import (
     S3ObjectStore,
     _s3,
 )
+from tests.support.botocore_sessions import record_aiobotocore_sessions
 
 #: A ``MockTransport`` handler: plain, or ``async`` when a test needs the
 #: PUT to stay in flight across an ``await`` (to observe concurrency).
@@ -927,3 +929,44 @@ async def test_delete_prefix_refuses_a_blank_prefix() -> None:
 
     assert client.paginate_kwargs is None
     assert client.delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_open_creates_the_client_from_an_injected_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store given a session opens its client from it and makes none.
+
+    The keeper-sync worker builds a destination store per build copy and
+    manifest hash, so a store that made its own ``AioSession`` re-parsed
+    botocore's S3 service model and endpoint ruleset per copy (PRD
+    #753). Handed the process's one session, the store must open its
+    client from that session and construct no session of its own.
+    """
+    shared = get_session()
+    create_calls: list[str] = []
+    original_create_client = shared.create_client
+
+    def _recording_create_client(
+        service_name: str, *args: Any, **kwargs: Any
+    ) -> ClientCreatorContext:
+        create_calls.append(service_name)
+        return original_create_client(service_name, *args, **kwargs)
+
+    monkeypatch.setattr(shared, "create_client", _recording_create_client)
+    sessions = record_aiobotocore_sessions(monkeypatch)
+    store = S3ObjectStore(
+        endpoint_url="https://account.r2.cloudflarestorage.com",
+        bucket="docs",
+        access_key_id="key-id",
+        secret_access_key="secret-key",
+        region="auto",
+        logger=structlog.get_logger("test"),
+        session=shared,
+    )
+
+    async with store:
+        pass
+
+    assert create_calls == ["s3"]
+    assert sessions == []

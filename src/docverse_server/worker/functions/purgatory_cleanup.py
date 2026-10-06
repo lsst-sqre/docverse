@@ -76,6 +76,10 @@ from docverse_server.metrics import (
 )
 from docverse_server.services.purgatory import PurgatoryPlan
 from docverse_server.storage.objectstore import ObjectStore
+from docverse_server.worker.functions._cancellation import (
+    cancellation_recorded,
+    record_cancellation,
+)
 
 __all__ = ["PurgatoryCleanupOutcome", "purgatory_cleanup"]
 
@@ -157,6 +161,7 @@ class PurgatoryCleanupOutcome:
         }
 
 
+@cancellation_recorded
 async def purgatory_cleanup(
     ctx: dict[str, Any], payload: dict[str, Any]
 ) -> str:
@@ -178,6 +183,14 @@ async def purgatory_cleanup(
         ``"completed_with_errors"`` when at least one build failed. A
         failure that makes the whole tick impossible marks the queue job
         ``failed`` and re-raises so arq logs the job as failed.
+
+    Raises
+    ------
+    asyncio.CancelledError
+        When arq cancels the job — the maintenance pool's per-job
+        timeout, or a worker shutdown — after
+        :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+        has failed the row.
     """
     org_id: int = payload["org_id"]
     org_slug: str = payload["org_slug"]
@@ -201,52 +214,67 @@ async def purgatory_cleanup(
             if await queue_job_store.start_if_queued(queue_job_id) is None:
                 return "skipped"
 
-        limit = config.purgatory_cleanup_max_builds_per_job
-        try:
-            plan, project_slugs, object_store = await _prepare(
-                session=session,
-                factory=factory,
-                org_id=org_id,
-                limit=limit,
-            )
-            async with object_store:
-                outcome = await _reclaim_plan(
+        # From here on the sweep holds an ``in_progress`` row — and with
+        # it the org's per-org mutex — which arq's timeout or a worker
+        # shutdown would otherwise strand for ``purgatory_cleanup_reaper``:
+        # their ``CancelledError`` bypasses the ``except Exception`` below
+        # (PRD #765). There is no run to roll up, and the builds already
+        # stamped are durable; the next tick resumes from the oldest
+        # unstamped one.
+        async with record_cancellation(
+            ctx,
+            queue_job_id=queue_job_id,
+            timeout_seconds=config.maintenance_job_timeout_seconds,
+            logger=logger,
+        ):
+            limit = config.purgatory_cleanup_max_builds_per_job
+            try:
+                plan, project_slugs, object_store = await _prepare(
                     session=session,
                     factory=factory,
-                    plan=plan,
-                    project_slugs=project_slugs,
-                    object_store=object_store,
+                    org_id=org_id,
                     limit=limit,
-                    logger=logger,
                 )
-        except Exception as exc:
-            logger.exception("Purgatory cleanup failed for org")
-            async with session.begin():
-                await queue_job_store.fail(
-                    queue_job_id,
-                    errors={
-                        "message": str(exc),
-                        "type": type(exc).__name__,
-                        "traceback": traceback.format_exc(),
-                    },
-                )
-            raise
+                async with object_store:
+                    outcome = await _reclaim_plan(
+                        session=session,
+                        factory=factory,
+                        plan=plan,
+                        project_slugs=project_slugs,
+                        object_store=object_store,
+                        limit=limit,
+                        logger=logger,
+                    )
+            except Exception as exc:
+                logger.exception("Purgatory cleanup failed for org")
+                async with session.begin():
+                    await queue_job_store.fail(
+                        queue_job_id,
+                        errors={
+                            "message": str(exc),
+                            "type": type(exc).__name__,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                raise
 
-        progress = outcome.as_progress()
-        async with session.begin():
-            await queue_job_store.update_progress(queue_job_id, progress)
-            await queue_job_store.complete(
-                queue_job_id, has_errors=outcome.has_errors
+            progress = outcome.as_progress()
+            async with session.begin():
+                await queue_job_store.update_progress(queue_job_id, progress)
+                await queue_job_store.complete(
+                    queue_job_id, has_errors=outcome.has_errors
+                )
+            logger.info("Purgatory cleanup completed for org", **progress)
+            # Published from the same tally the queue row just recorded, and
+            # only now that every stamp behind it is durable. Best-effort:
+            # production runs raise_on_error=False so a metrics outage can
+            # never fail a sweep (no defensive try/except).
+            await _publish_sweep_events(
+                ctx=ctx, org_slug=org_slug, outcome=outcome, started=started
             )
-        logger.info("Purgatory cleanup completed for org", **progress)
-        # Published from the same tally the queue row just recorded, and
-        # only now that every stamp behind it is durable. Best-effort:
-        # production runs raise_on_error=False so a metrics outage can
-        # never fail a sweep (no defensive try/except).
-        await _publish_sweep_events(
-            ctx=ctx, org_slug=org_slug, outcome=outcome, started=started
-        )
-        return "completed_with_errors" if outcome.has_errors else "completed"
+            return (
+                "completed_with_errors" if outcome.has_errors else "completed"
+            )
 
     msg = "No database session available"
     raise RuntimeError(msg)

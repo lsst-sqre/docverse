@@ -31,6 +31,7 @@ from typing import get_args, get_type_hints
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from arq.worker import Function
 from fastapi import APIRouter, params
 from fastapi.routing import APIRoute
 from safir.metrics import EventManager, EventPayload
@@ -39,6 +40,7 @@ from docverse.models import (
     DraftInactivityRule,
     EditionUpdate,
     KeeperSyncConfig,
+    KeeperSyncRun,
     KeeperSyncScopePreview,
     ProjectGitHubBinding,
     ProjectGitHubBindingCreate,
@@ -47,9 +49,18 @@ from docverse.models.keeper_sync import (
     _MAX_SLUG_PATTERN_LENGTH,
     _MAX_SLUG_PATTERNS,
 )
-from docverse_server.config import Configuration
+from docverse_server.config import (
+    KEEPER_SYNC_REAPER_MARGIN_SECONDS,
+    KEEPER_SYNC_SLICE_MARGIN_SECONDS,
+    Configuration,
+    _default_keeper_sync_reaper_threshold,
+    _default_keeper_sync_slice_budget,
+    config,
+)
+from docverse_server.diagnostics.memory import MemorySample
 from docverse_server.domain.edition_reconcile import ReconcileReason, _Skip
 from docverse_server.handlers.orgs.editions import router as editions_router
+from docverse_server.handlers.orgs.jobs import router as jobs_router
 from docverse_server.handlers.orgs.keeper_sync import (
     router as keeper_sync_router,
 )
@@ -67,6 +78,7 @@ from docverse_server.metrics import (
     HttpStatusClass,
     WebhookOutcome,
 )
+from docverse_server.sentry import DocverseSentryComponent
 from docverse_server.services.default_branch import DefaultBranchTrigger
 from docverse_server.services.edition_reconcile import (
     EditionReconcileOutcome,
@@ -86,13 +98,30 @@ from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.ltd import RETRYABLE_SOURCE_TRANSPORT_ERRORS
 from docverse_server.storage.pagination import ProjectSortOrder
+from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.worker.functions._cancellation import (
+    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+    CANCELLATION_RECORDED_ATTR,
+    JOB_TIMEOUT_MESSAGE,
+    TIMEOUT_REASON_SLACK,
+    CancellationReason,
+    _describe,
+    _fail_cancelled_job,
+)
 from docverse_server.worker.functions.edition_reconcile import (
     RECONCILED_DRIFT_MESSAGE,
 )
-from docverse_server.worker.functions.keeper_sync import _ScopeCounts
+from docverse_server.worker.functions.keeper_sync import (
+    _edition_failure_progress,
+    _ProjectSyncProgress,
+    _ScopeCounts,
+)
 from docverse_server.worker.main import (
     COPY_HTTP_CONNECTION_HEADROOM,
     COPY_HTTP_TIMEOUT,
+    KeeperSyncWorkerSettings,
+    MaintenanceWorkerSettings,
+    WorkerSettings,
     copy_http_limits,
 )
 
@@ -157,6 +186,101 @@ _KEEPER_SYNC_SERVICE_MODULE = "docverse_server.services.keeper_sync.service"
 
 _KEEPER_SYNC_TRACKING_MESSAGE = "Derived keeper-sync edition tracking and kind"
 """The debug line saying where a synced edition's tracking came from."""
+
+_MEMORY_PAGE = "memory-diagnostics.md"
+"""Operations page for the opt-in memory sampler (PRD #753)."""
+
+_MEMORY_MODULE = "docverse_server.diagnostics.memory"
+"""Module that writes every memory-diagnostics log line."""
+
+_MEMORY_KNOB_PREFIX = "memory_diagnostics_"
+"""Name prefix of the settings that shape the memory sampler."""
+
+_MEMORY_PHALANX_GROUP = "config.memoryDiagnostics"
+"""Phalanx values group the chart renders the sampler's settings from."""
+
+_MEMORY_LOGS_SECTION = "What the sampler logs"
+"""Memory page section holding its sample-field and log-line tables."""
+
+_OBJECTSTORE_CACHE_MODULE = "docverse_server.storage.objectstore._cache"
+"""Module that writes every shared destination-client log line."""
+
+_OBJECTSTORE_CACHE_SECTION = "Shared destination clients"
+"""Memory page section holding the shared-client log-line table."""
+_BUDGET_PAGE = "keeper-sync-budget.md"
+"""Operations page for keeper-sync slicing and arq cancellation (PRD #765)."""
+
+_LADDER_PHALANX_VALUES = {
+    "keeper_sync_slice_budget_seconds": "config.keeperSync.sliceBudgetSeconds",
+    "keeper_sync_job_timeout_seconds": "config.keeperSync.jobTimeoutSeconds",
+    "keeper_sync_reaper_threshold_seconds": (
+        "config.reaperThresholds.keeperSyncSeconds"
+    ),
+}
+"""The keeper-sync time ladder, bottom rung first, with each Phalanx value.
+
+The values live in the Phalanx chart, which this repository cannot
+read, so the page's table is checked against this transcription.
+"""
+
+_SLICE_END_PROGRESS_KEYS = frozenset(
+    {"continued", "continuation_job_id", "reason"}
+)
+"""Keys a ``keeper_sync_project`` slice adds to its position as it ends.
+
+``continued`` on every slice that ends normally, ``continuation_job_id``
+on one that handed off, and ``reason`` on one the no-progress guard
+stopped. They are literals in the worker's two chain-ending paths, with
+nothing to read them off, unlike the position keys that
+:meth:`_ProjectSyncProgress.snapshot` renders.
+"""
+
+_HANDOFF_ERRORS_KEYS = frozenset({"job_function"})
+"""``errors`` keys a hand-off cancel adds to the cancelled-job payload."""
+
+_PHALANX_REAPER_PIN_SECONDS = 21600
+"""The Phalanx reaper-threshold pin that held prod for six hours (#699)."""
+
+_WORKER_POOLS = (
+    (WorkerSettings, "default"),
+    (KeeperSyncWorkerSettings, "keeper-sync"),
+    (MaintenanceWorkerSettings, "maintenance"),
+)
+"""Each arq settings class with the name the budget page gives its pool."""
+
+_BUDGET_LOG_LINES: dict[str, tuple[str, ...]] = {
+    "docverse_server.worker.main": (
+        "Keeper-sync time ladder",
+        "Keeper-sync reaper threshold capped at the job timeout plus margin",
+    ),
+    "docverse_server.worker.functions.keeper_sync": (
+        "Keeper-sync slice budget reached; continuing in a new job",
+        "Keeper-sync slice made no progress within its budget; not continuing",
+        "Keeper-sync project completed",
+        "Keeper-sync project completed with edition failures",
+        (
+            "Skipping keeper_sync_project enqueue: "
+            "an active job for this project already exists"
+        ),
+    ),
+    "docverse_server.services.keeper_sync.service": (
+        "Project sync stopped at its slice budget",
+        (
+            "Resume cursor is no longer in LTD's edition list;"
+            " walking from the top"
+        ),
+    ),
+    "docverse_server.worker.functions._cancellation": (
+        "Queue job cancelled",
+        "Failed to record the queue job's cancellation",
+    ),
+}
+"""The log lines the budget page tabulates, by the module that writes them.
+
+Those modules write many other lines, so the table is checked against
+this curated set rather than against everything each one logs; within
+it, every call site of a listed message has to have its row.
+"""
 
 _LOG_LEVELS = frozenset({"debug", "info", "warning", "error", "exception"})
 """The structlog methods whose first argument is a log line's message."""
@@ -482,9 +606,15 @@ def _bound_log_fields(module_name: str) -> set[str]:
     }
 
 
-def _documented_log_lines(page: str) -> dict[str, _LogCall]:
-    """Return the GitHub page's log-line table, keyed by message."""
-    table = _subsection(_section(page, "Reading an outcome"), "Log lines")
+def _documented_log_lines(
+    page: str, *, section: str = "Reading an outcome"
+) -> dict[str, _LogCall]:
+    """Return a page's log-line table, keyed by message.
+
+    The table is the ``### Log lines`` subsection of ``section``, which
+    defaults to the GitHub page's.
+    """
+    table = _subsection(_section(page, section), "Log lines")
     return {
         cells[0].strip("`"): _LogCall(
             level=cells[1], fields=frozenset(_inline_code(cells[2]))
@@ -1434,3 +1564,579 @@ def test_github_manual_fallback_documented() -> None:
     fields = {"tracking_mode", "tracking_params", "build"}
     assert fields <= set(EditionUpdate.model_fields)
     assert not _uncoded(fields, section)
+
+
+def _camel_case(name: str) -> str:
+    """Spell a snake_case setting name the way Phalanx values are spelled."""
+    first, *rest = name.split("_")
+    return first + "".join(part.capitalize() for part in rest)
+
+
+def _memory_knobs() -> set[str]:
+    """Every ``memory_diagnostics_*`` setting :class:`Configuration` has."""
+    return {
+        name
+        for name in Configuration.model_fields
+        if name.startswith(_MEMORY_KNOB_PREFIX)
+    }
+
+
+def _memory_phalanx_key(name: str) -> str:
+    """Return a sampler setting's key under ``config.memoryDiagnostics``."""
+    return _camel_case(name.removeprefix(_MEMORY_KNOB_PREFIX))
+
+
+def _memory_sample(*, traced: bool) -> MemorySample:
+    """Build a sample as if taken with tracemalloc on (``traced``) or off."""
+    traced_value = 1 if traced else None
+    return MemorySample(
+        rss_bytes=1,
+        rss_peak_bytes=1,
+        gc_counts=(0, 0, 0),
+        gc_objects=traced_value,
+        tracemalloc_current_bytes=traced_value,
+        tracemalloc_peak_bytes=traced_value,
+        top_sites=(),
+    )
+
+
+def _memory_log_calls(
+    module_name: str = _MEMORY_MODULE,
+) -> dict[str, list[_LogCall]]:
+    """Every line a memory-page module writes, with its fields as logged.
+
+    ``module_name`` defaults to the sampler module. ``exc_info=True`` is
+    read as ``exception``: Safir's production profile renders the
+    traceback under that key, which is the one an operator reads in the
+    JSON logs.
+    """
+    return {
+        message: [
+            _LogCall(
+                level=call.level,
+                fields=frozenset(
+                    "exception" if field == "exc_info" else field
+                    for field in call.fields
+                ),
+            )
+            for call in calls
+        ]
+        for message, calls in _log_calls(module_name).items()
+    }
+
+
+def test_docs_index_links_the_memory_diagnostics_page() -> None:
+    """The index's Operations section points at the memory page."""
+    assert _MEMORY_PAGE in _section(_read("index.md"), "Operations")
+
+
+def test_memory_knobs_documented_with_env_var_default_and_value() -> None:
+    """Every sampler setting is a row naming its env var, default and value.
+
+    Checked both ways off :class:`Configuration`, like the GitHub table:
+    a ``memory_diagnostics_*`` setting the table lacks is a knob an
+    operator cannot find, and a row for one that no longer exists does
+    nothing. The Phalanx column is the setting's name, less the prefix,
+    in camelCase under ``config.memoryDiagnostics``.
+    """
+    section = _section(_read(_MEMORY_PAGE), "Configuration")
+    env_prefix = Configuration.model_config.get("env_prefix", "")
+    knobs = _memory_knobs()
+    assert knobs, "configuration exposes no memory diagnostics knobs"
+    documented = {cells[0].strip("`") for cells in _code_rows(section)}
+    assert documented == knobs
+    for name in sorted(knobs):
+        cells = _cells(_table_row(section, name))
+        env_var = f"{env_prefix}{name}".upper()
+        default = Configuration.model_fields[name].default
+        value = f"{_MEMORY_PHALANX_GROUP}.{_memory_phalanx_key(name)}"
+        assert cells[1] == f"`{env_var}`", name
+        assert cells[2] == _documented_default(default), name
+        assert cells[3] == f"`{value}`", name
+
+
+def test_memory_sample_fields_documented() -> None:
+    """The fields table is exactly what a ``Memory sample`` line carries.
+
+    Read off :meth:`MemorySample.log_fields` plus the ``component`` label
+    the sampler adds, so a field added to the line is a row the page has
+    to gain. The Present column has to say which fields only a traced
+    sample carries, since an untraced line leaves them off rather than
+    logging nulls.
+    """
+    section = _section(_read(_MEMORY_PAGE), _MEMORY_LOGS_SECTION)
+    rows = {
+        cells[0].strip("`"): cells
+        for cells in _code_rows(_subsection(section, "Sample fields"))
+    }
+    always = {"component", *_memory_sample(traced=False).log_fields()}
+    carried = {"component", *_memory_sample(traced=True).log_fields()}
+    assert set(rows) == carried
+    for name, cells in sorted(rows.items()):
+        expected = "always" if name in always else "with tracemalloc"
+        assert cells[1] == expected, name
+
+
+def test_memory_log_lines_match_the_code() -> None:
+    """The log table lists exactly the lines the sampler module writes.
+
+    Both ways: a row whose message, level or fields drifted from the
+    code is a line nobody can grep for, and a line the module adds is
+    one the page has to gain a row for.
+    """
+    documented = _documented_log_lines(
+        _read(_MEMORY_PAGE), section=_MEMORY_LOGS_SECTION
+    )
+    emitted = _memory_log_calls()
+    assert emitted, "the sampler module writes no log lines"
+    assert set(documented) == set(emitted)
+    wrong = sorted(
+        message
+        for message, row in documented.items()
+        if row not in emitted[message]
+    )
+    assert not wrong
+
+
+def test_objectstore_cache_log_lines_match_the_code() -> None:
+    """The shared-client log table lists exactly the cache's log lines.
+
+    A dev run counts the worker's destination clients from these lines
+    (#751), so a message, level or field that drifted from the code is
+    one the count cannot be read from.
+    """
+    documented = _documented_log_lines(
+        _read(_MEMORY_PAGE), section=_OBJECTSTORE_CACHE_SECTION
+    )
+    emitted = _memory_log_calls(_OBJECTSTORE_CACHE_MODULE)
+    assert emitted, "the cache module writes no log lines"
+    assert set(documented) == set(emitted)
+    wrong = sorted(
+        message
+        for message, row in documented.items()
+        if row not in emitted[message]
+    )
+    assert not wrong
+
+
+def test_memory_page_names_every_sampling_component() -> None:
+    """Every process label a sampler logs under is on the page.
+
+    ``cli`` is the one Sentry component that starts no sampler; each of
+    the others is a process whose samples an operator filters by.
+    """
+    components = set(get_args(DocverseSentryComponent)) - {"cli"}
+    assert components
+    section = _section(_read(_MEMORY_PAGE), _MEMORY_LOGS_SECTION)
+    assert not _uncoded(components, section)
+
+
+def test_memory_dev_snippet_uses_the_documented_phalanx_keys() -> None:
+    """The roundtable-dev values snippet turns on sampler and tracing.
+
+    Its keys under ``memoryDiagnostics`` have to be ones the
+    Configuration table names, so a renamed setting cannot leave the
+    snippet setting a value the chart ignores.
+    """
+    section = _section(_read(_MEMORY_PAGE), "Enabling on roundtable-dev")
+    parts = section.split("```yaml\n", 1)
+    assert len(parts) == 2, "the section quotes no values snippet"
+    block = parts[1].split("```", 1)[0]
+    assert "memoryDiagnostics:" in block
+    # The snippet sits in a list item, so every line of it is indented.
+    keys = set(re.findall(r"^\s+(\w+):", block, flags=re.MULTILINE))
+    keys -= {"config", "memoryDiagnostics"}
+    known = {_memory_phalanx_key(name) for name in _memory_knobs()}
+    assert keys, "the snippet sets no memoryDiagnostics values"
+    assert keys <= known
+    assert re.search(r"^\s+enabled: true$", block, flags=re.MULTILINE)
+    assert re.search(
+        r"^\s+tracemallocEnabled: true$", block, flags=re.MULTILINE
+    )
+
+
+def test_memory_leak_signature_guide_documented() -> None:
+    """The reading guide covers both signatures and the arena experiment.
+
+    Presence only: the section has to compare the fields the two
+    signatures are told apart by, and name the glibc setting to try
+    when the gap is outside the Python heap.
+    """
+    section = _section(_read(_MEMORY_PAGE), "Reading a leak signature")
+    for heading in (
+        "Python-heap growth",
+        "Fragmentation or native memory",
+        "The `MALLOC_ARENA_MAX` experiment",
+    ):
+        _subsection(section, heading)
+    assert not _uncoded(
+        {
+            "rss_bytes",
+            "rss_peak_bytes",
+            "tracemalloc_current_bytes",
+            "top_sites",
+            "MALLOC_ARENA_MAX=2",
+        },
+        section,
+    )
+
+
+def test_memory_top_sites_reading_documented() -> None:
+    """The ``top_sites`` section explains the diff and the cutoff.
+
+    Each site is a per-tick diff cut at ``memory_diagnostics_top_n`` and
+    grouped at ``memory_diagnostics_tracemalloc_frames``, so reading one
+    across ticks means knowing both settings and both diff columns.
+    """
+    section = _section(_read(_MEMORY_PAGE), "Reading `top_sites` across ticks")
+    assert {
+        "memory_diagnostics_top_n",
+        "memory_diagnostics_tracemalloc_frames",
+    } <= _memory_knobs()
+    assert not _uncoded(
+        {
+            "size_diff",
+            "count_diff",
+            "memory_diagnostics_top_n",
+            "memory_diagnostics_tracemalloc_frames",
+        },
+        section,
+    )
+
+
+def test_memory_tracemalloc_cost_documented() -> None:
+    """The cost section names the switch it argues stays off outside dev."""
+    section = _section(_read(_MEMORY_PAGE), "What tracemalloc costs")
+    assert "memory_diagnostics_tracemalloc_enabled" in _memory_knobs()
+    assert not _uncoded({"memory_diagnostics_tracemalloc_enabled"}, section)
+
+
+def _budget_section(heading: str) -> str:
+    """Return one ``## heading`` section of the keeper-sync budget page."""
+    return _section(_read(_BUDGET_PAGE), heading)
+
+
+def _stock_ladder() -> dict[str, int]:
+    """Return the three ladder values at the stock job timeout.
+
+    Derived through the configuration's own default factories, so a
+    change to either margin or to the timeout's default is a change the
+    page's table has to carry.
+    """
+    timeout = Configuration.model_fields["keeper_sync_job_timeout_seconds"]
+    data = {"keeper_sync_job_timeout_seconds": timeout.default}
+    return {
+        "keeper_sync_slice_budget_seconds": _default_keeper_sync_slice_budget(
+            data
+        ),
+        "keeper_sync_job_timeout_seconds": timeout.default,
+        "keeper_sync_reaper_threshold_seconds": (
+            _default_keeper_sync_reaper_threshold(data)
+        ),
+    }
+
+
+def _cancellation_recording_workers() -> dict[str, tuple[str, float | None]]:
+    """Every worker function marked as recording its own cancellation.
+
+    Read off what the three ``WorkerSettings`` classes register with
+    arq, each with its pool and the per-function timeout arq enforces on
+    it (``None`` for one registered without a timeout of its own, which
+    runs under arq's default). A function both listed and scheduled as
+    a cron job — the tier crons — is one entry.
+    """
+    found: dict[str, tuple[str, float | None]] = {}
+    for settings, pool in _WORKER_POOLS:
+        registered: list[tuple[object, float | None]] = [
+            (entry.coroutine, entry.timeout_s)
+            if isinstance(entry, Function)
+            else (entry, None)
+            for entry in settings.functions
+        ]
+        registered += [
+            (cron_job.coroutine, cron_job.timeout_s)
+            for cron_job in settings.cron_jobs
+        ]
+        for coroutine, timeout in registered:
+            # Each ``functions`` list mixes ``func(...)`` wrappers with
+            # bare coroutines.
+            assert callable(coroutine)
+            if not getattr(coroutine, CANCELLATION_RECORDED_ATTR, False):
+                continue
+            name = inspect.unwrap(coroutine).__name__
+            _, known = found.get(name, (pool, None))
+            found[name] = (pool, timeout if timeout is not None else known)
+    return found
+
+
+def _log_rows(table: str) -> list[tuple[str, _LogCall]]:
+    """Every row of a log-line table, keeping repeated messages.
+
+    Unlike :func:`_documented_log_lines`, a message logged from two call
+    sites with different fields keeps a row for each.
+    """
+    return [
+        (
+            cells[0].strip("`"),
+            _LogCall(level=cells[1], fields=frozenset(_inline_code(cells[2]))),
+        )
+        for cells in _code_rows(table)
+    ]
+
+
+def _as_logged(call: _LogCall) -> _LogCall:
+    """Describe a log call the way it reads in the JSON logs.
+
+    ``logger.exception`` logs at ``error`` with the traceback that
+    Safir's production profile renders under ``exception``.
+    """
+    if call.level == "exception":
+        return _LogCall(level="error", fields=call.fields | {"exception"})
+    return call
+
+
+def test_docs_index_links_the_budget_page() -> None:
+    """The index's Operations section points at the budget page."""
+    assert _BUDGET_PAGE in _section(_read("index.md"), "Operations")
+
+
+def test_budget_ladder_documented_with_env_var_default_and_value() -> None:
+    """The ladder table is exactly the three settings, each fully described.
+
+    Each row names the setting's environment variable, its stock value
+    (derived through the configuration's default factories, so the
+    budget and the reaper threshold are what the stock timeout gives),
+    and the Phalanx value that sets it. The two derived rows name the
+    margin each derivation uses, with its value.
+    """
+    section = _budget_section("The ladder")
+    env_prefix = Configuration.model_config.get("env_prefix", "")
+    rows = {cells[0].strip("`"): cells for cells in _code_rows(section)}
+    assert set(rows) == set(_LADDER_PHALANX_VALUES)
+    stock = _stock_ladder()
+    for name, phalanx_value in _LADDER_PHALANX_VALUES.items():
+        cells = rows[name]
+        assert cells[1] == f"`{env_prefix}{name}`".upper(), name
+        assert f"`{stock[name]}`" in cells[2], name
+        assert cells[3] == f"`{phalanx_value}`", name
+    budget = rows["keeper_sync_slice_budget_seconds"][2]
+    assert "`KEEPER_SYNC_SLICE_MARGIN_SECONDS`" in budget
+    assert f"({KEEPER_SYNC_SLICE_MARGIN_SECONDS})" in budget
+    reaper = rows["keeper_sync_reaper_threshold_seconds"][2]
+    assert "`KEEPER_SYNC_REAPER_MARGIN_SECONDS`" in reaper
+    assert f"({KEEPER_SYNC_REAPER_MARGIN_SECONDS})" in reaper
+
+
+def test_budget_ladder_names_the_startup_line() -> None:
+    """The ladder section quotes the sync worker's startup ladder line."""
+    section = _budget_section("The ladder")
+    assert "Keeper-sync time ladder" in _log_calls(
+        "docverse_server.worker.main"
+    )
+    assert "`Keeper-sync time ladder`" in section
+
+
+def test_budget_slice_progress_keys_documented() -> None:
+    """The job-row table is exactly the keys a slice records on ``progress``.
+
+    The position keys are read off the worker's own snapshot, so a key
+    added to a slice's record is a row the page has to gain. The keys
+    an edition-failure slice adds are named too, and the no-progress
+    guard's ``reason`` value.
+    """
+    section = _subsection(_budget_section("Reading a chain"), "The job rows")
+    documented = {cells[0].strip("`") for cells in _code_rows(section)}
+    position = set(_ProjectSyncProgress(slice_index=0).snapshot())
+    assert position, "a slice records no position"
+    assert documented == position | _SLICE_END_PROGRESS_KEYS
+    assert not _uncoded(
+        {"no_progress", *_edition_failure_progress([])}, section
+    )
+    assert _route_path("get_org_jobs", router=jobs_router) in section
+
+
+def test_budget_run_counters_documented() -> None:
+    """The run section names every counter a run reports."""
+    section = _subsection(_budget_section("Reading a chain"), "On the run")
+    counters = {
+        name for name in KeeperSyncRun.model_fields if name.endswith("_count")
+    }
+    assert counters, "a run reports no counters"
+    assert not _uncoded(counters | {"date_last_activity"}, section)
+
+
+def test_budget_log_lines_match_the_code() -> None:
+    """The log table is exactly the curated lines, as the code writes them.
+
+    Both ways for the curated set: every call site of each listed
+    message has a row with its level and fields, and no row describes a
+    line, level or field set the code does not write.
+    """
+    documented: dict[str, set[_LogCall]] = {}
+    for message, call in _log_rows(_budget_section("Log lines")):
+        documented.setdefault(message, set()).add(call)
+    emitted: dict[str, set[_LogCall]] = {}
+    for module, messages in _BUDGET_LOG_LINES.items():
+        calls = _log_calls(module)
+        for message in messages:
+            assert message in calls, f"{module} no longer logs {message!r}"
+            emitted[message] = {_as_logged(call) for call in calls[message]}
+    assert documented == emitted
+
+
+def test_budget_log_section_names_the_bound_slice_index() -> None:
+    """Every slice's log lines carry the ``slice_index`` the job binds."""
+    module = "docverse_server.worker.functions.keeper_sync"
+    assert "slice_index" in _bound_log_fields(module)
+    assert not _uncoded({"slice_index"}, _budget_section("Log lines"))
+
+
+def test_budget_cursor_rule_documented() -> None:
+    """The cursor section names the cursor and the crons that cover its gap.
+
+    The tier crons are read off the keeper-sync pool's schedule: they are
+    what picks up a change the cursor walks past.
+    """
+    section = _budget_section("The cursor rule")
+    _subsection(section, "What the cursor does not catch")
+    tiers = {
+        inspect.unwrap(cron_job.coroutine).__name__
+        for cron_job in KeeperSyncWorkerSettings.cron_jobs
+    }
+    tiers = {name for name in tiers if name.startswith("keeper_sync_tier_")}
+    assert tiers, "the keeper-sync pool schedules no tier crons"
+    assert not _uncoded(
+        {
+            "resume_after_ltd_edition_id",
+            "last_visited_ltd_edition_id",
+            "main",
+            *tiers,
+        },
+        section,
+    )
+
+
+@pytest.mark.asyncio
+async def test_budget_cancellation_errors_documented() -> None:
+    """The errors table is exactly what a cancel writes on a job's row.
+
+    The keys are read off the helper itself, run against a store that
+    records the ``errors`` it is asked to write; a hand-off cancel adds
+    the creator's ``job_function`` to the same payload.
+    """
+    store = Mock(spec=QueueJobStore)
+    store.get_elapsed_since_start = AsyncMock(return_value=timedelta(0))
+    store.fail_if_active = AsyncMock(return_value=None)
+    await _fail_cancelled_job(
+        store, queue_job_id=1, timeout=timedelta(hours=1), progress=None
+    )
+    errors = store.fail_if_active.call_args.kwargs["errors"]
+    section = _subsection(
+        _budget_section("Cancellation"), "The errors payload"
+    )
+    documented = {cells[0].strip("`") for cells in _code_rows(section)}
+    assert documented == set(errors) | _HANDOFF_ERRORS_KEYS
+
+
+def test_budget_cancellation_reasons_documented() -> None:
+    """The page tells a timeout from a deploy the way the helper does.
+
+    Both reasons, the slack the inference allows, the Sentry title a
+    timeout is captured under, and the two ``errors.message`` texts at
+    the stock keeper-sync timeout, which are what an operator greps.
+    """
+    section = _budget_section("Cancellation")
+    reasons = set(get_args(CancellationReason.__value__))
+    assert reasons, "the helper records no reasons"
+    assert not _uncoded(reasons | {"TIMEOUT_REASON_SLACK"}, section)
+    assert f"{TIMEOUT_REASON_SLACK.total_seconds():g} s" in section
+    assert JOB_TIMEOUT_MESSAGE in section
+    timeout = timedelta(
+        seconds=_stock_ladder()["keeper_sync_job_timeout_seconds"]
+    )
+    for reason in sorted(reasons):
+        assert _describe(reason, timeout=timeout) in section, reason
+
+
+def test_budget_page_tables_every_cancellation_recording_worker() -> None:
+    """The covered-jobs table is every marked worker, with pool and timeout.
+
+    Read off the three ``WorkerSettings`` classes, both ways, so a
+    worker function gaining the wrap is a row the page has to gain. The
+    timeout cell names what the reason is inferred against: arq's
+    default for a function registered without its own timeout, or the
+    setting whose value arq was given.
+    """
+    section = _subsection(
+        _budget_section("Cancellation"),
+        "Which jobs record their cancellation",
+    )
+    rows = {cells[0].strip("`"): cells for cells in _code_rows(section)}
+    workers = _cancellation_recording_workers()
+    assert workers, "no worker function records its cancellation"
+    assert set(rows) == set(workers)
+    settings = set(Configuration.model_fields)
+    for name, (pool, timeout) in sorted(workers.items()):
+        cells = rows[name]
+        assert cells[1] == pool, name
+        named = _inline_code(cells[2])
+        if timeout is None:
+            assert "ARQ_DEFAULT_JOB_TIMEOUT_SECONDS" in named, name
+            continue
+        assert any(
+            getattr(config, setting) == timeout for setting in named & settings
+        ), name
+    assert f"({ARQ_DEFAULT_JOB_TIMEOUT_SECONDS} s)" in section
+    assert not _uncoded(
+        {
+            "record_cancellation",
+            "record_handoff_cancellation",
+            "cancellation_recorded",
+            "tests/worker/cancellation_coverage_test.py",
+        },
+        section,
+    )
+
+
+def test_budget_no_progress_guard_documented() -> None:
+    """The guard section says what it records and how to get past it."""
+    section = _budget_section("The no-progress guard")
+    _subsection(section, "The timeout escape hatch")
+    assert not _uncoded(
+        {
+            "no_progress",
+            "completed_with_errors",
+            "keeper_sync_job_timeout_seconds",
+            "keeper_sync_slice_budget_seconds",
+        },
+        section,
+    )
+
+
+def test_budget_reaper_cap_documented() -> None:
+    """The cap section works #699's pin through the cap and quotes its log.
+
+    The effective value is what :class:`Configuration` itself makes of
+    the pin at the stock timeout, and the warning is the one the sync
+    worker writes at startup, with the fields that name both numbers.
+    """
+    section = _budget_section("The reaper cap")
+    timeout = _stock_ladder()["keeper_sync_job_timeout_seconds"]
+    capped = Configuration(
+        keeper_sync_job_timeout_seconds=timeout,
+        keeper_sync_reaper_threshold_seconds=_PHALANX_REAPER_PIN_SECONDS,
+    )
+    requested = capped.keeper_sync_reaper_threshold_requested_seconds
+    assert requested == _PHALANX_REAPER_PIN_SECONDS
+    effective = capped.keeper_sync_reaper_threshold_seconds
+    assert f"`{_PHALANX_REAPER_PIN_SECONDS}`" in section
+    assert f"`{effective}`" in section
+    warning = (
+        "Keeper-sync reaper threshold capped at the job timeout plus margin"
+    )
+    calls = _log_calls("docverse_server.worker.main")[warning]
+    assert [call.level for call in calls] == ["warning"]
+    assert f"`{warning}`" in section
+    assert not _uncoded(
+        {"KEEPER_SYNC_REAPER_MARGIN_SECONDS", *calls[0].fields}, section
+    )
