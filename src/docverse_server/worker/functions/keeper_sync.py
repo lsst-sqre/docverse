@@ -2466,7 +2466,9 @@ async def _run_tier(
     or on a worker shutdown — the ``CancelledError`` (which the per-org
     ``except Exception`` never sees) is caught here only to log how far
     the pass got, from the :class:`_TierPassProgress` every processor
-    advances, and is then re-raised so arq records the job as failed.
+    advances, and is then re-raised so arq records the job as failed. A
+    failure while logging is itself logged with its traceback and never
+    replaces the cancel.
     """
     started = time.monotonic()
     progress = _TierPassProgress()
@@ -2480,12 +2482,21 @@ async def _run_tier(
             progress=progress,
         )
     except asyncio.CancelledError:
-        _log_tier_cancellation(
-            logger=logger,
-            tier_name=tier_name,
-            started=started,
-            progress=progress,
-        )
+        try:
+            _log_tier_cancellation(
+                logger=logger,
+                tier_name=tier_name,
+                started=started,
+                progress=progress,
+            )
+        except Exception:
+            # Never let the log line's own failure (a structlog processor,
+            # a Sentry hook) replace the cancel: arq must still see the
+            # ``CancelledError``, as ``record_cancellation`` guarantees
+            # for a job that holds a row.
+            logger.exception(
+                "Failed to log the tier pass's cancellation", tier=tier_name
+            )
         raise
 
 

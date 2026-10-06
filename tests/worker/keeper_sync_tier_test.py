@@ -32,6 +32,7 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
+from structlog.typing import EventDict, WrappedLogger
 
 from docverse.models import JobKind, KeeperSyncConfig, OrganizationCreate
 from docverse_server.dbschema.queue_job import SqlQueueJob
@@ -3591,3 +3592,53 @@ async def test_tier_pass_cancelled_mid_scope_logs_how_far_it_got(
     assert not any(
         e["event"] == "Keeper-sync tier pass complete" for e in captured
     )
+
+
+@pytest.mark.asyncio
+async def test_tier_cancel_log_failure_still_propagates_the_cancel(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A failure while logging a tier pass's cancel never replaces it.
+
+    The warning is the cancelled pass's whole record, but rendering it
+    runs every structlog processor (and any Sentry hook), and one of
+    those raising must not swap the ``CancelledError`` for an unrelated
+    exception: arq would record the pass failed with the wrong
+    traceback. The failure is logged with its traceback instead and the
+    original cancel still reaches arq.
+    """
+    async with db_session.begin():
+        await _seed_org(
+            db_session, slug="ks-tier-cut-log", project_slugs=["aaa"]
+        )
+    _stub_products(mock_discovery, ["aaa"])
+    hang = HangUntilCancelled()
+    mock_discovery.get(f"{LTD_BASE}/products/aaa/editions/").mock(
+        side_effect=hang
+    )
+    ctx = _make_ctx(httpx.AsyncClient())
+
+    def _fail_on_cancel_warning(
+        _logger: WrappedLogger, _method: str, event_dict: EventDict
+    ) -> EventDict:
+        if event_dict["event"] == "Keeper-sync tier pass cancelled":
+            msg = "log processor failed"
+            raise RuntimeError(msg)
+        return event_dict
+
+    with capture_logs(processors=[_fail_on_cancel_warning]) as captured:
+        task = asyncio.create_task(keeper_sync_tier_other(ctx))
+        await cancel_when_reached(task, hang.reached)
+    await ctx["http_client"].aclose()
+
+    failures = [
+        e
+        for e in captured
+        if e["event"] == "Failed to log the tier pass's cancellation"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["log_level"] == "error"
+    assert failures[0]["exc_info"] is True
+    assert failures[0]["tier"] == "other"
