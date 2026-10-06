@@ -87,23 +87,20 @@ class InventoryCensusStore:
         # soft-deleted project are dropped below because that project
         # contributes no row to assemble them onto.
         edition_count_rows = (
-            (
-                await self._session.execute(
-                    select(SqlEdition.project_id, func.count(SqlEdition.id))
-                    .where(SqlEdition.date_deleted.is_(None))
-                    .group_by(SqlEdition.project_id)
-                )
+            await self._session.execute(
+                select(SqlEdition.project_id, func.count(SqlEdition.id))
+                .where(SqlEdition.date_deleted.is_(None))
+                .group_by(SqlEdition.project_id)
             )
-            .tuples()
-            .all()
-        )
+        ).all()
         edition_counts: dict[int, int] = dict(edition_count_rows)
 
         # Non-deleted build counts + byte sums per project. ``SUM`` skips
         # NULL ``total_size_bytes`` (an unprocessed build still counts
         # toward ``build_count`` but adds nothing to the footprint); the
         # ``coalesce`` yields 0 for a project whose builds are all
-        # NULL-sized.
+        # NULL-sized; the ``or 0`` below only narrows the ``int | None``
+        # SQLAlchemy infers from the nullable column.
         build_rows = (
             await self._session.execute(
                 select(
@@ -116,7 +113,7 @@ class InventoryCensusStore:
             )
         ).all()
         build_stats: dict[int, tuple[int, int]] = {
-            project_id: (count, int(total_bytes))
+            project_id: (count, int(total_bytes or 0))
             for project_id, count, total_bytes in build_rows
         }
 
@@ -147,11 +144,11 @@ class InventoryCensusStore:
         purgatory_stats: dict[int, tuple[int, int]] = {}
         org_purgatory_stats: dict[int, tuple[int, int]] = {}
         for project_id, org_id, count, total_bytes in purgatory_rows:
-            purgatory_stats[project_id] = (count, int(total_bytes))
+            purgatory_stats[project_id] = (count, int(total_bytes or 0))
             org_count, org_bytes = org_purgatory_stats.get(org_id, (0, 0))
             org_purgatory_stats[org_id] = (
                 org_count + count,
-                org_bytes + int(total_bytes),
+                org_bytes + int(total_bytes or 0),
             )
 
         projects: list[ProjectInventoryCensus] = []

@@ -894,7 +894,9 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         return {
-            (edition_id, build_id) for edition_id, build_id in result.all()
+            (edition_id, build_id)
+            for edition_id, build_id in result.all()
+            if edition_id is not None and build_id is not None
         }
 
     async def has_live_publish_job(
