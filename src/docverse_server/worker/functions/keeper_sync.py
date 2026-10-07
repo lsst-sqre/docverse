@@ -178,7 +178,9 @@ _MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
 #: accompanying log line). ``edition_failure_count`` is always exact;
 #: only the detail list is truncated, so a project whose entire release
 #: history is unreadable — LTD's oldest uploads carry no public-read
-#: object ACL — cannot write an unbounded blob into the job record.
+#: object ACL — cannot write an unbounded blob into the job record. The
+#: tier crons cap the URL list of their unparsable-edition-URL warning
+#: (:func:`_list_edition_ltd_ids`) at the same size, for the same reason.
 _MAX_RECORDED_EDITION_FAILURES = 20
 
 #: Tracking modes that identify a semver aggregate edition (``15`` /
@@ -3382,8 +3384,12 @@ async def _list_edition_ltd_ids(
     the project's polled stamp, and reach :func:`_run_tier_pass`'s
     per-org handler, dropping every remaining project of the org for
     the tick. The skip is logged as one warning per project naming the
-    org, slug and URLs, and the ids that did parse are returned for the
-    tier to decide on.
+    org, slug and the first :data:`_MAX_RECORDED_EDITION_FAILURES` URLs,
+    with ``skipped_count`` the exact total, and the ids that did parse
+    are returned for the tier to decide on. The URL list is capped
+    because an LTD URL-shape change would make every edition of every
+    in-scope product unparsable on every tick: ``pipelines`` alone would
+    otherwise put 2,938 URLs into one log line.
     """
     edition_urls = await ltd_client.list_edition_urls_for_product(ltd_slug)
     ltd_ids, unparsable = _split_listed_edition_urls(edition_urls)
@@ -3393,7 +3399,7 @@ async def _list_edition_ltd_ids(
             tier=tier.value,
             org=org_slug,
             ltd_slug=ltd_slug,
-            unparsable_urls=unparsable,
+            unparsable_urls=unparsable[:_MAX_RECORDED_EDITION_FAILURES],
             skipped_count=len(unparsable),
             parsed_count=len(ltd_ids),
         )

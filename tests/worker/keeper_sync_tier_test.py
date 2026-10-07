@@ -53,6 +53,7 @@ from docverse_server.storage.keeper_sync import (
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.keeper_sync import (
+    _MAX_RECORDED_EDITION_FAILURES,
     keeper_sync_tier_discovery,
     keeper_sync_tier_main,
     keeper_sync_tier_other,
@@ -2480,6 +2481,81 @@ async def test_tier_discovery_skips_unparsable_edition_url(
     assert warnings[0]["org"] == "ks-tier-disc-badurl"
     assert warnings[0]["ltd_slug"] == "aaa"
     assert warnings[0]["unparsable_urls"] == [_UNPARSABLE_EDITION_URL]
+
+    stamped = await _read_polled_annotation(
+        org_id=org_id, ltd_slug="aaa", key="date_discovery_last_polled"
+    )
+    assert (now - stamped) < timedelta(minutes=5)
+
+
+@pytest.mark.asyncio
+async def test_tier_unparsable_edition_url_warning_is_capped(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """The unparsable-URL warning names a bounded sample, counted exactly.
+
+    ``aaa`` lists more unreadable URLs than
+    ``_MAX_RECORDED_EDITION_FAILURES`` ahead of one well-formed id: the
+    shape every edition of ``pipelines`` (2,938) would take if LTD
+    changed its URL scheme. The warning carries only the first
+    ``_MAX_RECORDED_EDITION_FAILURES`` URLs, in listing order, while
+    ``skipped_count`` stays the exact total, so one tick cannot emit a
+    multi-megabyte log line per project. The parsed id is still decided
+    on — edition 2 has no state row, so ``aaa`` enqueues — and ``aaa``
+    is still stamped polled.
+    """
+    now = datetime.now(tz=UTC)
+    unparsable_urls = [
+        f"{LTD_BASE}/editions/latest-{n}"
+        for n in range(_MAX_RECORDED_EDITION_FAILURES + 5)
+    ]
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-badurl-cap",
+            project_slugs=["aaa"],
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="aaa",
+        )
+
+    _stub_products(mock_discovery, ["aaa"])
+    _stub_edition_url_listing(
+        mock_discovery,
+        product_slug="aaa",
+        urls=[*unparsable_urls, f"{LTD_BASE}/editions/2"],
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["aaa"]
+
+    warnings = [e for e in captured if e["event"] == _UNPARSABLE_URLS_EVENT]
+    assert len(warnings) == 1
+    assert (
+        warnings[0]["unparsable_urls"]
+        == (unparsable_urls[:_MAX_RECORDED_EDITION_FAILURES])
+    )
+    assert warnings[0]["skipped_count"] == len(unparsable_urls)
+    assert warnings[0]["parsed_count"] == 1
 
     stamped = await _read_polled_annotation(
         org_id=org_id, ltd_slug="aaa", key="date_discovery_last_polled"
