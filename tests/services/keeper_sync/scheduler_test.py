@@ -1431,6 +1431,25 @@ def test_tier_cron_timeout_caps_the_floor_at_a_shorter_interval(
     assert tier_cron_timeout(Tier.main) == interval
 
 
+@pytest.mark.parametrize("interval", [timedelta(0), timedelta(seconds=-300)])
+def test_tier_cron_timeout_rejects_a_non_positive_interval(
+    monkeypatch: pytest.MonkeyPatch, interval: timedelta
+) -> None:
+    """A zero or negative cadence fails loudly instead of clamping.
+
+    The floor-then-cap clamp would hand such a tier its own interval as
+    the timeout, so arq would cancel every pass the instant it started
+    with nothing logged beyond a cancellation per tick. A typo'd cadence
+    constant must fail at worker startup, naming the tier and interval.
+    """
+    monkeypatch.setitem(
+        scheduler._TIER_CRON_INTERVALS, Tier.discovery, interval
+    )
+    with pytest.raises(ValueError, match="discovery") as excinfo:
+        tier_cron_timeout(Tier.discovery)
+    assert repr(interval) in str(excinfo.value)
+
+
 @pytest.mark.parametrize(
     (
         "tier",

@@ -140,7 +140,11 @@ would leave 240 s, a fifth less than the 300 s it ran under before, and
 a pass that needed the difference would be cancelled, and start again
 from the top of its scope, on every tick. The cap keeps a tier whose
 cadence is shorter than the floor, should one be added, from running a
-pass that started on time into its own next tick.
+pass that started on time into its own next tick. A zero or negative
+interval is never clamped: `tier_cron_timeout` raises `ValueError`
+naming the tier and interval, so a mistyped cadence constant fails the
+worker at startup rather than registering a timeout that cancels every
+pass the instant it starts.
 
 The timeout bounds a pass. For `keeper_sync_tier_discovery` and
 `keeper_sync_tier_other` the margin also keeps a pass that started a

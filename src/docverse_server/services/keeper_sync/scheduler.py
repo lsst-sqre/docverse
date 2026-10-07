@@ -263,8 +263,23 @@ def tier_cron_timeout(tier: Tier) -> timedelta:
     ``cron(...)`` with this value and the tier crons read their
     cancellations against it, so the cadence constants and the
     registration cannot drift.
+
+    Raises
+    ------
+    ValueError
+        If the tier's cron interval is zero or negative. The clamp would
+        otherwise hand that tier its own interval as the timeout, and
+        arq would cancel every pass the instant it started; raising
+        instead fails the worker at startup, where the registration
+        reads this value.
     """
     interval = tier_cron_interval(tier)
+    if interval <= timedelta(0):
+        msg = (
+            f"The {tier.value} tier cron interval {interval!r} must be"
+            " positive to derive a timeout"
+        )
+        raise ValueError(msg)
     margin = max(
         interval // TIER_CRON_TIMEOUT_MARGIN_DIVISOR,
         TIER_CRON_TIMEOUT_MIN_MARGIN,
