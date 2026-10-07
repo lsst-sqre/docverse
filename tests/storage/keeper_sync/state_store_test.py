@@ -405,8 +405,8 @@ async def test_list_for_org_filters_by_ltd_ids(
 ) -> None:
     """``ltd_ids`` narrows the result to the supplied LTD ids only.
 
-    Used by ``_has_stale_non_main_edition`` so the worker only pays for
-    rows tied to editions LTD currently lists.
+    Used by the keeper-sync service so a sync only pays for rows tied
+    to editions LTD currently lists.
     """
     logger = structlog.get_logger("test")
     async with db_session.begin():

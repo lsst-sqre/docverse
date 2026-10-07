@@ -2990,13 +2990,14 @@ async def test_tier_other_batches_edition_state_lookups(
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One ``list_for_org`` per project; no per-edition ``get`` calls.
+    """No per-edition ``get`` calls; edition state comes from one read.
 
     Issue #310: tier_other walks every non-``main`` edition LTD lists.
     With per-edition ``get`` the cost grew with edition count; the
-    batched read makes it constant per project. The fixture lists five
-    branch editions plus ``main`` so a regression to the old shape would
-    show up as ``get_calls == 5``.
+    batched read makes it constant (and, since issue #800, one read per
+    org per tick). The fixture lists five branch editions plus ``main``
+    so a regression to the old shape would show up as
+    ``get_calls == 5``.
     """
     fresh = datetime.now(tz=UTC)
     async with db_session.begin():
@@ -3059,11 +3060,165 @@ async def test_tier_other_batches_edition_state_lookups(
     # :func:`_record_tier_polled` to merge with prior annotations
     # before stamping ``date_other_last_polled``. Two
     # ``list_for_org`` calls: one for the project-tombstone filter
-    # (issue #396) and one for the non-main edition staleness scan
-    # in :func:`_has_stale_non_main_edition`. The per-project
-    # edition-state cost stays independent of the branch count.
+    # (issue #396) and the org's one edition-state read that
+    # :func:`_tier_other_for_org` hoists out of its per-project loop
+    # (issue #800). The edition-state cost stays independent of the
+    # branch count.
     assert recorder.get_calls == 2
     assert recorder.list_for_org_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_tier_other_batches_edition_state_lookups_across_slugs(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One ``list_for_org(resource_type=edition)`` per tick, not per slug.
+
+    Issue #800: the per-project staleness scan read the listed
+    editions' state rows once per polled project, so a product whose
+    only edition is ``main`` (the common technote case) paid a query
+    just to discard its one row. The cron now loads the org's edition
+    rows once before the loop and checks each project in memory.
+    ``tech-a`` and ``tech-b`` list only a stale ``main``, which never
+    enqueues; ``pipelines`` has a stale branch edition, which does.
+    """
+    stale = datetime.now(tz=UTC) - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-batch-org",
+            project_slugs=["tech-a", "tech-b", "pipelines"],
+        )
+        for slug in ("tech-a", "tech-b", "pipelines"):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+            )
+        for ltd_id, slug in (
+            (1, "main"),
+            (2, "main"),
+            (3, "main"),
+            (4, "u-jsick-feature"),
+        ):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug=slug,
+                date_last_synced=stale,
+            )
+
+    _stub_products(mock_discovery, ["tech-a", "tech-b", "pipelines"])
+    for slug, edition_ids in (
+        ("tech-a", [1]),
+        ("tech-b", [2]),
+        ("pipelines", [4, 3]),
+    ):
+        _stub_editions_listing(
+            mock_discovery, product_slug=slug, edition_ids=edition_ids
+        )
+
+    recorder = _install_state_store_recorder(monkeypatch)
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["pipelines"]
+    # The acceptance criterion: exactly one
+    # ``list_for_org(resource_type=edition)`` per tier_other tick,
+    # regardless of how many in-scope projects the tick polls.
+    assert recorder.list_for_org_edition_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tier_other_ignores_tombstoned_stale_edition(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned non-main edition is never treated as stale.
+
+    LTD still lists the edition, and its state row is past the refresh
+    threshold, but Docverse tombstoned it (issue #396 / PRD #332 user
+    story 17): re-syncing it would only reach ``sync_edition``'s
+    tombstone short-circuit, so tier_other must not enqueue for it.
+    """
+    stale = datetime.now(tz=UTC) - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-tomb-ed",
+            project_slugs=["pipelines"],
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_last_synced=datetime.now(tz=UTC),
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="u-jsick-feature",
+            date_last_synced=stale,
+        )
+        await _seed_tombstone(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            reason=TombstoneReason.lifecycle_delete,
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -3131,7 +3286,7 @@ async def test_tier_other_polls_only_hot_and_due_dormant_projects(
             },
         )
         # Stale branch edition state for hot and due so each
-        # ``_has_stale_non_main_edition`` call returns True and
+        # ``_has_stale_non_main_edition`` check returns True and
         # triggers an enqueue. Skip-proj's edition state would also
         # be stale, but the planner skips before LTD is even queried.
         for ltd_id in (10, 20, 30):

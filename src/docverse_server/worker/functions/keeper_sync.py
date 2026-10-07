@@ -110,6 +110,7 @@ from docverse_server.storage.edition_build_history_store import (
 )
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
+    KeeperSyncState,
     KeeperSyncStateStore,
     ResourceType,
 )
@@ -2945,15 +2946,16 @@ async def _tier_other_for_org(
     its LTD slug, so no edition payload is fetched. A listed URL with no
     id to read is skipped with a warning (:func:`_list_edition_ltd_ids`);
     the project is still checked on the rest and still stamped polled.
+
+    The org's edition state rows are read once per tick, before the
+    per-project loop, and each polled project is checked against that
+    map in memory: one SELECT per org per tick rather than one per
+    polled project, most of which (single-edition technotes) list only
+    ``main`` and have nothing for the check to look at.
     """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
         return 0
-    # ``_list_in_scope_slugs`` drops tombstoned *project* slugs; for
-    # the editions themselves ``_has_stale_non_main_edition``'s default
-    # ``include_tombstoned=False`` already excludes tombstoned editions
-    # from the staleness scan, so no edition-level filter is needed
-    # here (issue #396 / PRD #332 user story 17).
     in_scope = await _list_in_scope_slugs(
         factory=factory,
         session=session,
@@ -2970,6 +2972,21 @@ async def _tier_other_for_org(
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
+    # Hoist the org-wide edition-state read out of the per-slug loop,
+    # as ``_tier_discovery_for_org`` does. ``_list_in_scope_slugs``
+    # drops tombstoned *project* slugs; for the editions themselves the
+    # default ``include_tombstoned=False`` leaves tombstoned rows out
+    # of the map, so a tombstoned edition LTD still lists reads like
+    # one with no state row and is never treated as stale (issue #396
+    # / PRD #332 user story 17).
+    async with session.begin():
+        edition_states = await state_store.list_for_org(
+            org_id=org.id,
+            resource_type=ResourceType.edition,
+        )
+    edition_state_by_ltd_id = {
+        s.ltd_id: s for s in edition_states if s.ltd_id is not None
+    }
     enqueued = 0
     for ltd_slug in progress.walk(in_scope):
         async with session.begin():
@@ -3011,10 +3028,8 @@ async def _tier_other_for_org(
                 now=now,
             )
             continue
-        if await _has_stale_non_main_edition(
-            session=session,
-            state_store=state_store,
-            org_id=org.id,
+        if _has_stale_non_main_edition(
+            edition_state_by_ltd_id=edition_state_by_ltd_id,
             ltd_edition_ids=ltd_edition_ids,
             now=now,
         ) and await _enqueue_tier_project_sync(
@@ -3441,11 +3456,9 @@ async def _project_needs_discovery(
     )
 
 
-async def _has_stale_non_main_edition(
+def _has_stale_non_main_edition(
     *,
-    session: AsyncSession,
-    state_store: KeeperSyncStateStore,
-    org_id: int,
+    edition_state_by_ltd_id: Mapping[int, KeeperSyncState],
     ltd_edition_ids: Sequence[int],
     now: datetime,
 ) -> bool:
@@ -3454,35 +3467,31 @@ async def _has_stale_non_main_edition(
     ``ltd_edition_ids`` are the LTD ids of the editions LTD lists for
     the project, parsed from its edition URLs; no edition payload is
     fetched, so LTD's slug for each edition is not available here.
-    ``main`` is instead recognised on the state rows read for those
-    ids, each of which records the LTD slug from the visit that wrote
-    it (:func:`~docverse_server.services.keeper_sync.mappers.is_ltd_main`),
+    ``main`` is instead recognised on the state row found for each id,
+    which records the LTD slug from the visit that wrote it
+    (:func:`~docverse_server.services.keeper_sync.mappers.is_ltd_main`),
     and left out of the staleness check: ``tier_main`` owns that row.
+
+    ``edition_state_by_ltd_id`` is the org's untombstoned edition
+    state rows keyed by LTD id, read once per tick by
+    :func:`_tier_other_for_org`, so this check makes no database call:
+    a product that lists only ``main`` costs nothing beyond its LTD
+    listing. A tombstoned edition has no entry, so it reads like one
+    without state.
 
     Editions without a state row are deliberately ignored — they are
     ``tier_discovery``'s job. This decoupling keeps the two cron
     functions' decisions independent so a single missing-state row
     cannot cause two tiers to enqueue for the same project on the
     same hour.
-
-    The state-row read is one batched ``list_for_org`` scoped to the
-    LTD ids the caller already lists, replacing N per-edition ``get``
-    round-trips. Memory cost stays bounded because the result set is
-    capped by LTD's edition count for the project.
     """
-    if not ltd_edition_ids:
-        return False
-    async with session.begin():
-        states = await state_store.list_for_org(
-            org_id=org_id,
-            resource_type=ResourceType.edition,
-            ltd_ids=ltd_edition_ids,
-        )
-    return any(
-        should_refresh_other_edition(state=s, now=now)
-        for s in states
-        if not is_ltd_main(s.ltd_slug)
-    )
+    for ltd_id in ltd_edition_ids:
+        state = edition_state_by_ltd_id.get(ltd_id)
+        if state is None or is_ltd_main(state.ltd_slug):
+            continue
+        if should_refresh_other_edition(state=state, now=now):
+            return True
+    return False
 
 
 async def _enqueue_tier_project_sync(
