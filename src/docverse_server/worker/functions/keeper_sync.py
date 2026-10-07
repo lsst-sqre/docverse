@@ -153,25 +153,12 @@ __all__ = [
     "keeper_sync_tier_other",
 ]
 
-#: Slug LTD assigns to every product's primary edition. Tier_main owns
-#: refreshes for this slug; tier_other skips it, recognising it by the
-#: slug its ``keeper_sync_state`` edition row records
-#: (:func:`~docverse_server.services.keeper_sync.mappers.is_ltd_main`)
-#: because it never fetches the edition payload that carries the slug.
-_LTD_MAIN_SLUG = "main"
-
 #: ``keeper_sync_state.annotations`` key on a project-resource state row
 #: holding the resolved LTD ``main`` edition's full ``self_url``. Owned
 #: by ``_tier_main_for_org`` so subsequent ticks bypass the
 #: ``GET /products/<slug>/editions/`` walk and go straight to
 #: ``GET /editions/<id>``.
 _MAIN_EDITION_URL_KEY = "main_edition_url"
-
-#: Companion to :data:`_MAIN_EDITION_URL_KEY`: the integer LTD edition
-#: id that ``main_edition_url`` resolves to. Stored alongside the URL
-#: so log lines and reverse lookups have the id without needing to
-#: re-parse the URL.
-_MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
 
 #: Cap on the number of per-edition failure detail entries written into
 #: a ``keeper_sync_project`` job's ``progress`` JSONB (and into the
@@ -3119,11 +3106,10 @@ async def _find_main_edition(
     """Locate the LTD ``main`` edition for ``ltd_slug``.
 
     Uses a per-project cache persisted on the project-resource state
-    row's ``annotations`` (``main_edition_url`` / ``main_edition_ltd_id``)
-    so the steady-state common case is one ``GET /editions/<id>`` per
-    project per tier_main tick instead of the
-    ``GET /products/<slug>/editions/`` listing plus an
-    ``GET /editions/<id>`` per non-``main`` edition. With ~1500 in-
+    row's ``annotations`` (``main_edition_url``) so the steady-state
+    common case is one ``GET /editions/<id>`` per project per tier_main
+    tick instead of the ``GET /products/<slug>/editions/`` listing plus
+    an ``GET /editions/<id>`` per non-``main`` edition. With ~1500 in-
     scope LTD products each carrying many ticket-branch editions, the
     walk path was the dominant load on the LTD API; the cache reduces
     it to one HTTP call per project.
@@ -3132,8 +3118,9 @@ async def _find_main_edition(
 
     * Cached fetch returns 404 (the edition was deleted on LTD) —
       discard the pointer and walk.
-    * Cached fetch returns 200 but the slug is no longer ``"main"`` —
-      a maintainer renamed the edition; discard the pointer and walk.
+    * Cached fetch returns 200 but the slug no longer names ``main``
+      (:func:`~docverse_server.services.keeper_sync.mappers.is_ltd_main`)
+      — a maintainer renamed the edition; discard the pointer and walk.
 
     The caller (:func:`_tier_main_for_org`) re-writes the cache
     annotations on every successful resolve, so the pointer self-heals
@@ -3154,7 +3141,7 @@ async def _find_main_edition(
             # the walk so we can rediscover ``main`` and overwrite.
             pass
         else:
-            if edition.slug == _LTD_MAIN_SLUG:
+            if is_ltd_main(edition.slug):
                 return edition
     return await _walk_for_main_edition(
         ltd_client=ltd_client, product_slug=ltd_slug
@@ -3202,21 +3189,24 @@ async def _walk_for_main_edition(
     ltd_client: LtdClient,
     product_slug: str,
 ) -> LtdEdition | None:
-    """Walk LTD's edition URL list looking for ``slug == "main"``.
+    """Walk LTD's edition URL list looking for the ``main`` edition.
 
     LTD has no slug-keyed edition lookup — every edition lives at
     ``/editions/{integer_id}``. We pull the URL list (one cheap HTTP
     call) and walk it in reverse: LTD orders the list newest-first
     and the ``main`` edition is typically the first edition created
     for a product (so it sits at the *end* of the listing), so this
-    loop terminates after one fetch in the common case. Returns
-    ``None`` when no ``main`` slug is found, which counts as "no main
-    edition to refresh" rather than an error.
+    loop terminates after one fetch in the common case. An edition is
+    ``main`` when its LTD slug passes
+    :func:`~docverse_server.services.keeper_sync.mappers.is_ltd_main`,
+    the same rule tier_other and the keeper-sync service apply. Returns
+    ``None`` when no edition qualifies, which counts as "no main edition
+    to refresh" rather than an error.
     """
     edition_urls = await ltd_client.list_edition_urls_for_product(product_slug)
     for url in reversed(edition_urls):
         edition = await ltd_client.get_edition_by_url(url)
-        if edition.slug == _LTD_MAIN_SLUG:
+        if is_ltd_main(edition.slug):
             return edition
     return None
 
@@ -3261,12 +3251,11 @@ async def _record_main_polled(
       ``TIER_MAIN_DORMANT_INTERVAL``. Skipping this on errors would
       let a flaky LTD endpoint defeat the rate limiter.
     * **Cached pointer + ``date_rebuilt_seen``.** When ``main_edition``
-      is non-``None`` we additionally rewrite ``main_edition_ltd_id`` /
-      ``main_edition_url`` (so the next tick's
-      :func:`_find_main_edition` skips the URL walk) and write
-      ``date_rebuilt_seen`` on the project state row so the next
-      tick's :func:`should_poll_main_for_project` can decide hot vs
-      dormant from this same row.
+      is non-``None`` we additionally rewrite ``main_edition_url`` (so
+      the next tick's :func:`_find_main_edition` skips the URL walk)
+      and write ``date_rebuilt_seen`` on the project state row so the
+      next tick's :func:`should_poll_main_for_project` can decide hot
+      vs dormant from this same row.
 
     Existing unrelated annotation keys are preserved by merge — no
     other writers exist today on the project-resource state row's
@@ -3290,7 +3279,6 @@ async def _record_main_polled(
         }
         date_rebuilt_for_upsert: datetime | None = None
         if main_edition is not None:
-            merged[_MAIN_EDITION_LTD_ID_KEY] = main_edition.ltd_id
             merged[_MAIN_EDITION_URL_KEY] = str(main_edition.self_url)
             date_rebuilt_for_upsert = main_edition.date_rebuilt
         await state_store.upsert(

@@ -37,6 +37,7 @@ from structlog.typing import EventDict, WrappedLogger
 from docverse.models import JobKind, KeeperSyncConfig, OrganizationCreate
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.queue import JobStatus
+from docverse_server.services.keeper_sync import mappers
 from docverse_server.services.keeper_sync.scheduler import (
     Tier,
     tier_cron_timeout,
@@ -533,8 +534,9 @@ async def test_tier_main_caches_main_edition_pointer_after_walk(
 
     Locks the cold-cache half of the contract: after ``_find_main_edition``
     walks the URL list to locate ``main``, the project-resource state row
-    carries ``main_edition_url`` / ``main_edition_ltd_id`` annotations so
-    the next tick can skip the walk.
+    carries a ``main_edition_url`` annotation so the next tick can skip
+    the walk. The pointer is the URL alone: no ``main_edition_ltd_id``
+    companion is written, since nothing reads one.
     """
     async with db_session.begin():
         org_id, _ = await _seed_org(
@@ -580,7 +582,7 @@ async def test_tier_main_caches_main_edition_pointer_after_walk(
             )
     assert project_state is not None
     assert project_state.annotations is not None
-    assert project_state.annotations["main_edition_ltd_id"] == 1
+    assert "main_edition_ltd_id" not in project_state.annotations
     assert (
         project_state.annotations["main_edition_url"]
         == f"{LTD_BASE}/editions/1"
@@ -617,7 +619,6 @@ async def test_tier_main_uses_cached_pointer_to_skip_walk(
             ltd_slug="pipelines",
             docverse_id=99,
             annotations={
-                "main_edition_ltd_id": 1,
                 "main_edition_url": f"{LTD_BASE}/editions/1",
             },
         )
@@ -698,7 +699,6 @@ async def test_tier_main_falls_back_to_walk_on_cached_404(
             ltd_slug="pipelines",
             docverse_id=99,
             annotations={
-                "main_edition_ltd_id": 99,
                 "main_edition_url": f"{LTD_BASE}/editions/99",
             },
         )
@@ -738,7 +738,6 @@ async def test_tier_main_falls_back_to_walk_on_cached_404(
             )
     assert project_state is not None
     assert project_state.annotations is not None
-    assert project_state.annotations["main_edition_ltd_id"] == 1
     assert (
         project_state.annotations["main_edition_url"]
         == f"{LTD_BASE}/editions/1"
@@ -767,7 +766,6 @@ async def test_tier_main_falls_back_to_walk_on_slug_mismatch(
             ltd_slug="pipelines",
             docverse_id=99,
             annotations={
-                "main_edition_ltd_id": 99,
                 "main_edition_url": f"{LTD_BASE}/editions/99",
             },
         )
@@ -811,11 +809,160 @@ async def test_tier_main_falls_back_to_walk_on_slug_mismatch(
             )
     assert project_state is not None
     assert project_state.annotations is not None
-    assert project_state.annotations["main_edition_ltd_id"] == 1
     assert (
         project_state.annotations["main_edition_url"]
         == f"{LTD_BASE}/editions/1"
     )
+
+
+def _fold_default_onto_main(
+    monkeypatch: pytest.MonkeyPatch, *, ltd_slug: str
+) -> None:
+    """Make the edition-slug mapper fold ``ltd_slug`` onto ``__main`` too.
+
+    ``mappers.is_ltd_main`` is defined by what
+    ``mappers.derive_edition_slug`` folds onto Docverse's default
+    edition, so widening the mapper is how a test shows a caller follows
+    that shared rule rather than a hard-coded ``"main"``.
+    """
+    real = mappers.derive_edition_slug
+
+    def folding(slug: str) -> str:
+        return real(mappers.LTD_MAIN_SLUG if slug == ltd_slug else slug)
+
+    monkeypatch.setattr(mappers, "derive_edition_slug", folding)
+
+
+@pytest.mark.asyncio
+async def test_tier_main_walk_follows_is_ltd_main(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The URL walk recognises any slug ``is_ltd_main`` accepts as ``main``.
+
+    tier_main and tier_other share one definition of ``main``: whatever
+    LTD slug the mapper folds onto Docverse's ``__main``. Here the
+    mapper also folds ``default``, so the walk resolves edition 1 (slug
+    ``default``) as the project's ``main``, caches its URL, and
+    enqueues a refresh because no edition state exists yet.
+    """
+    _fold_default_onto_main(monkeypatch, ltd_slug="default")
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-folded-walk",
+            project_slugs=["pipelines"],
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    # No edition carries the literal ``main`` slug, so only the shared
+    # rule can pick ``default`` out of the walk.
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[1, 2]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="default",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["pipelines"]
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            project_state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="pipelines",
+            )
+    assert project_state is not None
+    assert project_state.annotations is not None
+    assert (
+        project_state.annotations["main_edition_url"]
+        == f"{LTD_BASE}/editions/1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier_main_cached_pointer_follows_is_ltd_main(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached pointer to any slug ``is_ltd_main`` accepts stays valid.
+
+    The cached fetch's slug check uses the same shared rule as the walk:
+    with the mapper folding ``default`` onto ``__main``, a cached
+    pointer whose edition is slugged ``default`` is a hit, so the tick
+    never falls back to listing the project's edition URLs.
+    """
+    _fold_default_onto_main(monkeypatch, ltd_slug="default")
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-folded-cache",
+            project_slugs=["pipelines"],
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+            annotations={"main_edition_url": f"{LTD_BASE}/editions/1"},
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    listing_route = mock_discovery.get(
+        f"{LTD_BASE}/products/pipelines/editions/"
+    ).mock(return_value=httpx.Response(200, json={"editions": []}))
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="default",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    assert listing_route.call_count == 0
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert len(children) == 1
 
 
 @pytest.mark.asyncio
@@ -852,7 +999,6 @@ async def test_tier_main_polls_only_hot_and_due_dormant_projects(
             docverse_id=1,
             date_rebuilt_seen=now - timedelta(days=2),
             annotations={
-                "main_edition_ltd_id": 1,
                 "main_edition_url": f"{LTD_BASE}/editions/1",
             },
         )
@@ -865,7 +1011,6 @@ async def test_tier_main_polls_only_hot_and_due_dormant_projects(
             docverse_id=2,
             date_rebuilt_seen=now - timedelta(days=30),
             annotations={
-                "main_edition_ltd_id": 2,
                 "main_edition_url": f"{LTD_BASE}/editions/2",
                 "date_main_last_polled": (
                     now - timedelta(hours=1)
@@ -883,7 +1028,6 @@ async def test_tier_main_polls_only_hot_and_due_dormant_projects(
             docverse_id=3,
             date_rebuilt_seen=now - timedelta(days=30),
             annotations={
-                "main_edition_ltd_id": 3,
                 "main_edition_url": f"{LTD_BASE}/editions/3",
                 "date_main_last_polled": (
                     now - timedelta(hours=49)
@@ -1052,7 +1196,6 @@ async def test_tier_main_records_polled_annotation_on_ltd_error(
             docverse_id=1,
             date_rebuilt_seen=now - timedelta(days=30),
             annotations={
-                "main_edition_ltd_id": 9,
                 "main_edition_url": f"{LTD_BASE}/editions/9",
                 "date_main_last_polled": (
                     now - timedelta(hours=49)
@@ -2646,28 +2789,18 @@ async def test_tier_other_enqueues_for_stale_non_main_edition(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "project_annotations",
-    [
-        pytest.param({"main_edition_ltd_id": 1}, id="annotation-current"),
-        pytest.param(None, id="annotation-missing"),
-        pytest.param({"main_edition_ltd_id": 99}, id="annotation-stale"),
-    ],
-)
 async def test_tier_other_skips_when_only_main_is_stale(
     app: None,
     db_session: AsyncSession,
     mock_discovery: respx.Router,
-    project_annotations: dict[str, Any] | None,
 ) -> None:
     """``main`` editions belong to tier_main; tier_other ignores them.
 
     tier_other never fetches an edition payload, so it recognises
-    ``main`` by the LTD slug its ``keeper_sync_state`` row records.
-    The ``main_edition_ltd_id`` annotation tier_main caches on the
-    project's state row plays no part: whether it is current, missing
-    (tier_main has not resolved ``main`` yet), or stale (it names an id
-    LTD no longer lists), an old ``main`` alone never enqueues.
+    ``main`` by the LTD slug its ``keeper_sync_state`` row records. It
+    needs nothing tier_main caches on the project's state row (this
+    project has no annotations at all), and an old ``main`` alone never
+    enqueues.
     """
     stale = datetime.now(tz=UTC) - timedelta(hours=4)
     async with db_session.begin():
@@ -2680,7 +2813,6 @@ async def test_tier_other_skips_when_only_main_is_stale(
             resource_type=ResourceType.project,
             ltd_id=None,
             ltd_slug="pipelines",
-            annotations=project_annotations,
         )
         # Only main is stale.
         await _seed_state(

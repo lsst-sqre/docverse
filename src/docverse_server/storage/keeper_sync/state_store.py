@@ -76,8 +76,8 @@ class KeeperSyncState(BaseModel):
     Documented ``annotations`` keys
     -------------------------------
     Project-resource rows
-        ``main_edition_url`` / ``main_edition_ltd_id`` — the resolved
-        LTD ``main`` edition pointer cached by
+        ``main_edition_url`` — the resolved LTD ``main`` edition
+        pointer cached by
         :func:`docverse_server.worker.functions.keeper_sync._tier_main_for_org`
         so subsequent ticks issue one ``GET /editions/<id>`` instead of
         walking the project's edition URL list.
