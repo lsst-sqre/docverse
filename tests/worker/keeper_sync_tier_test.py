@@ -3582,3 +3582,60 @@ async def test_tier_cancel_log_failure_still_propagates_the_cancel(
     assert failures[0]["log_level"] == "error"
     assert failures[0]["exc_info"] is True
     assert failures[0]["tier"] == "other"
+
+
+@pytest.mark.asyncio
+async def test_tier_cancel_propagates_when_every_log_call_fails(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A cancel still escapes a pass whose logging fails on every call.
+
+    The fallback that reports a failed cancellation log runs through the
+    same structlog processors as the warning it reports on, so a
+    processor or Sentry hook that fails on *every* event raises again
+    from the fallback. That second failure is swallowed too: the
+    ``CancelledError`` is the only exception that may leave the pass, or
+    arq records it failed with an unrelated traceback and no cancel.
+    Logging breaks just as the cancel lands, so the pass reaches its
+    hang the normal way.
+    """
+    async with db_session.begin():
+        await _seed_org(
+            db_session, slug="ks-tier-cut-log-all", project_slugs=["aaa"]
+        )
+    _stub_products(mock_discovery, ["aaa"])
+    hang = HangUntilCancelled()
+    mock_discovery.get(f"{LTD_BASE}/products/aaa/editions/").mock(
+        side_effect=hang
+    )
+    ctx = _make_ctx(httpx.AsyncClient())
+    logging_broken = False
+    attempted: list[str] = []
+
+    def _fail_every_event(
+        _logger: WrappedLogger, _method: str, event_dict: EventDict
+    ) -> EventDict:
+        if logging_broken:
+            attempted.append(event_dict["event"])
+            msg = "log processor failed"
+            raise RuntimeError(msg)
+        return event_dict
+
+    async def _break_logging() -> None:
+        nonlocal logging_broken
+        logging_broken = True
+
+    with capture_logs(processors=[_fail_every_event]):
+        task = asyncio.create_task(keeper_sync_tier_other(ctx))
+        # Asserts the ``CancelledError``, and nothing else, leaves the task.
+        await cancel_when_reached(
+            task, hang.reached, before_cancel=_break_logging
+        )
+    await ctx["http_client"].aclose()
+
+    assert attempted == [
+        "Keeper-sync tier pass cancelled",
+        "Failed to log the tier pass's cancellation",
+    ]

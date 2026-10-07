@@ -36,6 +36,7 @@ This module owns the ``docverse:sync-queue`` callable surface:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
@@ -2468,7 +2469,8 @@ async def _run_tier(
     the pass got, from the :class:`_TierPassProgress` every processor
     advances, and is then re-raised so arq records the job as failed. A
     failure while logging is itself logged with its traceback and never
-    replaces the cancel.
+    replaces the cancel; if that fallback line fails too (a log pipeline
+    that fails on every event), its failure is dropped.
     """
     started = time.monotonic()
     progress = _TierPassProgress()
@@ -2493,10 +2495,15 @@ async def _run_tier(
             # Never let the log line's own failure (a structlog processor,
             # a Sentry hook) replace the cancel: arq must still see the
             # ``CancelledError``, as ``record_cancellation`` guarantees
-            # for a job that holds a row.
-            logger.exception(
-                "Failed to log the tier pass's cancellation", tier=tier_name
-            )
+            # for a job that holds a row. The fallback runs through the
+            # same processors, so a pipeline that fails on every event
+            # fails here too; that failure is dropped so the ``raise``
+            # below is always reached.
+            with contextlib.suppress(Exception):
+                logger.exception(
+                    "Failed to log the tier pass's cancellation",
+                    tier=tier_name,
+                )
         raise
 
 
