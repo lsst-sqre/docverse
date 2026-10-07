@@ -590,6 +590,79 @@ async def test_tier_main_caches_main_edition_pointer_after_walk(
 
 
 @pytest.mark.asyncio
+async def test_tier_main_drops_legacy_main_edition_ltd_id(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A poll removes the retired ``main_edition_ltd_id`` from old rows.
+
+    Releases before #799 wrote ``main_edition_ltd_id`` beside the
+    cached ``main_edition_url``. The upsert preserves unrelated keys by
+    merge, so without an explicit drop a row stamped by an earlier
+    release would keep a frozen id that a later re-resolve of the URL
+    could contradict. One polled visit must leave the URL pointer and
+    the rate-limit timestamp in place and the legacy id gone.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-legacy-id",
+            project_slugs=["pipelines"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+            docverse_id=99,
+            annotations={
+                "main_edition_url": f"{LTD_BASE}/editions/1",
+                "main_edition_ltd_id": 1,
+                "unrelated": "kept",
+            },
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            project_state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="pipelines",
+            )
+    assert project_state is not None
+    assert project_state.annotations is not None
+    assert "main_edition_ltd_id" not in project_state.annotations
+    assert (
+        project_state.annotations["main_edition_url"]
+        == f"{LTD_BASE}/editions/1"
+    )
+    assert project_state.annotations["unrelated"] == "kept"
+    assert "date_main_last_polled" in project_state.annotations
+
+
+@pytest.mark.asyncio
 async def test_tier_main_uses_cached_pointer_to_skip_walk(
     app: None,
     db_session: AsyncSession,

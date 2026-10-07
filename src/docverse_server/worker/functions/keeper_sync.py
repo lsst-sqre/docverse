@@ -160,6 +160,10 @@ __all__ = [
 #: ``GET /products/<slug>/editions/`` walk and go straight to
 #: ``GET /editions/<id>``.
 _MAIN_EDITION_URL_KEY = "main_edition_url"
+# Written by `_record_main_polled` before #799 and never read; popped on
+# every write so rows stamped by earlier releases converge on the URL-only
+# pointer instead of carrying an id that can contradict a re-resolved URL.
+_LEGACY_MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
 
 #: Cap on the number of per-edition failure detail entries written into
 #: a ``keeper_sync_project`` job's ``progress`` JSONB (and into the
@@ -3275,7 +3279,11 @@ async def _record_main_polled(
     Existing unrelated annotation keys are preserved by merge — no
     other writers exist today on the project-resource state row's
     annotations, but the forward-compatible posture costs nothing and
-    avoids a future drive-by writer being blindsided.
+    avoids a future drive-by writer being blindsided. The one exception
+    is the retired ``main_edition_ltd_id`` key: releases before #799
+    wrote it beside ``main_edition_url`` and nothing reads it, so it is
+    dropped on every write rather than carried forward where a later
+    re-resolve of the URL would leave it pointing at a different edition.
     """
     async with session.begin():
         existing = await state_store.get(
@@ -3292,6 +3300,7 @@ async def _record_main_polled(
             **prior,
             ANNOTATION_DATE_MAIN_LAST_POLLED: now.isoformat(),
         }
+        merged.pop(_LEGACY_MAIN_EDITION_LTD_ID_KEY, None)
         date_rebuilt_for_upsert: datetime | None = None
         if main_edition is not None:
             merged[_MAIN_EDITION_URL_KEY] = str(main_edition.self_url)
