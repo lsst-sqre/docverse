@@ -150,6 +150,7 @@ class Factory:
         superadmin_usernames: list[str] | None = None,
         http_client: httpx.AsyncClient | None = None,
         copy_http_client: httpx.AsyncClient | None = None,
+        ltd_http_client: httpx.AsyncClient | None = None,
         arq_queue: ArqQueue | None = None,
         discovery: DiscoveryClient | None = None,
         github_app_id: int | None = None,
@@ -196,6 +197,17 @@ class Factory:
         # ``WorkerFactoryBuilder``.
         self._copy_http_client = (
             copy_http_client if copy_http_client is not None else http_client
+        )
+        # The client every ``LtdClient`` this factory builds GETs LTD
+        # Keeper over, and no other client this factory builds. Falls back
+        # to the shared client so the API process and directly constructed
+        # factories (tests, scripts) behave exactly as before; the arq
+        # worker threads its connection-capped LTD client
+        # (``worker.main.create_ltd_http_client``) through
+        # ``WorkerFactoryBuilder`` so its jobs and tier crons cannot hold
+        # a hundred connections to LTD at once (#801).
+        self._ltd_http_client = (
+            ltd_http_client if ltd_http_client is not None else http_client
         )
         self._arq_queue = arq_queue
         self._discovery = discovery
@@ -297,6 +309,15 @@ class Factory:
         the shared client (``None`` when neither was).
         """
         return self._copy_http_client
+
+    @property
+    def ltd_http_client(self) -> httpx.AsyncClient | None:
+        """Client every :class:`LtdClient` this factory builds GETs over.
+
+        The worker's connection-capped LTD client when one was given,
+        otherwise the shared client (``None`` when neither was).
+        """
+        return self._ltd_http_client
 
     @property
     def keeper_sync_copy_concurrency(self) -> int:
@@ -1241,12 +1262,12 @@ class Factory:
     def create_ltd_client(
         self, *, base_url: str = "https://keeper.lsst.codes"
     ) -> LtdClient:
-        """Create an :class:`LtdClient` over the shared HTTP client."""
-        if self._http_client is None:
+        """Create an :class:`LtdClient` over :attr:`ltd_http_client`."""
+        if self._ltd_http_client is None:
             msg = "HTTP client is required to build an LtdClient"
             raise RuntimeError(msg)
         return LtdClient(
-            http_client=self._http_client,
+            http_client=self._ltd_http_client,
             base_url=base_url,
             logger=self._logger,
         )

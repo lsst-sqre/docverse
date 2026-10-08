@@ -10,6 +10,7 @@ mirroring how the worker's ``startup`` wires the two together.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import httpx
 import pytest
@@ -19,6 +20,7 @@ from cryptography.fernet import Fernet
 from pydantic import SecretStr
 from rubin.repertoire import DiscoveryClient
 from safir.arq import MockArqQueue
+from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
@@ -30,7 +32,13 @@ from docverse_server.storage.github import (
 )
 from docverse_server.storage.ltd import LtdS3Source
 from docverse_server.storage.objectstore import ObjectStoreCache
-from docverse_server.worker.main import WorkerFactoryBuilder
+from docverse_server.worker.main import (
+    LTD_HTTP_MAX_CONNECTIONS,
+    LTD_HTTP_TIMEOUT,
+    WorkerFactoryBuilder,
+    initialize_worker_http_clients,
+    shutdown,
+)
 from tests.support.github_mock import DEFAULT_APP_NAME, GitHubMock
 
 _config = Configuration()
@@ -44,6 +52,7 @@ def _make_builder(
     *,
     http_client: httpx.AsyncClient,
     copy_http_client: httpx.AsyncClient | None = None,
+    ltd_http_client: httpx.AsyncClient | None = None,
     github_app_id: int | None = None,
     github_app_private_key: SecretStr | None = None,
     github_webhook_secret: SecretStr | None = None,
@@ -62,6 +71,7 @@ def _make_builder(
         ),
         http_client=http_client,
         copy_http_client=copy_http_client,
+        ltd_http_client=ltd_http_client,
         arq_queue=MockArqQueue(default_queue_name=_config.arq_queue_name),
         discovery=DiscoveryClient(http_client),
         github_app_id=github_app_id,
@@ -170,7 +180,7 @@ async def test_builder_threads_copy_client_to_per_job_factory(
     ``_startup`` builds the copy client once per process, sized for the
     keeper-sync pool's full copy concurrency (PRD #685); a per-job
     factory that fell back to the shared client would put every copy
-    burst back on the pool the discovery, LTD API and GitHub calls use.
+    burst back on the pool the discovery and GitHub calls use.
     """
     async with (
         httpx.AsyncClient() as http_client,
@@ -192,6 +202,80 @@ async def test_builder_without_copy_client_copies_over_shared_client(
         builder = _make_builder(http_client=http_client)
         factory = builder(session=db_session, logger=_logger())
         assert factory.copy_http_client is http_client
+
+
+@pytest.mark.asyncio
+async def test_builder_threads_ltd_client_to_per_job_factory(
+    db_session: AsyncSession,
+) -> None:
+    """Every per-job factory calls LTD over the process's LTD client.
+
+    ``_startup`` builds the LTD client once per process with a small
+    connection cap (#801); a per-job factory that fell back to the
+    shared client would let the tier crons and every concurrent sync
+    job's edition listings hold a hundred connections to LTD Keeper.
+    """
+    async with (
+        httpx.AsyncClient() as http_client,
+        httpx.AsyncClient() as ltd_http_client,
+    ):
+        builder = _make_builder(
+            http_client=http_client, ltd_http_client=ltd_http_client
+        )
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.ltd_http_client is ltd_http_client
+
+
+@pytest.mark.asyncio
+async def test_builder_without_ltd_client_calls_ltd_over_shared_client(
+    db_session: AsyncSession,
+) -> None:
+    """A builder given no LTD client leaves LTD calls on the shared one."""
+    async with httpx.AsyncClient() as http_client:
+        builder = _make_builder(http_client=http_client)
+        factory = builder(session=db_session, logger=_logger())
+        assert factory.ltd_http_client is http_client
+
+
+@pytest.mark.asyncio
+async def test_worker_ships_with_three_http_clients_and_closes_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup opens the shared, copy and LTD clients; shutdown closes all.
+
+    The LTD client sits beside the other two in ctx, distinct from both
+    and capped at :data:`LTD_HTTP_MAX_CONNECTIONS` with every connection
+    kept alive, so ``_startup`` can hand it to the factory builder and
+    ``shutdown`` owns its teardown (#801).
+    """
+
+    async def _noop_aclose() -> None:
+        return None
+
+    # The session dependency is process-global; leave it to the fixtures
+    # that own it rather than disposing of their engine here.
+    monkeypatch.setattr(db_session_dependency, "aclose", _noop_aclose)
+    ctx: dict[str, Any] = {}
+
+    clients = initialize_worker_http_clients(ctx)
+
+    http_client = ctx["http_client"]
+    copy_http_client = ctx["copy_http_client"]
+    ltd_http_client = ctx["ltd_http_client"]
+    assert clients == (http_client, copy_http_client, ltd_http_client)
+    assert isinstance(ltd_http_client, httpx.AsyncClient)
+    assert ltd_http_client is not http_client
+    assert ltd_http_client is not copy_http_client
+    assert ltd_http_client.timeout == LTD_HTTP_TIMEOUT
+    pool = ltd_http_client._transport._pool  # type: ignore[attr-defined]
+    assert pool._max_connections == LTD_HTTP_MAX_CONNECTIONS
+    assert pool._max_keepalive_connections == LTD_HTTP_MAX_CONNECTIONS
+
+    await shutdown(ctx)
+
+    assert http_client.is_closed
+    assert copy_http_client.is_closed
+    assert ltd_http_client.is_closed
 
 
 @pytest.mark.asyncio

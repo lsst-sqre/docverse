@@ -203,12 +203,15 @@ failed this way.
 
 Presigned PUTs of copied objects go over a dedicated
 `httpx.AsyncClient`, and nothing else does. Every worker process opens
-it at startup next to the shared client (`ctx["copy_http_client"]`
-next to `ctx["http_client"]`) and `shutdown` closes both. The shared
+it at startup next to the shared client and the LTD API client
+(`ctx["copy_http_client"]` next to `ctx["http_client"]` and
+`ctx["ltd_http_client"]`), and `shutdown` closes all three. The shared
 client keeps httpx's defaults (5 s timeouts, 100 connections, 20 kept
-alive) and carries run discovery, the LTD API, GitHub, Cloudflare KV
-and CDN purges. LTD object downloads go through aiobotocore, so neither
-client carries them (see [The LTD source client](#the-ltd-source-client)).
+alive) and carries run discovery, GitHub, Cloudflare KV and CDN purges.
+LTD Keeper API calls have a client of their own (see
+[The LTD API client](#the-ltd-api-client)). LTD object downloads go
+through aiobotocore, so no HTTP client carries them (see
+[The LTD source client](#the-ltd-source-client)).
 
 Before the split, the stock 10 x 8 = 80 concurrent copies ran the
 shared 100-connection pool close to its ceiling. An upload waiting for
@@ -345,6 +348,58 @@ for the same organization. Presigned PUTs never use that client's
 connection pool, because the client only signs their URLs, so sharing
 it changes no connection count. See
 [Shared destination clients](memory-diagnostics.md#shared-destination-clients).
+
+### The LTD API client
+
+Calls to the LTD Keeper API, the product and edition GETs the tier
+crons and every `keeper_sync_project` job make, go over a third
+dedicated `httpx.AsyncClient`. Each worker process opens it at startup
+(`ctx["ltd_http_client"]`) and `shutdown` closes it.
+`WorkerFactoryBuilder` hands it to every job's `Factory`, and
+`Factory.create_ltd_client` builds each `LtdClient` over it.
+
+It exists because `LtdClient.list_editions_for_product` keeps up to 8
+edition GETs in flight, and that bound covers one call, not the
+process. Over the shared client's 100-connection pool, the three tier
+crons plus up to `keeper_sync_max_jobs` fanned-out sync jobs could hold
+about a hundred concurrent GETs, and open about a hundred new
+connections, against the one LTD Keeper deployment. After server
+1.0.0b8 reached roundtable-prod, every hourly `tier_other` tick on
+2026-10-08 logged a burst of LTD `ConnectTimeout` retries (265 between
+14:00 and 14:09 UTC, 372 between 15:00 and 15:09 UTC), and 3 to 6
+`keeper_sync_project` jobs per tick failed with `LtdClientError` once
+their retries ran out. The next tick re-drove them, so nothing was
+lost, but every failure reached Sentry (#801).
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `max_connections` | `LTD_HTTP_MAX_CONNECTIONS` (16) | Caps the process's concurrent GETs to LTD. Two edition listings run at full fan-out; any further call queues. |
+| `max_keepalive_connections` | Same as `max_connections` | Every connection the pool opens is reused, for the reason given in [Connection pool](#connection-pool). |
+| `keepalive_expiry` | `LTD_HTTP_KEEPALIVE_EXPIRY_SECONDS` (60 s) | Keeps the pool warm across the gaps between a tick's jobs, where httpx's default 5 s would re-dial LTD for each one. |
+| `connect`, `read`, `write` | 5 s | Unchanged from the shared client. |
+| `pool` | None | A call past the cap waits for a connection instead of failing. |
+
+Connection reuse matters as much as the cap. The failures were connect
+timeouts, so the fewer handshakes a burst of edition GETs makes, the
+fewer can time out. With every connection kept alive, a busy worker
+holds at most 16 connections to LTD and dials one only when the pool
+is below that.
+
+The pool timeout is off (`pool=None`) so that the cap queues callers
+rather than failing them. With a pool timeout, a GET that waited too
+long for a connection would raise `httpx.PoolTimeout`, which
+`LtdClient`'s retry loop treats as a transport failure and spends an
+attempt on, although the request never left the process. Every LTD GET
+reads its whole response, so a connection returns to the pool as soon
+as its GET finishes. The calling job's or cron's own arq timeout
+bounds any wait. A wait costs only wall-clock time: a tier cron's
+GETs can now queue behind a sync job's edition listing.
+
+The cap, the keepalive expiry and the timeouts are constants, like the
+per-call fan-out of 8: they bound the load on LTD, not on Docverse.
+`LtdClient`'s retries and backoff are unchanged. The API process opens
+no LTD client of its own: its few LTD calls, from the scope preview and
+the `?ltd=true` edition diff, still go over its shared client.
 
 ## The build-level retry
 
@@ -592,7 +647,11 @@ both passes sends the second pass's botocore exception from
 - **Report upload-slot waits.** No log line, metric or event field says
   how long an upload waited for a slot or how full the cap ran.
 - **Retry the LTD API differently.** The LTD client already rides out
-  up to a 300 s backoff ceiling.
+  up to a 300 s backoff ceiling. The LTD API client's connection cap
+  changes how many GETs reach LTD at once, not how each one retries.
+- **Make the LTD connection cap configurable.**
+  `LTD_HTTP_MAX_CONNECTIONS` bounds the load on LTD Keeper, so it is a
+  constant like the per-call edition fan-out.
 - **Retry LTD downloads per object.** A download has only botocore's
   own retries beneath the build-level retry; there is no Docverse
   budget for it like the one R2 uploads get. Sharing one LTD source
@@ -619,8 +678,10 @@ both passes sends the second pass's botocore exception from
   pool size, and `RETRYABLE_SOURCE_TRANSPORT_ERRORS`, the botocore
   transport errors the build-level retry re-runs.
 - `src/docverse_server/worker/main.py`: `COPY_HTTP_TIMEOUT`,
-  `copy_http_limits`, the upload semaphore `_startup` builds, and the
-  lifetimes of the copy client and the shared LTD source.
+  `copy_http_limits`, `LTD_HTTP_MAX_CONNECTIONS`, `LTD_HTTP_TIMEOUT`,
+  `ltd_http_limits`, the upload semaphore `_startup` builds, and the
+  lifetimes of the copy client, the LTD API client and the shared LTD
+  source.
 - `src/docverse_server/factory.py`:
   `create_build_content_copier_for_org`, which hands each copier the
   upload cap and the shared LTD source.

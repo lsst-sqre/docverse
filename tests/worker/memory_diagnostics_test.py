@@ -92,6 +92,7 @@ async def _shutdown(
     monkeypatch.setattr(db_session_dependency, "aclose", AsyncMock())
     ctx["http_client"] = httpx.AsyncClient()
     ctx["copy_http_client"] = httpx.AsyncClient()
+    ctx["ltd_http_client"] = httpx.AsyncClient()
     await shutdown(ctx)
 
 

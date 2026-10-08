@@ -1,7 +1,9 @@
 """HTTP client for the legacy LTD Keeper v1 API.
 
-A thin async wrapper over the worker's shared
-:class:`httpx.AsyncClient` that translates the API's resource URLs into
+A thin async wrapper over an :class:`httpx.AsyncClient` (in the worker,
+the connection-capped LTD client from
+``docverse_server.worker.main.create_ltd_http_client``; elsewhere, the
+process's shared client) that translates the API's resource URLs into
 typed Pydantic models, retries 429/5xx with bounded exponential
 backoff (obeying a rate-limit ``Retry-After`` up to
 :data:`_MAX_BACKOFF_SECONDS`, well past the tighter shared default),
@@ -63,6 +65,9 @@ _MAX_BACKOFF_SECONDS = 300.0
 #: cuts that close to eightfold while staying a polite load on a single
 #: LTD Keeper deployment. Deliberately a constant rather than a
 #: configuration setting: it bounds load on LTD, not on Docverse.
+#: It bounds one call only; across a worker process, concurrent calls
+#: share the connection cap of the worker's LTD client
+#: (``docverse_server.worker.main.LTD_HTTP_MAX_CONNECTIONS``, #801).
 _EDITION_FETCH_CONCURRENCY = 8
 
 #: Cap on the response body bytes carried into Sentry events. LTD error
@@ -193,7 +198,7 @@ class LtdProductsError(LtdClientError):
 
 
 class LtdClient:
-    """LTD Keeper v1 API client over a shared ``httpx.AsyncClient``."""
+    """LTD Keeper v1 API client over a caller-owned ``httpx.AsyncClient``."""
 
     def __init__(
         self,
