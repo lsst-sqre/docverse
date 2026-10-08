@@ -10,15 +10,19 @@ test.
 
 from __future__ import annotations
 
+import inspect
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from arq.worker import Worker
 
+from docverse_server.services.keeper_sync import scheduler
 from docverse_server.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
     ANNOTATION_DATE_OTHER_LAST_POLLED,
+    ARQ_DEFAULT_JOB_TIMEOUT,
     TIER_DISCOVERY_CRON_INTERVAL,
     TIER_DISCOVERY_DORMANT_INTERVAL,
     TIER_DISCOVERY_DORMANT_JITTER,
@@ -41,6 +45,8 @@ from docverse_server.services.keeper_sync.scheduler import (
     should_refresh_main_edition,
     should_refresh_other_edition,
     stable_hash_fraction,
+    tier_cron_interval,
+    tier_cron_timeout,
 )
 from docverse_server.storage.keeper_sync import KeeperSyncState
 
@@ -1342,6 +1348,106 @@ def test_tier_cron_interval_constants_match_documented_cadence() -> None:
     assert timedelta(minutes=5) == TIER_MAIN_CRON_INTERVAL
     assert timedelta(minutes=30) == TIER_DISCOVERY_CRON_INTERVAL
     assert timedelta(hours=1) == TIER_OTHER_CRON_INTERVAL
+
+
+def test_tier_cron_interval_reads_each_tiers_cadence_constant() -> None:
+    """Each tier's interval is the constant its ``cron(...)`` fires on."""
+    assert tier_cron_interval(Tier.main) == TIER_MAIN_CRON_INTERVAL
+    assert tier_cron_interval(Tier.discovery) == TIER_DISCOVERY_CRON_INTERVAL
+    assert tier_cron_interval(Tier.other) == TIER_OTHER_CRON_INTERVAL
+
+
+def test_arq_default_job_timeout_matches_arq() -> None:
+    """The floor is the timeout arq gives a function that sets none.
+
+    ``tier_main`` ran under arq's ``Worker`` default ``job_timeout``
+    before the tier crons had timeouts of their own, so the floor only
+    keeps it from losing time while it matches that default.
+    """
+    default = inspect.signature(Worker).parameters["job_timeout"].default
+    assert timedelta(seconds=default) == ARQ_DEFAULT_JOB_TIMEOUT
+
+
+@pytest.mark.parametrize("tier", list(Tier))
+def test_tier_cron_timeout_is_at_most_the_interval(tier: Tier) -> None:
+    """A tier pass never runs under a timeout longer than its cadence.
+
+    Without an explicit timeout arq applied its 300 s default to every
+    tier cron, so a pass that outgrew it was cancelled mid-scope on
+    every tick (prod, 2026-10-06). A timeout past the interval would let
+    a pass that started on time run into the same tier's next tick.
+    """
+    timeout = tier_cron_timeout(tier)
+    assert timedelta(0) < timeout <= tier_cron_interval(tier)
+
+
+@pytest.mark.parametrize("tier", list(Tier))
+def test_tier_cron_timeout_is_at_least_arqs_default(tier: Tier) -> None:
+    """No tier pass gets less time than arq's default gave it before."""
+    assert tier_cron_timeout(tier) >= ARQ_DEFAULT_JOB_TIMEOUT
+
+
+def test_tier_cron_timeouts_at_the_stock_cadences() -> None:
+    """Lock the stock timeouts: 300 s, 1500 s and 3000 s.
+
+    Discovery and other are the interval less a sixth of it. For the
+    5-minute tier_main that derivation, a minute short of the interval,
+    would give 240 s, a fifth less than the 300 s arq's default gave it,
+    so the floor holds it at 300 s.
+    """
+    assert tier_cron_timeout(Tier.main) == timedelta(seconds=300)
+    assert tier_cron_timeout(Tier.discovery) == timedelta(seconds=1500)
+    assert tier_cron_timeout(Tier.other) == timedelta(seconds=3000)
+
+
+def test_tier_cron_timeout_floors_a_short_derivation_at_arqs_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A derivation that falls short of arq's default is raised to it.
+
+    A 330 s cadence less its one-minute margin derives 270 s, below the
+    300 s floor and still inside the interval, so the floor alone sets
+    the timeout.
+    """
+    monkeypatch.setitem(
+        scheduler._TIER_CRON_INTERVALS, Tier.main, timedelta(seconds=330)
+    )
+    assert tier_cron_timeout(Tier.main) == ARQ_DEFAULT_JOB_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    "interval", [timedelta(minutes=1), timedelta(minutes=4)]
+)
+def test_tier_cron_timeout_caps_the_floor_at_a_shorter_interval(
+    monkeypatch: pytest.MonkeyPatch, interval: timedelta
+) -> None:
+    """A cadence shorter than arq's default bounds the timeout itself.
+
+    The floor would otherwise hand such a tier a timeout past its own
+    interval; one minute, which the margin alone would leave with no
+    timeout at all, gets the whole minute.
+    """
+    monkeypatch.setitem(scheduler._TIER_CRON_INTERVALS, Tier.main, interval)
+    assert tier_cron_timeout(Tier.main) == interval
+
+
+@pytest.mark.parametrize("interval", [timedelta(0), timedelta(seconds=-300)])
+def test_tier_cron_timeout_rejects_a_non_positive_interval(
+    monkeypatch: pytest.MonkeyPatch, interval: timedelta
+) -> None:
+    """A zero or negative cadence fails loudly instead of clamping.
+
+    The floor-then-cap clamp would hand such a tier its own interval as
+    the timeout, so arq would cancel every pass the instant it started
+    with nothing logged beyond a cancellation per tick. A typo'd cadence
+    constant must fail at worker startup, naming the tier and interval.
+    """
+    monkeypatch.setitem(
+        scheduler._TIER_CRON_INTERVALS, Tier.discovery, interval
+    )
+    with pytest.raises(ValueError, match="discovery") as excinfo:
+        tier_cron_timeout(Tier.discovery)
+    assert repr(interval) in str(excinfo.value)
 
 
 @pytest.mark.parametrize(

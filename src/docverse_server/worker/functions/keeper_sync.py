@@ -35,9 +35,11 @@ This module owns the ``docverse:sync-queue`` callable surface:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -70,6 +72,7 @@ from docverse_server.services.keeper_sync.budget import (
     SliceBudget,
     SliceProgress,
 )
+from docverse_server.services.keeper_sync.mappers import is_ltd_main
 from docverse_server.services.keeper_sync.scheduler import (
     _TIER_ANNOTATION_KEYS,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
@@ -85,6 +88,7 @@ from docverse_server.services.keeper_sync.scheduler import (
     should_poll_main_for_project,
     should_refresh_main_edition,
     should_refresh_other_edition,
+    tier_cron_timeout,
 )
 from docverse_server.services.keeper_sync.service import (
     BuildCopiedCallback,
@@ -106,6 +110,7 @@ from docverse_server.storage.edition_build_history_store import (
 )
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
+    KeeperSyncState,
     KeeperSyncStateStore,
     ResourceType,
 )
@@ -116,14 +121,15 @@ from docverse_server.storage.ltd import (
     LtdEdition,
     LtdNotFoundError,
     LtdProductsError,
+    parse_ltd_id,
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions._cancellation import (
-    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
     cancellation_recorded,
     discovery_run_finaliser,
+    infer_cancellation_reason,
     keeper_sync_run_finaliser,
     record_cancellation,
     record_handoff_cancellation,
@@ -148,29 +154,25 @@ __all__ = [
     "keeper_sync_tier_other",
 ]
 
-#: Slug LTD assigns to every product's primary edition. Tier_main owns
-#: refreshes for this slug; tier_other explicitly skips it.
-_LTD_MAIN_SLUG = "main"
-
 #: ``keeper_sync_state.annotations`` key on a project-resource state row
 #: holding the resolved LTD ``main`` edition's full ``self_url``. Owned
 #: by ``_tier_main_for_org`` so subsequent ticks bypass the
 #: ``GET /products/<slug>/editions/`` walk and go straight to
 #: ``GET /editions/<id>``.
 _MAIN_EDITION_URL_KEY = "main_edition_url"
-
-#: Companion to :data:`_MAIN_EDITION_URL_KEY`: the integer LTD edition
-#: id that ``main_edition_url`` resolves to. Stored alongside the URL
-#: so log lines and future reverse lookups have the id without needing
-#: to re-parse the URL.
-_MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
+# Written by `_record_main_polled` before #799 and never read; popped on
+# every write so rows stamped by earlier releases converge on the URL-only
+# pointer instead of carrying an id that can contradict a re-resolved URL.
+_LEGACY_MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
 
 #: Cap on the number of per-edition failure detail entries written into
 #: a ``keeper_sync_project`` job's ``progress`` JSONB (and into the
 #: accompanying log line). ``edition_failure_count`` is always exact;
 #: only the detail list is truncated, so a project whose entire release
 #: history is unreadable — LTD's oldest uploads carry no public-read
-#: object ACL — cannot write an unbounded blob into the job record.
+#: object ACL — cannot write an unbounded blob into the job record. The
+#: tier crons cap the URL list of their unparsable-edition-URL warning
+#: (:func:`_list_edition_ltd_ids`) at the same size, for the same reason.
 _MAX_RECORDED_EDITION_FAILURES = 20
 
 #: Tracking modes that identify a semver aggregate edition (``15`` /
@@ -2452,8 +2454,66 @@ async def _run_tier(
     is cancelled while handing a child row to arq records the cancel
     against the time the cron job has run for (see
     :func:`_enqueue_tier_project_sync`).
+
+    A pass holds no ``queue_jobs`` row of its own, so when arq cancels
+    it — at the tier's
+    :func:`~docverse_server.services.keeper_sync.scheduler.tier_cron_timeout`,
+    or on a worker shutdown — the ``CancelledError`` (which the per-org
+    ``except Exception`` never sees) is caught here only to log how far
+    the pass got, from the :class:`_TierPassProgress` every processor
+    advances, and is then re-raised so arq records the job as failed. A
+    failure while logging is itself logged with its traceback and never
+    replaces the cancel; if that fallback line fails too (a log pipeline
+    that fails on every event), its failure is dropped.
     """
     started = time.monotonic()
+    progress = _TierPassProgress()
+    try:
+        return await _run_tier_pass(
+            ctx=ctx,
+            logger=logger,
+            processor=processor,
+            tier_name=tier_name,
+            started=started,
+            progress=progress,
+        )
+    except asyncio.CancelledError:
+        try:
+            _log_tier_cancellation(
+                logger=logger,
+                tier_name=tier_name,
+                started=started,
+                progress=progress,
+            )
+        except Exception:
+            # Never let the log line's own failure (a structlog processor,
+            # a Sentry hook) replace the cancel: arq must still see the
+            # ``CancelledError``, as ``record_cancellation`` guarantees
+            # for a job that holds a row. The fallback runs through the
+            # same processors, so a pipeline that fails on every event
+            # fails here too; that failure is dropped so the ``raise``
+            # below is always reached.
+            with contextlib.suppress(Exception):
+                logger.exception(
+                    "Failed to log the tier pass's cancellation",
+                    tier=tier_name,
+                )
+        raise
+
+
+async def _run_tier_pass(
+    *,
+    ctx: dict[str, Any],
+    logger: structlog.stdlib.BoundLogger,
+    processor: TierOrgProcessor,
+    tier_name: str,
+    started: float,
+    progress: _TierPassProgress,
+) -> str:
+    """Run one pass of a tier over every enabled org.
+
+    The body of :func:`_run_tier`, which wraps it to log a cancellation.
+    """
     enqueued_total = 0
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
@@ -2466,7 +2526,9 @@ async def _run_tier(
             if o.keeper_sync_config is not None
             and o.keeper_sync_config.enabled
         ]
+        progress.orgs_total = len(candidates)
         for org in candidates:
+            progress.begin_org(org.slug)
             try:
                 enqueued_total += await processor(
                     ctx=ctx,
@@ -2475,6 +2537,7 @@ async def _run_tier(
                     org=org,
                     logger=logger,
                     started=started,
+                    progress=progress,
                 )
             except Exception as exc:
                 sentry_sdk.capture_exception(exc)
@@ -2483,6 +2546,7 @@ async def _run_tier(
                     tier=tier_name,
                     org=org.slug,
                 )
+            progress.end_org()
         logger.info(
             "Keeper-sync tier pass complete",
             tier=tier_name,
@@ -2495,6 +2559,95 @@ async def _run_tier(
     raise RuntimeError(msg)
 
 
+def _log_tier_cancellation(
+    *,
+    logger: structlog.stdlib.BoundLogger,
+    tier_name: str,
+    started: float,
+    progress: _TierPassProgress,
+) -> None:
+    """Log one warning saying how far a cancelled tier pass got.
+
+    The same reading as
+    :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
+    gives a job's row: the ``reason`` is inferred from how long the pass
+    ran against the tier's arq timeout. ``org``, ``projects_visited``,
+    ``projects_total`` and ``ltd_slug`` describe the org in flight when
+    the cancel landed: ``projects_visited`` counts the slugs of its
+    scope the pass had finished, and ``ltd_slug`` is the one it was on.
+    """
+    elapsed = time.monotonic() - started
+    timeout = tier_cron_timeout(Tier(tier_name))
+    logger.warning(
+        "Keeper-sync tier pass cancelled",
+        tier=tier_name,
+        reason=infer_cancellation_reason(
+            timedelta(seconds=elapsed), timeout=timeout
+        ),
+        elapsed_seconds=round(elapsed, 1),
+        timeout_seconds=timeout.total_seconds(),
+        orgs_completed=progress.orgs_completed,
+        orgs_total=progress.orgs_total,
+        org=progress.org,
+        projects_visited=progress.projects_visited,
+        projects_total=progress.projects_total,
+        ltd_slug=progress.ltd_slug,
+    )
+
+
+@dataclass(slots=True)
+class _TierPassProgress:
+    """How far one tier pass has got through its orgs and their scopes.
+
+    :func:`_run_tier` advances the org counters around each processor
+    call, and each processor walks its scope through :meth:`walk`, so a
+    cancelled pass can log where arq cut it off.
+    """
+
+    orgs_total: int | None = None
+    """Enabled orgs the pass will visit; ``None`` until they are listed."""
+
+    orgs_completed: int = 0
+    """Orgs the pass has finished, whether or not their processor failed."""
+
+    org: str | None = None
+    """Slug of the org in flight, or ``None`` between orgs."""
+
+    projects_total: int | None = None
+    """Size of the in-flight org's scope; ``None`` until it is resolved."""
+
+    projects_visited: int = 0
+    """Slugs of the in-flight org's scope the pass has finished."""
+
+    ltd_slug: str | None = None
+    """The in-scope slug the pass is working on, if any."""
+
+    def begin_org(self, org_slug: str) -> None:
+        """Start counting a new org's scope."""
+        self.org = org_slug
+        self.projects_total = None
+        self.projects_visited = 0
+        self.ltd_slug = None
+
+    def end_org(self) -> None:
+        """Count the in-flight org as finished."""
+        self.orgs_completed += 1
+        self.org = None
+        self.projects_total = None
+        self.projects_visited = 0
+        self.ltd_slug = None
+
+    def walk(self, slugs: Sequence[str]) -> Iterator[str]:
+        """Yield each in-scope slug, counting those finished before it."""
+        self.projects_total = len(slugs)
+        for index, slug in enumerate(slugs):
+            self.projects_visited = index
+            self.ltd_slug = slug
+            yield slug
+        self.projects_visited = len(slugs)
+        self.ltd_slug = None
+
+
 class TierOrgProcessor(Protocol):
     """Per-org tier processor callable shared by ``_run_tier``.
 
@@ -2502,7 +2655,9 @@ class TierOrgProcessor(Protocol):
     function matching this signature; it returns the number of
     ``keeper_sync_project`` children it enqueued for the org.
     ``started`` is the :func:`time.monotonic` reading the tick began at,
-    passed through to :func:`_enqueue_tier_project_sync`.
+    passed through to :func:`_enqueue_tier_project_sync`. ``progress``
+    is the pass's position, whose :meth:`_TierPassProgress.walk` the
+    processor iterates its scope through.
     """
 
     async def __call__(
@@ -2514,6 +2669,7 @@ class TierOrgProcessor(Protocol):
         org: Organization,
         logger: structlog.stdlib.BoundLogger,
         started: float,
+        progress: _TierPassProgress,
     ) -> int: ...
 
 
@@ -2525,6 +2681,7 @@ async def _tier_main_for_org(
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
     started: float,
+    progress: _TierPassProgress,
 ) -> int:
     """Run one tier_main pass for a single enabled org.
 
@@ -2554,7 +2711,7 @@ async def _tier_main_for_org(
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
     enqueued = 0
-    for ltd_slug in in_scope:
+    for ltd_slug in progress.walk(in_scope):
         async with session.begin():
             project_state = await state_store.get(
                 org_id=org.id,
@@ -2637,6 +2794,7 @@ async def _tier_discovery_for_org(
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
     started: float,
+    progress: _TierPassProgress,
 ) -> int:
     """Run one tier_discovery pass for a single enabled org.
 
@@ -2646,6 +2804,11 @@ async def _tier_discovery_for_org(
     projects (LTD ``main`` rebuilt within ``TIER_DISCOVERY_HOT_WINDOW``)
     keep the 30-min cadence; dormant projects fall back to one pass per
     ``TIER_DISCOVERY_DORMANT_INTERVAL``.
+
+    A polled project with a state row costs one LTD call, its edition
+    URL listing; :func:`_project_needs_discovery` reads the edition ids
+    off the URLs and fetches no edition payload. One without a state
+    row costs none.
     """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
@@ -2688,7 +2851,7 @@ async def _tier_discovery_for_org(
         s.ltd_id: s for s in edition_states if s.ltd_id is not None
     }
     enqueued = 0
-    for ltd_slug in in_scope:
+    for ltd_slug in progress.walk(in_scope):
         async with session.begin():
             project_state = await state_store.get(
                 org_id=org.id,
@@ -2707,9 +2870,11 @@ async def _tier_discovery_for_org(
         try:
             should_enqueue = await _project_needs_discovery(
                 ltd_client=ltd_client,
+                org_slug=org.slug,
                 ltd_slug=ltd_slug,
                 project_state=project_state,
                 edition_state_by_ltd_id=edition_state_by_ltd_id,
+                logger=logger,
             )
         except LtdClientError as exc:
             sentry_sdk.capture_exception(exc)
@@ -2767,6 +2932,7 @@ async def _tier_other_for_org(
     org: Organization,
     logger: structlog.stdlib.BoundLogger,
     started: float,
+    progress: _TierPassProgress,
 ) -> int:
     """Run one tier_other pass for a single enabled org.
 
@@ -2774,18 +2940,26 @@ async def _tier_other_for_org(
     skip dormant projects before the per-project
     ``GET /products/<slug>/editions/`` listing, so a project whose
     branches haven't been touched in months stops driving an hourly
-    LTD fetch. Hot and dormant-due projects continue to fetch the
-    edition list and re-enqueue when state lags past
+    LTD fetch. Hot and dormant-due projects continue to list their
+    edition URLs and re-enqueue when state lags past
     :data:`TIER_OTHER_REFRESH_THRESHOLD`.
+
+    The listing is the only LTD call per polled project: the check
+    needs each edition's LTD id, which the URL carries, and which id is
+    ``main``, which the edition's ``keeper_sync_state`` row records as
+    its LTD slug, so no edition payload is fetched. A listed URL with no
+    id to read is skipped with a warning (:func:`_list_edition_ltd_ids`);
+    the project is still checked on the rest and still stamped polled.
+
+    The org's edition state rows are read once per tick, before the
+    per-project loop, and each polled project is checked against that
+    map in memory: one SELECT per org per tick rather than one per
+    polled project, most of which (single-edition technotes) list only
+    ``main`` and have nothing for the check to look at.
     """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
         return 0
-    # ``_list_in_scope_slugs`` drops tombstoned *project* slugs; for
-    # the editions themselves ``_has_stale_non_main_edition``'s default
-    # ``include_tombstoned=False`` already excludes tombstoned editions
-    # from the staleness scan, so no edition-level filter is needed
-    # here (issue #396 / PRD #332 user story 17).
     in_scope = await _list_in_scope_slugs(
         factory=factory,
         session=session,
@@ -2802,8 +2976,23 @@ async def _tier_other_for_org(
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
     now = datetime.now(tz=UTC)
+    # Hoist the org-wide edition-state read out of the per-slug loop,
+    # as ``_tier_discovery_for_org`` does. ``_list_in_scope_slugs``
+    # drops tombstoned *project* slugs; for the editions themselves the
+    # default ``include_tombstoned=False`` leaves tombstoned rows out
+    # of the map, so a tombstoned edition LTD still lists reads like
+    # one with no state row and is never treated as stale (issue #396
+    # / PRD #332 user story 17).
+    async with session.begin():
+        edition_states = await state_store.list_for_org(
+            org_id=org.id,
+            resource_type=ResourceType.edition,
+        )
+    edition_state_by_ltd_id = {
+        s.ltd_id: s for s in edition_states if s.ltd_id is not None
+    }
     enqueued = 0
-    for ltd_slug in in_scope:
+    for ltd_slug in progress.walk(in_scope):
         async with session.begin():
             project_state = await state_store.get(
                 org_id=org.id,
@@ -2820,7 +3009,13 @@ async def _tier_other_for_org(
         ):
             continue
         try:
-            ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
+            ltd_edition_ids = await _list_edition_ltd_ids(
+                ltd_client=ltd_client,
+                org_slug=org.slug,
+                ltd_slug=ltd_slug,
+                tier=Tier.other,
+                logger=logger,
+            )
         except LtdClientError as exc:
             sentry_sdk.capture_exception(exc)
             logger.exception(
@@ -2837,11 +3032,9 @@ async def _tier_other_for_org(
                 now=now,
             )
             continue
-        if await _has_stale_non_main_edition(
-            session=session,
-            state_store=state_store,
-            org_id=org.id,
-            ltd_editions=ltd_editions,
+        if _has_stale_non_main_edition(
+            edition_state_by_ltd_id=edition_state_by_ltd_id,
+            ltd_edition_ids=ltd_edition_ids,
             now=now,
         ) and await _enqueue_tier_project_sync(
             ctx=ctx,
@@ -2932,11 +3125,10 @@ async def _find_main_edition(
     """Locate the LTD ``main`` edition for ``ltd_slug``.
 
     Uses a per-project cache persisted on the project-resource state
-    row's ``annotations`` (``main_edition_url`` / ``main_edition_ltd_id``)
-    so the steady-state common case is one ``GET /editions/<id>`` per
-    project per tier_main tick instead of the
-    ``GET /products/<slug>/editions/`` listing plus an
-    ``GET /editions/<id>`` per non-``main`` edition. With ~1500 in-
+    row's ``annotations`` (``main_edition_url``) so the steady-state
+    common case is one ``GET /editions/<id>`` per project per tier_main
+    tick instead of the ``GET /products/<slug>/editions/`` listing plus
+    an ``GET /editions/<id>`` per non-``main`` edition. With ~1500 in-
     scope LTD products each carrying many ticket-branch editions, the
     walk path was the dominant load on the LTD API; the cache reduces
     it to one HTTP call per project.
@@ -2945,8 +3137,9 @@ async def _find_main_edition(
 
     * Cached fetch returns 404 (the edition was deleted on LTD) —
       discard the pointer and walk.
-    * Cached fetch returns 200 but the slug is no longer ``"main"`` —
-      a maintainer renamed the edition; discard the pointer and walk.
+    * Cached fetch returns 200 but the slug no longer names ``main``
+      (:func:`~docverse_server.services.keeper_sync.mappers.is_ltd_main`)
+      — a maintainer renamed the edition; discard the pointer and walk.
 
     The caller (:func:`_tier_main_for_org`) re-writes the cache
     annotations on every successful resolve, so the pointer self-heals
@@ -2967,7 +3160,7 @@ async def _find_main_edition(
             # the walk so we can rediscover ``main`` and overwrite.
             pass
         else:
-            if edition.slug == _LTD_MAIN_SLUG:
+            if is_ltd_main(edition.slug):
                 return edition
     return await _walk_for_main_edition(
         ltd_client=ltd_client, product_slug=ltd_slug
@@ -3015,21 +3208,24 @@ async def _walk_for_main_edition(
     ltd_client: LtdClient,
     product_slug: str,
 ) -> LtdEdition | None:
-    """Walk LTD's edition URL list looking for ``slug == "main"``.
+    """Walk LTD's edition URL list looking for the ``main`` edition.
 
     LTD has no slug-keyed edition lookup — every edition lives at
     ``/editions/{integer_id}``. We pull the URL list (one cheap HTTP
     call) and walk it in reverse: LTD orders the list newest-first
     and the ``main`` edition is typically the first edition created
     for a product (so it sits at the *end* of the listing), so this
-    loop terminates after one fetch in the common case. Returns
-    ``None`` when no ``main`` slug is found, which counts as "no main
-    edition to refresh" rather than an error.
+    loop terminates after one fetch in the common case. An edition is
+    ``main`` when its LTD slug passes
+    :func:`~docverse_server.services.keeper_sync.mappers.is_ltd_main`,
+    the same rule tier_other and the keeper-sync service apply. Returns
+    ``None`` when no edition qualifies, which counts as "no main edition
+    to refresh" rather than an error.
     """
     edition_urls = await ltd_client.list_edition_urls_for_product(product_slug)
     for url in reversed(edition_urls):
         edition = await ltd_client.get_edition_by_url(url)
-        if edition.slug == _LTD_MAIN_SLUG:
+        if is_ltd_main(edition.slug):
             return edition
     return None
 
@@ -3074,17 +3270,20 @@ async def _record_main_polled(
       ``TIER_MAIN_DORMANT_INTERVAL``. Skipping this on errors would
       let a flaky LTD endpoint defeat the rate limiter.
     * **Cached pointer + ``date_rebuilt_seen``.** When ``main_edition``
-      is non-``None`` we additionally rewrite ``main_edition_ltd_id`` /
-      ``main_edition_url`` (so the next tick's
-      :func:`_find_main_edition` skips the URL walk) and write
-      ``date_rebuilt_seen`` on the project state row so the next
-      tick's :func:`should_poll_main_for_project` can decide hot vs
-      dormant from this same row.
+      is non-``None`` we additionally rewrite ``main_edition_url`` (so
+      the next tick's :func:`_find_main_edition` skips the URL walk)
+      and write ``date_rebuilt_seen`` on the project state row so the
+      next tick's :func:`should_poll_main_for_project` can decide hot
+      vs dormant from this same row.
 
     Existing unrelated annotation keys are preserved by merge — no
     other writers exist today on the project-resource state row's
     annotations, but the forward-compatible posture costs nothing and
-    avoids a future drive-by writer being blindsided.
+    avoids a future drive-by writer being blindsided. The one exception
+    is the retired ``main_edition_ltd_id`` key: releases before #799
+    wrote it beside ``main_edition_url`` and nothing reads it, so it is
+    dropped on every write rather than carried forward where a later
+    re-resolve of the URL would leave it pointing at a different edition.
     """
     async with session.begin():
         existing = await state_store.get(
@@ -3101,9 +3300,9 @@ async def _record_main_polled(
             **prior,
             ANNOTATION_DATE_MAIN_LAST_POLLED: now.isoformat(),
         }
+        merged.pop(_LEGACY_MAIN_EDITION_LTD_ID_KEY, None)
         date_rebuilt_for_upsert: datetime | None = None
         if main_edition is not None:
-            merged[_MAIN_EDITION_LTD_ID_KEY] = main_edition.ltd_id
             merged[_MAIN_EDITION_URL_KEY] = str(main_edition.self_url)
             date_rebuilt_for_upsert = main_edition.date_rebuilt
         await state_store.upsert(
@@ -3158,23 +3357,93 @@ async def _record_tier_polled(
         )
 
 
+def _split_listed_edition_urls(
+    edition_urls: Sequence[str],
+) -> tuple[list[int], list[str]]:
+    """Split a product's edition URLs into LTD ids and unreadable URLs.
+
+    Returns the ids :func:`parse_ltd_id` reads off the URLs, in listing
+    order, and the URLs it could not read one from (no trailing integer
+    path segment), also in listing order. ``parse_ltd_id`` itself keeps
+    raising on such a URL; this is where the tier crons choose to skip
+    it instead.
+    """
+    ltd_ids: list[int] = []
+    unparsable: list[str] = []
+    for url in edition_urls:
+        try:
+            ltd_ids.append(parse_ltd_id(url))
+        except ValueError:
+            unparsable.append(url)
+    return ltd_ids, unparsable
+
+
+async def _list_edition_ltd_ids(
+    *,
+    ltd_client: LtdClient,
+    org_slug: str,
+    ltd_slug: str,
+    tier: Tier,
+    logger: structlog.stdlib.BoundLogger,
+) -> list[int]:
+    """List a product's editions and return the LTD ids their URLs carry.
+
+    One ``GET /products/<slug>/editions/``; no edition is followed. The
+    discovery and other tiers call this inside their per-project
+    ``except LtdClientError``, so a listing failure still costs only
+    that project. A listed URL with no trailing integer id is skipped
+    rather than raised: a ``ValueError`` would escape that handler, skip
+    the project's polled stamp, and reach :func:`_run_tier_pass`'s
+    per-org handler, dropping every remaining project of the org for
+    the tick. The skip is logged as one warning per project naming the
+    org, slug and the first :data:`_MAX_RECORDED_EDITION_FAILURES` URLs,
+    with ``skipped_count`` the exact total, and the ids that did parse
+    are returned for the tier to decide on. The URL list is capped
+    because an LTD URL-shape change would make every edition of every
+    in-scope product unparsable on every tick: ``pipelines`` alone would
+    otherwise put 2,938 URLs into one log line.
+    """
+    edition_urls = await ltd_client.list_edition_urls_for_product(ltd_slug)
+    ltd_ids, unparsable = _split_listed_edition_urls(edition_urls)
+    if unparsable:
+        logger.warning(
+            "Keeper-sync tier skipped unparsable LTD edition URLs",
+            tier=tier.value,
+            org=org_slug,
+            ltd_slug=ltd_slug,
+            unparsable_urls=unparsable[:_MAX_RECORDED_EDITION_FAILURES],
+            skipped_count=len(unparsable),
+            parsed_count=len(ltd_ids),
+        )
+    return ltd_ids
+
+
 async def _project_needs_discovery(
     *,
     ltd_client: LtdClient,
+    org_slug: str,
     ltd_slug: str,
     project_state: Any,
     edition_state_by_ltd_id: dict[int, Any],
+    logger: structlog.stdlib.BoundLogger,
 ) -> bool:
     """Return True when an in-scope project has any unseen LTD resource.
 
     The cheap check first: if the project itself has no state row,
-    enqueue immediately and skip the per-edition walk. Otherwise
-    consult the pre-loaded org-wide edition-state map and walk LTD's
-    edition list checking presence in memory. The caller hoists the
-    ``list_for_org(resource_type=edition)`` read out of the per-slug
-    loop and passes the resulting map in: with 1500 in-scope projects
-    that flips ~1500 ``list_for_org`` round-trips per discovery tick
-    into one.
+    enqueue immediately without touching LTD. Otherwise list the
+    project's edition URLs and look each one's LTD id, parsed from the
+    URL, up in the pre-loaded org-wide edition-state map. The caller
+    hoists the ``list_for_org(resource_type=edition)`` read out of the
+    per-slug loop and passes the resulting map in: with 1500 in-scope
+    projects that flips ~1500 ``list_for_org`` round-trips per
+    discovery tick into one.
+
+    The id is all this check needs, so it never follows the URLs: one
+    ``GET /products/<slug>/editions/`` per project, rather than one
+    more ``GET /editions/<id>`` per edition, which on ``pipelines``
+    (2,938 editions) pushed the cron past arq's cron timeout. A listed
+    URL with no id to read is skipped with a warning
+    (:func:`_list_edition_ltd_ids`) and the check runs on the rest.
 
     ``project_state`` is the state row already fetched by the caller
     (so the dormancy planner and this helper share one read). Pass
@@ -3183,48 +3452,55 @@ async def _project_needs_discovery(
     """
     if is_unknown_resource(project_state):
         return True
-    ltd_editions = await ltd_client.list_editions_for_product(ltd_slug)
-    for ltd_edition in ltd_editions:
-        if is_unknown_resource(
-            edition_state_by_ltd_id.get(ltd_edition.ltd_id)
-        ):
-            return True
-    return False
+    ltd_edition_ids = await _list_edition_ltd_ids(
+        ltd_client=ltd_client,
+        org_slug=org_slug,
+        ltd_slug=ltd_slug,
+        tier=Tier.discovery,
+        logger=logger,
+    )
+    return any(
+        is_unknown_resource(edition_state_by_ltd_id.get(ltd_id))
+        for ltd_id in ltd_edition_ids
+    )
 
 
-async def _has_stale_non_main_edition(
+def _has_stale_non_main_edition(
     *,
-    session: AsyncSession,
-    state_store: KeeperSyncStateStore,
-    org_id: int,
-    ltd_editions: list[LtdEdition],
+    edition_state_by_ltd_id: Mapping[int, KeeperSyncState],
+    ltd_edition_ids: Sequence[int],
     now: datetime,
 ) -> bool:
     """Return True when any non-``main`` edition's state is past threshold.
+
+    ``ltd_edition_ids`` are the LTD ids of the editions LTD lists for
+    the project, parsed from its edition URLs; no edition payload is
+    fetched, so LTD's slug for each edition is not available here.
+    ``main`` is instead recognised on the state row found for each id,
+    which records the LTD slug from the visit that wrote it
+    (:func:`~docverse_server.services.keeper_sync.mappers.is_ltd_main`),
+    and left out of the staleness check: ``tier_main`` owns that row.
+
+    ``edition_state_by_ltd_id`` is the org's untombstoned edition
+    state rows keyed by LTD id, read once per tick by
+    :func:`_tier_other_for_org`, so this check makes no database call:
+    a product that lists only ``main`` costs nothing beyond its LTD
+    listing. A tombstoned edition has no entry, so it reads like one
+    without state.
 
     Editions without a state row are deliberately ignored — they are
     ``tier_discovery``'s job. This decoupling keeps the two cron
     functions' decisions independent so a single missing-state row
     cannot cause two tiers to enqueue for the same project on the
     same hour.
-
-    The state-row read is one batched ``list_for_org`` scoped to the
-    LTD ids the caller already lists, replacing N per-edition ``get``
-    round-trips. Memory cost stays bounded because the result set is
-    capped by LTD's edition count for the project.
     """
-    non_main_ltd_ids = [
-        e.ltd_id for e in ltd_editions if e.slug != _LTD_MAIN_SLUG
-    ]
-    if not non_main_ltd_ids:
-        return False
-    async with session.begin():
-        states = await state_store.list_for_org(
-            org_id=org_id,
-            resource_type=ResourceType.edition,
-            ltd_ids=non_main_ltd_ids,
-        )
-    return any(should_refresh_other_edition(state=s, now=now) for s in states)
+    for ltd_id in ltd_edition_ids:
+        state = edition_state_by_ltd_id.get(ltd_id)
+        if state is None or is_ltd_main(state.ltd_slug):
+            continue
+        if should_refresh_other_edition(state=state, now=now):
+            return True
+    return False
 
 
 async def _enqueue_tier_project_sync(
@@ -3284,8 +3560,9 @@ async def _enqueue_tier_project_sync(
     :func:`~docverse_server.worker.functions._cancellation.record_handoff_cancellation`
     fails it at once instead, unless its backend id was already stamped.
     ``started`` is the tick's :func:`time.monotonic` start, against which
-    that cancel is read: cron jobs run under arq's default per-job
-    timeout.
+    that cancel is read, together with the timeout the tier's cron is
+    registered with: the tier's
+    :func:`~docverse_server.services.keeper_sync.scheduler.tier_cron_timeout`.
     """
     async with session.begin():
         if await queue_job_store.has_active_for_subject(
@@ -3321,7 +3598,7 @@ async def _enqueue_tier_project_sync(
         queue_job_ids=lambda: (queue_job.id,),
         job_function=f"keeper_sync_tier_{tier}",
         started=started,
-        timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+        timeout_seconds=tier_cron_timeout(Tier(tier)).total_seconds(),
         logger=logger,
     ):
         metadata = await arq_queue.enqueue(

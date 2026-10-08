@@ -31,6 +31,7 @@ from typing import get_args, get_type_hints
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from arq.cron import CronJob
 from arq.worker import Function
 from fastapi import APIRouter, params
 from fastapi.routing import APIRoute
@@ -88,6 +89,7 @@ from docverse_server.services.keeper_sync import (
     EditionSyncOutcome,
     ProjectSyncResult,
     TrackingDerivationSource,
+    scheduler,
 )
 from docverse_server.storage._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
@@ -241,6 +243,9 @@ _HANDOFF_ERRORS_KEYS = frozenset({"job_function"})
 _PHALANX_REAPER_PIN_SECONDS = 21600
 """The Phalanx reaper-threshold pin that held prod for six hours (#699)."""
 
+_TIER_CRON_PREFIX = "keeper_sync_tier_"
+"""Name prefix of the keeper-sync tier crons; the rest is the tier."""
+
 _WORKER_POOLS = (
     (WorkerSettings, "default"),
     (KeeperSyncWorkerSettings, "keeper-sync"),
@@ -262,6 +267,7 @@ _BUDGET_LOG_LINES: dict[str, tuple[str, ...]] = {
             "Skipping keeper_sync_project enqueue: "
             "an active job for this project already exists"
         ),
+        "Keeper-sync tier pass cancelled",
     ),
     "docverse_server.services.keeper_sync.service": (
         "Project sync stopped at its slice budget",
@@ -1816,6 +1822,24 @@ def _budget_section(heading: str) -> str:
     return _section(_read(_BUDGET_PAGE), heading)
 
 
+def _section_lead(section: str) -> str:
+    """Return the part of a section before its first ``###`` subsection."""
+    return section.split("\n### ", 1)[0]
+
+
+def _tier_cron_jobs() -> dict[str, CronJob]:
+    """Return the keeper-sync pool's tier crons, by function name."""
+    crons = {
+        inspect.unwrap(cron_job.coroutine).__name__: cron_job
+        for cron_job in KeeperSyncWorkerSettings.cron_jobs
+    }
+    return {
+        name: cron_job
+        for name, cron_job in crons.items()
+        if name.startswith(_TIER_CRON_PREFIX)
+    }
+
+
 def _stock_ladder() -> dict[str, int]:
     """Return the three ladder values at the stock job timeout.
 
@@ -1909,7 +1933,7 @@ def test_budget_ladder_documented_with_env_var_default_and_value() -> None:
     and the Phalanx value that sets it. The two derived rows name the
     margin each derivation uses, with its value.
     """
-    section = _budget_section("The ladder")
+    section = _section_lead(_budget_section("The ladder"))
     env_prefix = Configuration.model_config.get("env_prefix", "")
     rows = {cells[0].strip("`"): cells for cells in _code_rows(section)}
     assert set(rows) == set(_LADDER_PHALANX_VALUES)
@@ -2083,6 +2107,10 @@ def test_budget_page_tables_every_cancellation_recording_worker() -> None:
         if timeout is None:
             assert "ARQ_DEFAULT_JOB_TIMEOUT_SECONDS" in named, name
             continue
+        if name.startswith(_TIER_CRON_PREFIX):
+            assert "tier_cron_timeout" in named, name
+            assert f"({timeout:g} s)" in cells[2], name
+            continue
         assert any(
             getattr(config, setting) == timeout for setting in named & settings
         ), name
@@ -2096,6 +2124,45 @@ def test_budget_page_tables_every_cancellation_recording_worker() -> None:
         },
         section,
     )
+
+
+def test_budget_tier_cron_timeouts_documented() -> None:
+    """The tier-cron table is every tier cron, with its interval and timeout.
+
+    Read off the keeper-sync pool's schedule, so a tier cron added, or a
+    timeout that moves with its interval, is a row the page has to
+    change. Each row names the cadence constant the interval comes from,
+    and the section names the helper and the constants the timeout
+    derives through, the floor it never falls below, and the line a
+    cancelled pass logs.
+    """
+    section = _subsection(_budget_section("The ladder"), "Tier-cron timeouts")
+    rows = {cells[0].strip("`"): cells for cells in _code_rows(section)}
+    crons = _tier_cron_jobs()
+    assert crons, "the keeper-sync pool schedules no tier crons"
+    assert set(rows) == set(crons)
+    for name, cron_job in crons.items():
+        tier = scheduler.Tier(name.removeprefix(_TIER_CRON_PREFIX))
+        interval = scheduler.tier_cron_interval(tier)
+        constant = f"TIER_{tier.name.upper()}_CRON_INTERVAL"
+        assert getattr(scheduler, constant) == interval, name
+        cells = rows[name]
+        assert f"{interval.total_seconds() / 60:g} min" in cells[1], name
+        assert constant in _inline_code(cells[1]), name
+        assert cron_job.timeout_s is not None, name
+        assert cells[2] == f"{cron_job.timeout_s:g} s", name
+    assert not _uncoded(
+        {
+            "tier_cron_timeout",
+            "TIER_CRON_TIMEOUT_MARGIN_DIVISOR",
+            "TIER_CRON_TIMEOUT_MIN_MARGIN",
+            "ARQ_DEFAULT_JOB_TIMEOUT",
+            "Keeper-sync tier pass cancelled",
+        },
+        section,
+    )
+    assert f"({scheduler.TIER_CRON_TIMEOUT_MARGIN_DIVISOR})" in section
+    assert f"({ARQ_DEFAULT_JOB_TIMEOUT_SECONDS} s)" in section
 
 
 def test_budget_no_progress_guard_documented() -> None:

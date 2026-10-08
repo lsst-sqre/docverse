@@ -51,6 +51,8 @@ from docverse_server.services.keeper_sync.scheduler import (
     TIER_DISCOVERY_CRON_INTERVAL,
     TIER_MAIN_CRON_INTERVAL,
     TIER_OTHER_CRON_INTERVAL,
+    Tier,
+    tier_cron_timeout,
 )
 from docverse_server.storage.github import validate_github_app
 from docverse_server.storage.ltd import LtdS3Source
@@ -980,14 +982,28 @@ class KeeperSyncWorkerSettings:
             max_tries=1,
         ),
         instrument_arq_task(keeper_sync_reaper),
-        instrument_arq_task(keeper_sync_tier_main),
-        instrument_arq_task(keeper_sync_tier_discovery),
-        instrument_arq_task(keeper_sync_tier_other),
+        # A tier pass enqueued by name runs under the same timeout as its
+        # cron job, which arq registers separately.
+        func(
+            instrument_arq_task(keeper_sync_tier_main),
+            timeout=tier_cron_timeout(Tier.main),
+        ),
+        func(
+            instrument_arq_task(keeper_sync_tier_discovery),
+            timeout=tier_cron_timeout(Tier.discovery),
+        ),
+        func(
+            instrument_arq_task(keeper_sync_tier_other),
+            timeout=tier_cron_timeout(Tier.other),
+        ),
     ]
     # Tier-cron cadences come from the constants in
     # ``services/keeper_sync/scheduler.py`` so the planner's next-tick
     # math (``explain_tier_status``) and the cron's actual firing
-    # schedule cannot drift.
+    # schedule cannot drift. Each tier's ``timeout`` derives from the
+    # same interval (``tier_cron_timeout``), at most the interval and
+    # never below arq's 300 s default, so a large scope's pass is not cut
+    # off at that default and no tier gets less time than it had.
     cron_jobs = [
         cron(
             instrument_arq_task(keeper_sync_reaper),
@@ -998,6 +1014,7 @@ class KeeperSyncWorkerSettings:
         cron(
             instrument_arq_task(keeper_sync_tier_main),
             minute=_cron_minutes_for_tier_interval(TIER_MAIN_CRON_INTERVAL),
+            timeout=tier_cron_timeout(Tier.main),
         ),
         # Tier 2 — discovers LTD resources without a
         # ``keeper_sync_state`` row.
@@ -1006,12 +1023,14 @@ class KeeperSyncWorkerSettings:
             minute=_cron_minutes_for_tier_interval(
                 TIER_DISCOVERY_CRON_INTERVAL
             ),
+            timeout=tier_cron_timeout(Tier.discovery),
         ),
         # Tier 3 — catches non-``main`` editions whose state has aged
         # past the threshold.
         cron(
             instrument_arq_task(keeper_sync_tier_other),
             minute=_cron_minutes_for_tier_interval(TIER_OTHER_CRON_INTERVAL),
+            timeout=tier_cron_timeout(Tier.other),
         ),
         # Generic arq-queue metrics (SQR-112): per-pool ``arq_queue_stats``
         # gauge for the keeper-sync queue.

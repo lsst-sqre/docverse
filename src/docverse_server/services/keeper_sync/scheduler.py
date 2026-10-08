@@ -25,6 +25,9 @@ __all__ = [
     "ANNOTATION_DATE_DISCOVERY_LAST_POLLED",
     "ANNOTATION_DATE_MAIN_LAST_POLLED",
     "ANNOTATION_DATE_OTHER_LAST_POLLED",
+    "ARQ_DEFAULT_JOB_TIMEOUT",
+    "TIER_CRON_TIMEOUT_MARGIN_DIVISOR",
+    "TIER_CRON_TIMEOUT_MIN_MARGIN",
     "TIER_DISCOVERY_CRON_INTERVAL",
     "TIER_DISCOVERY_DORMANT_INTERVAL",
     "TIER_DISCOVERY_DORMANT_JITTER",
@@ -49,6 +52,8 @@ __all__ = [
     "should_refresh_main_edition",
     "should_refresh_other_edition",
     "stable_hash_fraction",
+    "tier_cron_interval",
+    "tier_cron_timeout",
 ]
 
 
@@ -85,6 +90,25 @@ TIER_DISCOVERY_CRON_INTERVAL = timedelta(minutes=30)
 #: :data:`TIER_OTHER_REFRESH_THRESHOLD`; the SLO is also hourly so the
 #: cron and the threshold are intentionally identical.
 TIER_OTHER_CRON_INTERVAL = timedelta(hours=1)
+
+#: A tier cron's arq timeout holds back this fraction (one part in
+#: this many) of the tier's cron interval; see :func:`tier_cron_timeout`.
+TIER_CRON_TIMEOUT_MARGIN_DIVISOR = 6
+
+#: The least a tier cron's arq timeout holds back from its interval,
+#: before :data:`ARQ_DEFAULT_JOB_TIMEOUT` floors it; see
+#: :func:`tier_cron_timeout`.
+TIER_CRON_TIMEOUT_MIN_MARGIN = timedelta(minutes=1)
+
+#: arq's default ``job_timeout``: the timeout arq's ``Worker`` gives a
+#: function or ``cron(...)`` job registered without one of its own, and
+#: the one every tier cron ran under before :func:`tier_cron_timeout`.
+#: A tier cron's timeout never falls below it, so no tier gets less time
+#: per pass than it had then. The worker package's
+#: ``ARQ_DEFAULT_JOB_TIMEOUT_SECONDS`` is the same value in seconds;
+#: this copy keeps the scheduler clear of the worker package, and a
+#: test pins both to arq's own default.
+ARQ_DEFAULT_JOB_TIMEOUT = timedelta(seconds=300)
 
 #: Window after a project's last observed LTD ``main`` rebuild during
 #: which ``keeper_sync_tier_main`` always polls on its 5-minute cadence.
@@ -186,6 +210,81 @@ class Tier(StrEnum):
     main = "main"
     discovery = "discovery"
     other = "other"
+
+
+_TIER_CRON_INTERVALS: dict[Tier, timedelta] = {
+    Tier.main: TIER_MAIN_CRON_INTERVAL,
+    Tier.discovery: TIER_DISCOVERY_CRON_INTERVAL,
+    Tier.other: TIER_OTHER_CRON_INTERVAL,
+}
+
+
+def tier_cron_interval(tier: Tier) -> timedelta:
+    """Return the wall-clock cadence ``tier``'s cron fires on."""
+    return _TIER_CRON_INTERVALS[tier]
+
+
+def tier_cron_timeout(tier: Tier) -> timedelta:
+    """Return the arq timeout for one pass of ``tier``'s cron.
+
+    The tier's cron interval less a margin of one
+    :data:`TIER_CRON_TIMEOUT_MARGIN_DIVISOR`-th of it, and never less
+    than :data:`TIER_CRON_TIMEOUT_MIN_MARGIN`, but never below arq's
+    default :data:`ARQ_DEFAULT_JOB_TIMEOUT` nor past the interval
+    itself: 300 s for ``tier_main``, 1500 s for ``tier_discovery`` and
+    3000 s for ``tier_other``. A ``cron(...)`` registered without a
+    ``timeout`` runs under arq's 300 s default instead, which a large
+    scope outgrows — on prod (2026-10-06) the discovery and other
+    passes were cancelled mid-scope on every tick, and the tail of the
+    scope starved.
+
+    The floor keeps the 5-minute ``tier_main`` at the 300 s it ran under
+    before; the margin alone would leave it 240 s, and a pass that
+    needed the difference would be cancelled, and start again from the
+    top of its scope, on every tick. The cap keeps a tier whose cadence
+    is shorter than the floor from running a pass that started on time
+    into its own next tick.
+
+    The timeout bounds a pass. Where the margin survives the floor, as
+    for ``tier_discovery`` and ``tier_other``, it also keeps a pass that
+    started a little late, because the pool's job slots were all busy at
+    the tick, from running into the same tier's next tick in the common
+    case, with room for the cleanup a cancelled pass runs on its way
+    out. Nothing rules an overlap out, though: arq measures the timeout
+    from when the pass starts, not from the tick, so a pass that started
+    late on a saturated pool can still be running when the next tick's
+    pass starts, and ``tier_main``, held at the floor, has no margin at
+    all. The per-project active-job slot absorbs any duplicate enqueue
+    that follows: two passes can each try to enqueue a project's sync,
+    but only one ``keeper_sync_project`` job per project is active at a
+    time.
+
+    :mod:`docverse_server.worker.main` registers each tier's
+    ``cron(...)`` with this value and the tier crons read their
+    cancellations against it, so the cadence constants and the
+    registration cannot drift.
+
+    Raises
+    ------
+    ValueError
+        If the tier's cron interval is zero or negative. The clamp would
+        otherwise hand that tier its own interval as the timeout, and
+        arq would cancel every pass the instant it started; raising
+        instead fails the worker at startup, where the registration
+        reads this value.
+    """
+    interval = tier_cron_interval(tier)
+    if interval <= timedelta(0):
+        msg = (
+            f"The {tier.value} tier cron interval {interval!r} must be"
+            " positive to derive a timeout"
+        )
+        raise ValueError(msg)
+    margin = max(
+        interval // TIER_CRON_TIMEOUT_MARGIN_DIVISOR,
+        TIER_CRON_TIMEOUT_MIN_MARGIN,
+    )
+    return min(max(interval - margin, ARQ_DEFAULT_JOB_TIMEOUT), interval)
 
 
 _TIER_ANNOTATION_KEYS: dict[Tier, str] = {

@@ -4,15 +4,23 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from arq.cron import CronJob
 from arq.worker import Function
 
 from docverse_server.config import Configuration
+from docverse_server.services.keeper_sync.scheduler import (
+    Tier,
+    tier_cron_timeout,
+)
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.worker.functions import (
     keeper_sync_project,
     keeper_sync_reaper,
     keeper_sync_run_discovery,
+    keeper_sync_tier_discovery,
+    keeper_sync_tier_main,
+    keeper_sync_tier_other,
 )
 from docverse_server.worker.main import (
     KeeperSyncWorkerSettings,
@@ -23,6 +31,13 @@ from docverse_server.worker.main import (
 )
 
 _config = Configuration()
+
+_TIER_CRON_TIMEOUTS = (
+    (Tier.main, keeper_sync_tier_main, 300),
+    (Tier.discovery, keeper_sync_tier_discovery, 1500),
+    (Tier.other, keeper_sync_tier_other, 3000),
+)
+"""Each keeper-sync tier with its cron function and timeout in seconds."""
 
 
 def _underlying(coroutine: Any) -> Any:
@@ -144,3 +159,49 @@ def test_default_worker_has_no_keeper_sync_cron() -> None:
         if isinstance(job, CronJob)
     }
     assert keeper_sync_reaper not in coroutines
+
+
+@pytest.mark.parametrize(
+    ("tier", "coroutine", "timeout_s"),
+    _TIER_CRON_TIMEOUTS,
+    ids=[tier for tier, _, _ in _TIER_CRON_TIMEOUTS],
+)
+def test_tier_cron_jobs_carry_the_scheduler_derived_timeout(
+    tier: Tier, coroutine: object, timeout_s: int
+) -> None:
+    """Each tier ``cron(...)`` runs under its tier's derived timeout.
+
+    Registered without one, a tier cron ran under arq's 300 s default,
+    which the discovery and other passes outgrew on prod (2026-10-06).
+    The value comes from the scheduler, as the cadence does, so the
+    registration cannot drift from the tier's interval; ``tier_main``
+    keeps the full 300 s rather than less than it had before.
+    """
+    cron_jobs = [
+        job
+        for job in KeeperSyncWorkerSettings.cron_jobs
+        if isinstance(job, CronJob) and _underlying(job.coroutine) is coroutine
+    ]
+    assert len(cron_jobs) == 1
+    assert cron_jobs[0].timeout_s == timeout_s
+    assert cron_jobs[0].timeout_s == tier_cron_timeout(tier).total_seconds()
+
+
+@pytest.mark.parametrize(
+    ("tier", "coroutine", "timeout_s"),
+    _TIER_CRON_TIMEOUTS,
+    ids=[tier for tier, _, _ in _TIER_CRON_TIMEOUTS],
+)
+def test_tier_functions_carry_the_scheduler_derived_timeout(
+    tier: Tier, coroutine: object, timeout_s: int
+) -> None:
+    """A tier pass enqueued by name runs under the same timeout as its cron.
+
+    arq registers the ``functions`` entry separately from the cron job,
+    so without its own ``timeout`` a pass enqueued by name would fall
+    back to arq's default and read its cancellation against the wrong
+    allowance.
+    """
+    function = _function_by_coroutine(coroutine)
+    assert function.timeout_s == timeout_s
+    assert function.timeout_s == tier_cron_timeout(tier).total_seconds()

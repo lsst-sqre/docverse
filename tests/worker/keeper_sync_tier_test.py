@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -31,10 +32,16 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
+from structlog.typing import EventDict, WrappedLogger
 
 from docverse.models import JobKind, KeeperSyncConfig, OrganizationCreate
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.queue import JobStatus
+from docverse_server.services.keeper_sync import mappers
+from docverse_server.services.keeper_sync.scheduler import (
+    Tier,
+    tier_cron_timeout,
+)
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
@@ -46,10 +53,8 @@ from docverse_server.storage.keeper_sync import (
 )
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
-from docverse_server.worker.functions._cancellation import (
-    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
-)
 from docverse_server.worker.functions.keeper_sync import (
+    _MAX_RECORDED_EDITION_FAILURES,
     keeper_sync_tier_discovery,
     keeper_sync_tier_main,
     keeper_sync_tier_other,
@@ -64,6 +69,11 @@ LTD_BASE = "https://keeper.lsst.codes"
 #: ``date_rebuilt`` for the canonical ``main`` edition fixture. Used by
 #: tests that need to compare LTD's published timestamp against state.
 _FIXTURE_MAIN_DATE_REBUILT = datetime(2026, 4, 30, 18, 30, tzinfo=UTC)
+
+#: Path of one LTD edition resource, ``GET /editions/<id>``: the
+#: per-edition payload fetch the discovery and other tiers must never
+#: make.
+_EDITION_RESOURCE_PATH = re.compile(r"/editions/\d+/?")
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -211,6 +221,80 @@ def _stub_edition(
     )
 
 
+def _ltd_request_paths(mock_discovery: respx.Router) -> list[str]:
+    """Return the path of every request the tick sent to LTD, in order.
+
+    ``respx`` records every call on the router, matched or not, so a
+    request to an unstubbed LTD URL shows up here too.
+    """
+    return [
+        call.request.url.path
+        for call in mock_discovery.calls
+        if str(call.request.url).startswith(LTD_BASE)
+    ]
+
+
+def _assert_no_edition_fetches(mock_discovery: respx.Router) -> None:
+    """Fail when the tick fetched any edition payload from LTD.
+
+    ``tier_discovery`` and ``tier_other`` decide from each listed
+    edition's LTD id alone, which the edition URL carries, so they list
+    a product's edition URLs and never follow them: following them is
+    one ``GET /editions/<id>`` per edition, which on ``pipelines``
+    (2,938 editions) pushed both crons past arq's cron timeout.
+    """
+    fetched = [
+        path
+        for path in _ltd_request_paths(mock_discovery)
+        if _EDITION_RESOURCE_PATH.fullmatch(path)
+    ]
+    assert fetched == []
+
+
+#: An edition URL whose last path segment is no integer id, so
+#: :func:`~docverse_server.storage.ltd.models.parse_ltd_id` raises on it.
+_UNPARSABLE_EDITION_URL = f"{LTD_BASE}/editions/latest"
+
+#: The warning the discovery and other tiers log for a project whose
+#: edition listing carries URLs they cannot read an id from.
+_UNPARSABLE_URLS_EVENT = "Keeper-sync tier skipped unparsable LTD edition URLs"
+
+
+def _stub_edition_url_listing(
+    mock_discovery: respx.Router, *, product_slug: str, urls: list[str]
+) -> None:
+    """Stub ``GET /products/<slug>/editions/`` to list ``urls`` verbatim.
+
+    Unlike :func:`_stub_editions_listing`, which builds well-formed URLs
+    from ids, this lets a test list a URL with no trailing id.
+    """
+    mock_discovery.get(f"{LTD_BASE}/products/{product_slug}/editions/").mock(
+        return_value=httpx.Response(200, json={"editions": urls})
+    )
+
+
+async def _read_polled_annotation(
+    *, org_id: int, ltd_slug: str, key: str
+) -> datetime:
+    """Return a project's ``date_<tier>_last_polled`` annotation."""
+    stamped: datetime | None = None
+    async for session in db_session_dependency():
+        async with session.begin():
+            store = KeeperSyncStateStore(session=session, logger=_logger())
+            row = await store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug=ltd_slug,
+            )
+        assert row is not None
+        assert row.annotations is not None
+        raw = row.annotations[key]
+        assert isinstance(raw, str)
+        stamped = datetime.fromisoformat(raw)
+    assert stamped is not None
+    return stamped
+
+
 def _make_ctx(http_client: httpx.AsyncClient) -> dict[str, Any]:
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
@@ -227,6 +311,7 @@ async def _seed_state(
     docverse_id: int | None = 99,
     date_last_synced: datetime | None = None,
     date_rebuilt_seen: datetime | None = None,
+    annotations: dict[str, Any] | None = None,
 ) -> None:
     state_store = KeeperSyncStateStore(session=db_session, logger=_logger())
     await state_store.upsert(
@@ -237,6 +322,7 @@ async def _seed_state(
         docverse_id=docverse_id,
         date_last_synced=date_last_synced,
         date_rebuilt_seen=date_rebuilt_seen,
+        annotations=annotations,
     )
 
 
@@ -448,8 +534,9 @@ async def test_tier_main_caches_main_edition_pointer_after_walk(
 
     Locks the cold-cache half of the contract: after ``_find_main_edition``
     walks the URL list to locate ``main``, the project-resource state row
-    carries ``main_edition_url`` / ``main_edition_ltd_id`` annotations so
-    the next tick can skip the walk.
+    carries a ``main_edition_url`` annotation so the next tick can skip
+    the walk. The pointer is the URL alone: no ``main_edition_ltd_id``
+    companion is written, since nothing reads one.
     """
     async with db_session.begin():
         org_id, _ = await _seed_org(
@@ -495,11 +582,84 @@ async def test_tier_main_caches_main_edition_pointer_after_walk(
             )
     assert project_state is not None
     assert project_state.annotations is not None
-    assert project_state.annotations["main_edition_ltd_id"] == 1
+    assert "main_edition_ltd_id" not in project_state.annotations
     assert (
         project_state.annotations["main_edition_url"]
         == f"{LTD_BASE}/editions/1"
     )
+
+
+@pytest.mark.asyncio
+async def test_tier_main_drops_legacy_main_edition_ltd_id(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A poll removes the retired ``main_edition_ltd_id`` from old rows.
+
+    Releases before #799 wrote ``main_edition_ltd_id`` beside the
+    cached ``main_edition_url``. The upsert preserves unrelated keys by
+    merge, so without an explicit drop a row stamped by an earlier
+    release would keep a frozen id that a later re-resolve of the URL
+    could contradict. One polled visit must leave the URL pointer and
+    the rate-limit timestamp in place and the legacy id gone.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-legacy-id",
+            project_slugs=["pipelines"],
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="pipelines",
+            docverse_id=99,
+            annotations={
+                "main_edition_url": f"{LTD_BASE}/editions/1",
+                "main_edition_ltd_id": 1,
+                "unrelated": "kept",
+            },
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="main",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            project_state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="pipelines",
+            )
+    assert project_state is not None
+    assert project_state.annotations is not None
+    assert "main_edition_ltd_id" not in project_state.annotations
+    assert (
+        project_state.annotations["main_edition_url"]
+        == f"{LTD_BASE}/editions/1"
+    )
+    assert project_state.annotations["unrelated"] == "kept"
+    assert "date_main_last_polled" in project_state.annotations
 
 
 @pytest.mark.asyncio
@@ -532,7 +692,6 @@ async def test_tier_main_uses_cached_pointer_to_skip_walk(
             ltd_slug="pipelines",
             docverse_id=99,
             annotations={
-                "main_edition_ltd_id": 1,
                 "main_edition_url": f"{LTD_BASE}/editions/1",
             },
         )
@@ -613,7 +772,6 @@ async def test_tier_main_falls_back_to_walk_on_cached_404(
             ltd_slug="pipelines",
             docverse_id=99,
             annotations={
-                "main_edition_ltd_id": 99,
                 "main_edition_url": f"{LTD_BASE}/editions/99",
             },
         )
@@ -653,7 +811,6 @@ async def test_tier_main_falls_back_to_walk_on_cached_404(
             )
     assert project_state is not None
     assert project_state.annotations is not None
-    assert project_state.annotations["main_edition_ltd_id"] == 1
     assert (
         project_state.annotations["main_edition_url"]
         == f"{LTD_BASE}/editions/1"
@@ -682,7 +839,6 @@ async def test_tier_main_falls_back_to_walk_on_slug_mismatch(
             ltd_slug="pipelines",
             docverse_id=99,
             annotations={
-                "main_edition_ltd_id": 99,
                 "main_edition_url": f"{LTD_BASE}/editions/99",
             },
         )
@@ -726,11 +882,160 @@ async def test_tier_main_falls_back_to_walk_on_slug_mismatch(
             )
     assert project_state is not None
     assert project_state.annotations is not None
-    assert project_state.annotations["main_edition_ltd_id"] == 1
     assert (
         project_state.annotations["main_edition_url"]
         == f"{LTD_BASE}/editions/1"
     )
+
+
+def _fold_default_onto_main(
+    monkeypatch: pytest.MonkeyPatch, *, ltd_slug: str
+) -> None:
+    """Make the edition-slug mapper fold ``ltd_slug`` onto ``__main`` too.
+
+    ``mappers.is_ltd_main`` is defined by what
+    ``mappers.derive_edition_slug`` folds onto Docverse's default
+    edition, so widening the mapper is how a test shows a caller follows
+    that shared rule rather than a hard-coded ``"main"``.
+    """
+    real = mappers.derive_edition_slug
+
+    def folding(slug: str) -> str:
+        return real(mappers.LTD_MAIN_SLUG if slug == ltd_slug else slug)
+
+    monkeypatch.setattr(mappers, "derive_edition_slug", folding)
+
+
+@pytest.mark.asyncio
+async def test_tier_main_walk_follows_is_ltd_main(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The URL walk recognises any slug ``is_ltd_main`` accepts as ``main``.
+
+    tier_main and tier_other share one definition of ``main``: whatever
+    LTD slug the mapper folds onto Docverse's ``__main``. Here the
+    mapper also folds ``default``, so the walk resolves edition 1 (slug
+    ``default``) as the project's ``main``, caches its URL, and
+    enqueues a refresh because no edition state exists yet.
+    """
+    _fold_default_onto_main(monkeypatch, ltd_slug="default")
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-folded-walk",
+            project_slugs=["pipelines"],
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    # No edition carries the literal ``main`` slug, so only the shared
+    # rule can pick ``default`` out of the walk.
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[1, 2]
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="default",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+    _stub_edition(
+        mock_discovery,
+        edition_id=2,
+        slug="u-jsick-feature",
+        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["pipelines"]
+    async for session in db_session_dependency():
+        async with session.begin():
+            state_store = KeeperSyncStateStore(
+                session=session, logger=_logger()
+            )
+            project_state = await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug="pipelines",
+            )
+    assert project_state is not None
+    assert project_state.annotations is not None
+    assert (
+        project_state.annotations["main_edition_url"]
+        == f"{LTD_BASE}/editions/1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier_main_cached_pointer_follows_is_ltd_main(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cached pointer to any slug ``is_ltd_main`` accepts stays valid.
+
+    The cached fetch's slug check uses the same shared rule as the walk:
+    with the mapper folding ``default`` onto ``__main``, a cached
+    pointer whose edition is slugged ``default`` is a hit, so the tick
+    never falls back to listing the project's edition URLs.
+    """
+    _fold_default_onto_main(monkeypatch, ltd_slug="default")
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-main-folded-cache",
+            project_slugs=["pipelines"],
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+            annotations={"main_edition_url": f"{LTD_BASE}/editions/1"},
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    listing_route = mock_discovery.get(
+        f"{LTD_BASE}/products/pipelines/editions/"
+    ).mock(return_value=httpx.Response(200, json={"editions": []}))
+    _stub_edition(
+        mock_discovery,
+        edition_id=1,
+        slug="default",
+        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_main(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    assert listing_route.call_count == 0
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert len(children) == 1
 
 
 @pytest.mark.asyncio
@@ -767,7 +1072,6 @@ async def test_tier_main_polls_only_hot_and_due_dormant_projects(
             docverse_id=1,
             date_rebuilt_seen=now - timedelta(days=2),
             annotations={
-                "main_edition_ltd_id": 1,
                 "main_edition_url": f"{LTD_BASE}/editions/1",
             },
         )
@@ -780,7 +1084,6 @@ async def test_tier_main_polls_only_hot_and_due_dormant_projects(
             docverse_id=2,
             date_rebuilt_seen=now - timedelta(days=30),
             annotations={
-                "main_edition_ltd_id": 2,
                 "main_edition_url": f"{LTD_BASE}/editions/2",
                 "date_main_last_polled": (
                     now - timedelta(hours=1)
@@ -798,7 +1101,6 @@ async def test_tier_main_polls_only_hot_and_due_dormant_projects(
             docverse_id=3,
             date_rebuilt_seen=now - timedelta(days=30),
             annotations={
-                "main_edition_ltd_id": 3,
                 "main_edition_url": f"{LTD_BASE}/editions/3",
                 "date_main_last_polled": (
                     now - timedelta(hours=49)
@@ -967,7 +1269,6 @@ async def test_tier_main_records_polled_annotation_on_ltd_error(
             docverse_id=1,
             date_rebuilt_seen=now - timedelta(days=30),
             annotations={
-                "main_edition_ltd_id": 9,
                 "main_edition_url": f"{LTD_BASE}/editions/9",
                 "date_main_last_polled": (
                     now - timedelta(hours=49)
@@ -1570,6 +1871,7 @@ async def test_tier_discovery_enqueues_when_project_state_missing(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -1621,17 +1923,78 @@ async def test_tier_discovery_enqueues_when_edition_state_missing(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+
+    # Single enqueue covers the project; the unseen edition gets
+    # imported as a side effect of ``KeeperSyncService.sync_project``.
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
+    assert len(children) == 1
+
+
+@pytest.mark.asyncio
+async def test_tier_discovery_reads_only_the_edition_url_listing(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """One LTD call per project with a state row: its edition URL list.
+
+    Discovery needs only each listed edition's LTD id, which the URL
+    carries, so it compares the parsed ids against the edition-state
+    map and never fetches an edition payload. ``sqr-001`` lists an id
+    with no state row and enqueues; every id ``pipelines`` lists is
+    known, so it does not. No edition resource is stubbed, so a
+    regression to following the URLs also shows up as an
+    ``/editions/<id>`` request.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-urls",
+            project_slugs=["pipelines", "sqr-001"],
+        )
+        for slug in ("pipelines", "sqr-001"):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+            )
+        for ltd_id, slug in ((1, "main"), (2, "branch-a"), (3, "branch-b")):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug=slug,
+            )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=10,
+            ltd_slug="main",
+        )
+
+    _stub_products(mock_discovery, ["pipelines", "sqr-001"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[3, 2, 1]
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="sqr-001", edition_ids=[11, 10]
     )
 
     http_client = httpx.AsyncClient()
@@ -1642,14 +2005,18 @@ async def test_tier_discovery_enqueues_when_edition_state_missing(
         await ctx["http_client"].aclose()
     assert result == "completed"
 
-    # Single enqueue covers the project; the unseen edition gets
-    # imported as a side effect of ``KeeperSyncService.sync_project``.
     children = get_jobs_by_name(
         ctx["arq_queue"],
         "keeper_sync_project",
         queue_name=KEEPER_SYNC_QUEUE_NAME,
     )
-    assert len(children) == 1
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["sqr-001"]
+    _assert_no_edition_fetches(mock_discovery)
+    assert sorted(_ltd_request_paths(mock_discovery)) == [
+        "/products/",
+        "/products/pipelines/editions/",
+        "/products/sqr-001/editions/",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1700,24 +2067,6 @@ async def test_tier_discovery_batches_edition_state_lookups(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[5, 4, 3, 2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    for edition_id, slug in (
-        (2, "branch-a"),
-        (3, "branch-b"),
-        (4, "branch-c"),
-        (5, "branch-d"),
-    ):
-        _stub_edition(
-            mock_discovery,
-            edition_id=edition_id,
-            slug=slug,
-            date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-        )
 
     recorder = _install_state_store_recorder(monkeypatch)
     http_client = httpx.AsyncClient()
@@ -1727,6 +2076,7 @@ async def test_tier_discovery_batches_edition_state_lookups(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     # Fully-known project — no enqueue.
     assert (
@@ -1808,12 +2158,6 @@ async def test_tier_discovery_batches_edition_state_lookups_across_slugs(
         _stub_editions_listing(
             mock_discovery, product_slug=slug, edition_ids=[edition_id]
         )
-        _stub_edition(
-            mock_discovery,
-            edition_id=edition_id,
-            slug=f"main-{slug[-1]}",
-            date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-        )
 
     recorder = _install_state_store_recorder(monkeypatch)
     http_client = httpx.AsyncClient()
@@ -1823,6 +2167,7 @@ async def test_tier_discovery_batches_edition_state_lookups_across_slugs(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     # Fully-known: no enqueues across all three slugs.
     assert (
@@ -1869,12 +2214,6 @@ async def test_tier_discovery_skips_fully_known_project(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -1883,6 +2222,7 @@ async def test_tier_discovery_skips_fully_known_project(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
     assert (
         get_jobs_by_name(
             ctx["arq_queue"],
@@ -1987,24 +2327,6 @@ async def test_tier_discovery_polls_only_hot_and_due_dormant_projects(
             200, json={"editions": [f"{LTD_BASE}/editions/3"]}
         )
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=3,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2013,6 +2335,7 @@ async def test_tier_discovery_polls_only_hot_and_due_dormant_projects(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     # Acceptance: LTD HTTP fired exactly for the polled cohort.
     assert hot_listing.call_count == 1
@@ -2106,6 +2429,7 @@ async def test_tier_discovery_records_polled_annotation_on_ltd_error(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -2162,6 +2486,7 @@ async def test_tier_discovery_skips_tombstoned_project_slug(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -2228,18 +2553,6 @@ async def test_tier_discovery_does_not_treat_tombstoned_edition_as_unknown(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2248,6 +2561,7 @@ async def test_tier_discovery_does_not_treat_tombstoned_edition_as_unknown(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     assert (
         get_jobs_by_name(
@@ -2293,6 +2607,7 @@ async def test_tier_discovery_honours_scope_patterns_and_excludes(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -2300,6 +2615,168 @@ async def test_tier_discovery_honours_scope_patterns_and_excludes(
         queue_name=KEEPER_SYNC_QUEUE_NAME,
     )
     assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["sqr-100"]
+
+
+@pytest.mark.asyncio
+async def test_tier_discovery_skips_unparsable_edition_url(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An edition URL with no trailing id costs that URL, not the org's tick.
+
+    ``aaa`` lists a URL :func:`parse_ltd_id` cannot read ahead of two
+    well-formed ones. The tick logs one warning naming the org, the slug
+    and the URL, still decides ``aaa`` from the ids that did parse —
+    edition 2 has no state row, so it enqueues — and still stamps its
+    polled annotation. ``bbb``, later in the same scope, is still
+    visited: a raise on the URL would have dropped it for the tick.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-badurl",
+            project_slugs=["aaa", "bbb"],
+        )
+        for slug in ("aaa", "bbb"):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+            )
+        for ltd_id in (1, 3):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug="main",
+            )
+
+    _stub_products(mock_discovery, ["aaa", "bbb"])
+    _stub_edition_url_listing(
+        mock_discovery,
+        product_slug="aaa",
+        urls=[
+            _UNPARSABLE_EDITION_URL,
+            f"{LTD_BASE}/editions/2",
+            f"{LTD_BASE}/editions/1",
+        ],
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="bbb", edition_ids=[4, 3]
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == [
+        "aaa",
+        "bbb",
+    ]
+
+    warnings = [e for e in captured if e["event"] == _UNPARSABLE_URLS_EVENT]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["tier"] == "discovery"
+    assert warnings[0]["org"] == "ks-tier-disc-badurl"
+    assert warnings[0]["ltd_slug"] == "aaa"
+    assert warnings[0]["unparsable_urls"] == [_UNPARSABLE_EDITION_URL]
+
+    stamped = await _read_polled_annotation(
+        org_id=org_id, ltd_slug="aaa", key="date_discovery_last_polled"
+    )
+    assert (now - stamped) < timedelta(minutes=5)
+
+
+@pytest.mark.asyncio
+async def test_tier_unparsable_edition_url_warning_is_capped(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """The unparsable-URL warning names a bounded sample, counted exactly.
+
+    ``aaa`` lists more unreadable URLs than
+    ``_MAX_RECORDED_EDITION_FAILURES`` ahead of one well-formed id: the
+    shape every edition of ``pipelines`` (2,938) would take if LTD
+    changed its URL scheme. The warning carries only the first
+    ``_MAX_RECORDED_EDITION_FAILURES`` URLs, in listing order, while
+    ``skipped_count`` stays the exact total, so one tick cannot emit a
+    multi-megabyte log line per project. The parsed id is still decided
+    on — edition 2 has no state row, so ``aaa`` enqueues — and ``aaa``
+    is still stamped polled.
+    """
+    now = datetime.now(tz=UTC)
+    unparsable_urls = [
+        f"{LTD_BASE}/editions/latest-{n}"
+        for n in range(_MAX_RECORDED_EDITION_FAILURES + 5)
+    ]
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-badurl-cap",
+            project_slugs=["aaa"],
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="aaa",
+        )
+
+    _stub_products(mock_discovery, ["aaa"])
+    _stub_edition_url_listing(
+        mock_discovery,
+        product_slug="aaa",
+        urls=[*unparsable_urls, f"{LTD_BASE}/editions/2"],
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["aaa"]
+
+    warnings = [e for e in captured if e["event"] == _UNPARSABLE_URLS_EVENT]
+    assert len(warnings) == 1
+    assert (
+        warnings[0]["unparsable_urls"]
+        == (unparsable_urls[:_MAX_RECORDED_EDITION_FAILURES])
+    )
+    assert warnings[0]["skipped_count"] == len(unparsable_urls)
+    assert warnings[0]["parsed_count"] == 1
+
+    stamped = await _read_polled_annotation(
+        org_id=org_id, ltd_slug="aaa", key="date_discovery_last_polled"
+    )
+    assert (now - stamped) < timedelta(minutes=5)
 
 
 # ---------------------------------------------------------------------------
@@ -2315,13 +2792,22 @@ async def test_tier_other_enqueues_for_stale_non_main_edition(
 ) -> None:
     """A non-main edition past the threshold — enqueue refresh.
 
-    Also asserts the queue_jobs row carries ``keeper_sync_run_id IS
-    NULL`` and the payload lacks ``run_id``.
+    ``main`` is stale too, but its state row records the ``main`` slug,
+    so tier_other leaves it out and the enqueue comes from the branch
+    edition alone. Also asserts the queue_jobs row carries
+    ``keeper_sync_run_id IS NULL`` and the payload lacks ``run_id``.
     """
     stale = datetime.now(tz=UTC) - timedelta(hours=2)
     async with db_session.begin():
         org_id, _ = await _seed_org(
             db_session, slug="ks-tier-other-1", project_slugs=["pipelines"]
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
         )
         # Branch edition (ltd_id=2): stale.
         await _seed_state(
@@ -2346,18 +2832,6 @@ async def test_tier_other_enqueues_for_stale_non_main_edition(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2366,6 +2840,7 @@ async def test_tier_other_enqueues_for_stale_non_main_edition(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -2392,11 +2867,25 @@ async def test_tier_other_skips_when_only_main_is_stale(
     db_session: AsyncSession,
     mock_discovery: respx.Router,
 ) -> None:
-    """``main`` editions belong to tier_main; tier_other ignores them."""
+    """``main`` editions belong to tier_main; tier_other ignores them.
+
+    tier_other never fetches an edition payload, so it recognises
+    ``main`` by the LTD slug its ``keeper_sync_state`` row records. It
+    needs nothing tier_main caches on the project's state row (this
+    project has no annotations at all), and an old ``main`` alone never
+    enqueues.
+    """
     stale = datetime.now(tz=UTC) - timedelta(hours=4)
     async with db_session.begin():
         org_id, _ = await _seed_org(
             db_session, slug="ks-tier-other-2", project_slugs=["pipelines"]
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
         )
         # Only main is stale.
         await _seed_state(
@@ -2421,17 +2910,79 @@ async def test_tier_other_skips_when_only_main_is_stale(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 5, 7, tzinfo=UTC),
+
+
+@pytest.mark.asyncio
+async def test_tier_other_reads_only_the_edition_url_listing(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """One LTD call per polled project: its edition URL list.
+
+    tier_other needs only each listed edition's LTD id (to read its
+    state row, which also names ``main`` by its LTD slug), so it never
+    fetches an edition payload. ``pipelines`` has a stale
+    branch edition and enqueues; every edition ``sqr-001`` lists is
+    fresh, so it does not. No edition resource is stubbed, so a
+    regression to following the URLs also shows up as an
+    ``/editions/<id>`` request.
+    """
+    now = datetime.now(tz=UTC)
+    stale = now - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-urls",
+            project_slugs=["pipelines", "sqr-001"],
+        )
+        for slug in ("pipelines", "sqr-001"):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+            )
+        for ltd_id, slug, synced in (
+            (1, "main", now),
+            (2, "branch-a", now),
+            (3, "branch-b", stale),
+            (10, "main", now),
+            (11, "branch-c", now),
+        ):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug=slug,
+                date_last_synced=synced,
+            )
+
+    _stub_products(mock_discovery, ["pipelines", "sqr-001"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[3, 2, 1]
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="sqr-001", edition_ids=[11, 10]
     )
 
     http_client = httpx.AsyncClient()
@@ -2441,14 +2992,19 @@ async def test_tier_other_skips_when_only_main_is_stale(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
-    assert (
-        get_jobs_by_name(
-            ctx["arq_queue"],
-            "keeper_sync_project",
-            queue_name=KEEPER_SYNC_QUEUE_NAME,
-        )
-        == []
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
     )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["pipelines"]
+    _assert_no_edition_fetches(mock_discovery)
+    assert sorted(_ltd_request_paths(mock_discovery)) == [
+        "/products/",
+        "/products/pipelines/editions/",
+        "/products/sqr-001/editions/",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2481,18 +3037,6 @@ async def test_tier_other_skips_edition_with_no_state(
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2501,6 +3045,7 @@ async def test_tier_other_skips_edition_with_no_state(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
     assert (
         get_jobs_by_name(
             ctx["arq_queue"],
@@ -2518,13 +3063,14 @@ async def test_tier_other_batches_edition_state_lookups(
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One ``list_for_org`` per project; no per-edition ``get`` calls.
+    """No per-edition ``get`` calls; edition state comes from one read.
 
     Issue #310: tier_other walks every non-``main`` edition LTD lists.
     With per-edition ``get`` the cost grew with edition count; the
-    batched read makes it constant per project. The fixture lists five
-    branch editions plus ``main`` so a regression to the old shape would
-    show up as ``get_calls == 5``.
+    batched read makes it constant (and, since issue #800, one read per
+    org per tick). The fixture lists five branch editions plus ``main``
+    so a regression to the old shape would show up as
+    ``get_calls == 5``.
     """
     fresh = datetime.now(tz=UTC)
     async with db_session.begin():
@@ -2563,25 +3109,6 @@ async def test_tier_other_batches_edition_state_lookups(
         product_slug="pipelines",
         edition_ids=[6, 5, 4, 3, 2, 1],
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    for edition_id, slug in (
-        (2, "branch-a"),
-        (3, "branch-b"),
-        (4, "branch-c"),
-        (5, "branch-d"),
-        (6, "branch-e"),
-    ):
-        _stub_edition(
-            mock_discovery,
-            edition_id=edition_id,
-            slug=slug,
-            date_rebuilt=datetime(2026, 5, 7, tzinfo=UTC),
-        )
 
     recorder = _install_state_store_recorder(monkeypatch)
     http_client = httpx.AsyncClient()
@@ -2591,6 +3118,7 @@ async def test_tier_other_batches_edition_state_lookups(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     assert (
         get_jobs_by_name(
@@ -2605,11 +3133,165 @@ async def test_tier_other_batches_edition_state_lookups(
     # :func:`_record_tier_polled` to merge with prior annotations
     # before stamping ``date_other_last_polled``. Two
     # ``list_for_org`` calls: one for the project-tombstone filter
-    # (issue #396) and one for the non-main edition staleness scan
-    # in :func:`_has_stale_non_main_edition`. The per-project
-    # edition-state cost stays independent of the branch count.
+    # (issue #396) and the org's one edition-state read that
+    # :func:`_tier_other_for_org` hoists out of its per-project loop
+    # (issue #800). The edition-state cost stays independent of the
+    # branch count.
     assert recorder.get_calls == 2
     assert recorder.list_for_org_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_tier_other_batches_edition_state_lookups_across_slugs(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One ``list_for_org(resource_type=edition)`` per tick, not per slug.
+
+    Issue #800: the per-project staleness scan read the listed
+    editions' state rows once per polled project, so a product whose
+    only edition is ``main`` (the common technote case) paid a query
+    just to discard its one row. The cron now loads the org's edition
+    rows once before the loop and checks each project in memory.
+    ``tech-a`` and ``tech-b`` list only a stale ``main``, which never
+    enqueues; ``pipelines`` has a stale branch edition, which does.
+    """
+    stale = datetime.now(tz=UTC) - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-batch-org",
+            project_slugs=["tech-a", "tech-b", "pipelines"],
+        )
+        for slug in ("tech-a", "tech-b", "pipelines"):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+            )
+        for ltd_id, slug in (
+            (1, "main"),
+            (2, "main"),
+            (3, "main"),
+            (4, "u-jsick-feature"),
+        ):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug=slug,
+                date_last_synced=stale,
+            )
+
+    _stub_products(mock_discovery, ["tech-a", "tech-b", "pipelines"])
+    for slug, edition_ids in (
+        ("tech-a", [1]),
+        ("tech-b", [2]),
+        ("pipelines", [4, 3]),
+    ):
+        _stub_editions_listing(
+            mock_discovery, product_slug=slug, edition_ids=edition_ids
+        )
+
+    recorder = _install_state_store_recorder(monkeypatch)
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["pipelines"]
+    # The acceptance criterion: exactly one
+    # ``list_for_org(resource_type=edition)`` per tier_other tick,
+    # regardless of how many in-scope projects the tick polls.
+    assert recorder.list_for_org_edition_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_tier_other_ignores_tombstoned_stale_edition(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstoned non-main edition is never treated as stale.
+
+    LTD still lists the edition, and its state row is past the refresh
+    threshold, but Docverse tombstoned it (issue #396 / PRD #332 user
+    story 17): re-syncing it would only reach ``sync_edition``'s
+    tombstone short-circuit, so tier_other must not enqueue for it.
+    """
+    stale = datetime.now(tz=UTC) - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-tomb-ed",
+            project_slugs=["pipelines"],
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_last_synced=datetime.now(tz=UTC),
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="u-jsick-feature",
+            date_last_synced=stale,
+        )
+        await _seed_tombstone(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            reason=TombstoneReason.lifecycle_delete,
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -2677,7 +3359,7 @@ async def test_tier_other_polls_only_hot_and_due_dormant_projects(
             },
         )
         # Stale branch edition state for hot and due so each
-        # ``_has_stale_non_main_edition`` call returns True and
+        # ``_has_stale_non_main_edition`` check returns True and
         # triggers an enqueue. Skip-proj's edition state would also
         # be stale, but the planner skips before LTD is even queried.
         for ltd_id in (10, 20, 30):
@@ -2712,24 +3394,6 @@ async def test_tier_other_polls_only_hot_and_due_dormant_projects(
             200, json={"editions": [f"{LTD_BASE}/editions/30"]}
         )
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=10,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=20,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=30,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2738,6 +3402,7 @@ async def test_tier_other_polls_only_hot_and_due_dormant_projects(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     # Acceptance: LTD HTTP fired exactly for the polled cohort.
     assert hot_listing.call_count == 1
@@ -2827,6 +3492,7 @@ async def test_tier_other_records_polled_annotation_on_ltd_error(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     async for session in db_session_dependency():
         async with session.begin():
@@ -2890,18 +3556,6 @@ async def test_tier_other_skips_tombstoned_project_slug(
     _stub_editions_listing(
         mock_discovery, product_slug="live-proj", edition_ids=[20, 10]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=10,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=20,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2910,6 +3564,7 @@ async def test_tier_other_skips_tombstoned_project_slug(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -2954,18 +3609,6 @@ async def test_tier_other_honours_scope_patterns_and_excludes(
     _stub_editions_listing(
         mock_discovery, product_slug="sqr-100", edition_ids=[2, 1]
     )
-    _stub_edition(
-        mock_discovery,
-        edition_id=1,
-        slug="main",
-        date_rebuilt=_FIXTURE_MAIN_DATE_REBUILT,
-    )
-    _stub_edition(
-        mock_discovery,
-        edition_id=2,
-        slug="u-jsick-feature",
-        date_rebuilt=datetime(2026, 4, 29, tzinfo=UTC),
-    )
 
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
@@ -2974,6 +3617,7 @@ async def test_tier_other_honours_scope_patterns_and_excludes(
     finally:
         await ctx["http_client"].aclose()
     assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
 
     children = get_jobs_by_name(
         ctx["arq_queue"],
@@ -2981,6 +3625,95 @@ async def test_tier_other_honours_scope_patterns_and_excludes(
         queue_name=KEEPER_SYNC_QUEUE_NAME,
     )
     assert [c.kwargs["payload"]["ltd_slug"] for c in children] == ["sqr-100"]
+
+
+@pytest.mark.asyncio
+async def test_tier_other_skips_unparsable_edition_url(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An edition URL with no trailing id costs that URL, not the org's tick.
+
+    ``aaa`` lists a URL :func:`parse_ltd_id` cannot read alongside two
+    well-formed ones. The tick logs one warning naming the org, the slug
+    and the URL, still scans the ids that did parse — branch edition 2
+    is stale, so ``aaa`` enqueues — and still stamps its polled
+    annotation. ``bbb``, later in the same scope, is still visited: a
+    raise on the URL would have dropped it for the tick.
+    """
+    now = datetime.now(tz=UTC)
+    stale = now - timedelta(hours=2)
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-other-badurl",
+            project_slugs=["aaa", "bbb"],
+        )
+        for slug in ("aaa", "bbb"):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_id=None,
+                ltd_slug=slug,
+            )
+        for ltd_id in (2, 4):
+            await _seed_state(
+                db_session,
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug="u-jsick-feature",
+                date_last_synced=stale,
+            )
+
+    _stub_products(mock_discovery, ["aaa", "bbb"])
+    _stub_edition_url_listing(
+        mock_discovery,
+        product_slug="aaa",
+        urls=[
+            f"{LTD_BASE}/editions/2",
+            _UNPARSABLE_EDITION_URL,
+            f"{LTD_BASE}/editions/1",
+        ],
+    )
+    _stub_editions_listing(
+        mock_discovery, product_slug="bbb", edition_ids=[4, 3]
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        with capture_logs() as captured:
+            result = await keeper_sync_tier_other(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+
+    children = get_jobs_by_name(
+        ctx["arq_queue"],
+        "keeper_sync_project",
+        queue_name=KEEPER_SYNC_QUEUE_NAME,
+    )
+    assert [c.kwargs["payload"]["ltd_slug"] for c in children] == [
+        "aaa",
+        "bbb",
+    ]
+
+    warnings = [e for e in captured if e["event"] == _UNPARSABLE_URLS_EVENT]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["tier"] == "other"
+    assert warnings[0]["org"] == "ks-tier-other-badurl"
+    assert warnings[0]["ltd_slug"] == "aaa"
+    assert warnings[0]["unparsable_urls"] == [_UNPARSABLE_EDITION_URL]
+
+    stamped = await _read_polled_annotation(
+        org_id=org_id, ltd_slug="aaa", key="date_other_last_polled"
+    )
+    assert (now - stamped) < timedelta(minutes=5)
 
 
 # ---------------------------------------------------------------------------
@@ -3136,8 +3869,8 @@ async def test_tier_cancel_mid_handoff_fails_the_orphaned_child(
     holds the slug's active-job mutex — so every tick and run skips the
     project — until ``keeper_sync_reaper``'s orphan sweep reaches it.
     Instead it fails at once with a ``CancelledError`` payload naming the
-    cron, read against the arq default timeout cron jobs run under, and
-    the slug is free for the next tick.
+    cron, read against the timeout the cron is registered with, and the
+    slug is free for the next tick.
     """
     async with db_session.begin():
         org_id, _ = await _seed_org(
@@ -3165,7 +3898,7 @@ async def test_tier_cancel_mid_handoff_fails_the_orphaned_child(
             assert row.errors["reason"] == "worker_shutdown"
             assert row.errors["job_function"] == "keeper_sync_tier_discovery"
             assert row.errors["timeout_seconds"] == (
-                ARQ_DEFAULT_JOB_TIMEOUT_SECONDS
+                tier_cron_timeout(Tier.discovery).total_seconds()
             )
             assert not await QueueJobStore(
                 session=session, logger=_logger()
@@ -3174,3 +3907,171 @@ async def test_tier_cancel_mid_handoff_fails_the_orphaned_child(
                 kind=JobKind.keeper_sync_project,
                 subject_label="pipelines",
             )
+
+
+@pytest.mark.asyncio
+async def test_tier_pass_cancelled_mid_scope_logs_how_far_it_got(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tier pass arq cancels logs one warning saying how far it got.
+
+    The pass holds no ``queue_jobs`` row of its own, so the log line is
+    its whole record. The first org finishes its one project; the second
+    is cancelled while LTD lists the editions of its second of three
+    projects, as a timeout or a rolling deploy would catch it. The
+    warning names the tier, the time the pass ran, the orgs it finished,
+    and the in-flight org's position in its scope, and the cancel still
+    reaches arq.
+    """
+    async with db_session.begin():
+        await _seed_org(
+            db_session, slug="ks-tier-cut-a", project_slugs=["aaa"]
+        )
+        await _seed_org(
+            db_session,
+            slug="ks-tier-cut-b",
+            project_slugs=["aaa", "bbb", "ccc"],
+        )
+    _stub_products(mock_discovery, ["aaa", "bbb", "ccc"])
+    _stub_editions_listing(mock_discovery, product_slug="aaa", edition_ids=[1])
+    hang = HangUntilCancelled()
+    mock_discovery.get(f"{LTD_BASE}/products/bbb/editions/").mock(
+        side_effect=hang
+    )
+    ctx = _make_ctx(httpx.AsyncClient())
+
+    with capture_logs() as captured:
+        task = asyncio.create_task(keeper_sync_tier_other(ctx))
+        await cancel_when_reached(task, hang.reached)
+    await ctx["http_client"].aclose()
+
+    cancelled = [
+        e for e in captured if e["event"] == "Keeper-sync tier pass cancelled"
+    ]
+    assert len(cancelled) == 1
+    event = cancelled[0]
+    assert event["log_level"] == "warning"
+    assert event["tier"] == "other"
+    assert event["reason"] == "worker_shutdown"
+    assert event["elapsed_seconds"] >= 0
+    assert event["timeout_seconds"] == (
+        tier_cron_timeout(Tier.other).total_seconds()
+    )
+    assert event["orgs_completed"] == 1
+    assert event["orgs_total"] == 2
+    assert event["org"] == "ks-tier-cut-b"
+    assert event["projects_visited"] == 1
+    assert event["projects_total"] == 3
+    assert event["ltd_slug"] == "bbb"
+    assert not any(
+        e["event"] == "Keeper-sync tier pass complete" for e in captured
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier_cancel_log_failure_still_propagates_the_cancel(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A failure while logging a tier pass's cancel never replaces it.
+
+    The warning is the cancelled pass's whole record, but rendering it
+    runs every structlog processor (and any Sentry hook), and one of
+    those raising must not swap the ``CancelledError`` for an unrelated
+    exception: arq would record the pass failed with the wrong
+    traceback. The failure is logged with its traceback instead and the
+    original cancel still reaches arq.
+    """
+    async with db_session.begin():
+        await _seed_org(
+            db_session, slug="ks-tier-cut-log", project_slugs=["aaa"]
+        )
+    _stub_products(mock_discovery, ["aaa"])
+    hang = HangUntilCancelled()
+    mock_discovery.get(f"{LTD_BASE}/products/aaa/editions/").mock(
+        side_effect=hang
+    )
+    ctx = _make_ctx(httpx.AsyncClient())
+
+    def _fail_on_cancel_warning(
+        _logger: WrappedLogger, _method: str, event_dict: EventDict
+    ) -> EventDict:
+        if event_dict["event"] == "Keeper-sync tier pass cancelled":
+            msg = "log processor failed"
+            raise RuntimeError(msg)
+        return event_dict
+
+    with capture_logs(processors=[_fail_on_cancel_warning]) as captured:
+        task = asyncio.create_task(keeper_sync_tier_other(ctx))
+        await cancel_when_reached(task, hang.reached)
+    await ctx["http_client"].aclose()
+
+    failures = [
+        e
+        for e in captured
+        if e["event"] == "Failed to log the tier pass's cancellation"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["log_level"] == "error"
+    assert failures[0]["exc_info"] is True
+    assert failures[0]["tier"] == "other"
+
+
+@pytest.mark.asyncio
+async def test_tier_cancel_propagates_when_every_log_call_fails(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A cancel still escapes a pass whose logging fails on every call.
+
+    The fallback that reports a failed cancellation log runs through the
+    same structlog processors as the warning it reports on, so a
+    processor or Sentry hook that fails on *every* event raises again
+    from the fallback. That second failure is swallowed too: the
+    ``CancelledError`` is the only exception that may leave the pass, or
+    arq records it failed with an unrelated traceback and no cancel.
+    Logging breaks just as the cancel lands, so the pass reaches its
+    hang the normal way.
+    """
+    async with db_session.begin():
+        await _seed_org(
+            db_session, slug="ks-tier-cut-log-all", project_slugs=["aaa"]
+        )
+    _stub_products(mock_discovery, ["aaa"])
+    hang = HangUntilCancelled()
+    mock_discovery.get(f"{LTD_BASE}/products/aaa/editions/").mock(
+        side_effect=hang
+    )
+    ctx = _make_ctx(httpx.AsyncClient())
+    logging_broken = False
+    attempted: list[str] = []
+
+    def _fail_every_event(
+        _logger: WrappedLogger, _method: str, event_dict: EventDict
+    ) -> EventDict:
+        if logging_broken:
+            attempted.append(event_dict["event"])
+            msg = "log processor failed"
+            raise RuntimeError(msg)
+        return event_dict
+
+    async def _break_logging() -> None:
+        nonlocal logging_broken
+        logging_broken = True
+
+    with capture_logs(processors=[_fail_every_event]):
+        task = asyncio.create_task(keeper_sync_tier_other(ctx))
+        # Asserts the ``CancelledError``, and nothing else, leaves the task.
+        await cancel_when_reached(
+            task, hang.reached, before_cancel=_break_logging
+        )
+    await ctx["http_client"].aclose()
+
+    assert attempted == [
+        "Keeper-sync tier pass cancelled",
+        "Failed to log the tier pass's cancellation",
+    ]

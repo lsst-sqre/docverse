@@ -39,6 +39,7 @@ __all__ = [
     "derive_edition_source_prefix",
     "derive_synced_build_git_ref",
     "derive_tracking_source",
+    "is_ltd_main",
     "map_edition_tracking",
     "tracking_reads_live_refs",
 ]
@@ -225,7 +226,7 @@ def derive_edition_kind(
     EditionKindDerivation
         The derived kind and where it came from.
     """
-    if ltd_edition.slug == LTD_MAIN_SLUG:
+    if is_ltd_main(ltd_edition.slug):
         return EditionKindDerivation(
             kind=EditionKind.main, source=KindDerivationSource.ltd_main
         )
@@ -281,6 +282,23 @@ def derive_edition_slug(ltd_slug: str) -> str:
     return ltd_slug
 
 
+def is_ltd_main(ltd_edition_slug: str) -> bool:
+    """Return whether an LTD edition slug names the product's ``main``.
+
+    This is the single shared definition of LTD's ``main`` edition: true
+    exactly when :func:`derive_edition_slug` folds the slug onto
+    Docverse's default edition. Every keeper-sync check that asks
+    "is this ``main``?" of an LTD slug goes through it — this module's
+    kind, tracking, and source-prefix derivations, the keeper-sync
+    service (its ``main``-first walk order and its state-row lookup of
+    ``main``'s LTD id), the ``tier_main`` cron (its cached-pointer check
+    and edition URL walk), and the ``tier_other`` cron (which reads the
+    slug off the ``keeper_sync_state`` rows it already fetches) — so the
+    callers cannot disagree about which edition is ``main``.
+    """
+    return derive_edition_slug(ltd_edition_slug) == DOCVERSE_MAIN_SLUG
+
+
 def derive_edition_dates(ltd_edition: LtdEdition) -> tuple[datetime, datetime]:
     """Derive a synced edition's ``(date_created, date_updated)`` from LTD.
 
@@ -333,7 +351,7 @@ def derive_edition_source_prefix(
         that is not ``<product>/builds/<build-slug>`` does not locate a
         product root at all.
     """
-    if derive_edition_slug(ltd_edition_slug) == DOCVERSE_MAIN_SLUG:
+    if is_ltd_main(ltd_edition_slug):
         return None
     segments = bucket_root_dir.strip("/").split("/")
     if len(segments) < 3 or segments[-2] != _LTD_BUILDS_SEGMENT:
@@ -432,7 +450,7 @@ def _divergent_ltd_main_ref(
     """
     if (
         default_branch is None
-        or edition.slug != LTD_MAIN_SLUG
+        or not is_ltd_main(edition.slug)
         or edition.mode != LtdEditionMode.git_refs
         or not edition.tracked_refs
     ):

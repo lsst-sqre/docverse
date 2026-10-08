@@ -12,6 +12,7 @@ distinguish "LTD doesn't have this any more" (soft-deletion path) from
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, override
 
 import httpx
@@ -51,6 +52,18 @@ __all__ = [
 #: (``Config.keeper_sync_job_timeout_seconds``, an hour by default)
 #: remains the outer bound on a job that keeps being throttled.
 _MAX_BACKOFF_SECONDS = 300.0
+
+#: Most edition GETs `LtdClient.list_editions_for_product` keeps in
+#: flight at once.
+#:
+#: The legacy API has no bulk edition endpoint, so listing a product
+#: costs one GET per edition. Following them one at a time made
+#: ``pipelines`` (about 2,900 editions) a two-minute call, which pushed
+#: the keeper-sync tier crons past arq's cron timeout. Eight in flight
+#: cuts that close to eightfold while staying a polite load on a single
+#: LTD Keeper deployment. Deliberately a constant rather than a
+#: configuration setting: it bounds load on LTD, not on Docverse.
+_EDITION_FETCH_CONCURRENCY = 8
 
 #: Cap on the response body bytes carried into Sentry events. LTD error
 #: bodies can be arbitrarily large (HTML error pages, full JSON payloads);
@@ -216,14 +229,37 @@ class LtdClient:
 
         The legacy API returns ``{"editions": [<edition_url>, ...]}``;
         this helper follows each URL and validates the result so the
-        caller gets a flat list of :class:`LtdEdition` models.
+        caller gets a flat list of :class:`LtdEdition` models, in the
+        URL list's order whatever order the GETs complete in.
+
+        The edition GETs run concurrently, at most
+        :data:`_EDITION_FETCH_CONCURRENCY` in flight at once, each
+        through the same retrying :meth:`_get_json` path as every other
+        call. The first one to fail cancels the rest, and its error is
+        raised unchanged (an :class:`LtdNotFoundError` or
+        :class:`LtdClientError`, never an exception group), as the
+        one-at-a-time walk this replaces did.
         """
         edition_urls = await self.list_edition_urls_for_product(product_slug)
-        results: list[LtdEdition] = []
-        for url in edition_urls:
-            edition_payload = await self._get_json(url)
-            results.append(LtdEdition.model_validate(edition_payload))
-        return results
+        semaphore = asyncio.Semaphore(_EDITION_FETCH_CONCURRENCY)
+
+        async def _fetch(url: str) -> LtdEdition:
+            async with semaphore:
+                return await self.get_edition_by_url(url)
+
+        tasks = [asyncio.create_task(_fetch(url)) for url in edition_urls]
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            # ``gather`` raises the first failure but leaves its siblings
+            # running, so cancel them here, then wait for them to settle
+            # so none outlives this call or logs an unretrieved
+            # exception. The same teardown runs when this call itself is
+            # cancelled (an arq job timeout or worker shutdown).
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def list_edition_urls_for_product(
         self, product_slug: str
@@ -232,10 +268,13 @@ class LtdClient:
 
         The cheap variant of :meth:`list_editions_for_product`: one HTTP
         call returns every edition's resource URL, but this helper does
-        not follow them. Used by ``keeper_sync_tier_main`` where we
-        want to walk the URL list looking for the ``main`` edition
-        without paying a round-trip per non-``main`` edition along the
-        way.
+        not follow them. Each URL carries its edition's LTD id
+        (:func:`~docverse_server.storage.ltd.models.parse_ltd_id`), so a
+        caller that needs only ids should list URLs, not editions.
+        ``keeper_sync_tier_main`` walks the URL list looking for the
+        ``main`` edition without paying a round-trip per non-``main``
+        edition along the way, and ``keeper_sync_tier_discovery`` and
+        ``keeper_sync_tier_other`` decide from the ids alone.
         """
         payload = await self._get_json(
             self._url(f"/products/{product_slug}/editions/")

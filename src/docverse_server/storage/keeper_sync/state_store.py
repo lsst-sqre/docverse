@@ -76,8 +76,8 @@ class KeeperSyncState(BaseModel):
     Documented ``annotations`` keys
     -------------------------------
     Project-resource rows
-        ``main_edition_url`` / ``main_edition_ltd_id`` — the resolved
-        LTD ``main`` edition pointer cached by
+        ``main_edition_url`` — the resolved LTD ``main`` edition
+        pointer cached by
         :func:`docverse_server.worker.functions.keeper_sync._tier_main_for_org`
         so subsequent ticks issue one ``GET /editions/<id>`` instead of
         walking the project's edition URL list.
@@ -283,14 +283,14 @@ class KeeperSyncStateStore:
         worker functions used to make: callers fetch the org's rows
         once and resolve presence / staleness via an in-memory dict
         keyed on ``ltd_id``. Pass ``ltd_ids`` to scope the query to a
-        known LTD-side id set (used by tier_other so the WHERE clause
-        only spans editions LTD currently lists). Pass ``docverse_ids``
-        to scope to a known Docverse-side id set (used by the
-        per-project read paths whose scope is "this project's
-        editions" — ``keeper_sync_state`` has no ``project_id``
-        column, so the Docverse edition ids are the natural project
-        scope). Passing an empty ``ltd_ids`` or ``docverse_ids``
-        returns ``[]`` without hitting the database.
+        known LTD-side id set (used by the keeper-sync service so the
+        WHERE clause only spans editions LTD currently lists). Pass
+        ``docverse_ids`` to scope to a known Docverse-side id set (used
+        by the per-project read paths whose scope is "this project's
+        editions" — ``keeper_sync_state`` has no ``project_id`` column,
+        so the Docverse edition ids are the natural project scope).
+        Passing an empty ``ltd_ids`` or ``docverse_ids`` returns ``[]``
+        without hitting the database.
 
         Tombstoned rows are filtered out by default so the
         convergence and short-circuit callers see a tombstoned LTD
