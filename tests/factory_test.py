@@ -178,6 +178,77 @@ async def test_factory_create_ltd_client_without_http_raises(
         factory.create_ltd_client()
 
 
+def _record_gets(paths: list[str]) -> httpx.MockTransport:
+    """Record each request's path and answer it with an empty edition list."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"editions": []})
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.mark.asyncio
+async def test_factory_ltd_client_gets_over_the_ltd_http_client(
+    db_session: AsyncSession,
+) -> None:
+    """LTD API calls go over the worker's connection-capped LTD client.
+
+    The worker opens one LTD client per process with a small connection
+    cap, so its sync jobs and tier crons together cannot open a
+    hundred connections to LTD Keeper at once (#801). An ``LtdClient``
+    built over the shared client instead would put every edition
+    listing back on its 100-connection pool.
+    """
+    shared_gets: list[str] = []
+    ltd_gets: list[str] = []
+    async with (
+        httpx.AsyncClient(transport=_record_gets(shared_gets)) as http_client,
+        httpx.AsyncClient(transport=_record_gets(ltd_gets)) as ltd_http_client,
+    ):
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            http_client=http_client,
+            ltd_http_client=ltd_http_client,
+            default_queue_name="docverse:queue",
+        )
+        client = factory.create_ltd_client(base_url="https://ltd.example")
+
+        await client.list_edition_urls_for_product("pipelines")
+
+    assert factory.ltd_http_client is ltd_http_client
+    assert ltd_gets == ["/products/pipelines/editions/"]
+    assert shared_gets == []
+
+
+@pytest.mark.asyncio
+async def test_factory_ltd_client_falls_back_to_the_shared_client(
+    db_session: AsyncSession,
+) -> None:
+    """Without an LTD client, LTD API calls go over the shared client.
+
+    The API process and directly constructed factories (tests, scripts)
+    open no LTD client of their own and keep calling LTD as before.
+    """
+    shared_gets: list[str] = []
+    async with httpx.AsyncClient(
+        transport=_record_gets(shared_gets)
+    ) as http_client:
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            http_client=http_client,
+            default_queue_name="docverse:queue",
+        )
+        client = factory.create_ltd_client(base_url="https://ltd.example")
+
+        await client.list_edition_urls_for_product("pipelines")
+
+    assert factory.ltd_http_client is http_client
+    assert shared_gets == ["/products/pipelines/editions/"]
+
+
 @pytest.mark.asyncio
 async def test_factory_create_ltd_s3_source_returns_unopened(
     db_session: AsyncSession,

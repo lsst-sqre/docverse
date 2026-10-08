@@ -294,9 +294,10 @@ def create_copy_http_client(*, upload_concurrency: int) -> httpx.AsyncClient:
     """Build the worker's dedicated HTTP client for build-content copies.
 
     Presigned PUTs of copied build content go over this client so that
-    a copy burst neither queues behind nor starves the discovery, LTD
-    API, GitHub, Cloudflare KV and purge calls on the shared client. The
-    caller owns its lifetime: :func:`shutdown` closes it.
+    a copy burst neither queues behind nor starves the discovery,
+    GitHub, Cloudflare KV and purge calls on the shared client, or the
+    LTD API calls on :func:`create_ltd_http_client`'s. The caller owns
+    its lifetime: :func:`shutdown` closes it.
 
     Parameters
     ----------
@@ -310,35 +311,117 @@ def create_copy_http_client(*, upload_concurrency: int) -> httpx.AsyncClient:
     )
 
 
+LTD_HTTP_MAX_CONNECTIONS = 16
+"""Most connections a worker process holds open to LTD Keeper at once.
+
+``LtdClient.list_editions_for_product`` keeps up to eight edition GETs
+in flight per call, but that bound is per call, not per process: over
+the shared client's 100-connection pool, the three keeper-sync tier
+crons plus up to ``keeper_sync_max_jobs`` sync jobs could hold about a
+hundred concurrent GETs, and open about a hundred fresh connections,
+against the one LTD Keeper deployment. On roundtable-prod on 2026-10-08
+every hourly ``tier_other`` tick then logged hundreds of LTD
+``ConnectTimeout`` retries and failed a few ``keeper_sync_project`` jobs
+outright (#801). Sixteen lets two edition listings run at full fan-out
+while every other LTD call queues for a connection (see
+:data:`LTD_HTTP_TIMEOUT`). A constant rather than configuration, like
+the per-call fan-out: it bounds the load on LTD, not on Docverse.
+"""
+
+LTD_HTTP_KEEPALIVE_EXPIRY_SECONDS = 60.0
+"""Seconds an idle LTD-client connection stays open for reuse.
+
+Reused connections matter as much as the cap: the 2026-10-08 failures
+were connect timeouts, so the fewer handshakes a burst of edition GETs
+makes, the fewer can time out. A minute keeps the pool warm across the
+gaps between a tick's jobs, where httpx's default of 5 s would re-dial
+LTD for each one; a quiet worker still lets its connections go.
+"""
+
+LTD_HTTP_TIMEOUT = httpx.Timeout(5.0, pool=None)
+"""Timeouts of the HTTP client that carries LTD Keeper API calls.
+
+``connect``, ``read`` and ``write`` keep the shared client's 5 s, so an
+LTD call that reaches a connection behaves exactly as before. ``pool``
+is ``None``: a GET past :data:`LTD_HTTP_MAX_CONNECTIONS` waits for a
+free connection instead of raising ``httpx.PoolTimeout``, which
+``LtdClient``'s retry loop would otherwise spend an attempt on. Every
+LTD GET reads its whole response, so connections return to the pool
+promptly, and the calling arq job's own timeout bounds the wait.
+"""
+
+
+def ltd_http_limits() -> httpx.Limits:
+    """Return the LTD client's connection pool limits.
+
+    Every connection the pool may open is also kept alive, for the
+    reason :func:`copy_http_limits` gives: httpcore closes an idle
+    connection whenever the pool holds more connections in total than
+    ``max_keepalive_connections``, so a smaller keepalive limit would
+    re-dial LTD after almost every GET of a burst.
+
+    Returns
+    -------
+    httpx.Limits
+        :data:`LTD_HTTP_MAX_CONNECTIONS` connections, all of them kept
+        alive for :data:`LTD_HTTP_KEEPALIVE_EXPIRY_SECONDS`.
+    """
+    return httpx.Limits(
+        max_connections=LTD_HTTP_MAX_CONNECTIONS,
+        max_keepalive_connections=LTD_HTTP_MAX_CONNECTIONS,
+        keepalive_expiry=LTD_HTTP_KEEPALIVE_EXPIRY_SECONDS,
+    )
+
+
+def create_ltd_http_client() -> httpx.AsyncClient:
+    """Build the worker's dedicated HTTP client for LTD Keeper API calls.
+
+    Every ``LtdClient`` a worker job or tier cron builds goes over this
+    client, so the process's concurrent LTD GETs are capped at
+    :data:`LTD_HTTP_MAX_CONNECTIONS` however many jobs list editions at
+    once, and an LTD burst neither queues behind nor starves the
+    discovery, GitHub, Cloudflare KV and purge calls on the shared
+    client. The caller owns its lifetime: :func:`shutdown` closes it.
+    """
+    return httpx.AsyncClient(
+        timeout=LTD_HTTP_TIMEOUT, limits=ltd_http_limits()
+    )
+
+
 def initialize_worker_http_clients(
     ctx: dict[str, Any],
-) -> tuple[httpx.AsyncClient, httpx.AsyncClient]:
-    """Open this worker process's two HTTP clients and record them in ctx.
+) -> tuple[httpx.AsyncClient, httpx.AsyncClient, httpx.AsyncClient]:
+    """Open this worker process's three HTTP clients and record them in ctx.
 
-    ``ctx["http_client"]`` is the shared client (httpx defaults) and
+    ``ctx["http_client"]`` is the shared client (httpx defaults),
     ``ctx["copy_http_client"]`` the build-copy client from
     :func:`create_copy_http_client`, sized from
-    ``keeper_sync_upload_concurrency`` whichever pool is starting: the
-    pools share :func:`_startup`, only keeper-sync jobs copy, and the
-    copy client opens no connection until a copy uses it.
+    ``keeper_sync_upload_concurrency`` whichever pool is starting, and
+    ``ctx["ltd_http_client"]`` the connection-capped LTD Keeper client
+    from :func:`create_ltd_http_client`. Every pool opens all three,
+    since the pools share :func:`_startup`, but only keeper-sync jobs
+    and crons copy or call LTD, and neither dedicated client opens a
+    connection until one of those uses it.
 
     Split out of :func:`_startup`, like :func:`initialize_worker_db_pool`,
     so the clients a worker actually ships with are reachable without
     standing up Redis, Alembic and the metrics event manager.
-    :func:`shutdown` closes both.
+    :func:`shutdown` closes all three.
 
     Returns
     -------
-    tuple of (httpx.AsyncClient, httpx.AsyncClient)
-        The shared client and the copy client.
+    tuple of (httpx.AsyncClient, httpx.AsyncClient, httpx.AsyncClient)
+        The shared client, the copy client and the LTD client.
     """
     http_client = httpx.AsyncClient()
     copy_http_client = create_copy_http_client(
         upload_concurrency=config.keeper_sync_upload_concurrency
     )
+    ltd_http_client = create_ltd_http_client()
     ctx["http_client"] = http_client
     ctx["copy_http_client"] = copy_http_client
-    return http_client, copy_http_client
+    ctx["ltd_http_client"] = ltd_http_client
+    return http_client, copy_http_client, ltd_http_client
 
 
 async def initialize_worker_ltd_s3_source(
@@ -507,6 +590,7 @@ class WorkerFactoryBuilder:
         encryptor: CredentialEncryptor,
         http_client: httpx.AsyncClient,
         copy_http_client: httpx.AsyncClient | None = None,
+        ltd_http_client: httpx.AsyncClient | None = None,
         arq_queue: ArqQueue,
         discovery: DiscoveryClient,
         github_app_id: int | None,
@@ -537,6 +621,12 @@ class WorkerFactoryBuilder:
         # copy build content need not build one; a per-job factory then
         # copies over ``http_client`` instead.
         self._copy_http_client = copy_http_client
+        # Process-lifetime and owned by ``shutdown``, like
+        # ``copy_http_client``, and optional for the same reason: test
+        # ctxs need not build one, and their per-job factories then call
+        # LTD over ``http_client``. Shared so the connection cap holds
+        # across every job and tier cron in the process (#801).
+        self._ltd_http_client = ltd_http_client
         self._arq_queue = arq_queue
         self._discovery = discovery
         self._github_app_id = github_app_id
@@ -626,6 +716,7 @@ class WorkerFactoryBuilder:
             credential_encryptor=self._encryptor,
             http_client=self._http_client,
             copy_http_client=self._copy_http_client,
+            ltd_http_client=self._ltd_http_client,
             arq_queue=self._arq_queue,
             discovery=self._discovery,
             github_app_id=self._github_app_id,
@@ -707,7 +798,9 @@ async def _startup(
         retired_key=retired_key,
     )
 
-    http_client, copy_http_client = initialize_worker_http_clients(ctx)
+    http_client, copy_http_client, ltd_http_client = (
+        initialize_worker_http_clients(ctx)
+    )
     # One per worker process, like the LTD source opened from it: every
     # S3 client the process opens — the LTD source's and each build
     # copy's destination store's — comes from this session, so botocore
@@ -733,7 +826,7 @@ async def _startup(
         default_queue_name=config.arq_queue_name,
     )
 
-    # ``arq_queue``, the two HTTP clients, the LTD source and the object
+    # ``arq_queue``, the three HTTP clients, the LTD source and the object
     # store cache stay in ctx because ``shutdown`` owns their teardown.
     # The factory builder captures them by reference, so worker functions
     # never need to look them up directly.
@@ -742,6 +835,7 @@ async def _startup(
         encryptor=encryptor,
         http_client=http_client,
         copy_http_client=copy_http_client,
+        ltd_http_client=ltd_http_client,
         arq_queue=arq_queue,
         discovery=discovery,
         github_app_id=config.github_app_id,
@@ -860,6 +954,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
         await objectstore_cache.aclose()
     await ctx["http_client"].aclose()
     await ctx["copy_http_client"].aclose()
+    await ctx["ltd_http_client"].aclose()
     ltd_s3_source = ctx.get("ltd_s3_source")
     if ltd_s3_source is not None:
         await ltd_s3_source.close()
