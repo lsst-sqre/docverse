@@ -24,6 +24,7 @@ from docverse_server.metrics import (
     GitHubWebhookReceivedEvent,
     HttpMethod,
     HttpStatusClass,
+    KeeperSyncPushCheckEvent,
 )
 
 
@@ -255,3 +256,31 @@ def test_github_webhook_received_fields() -> None:
         assert not isinstance(fields[required], list)
     # Every union member must still be one InfluxDB can store.
     GitHubWebhookReceivedEvent.validate_structure()
+
+
+def test_keeper_sync_push_check_fields() -> None:
+    """``keeper_sync_push_check`` is a project-scoped event per pushed ref.
+
+    One point per stamped ref ``tier_main`` visits: the org and project
+    the shared base carries, the ref, what the visit found, whether it
+    enqueued the project's sync, and the time from the push to that
+    enqueue. ``push_lag`` is nullable because only an enqueue has one;
+    every other field is always present.
+    """
+    assert issubclass(KeeperSyncPushCheckEvent, DocverseEventBase)
+    fields = _avro_field_types(KeeperSyncPushCheckEvent)
+
+    assert list(fields) == [
+        "organization",
+        "project",
+        "github_ref",
+        "outcome",
+        "enqueued",
+        "push_lag",
+    ]
+    assert isinstance(fields["push_lag"], list)
+    assert "null" in fields["push_lag"]
+    for required in ("github_ref", "outcome", "enqueued"):
+        assert not isinstance(fields[required], list)
+    # Every union member must be one InfluxDB can store.
+    KeeperSyncPushCheckEvent.validate_structure()

@@ -235,6 +235,8 @@ class KeeperSyncProjectStatus(_KeeperSyncProjectStatusBase):
             in_scope=result.in_scope,
             project_state=result.project_state,
             tier_status=result.tier_status,
+            in_push_window=result.in_push_window,
+            pushed_refs=result.pushed_refs,
             main_edition=main_edition,
             edition_diff=result.edition_diff,
         )

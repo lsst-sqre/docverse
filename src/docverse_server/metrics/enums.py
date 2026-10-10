@@ -16,6 +16,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from docverse.models import EditionKind, OrgRole, PrincipalType
     from docverse_server.domain.conditional_get import PreconditionKind
+    from docverse_server.services.keeper_sync.push_hints import (
+        PushCheckOutcome,
+    )
 
 __all__ = [
     "ConditionalGetEndpoint",
@@ -24,6 +27,7 @@ __all__ = [
     "EditionPublishTrigger",
     "HttpMethod",
     "HttpStatusClass",
+    "KeeperSyncPushCheckOutcome",
     "LifecycleAction",
     "LifecycleActionTrigger",
     "LifecycleReapAction",
@@ -442,3 +446,48 @@ class WebhookOutcome(StrEnum):
     header. gidgethub verifies the signature before parsing, so an
     unsigned request is :attr:`invalid_signature`, not this.
     """
+
+
+class KeeperSyncPushCheckOutcome(StrEnum):
+    """What ``tier_main``'s visit to one pushed ref found.
+
+    Recorded on ``keeper_sync_push_check``, one per stamped ref a
+    ``tier_main`` tick visits (PRD #803). Mirrors
+    :class:`~docverse_server.services.keeper_sync.push_hints.PushCheckOutcome`
+    value-for-value; the emission site maps the domain enum to this one
+    so the published Avro schema does not move when the check's
+    internals do (SQR-112 D4). A new outcome is appended, so every
+    existing symbol keeps its index in the Avro enum.
+    """
+
+    new_edition = "new_edition"
+    """No synced edition tracks the ref, and LTD lists one keeper-sync
+    has not seen; the project's sync is called for."""
+
+    rebuilt = "rebuilt"
+    """LTD rebuilt the ref's edition since keeper-sync last synced it;
+    the project's sync is called for."""
+
+    unchanged = "unchanged"
+    """The ref's edition is as keeper-sync last synced it."""
+
+    expired = "expired"
+    """The ref's window passed without a sync; its stamp is pruned."""
+
+    not_found = "not_found"
+    """No synced edition tracks the ref, and LTD lists nothing new."""
+
+    error = "error"
+    """LTD failed to answer; the stamp is kept for the next tick."""
+
+    @classmethod
+    def from_domain(
+        cls, outcome: PushCheckOutcome
+    ) -> KeeperSyncPushCheckOutcome:
+        """Map ``tier_main``'s :class:`PushCheckOutcome`.
+
+        Values are identical, so this is a straight value lookup; keeping
+        it explicit makes a divergence a reviewable edit rather than a
+        silent schema break.
+        """
+        return cls(outcome.value)

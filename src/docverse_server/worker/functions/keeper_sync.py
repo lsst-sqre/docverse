@@ -64,7 +64,12 @@ from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.queue import QueueJob
 from docverse_server.factory import Factory
-from docverse_server.metrics import BuildContentCopiedEvent, DocverseEvents
+from docverse_server.metrics import (
+    BuildContentCopiedEvent,
+    DocverseEvents,
+    KeeperSyncPushCheckEvent,
+    KeeperSyncPushCheckOutcome,
+)
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
 )
@@ -2709,8 +2714,10 @@ async def _tier_main_for_org(
     its window passes, and an expired ref is pruned even once the
     project is dormant again. The ``main`` check and the pushed refs
     share one enqueue per project, and the stamps are settled afterwards
-    (:func:`_settle_pushed_refs`). With the hot path off, the stamps are
-    neither read nor written, and count for nothing in the gate.
+    (:func:`_settle_pushed_refs`), which publishes one
+    ``keeper_sync_push_check`` metrics event per visited ref. With the hot
+    path off, the stamps are neither read nor written, and count for
+    nothing in the gate.
     """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
@@ -2808,6 +2815,7 @@ async def _tier_main_for_org(
                 enqueued_at=enqueued_at,
                 now=now,
                 window=push_window,
+                events=ctx.get("events"),
                 logger=logger,
             )
     return enqueued
@@ -3088,9 +3096,10 @@ async def _settle_pushed_refs(
     enqueued_at: datetime | None,
     now: datetime,
     window: timedelta,
+    events: DocverseEvents | None,
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
-    """Write a project's pushed-ref visit back to its state row and log it.
+    """Write a project's pushed-ref visit back to its state row and report it.
 
     Once the project's sync is enqueued (at ``enqueued_at``), every ref
     whose outcome called for it is cleared, and its push-to-enqueue lag
@@ -3101,6 +3110,10 @@ async def _settle_pushed_refs(
     :func:`settle_pushed_refs`, so a push stamped since the visit read
     the row keeps its stamp, and the write is skipped when nothing is
     cleared or pruned.
+
+    Each visited ref is then logged and published as one
+    ``keeper_sync_push_check`` event (:func:`_publish_push_check`), after
+    the write, so the event reports what the tick settled.
     """
     cleared = {
         check.ref: check.pushed_at
@@ -3127,6 +3140,12 @@ async def _settle_pushed_refs(
                     ),
                 )
     for check in checks:
+        enqueued = check.ref in cleared
+        push_lag = (
+            enqueued_at - check.pushed_at
+            if enqueued_at is not None and enqueued
+            else None
+        )
         logger.info(
             "Tier-main: checked pushed ref",
             org=org.slug,
@@ -3134,19 +3153,57 @@ async def _settle_pushed_refs(
             github_ref=check.ref,
             outcome=check.outcome.value,
             pushed_at=check.pushed_at.isoformat(),
-            enqueued=check.ref in cleared,
+            enqueued=enqueued,
         )
-        if enqueued_at is not None and check.ref in cleared:
+        if push_lag is not None:
             logger.info(
                 "Tier-main: enqueued project sync for pushed ref",
                 org=org.slug,
                 project=ltd_slug,
                 github_ref=check.ref,
                 outcome=check.outcome.value,
-                push_lag_seconds=round(
-                    (enqueued_at - check.pushed_at).total_seconds(), 1
-                ),
+                push_lag_seconds=round(push_lag.total_seconds(), 1),
             )
+        await _publish_push_check(
+            events=events,
+            event=KeeperSyncPushCheckEvent(
+                organization=org.slug,
+                project=ltd_slug,
+                github_ref=check.ref,
+                outcome=KeeperSyncPushCheckOutcome.from_domain(check.outcome),
+                enqueued=enqueued,
+                push_lag=push_lag,
+            ),
+            logger=logger,
+        )
+
+
+async def _publish_push_check(
+    *,
+    events: DocverseEvents | None,
+    event: KeeperSyncPushCheckEvent,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Publish one ``keeper_sync_push_check`` event, best-effort.
+
+    Skips silently when the worker has no metrics events (tests that do
+    not ask for them). A failed publish is sent to Sentry and logged,
+    and never raised: the tick has already enqueued and settled the
+    project, and an exception here would abandon the org's remaining
+    projects for a metrics hiccup.
+    """
+    if events is None:
+        return
+    try:
+        await events.keeper_sync_push_check.publish(event)
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
+        logger.exception(
+            "Tier-main: failed to publish pushed ref check",
+            org=event.organization,
+            project=event.project,
+            github_ref=event.github_ref,
+        )
 
 
 async def _tier_discovery_for_org(
