@@ -187,6 +187,15 @@ _LEGACY_MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
 #: (:func:`_list_edition_ltd_ids`) at the same size, for the same reason.
 _MAX_RECORDED_EDITION_FAILURES = 20
 
+#: Most editions ``tier_main``'s pushed-ref fallback fetches from a
+#: project's LTD edition listing per tick, to see which ref each one
+#: tracks (:meth:`_PushedRefChecker._unseen_editions`). Only editions
+#: keeper-sync has no state row for are fetched, newest (highest LTD id)
+#: first: the edition a push's CI just made LTD create is the newest, and
+#: three covers a handful of branches uploading at once while bounding
+#: the LTD calls of a project that has accumulated unsynced editions.
+_MAX_UNSEEN_EDITIONS_FETCHED = 3
+
 #: Tracking modes that identify a semver aggregate edition (``15`` /
 #: ``15.2``). These rows are not LTD resources, so they never appear as
 #: their own :class:`EditionSyncOutcome` and
@@ -2928,11 +2937,14 @@ class _PushedRefCheck:
 class _PushedRefChecker:
     """Checks a project's pushed refs against LTD for one ``tier_main`` tick.
 
-    Each ref costs at most two LTD calls: the edition the ref's Docverse
-    edition maps to, and, when the ref has no such edition or LTD no
-    longer has it, the project's edition listing. The listing's answer
-    is shared by every ref of the project, and an edition the ``main``
-    check already fetched this tick is not fetched again.
+    Each ref costs at most two LTD calls of its own: the edition the
+    ref's Docverse edition maps to, and, when the ref has no such edition
+    or LTD no longer has it, the project's edition listing, with the
+    newest editions on it that keeper-sync has not seen (at most
+    :data:`_MAX_UNSEEN_EDITIONS_FETCHED`). The listing and those editions
+    are fetched once per project per tick and shared by every ref, and
+    an edition the ``main`` check already fetched this tick is not
+    fetched again.
     """
 
     session: AsyncSession
@@ -2949,16 +2961,17 @@ class _PushedRefChecker:
 
     logger: structlog.stdlib.BoundLogger
     _editions: dict[int, LtdEdition] = field(default_factory=dict, init=False)
-    _lists_unseen: bool | None = field(default=None, init=False)
+    _unseen: list[LtdEdition] | None = field(default=None, init=False)
 
     async def check(self, ref: str) -> PushCheckOutcome:
         """Return what LTD says about the edition a pushed ref feeds.
 
         ``rebuilt`` or ``unchanged`` when a synced edition tracks the
         ref and LTD still has it (:func:`ltd_rebuilt_since_sync`);
-        otherwise the discovery listing check decides between
-        ``new_edition`` and ``not_found``. An LTD failure is logged,
-        sent to Sentry, and reported as ``error``.
+        otherwise ``new_edition`` when LTD lists an edition keeper-sync
+        has not seen that tracks the ref, and ``not_found`` when it lists
+        none. An LTD failure is logged, sent to Sentry, and reported as
+        ``error``.
         """
         state = await self._tracking_state(ref)
         try:
@@ -2970,7 +2983,7 @@ class _PushedRefChecker:
                     ):
                         return PushCheckOutcome.rebuilt
                     return PushCheckOutcome.unchanged
-            if await self._lists_unseen_edition():
+            if await self._lists_unseen_edition_of(ref):
                 return PushCheckOutcome.new_edition
         except LtdClientError as exc:
             sentry_sdk.capture_exception(exc)
@@ -3016,17 +3029,35 @@ class _PushedRefChecker:
             self._editions[ltd_id] = edition
         return edition
 
-    async def _lists_unseen_edition(self) -> bool:
-        """Return whether LTD lists an edition keeper-sync has not seen.
+    async def _lists_unseen_edition_of(self, ref: str) -> bool:
+        """Return whether LTD lists an unseen edition that tracks ``ref``.
 
-        The discovery tier's check (:func:`_project_needs_discovery`) on
-        one project: its edition listing's LTD ids against the org's
-        edition state rows, tombstoned ones counting as seen. The state
-        rows are read for the listed ids only, as ``tier_main`` does not
-        load the org's whole edition-state map. Answered once per
-        project per tick.
+        An unseen edition tracking some other ref is not the push's: a
+        dormant project can carry one from a branch nobody pushed to
+        lately, and a sync enqueued on it would not bring in the pushed
+        ref's edition, which LTD has yet to create. Discovery syncs that
+        edition on its own cadence, which the push has made the fast
+        one.
         """
-        if self._lists_unseen is None:
+        return any(
+            ref in (edition.tracked_refs or ())
+            for edition in await self._unseen_editions()
+        )
+
+    async def _unseen_editions(self) -> list[LtdEdition]:
+        """Return the newest LTD editions keeper-sync has not seen.
+
+        The discovery tier's listing check (:func:`_project_needs_discovery`)
+        on one project — its edition listing's LTD ids against the org's
+        edition state rows, tombstoned ones counting as seen — followed
+        by a fetch of each unseen edition, so the caller can read the
+        ref it tracks. The state rows are read for the listed ids only,
+        as ``tier_main`` does not load the org's whole edition-state
+        map. At most :data:`_MAX_UNSEEN_EDITIONS_FETCHED` editions are
+        fetched, highest LTD id first, and one LTD no longer has is left
+        out. Answered once per project per tick.
+        """
+        if self._unseen is None:
             ltd_edition_ids = await _list_edition_ltd_ids(
                 ltd_client=self.ltd_client,
                 org_slug=self.org.slug,
@@ -3041,7 +3072,7 @@ class _PushedRefChecker:
                     ltd_ids=ltd_edition_ids,
                     include_tombstoned=True,
                 )
-            self._lists_unseen = _has_unseen_edition(
+            unseen_ids = _unseen_edition_ltd_ids(
                 ltd_edition_ids=ltd_edition_ids,
                 edition_state_by_ltd_id={
                     state.ltd_id: state
@@ -3049,7 +3080,15 @@ class _PushedRefChecker:
                     if state.ltd_id is not None
                 },
             )
-        return self._lists_unseen
+            unseen: list[LtdEdition] = []
+            for ltd_id in sorted(set(unseen_ids), reverse=True)[
+                :_MAX_UNSEEN_EDITIONS_FETCHED
+            ]:
+                edition = await self._fetch(ltd_id)
+                if edition is not None:
+                    unseen.append(edition)
+            self._unseen = unseen
+        return self._unseen
 
 
 async def _visit_pushed_refs(
@@ -3909,14 +3948,34 @@ def _has_unseen_edition(
 ) -> bool:
     """Return whether any listed LTD edition has no state row.
 
-    The rule of discovery's listing check, shared by
-    :func:`_project_needs_discovery` and ``tier_main``'s pushed-ref
-    fallback (:meth:`_PushedRefChecker._lists_unseen_edition`).
+    The rule of discovery's listing check
+    (:func:`_project_needs_discovery`); :func:`_unseen_edition_ltd_ids`
+    names the editions it finds.
     """
-    return any(
-        is_unknown_resource(edition_state_by_ltd_id.get(ltd_id))
-        for ltd_id in ltd_edition_ids
+    return bool(
+        _unseen_edition_ltd_ids(
+            ltd_edition_ids=ltd_edition_ids,
+            edition_state_by_ltd_id=edition_state_by_ltd_id,
+        )
     )
+
+
+def _unseen_edition_ltd_ids(
+    *,
+    ltd_edition_ids: Sequence[int],
+    edition_state_by_ltd_id: Mapping[int, Any],
+) -> list[int]:
+    """Return the listed LTD edition ids that have no state row.
+
+    The editions discovery's listing check counts as unseen, in listing
+    order, for ``tier_main``'s pushed-ref fallback
+    (:meth:`_PushedRefChecker._unseen_editions`) to fetch.
+    """
+    return [
+        ltd_id
+        for ltd_id in ltd_edition_ids
+        if is_unknown_resource(edition_state_by_ltd_id.get(ltd_id))
+    ]
 
 
 def _has_stale_non_main_edition(

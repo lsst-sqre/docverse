@@ -6,8 +6,9 @@ each pass, ``keeper_sync_tier_main`` visits every stamped ref: it finds
 the Docverse edition tracking the ref, fetches that edition from LTD,
 and enqueues the project's ``keeper_sync_project`` when LTD has rebuilt
 it, or when the ref has no edition yet and LTD lists one keeper-sync has
-not seen. These tests seed the stamp directly, run one tick against the
-``respx`` LTD mock, and assert on the enqueued jobs and the stamps left.
+not seen that tracks the ref. These tests seed the stamp directly, run
+one tick against the ``respx`` LTD mock, and assert on the enqueued jobs
+and the stamps left.
 
 Unless a test says otherwise, the seeded project is *dormant*: its LTD
 ``main`` rebuilt a month ago and every tier polled it an hour ago, so
@@ -374,8 +375,9 @@ async def test_pushed_ref_without_edition_enqueues_on_unseen_ltd_edition(
 ) -> None:
     """No edition tracks the ref yet, and LTD lists one not seen: sync.
 
-    The discovery fallback lists the project's edition URLs and reads
-    their ids; it fetches no edition payload.
+    The fallback lists the project's edition URLs, reads their ids, and
+    fetches the one edition keeper-sync has no state row for, which
+    tracks the pushed ref.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, "ks-push-new")
@@ -386,6 +388,13 @@ async def test_pushed_ref_without_edition_enqueues_on_unseen_ltd_edition(
         )
     _stub_ltd(mock_discovery)
     _stub_listing(mock_discovery, [3, _MAIN_LTD_ID])
+    _stub_edition(
+        mock_discovery,
+        ltd_id=3,
+        slug="tickets-DM-2",
+        tracked_ref="tickets/DM-2",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
 
     jobs = await _run_tier_main()
 
@@ -393,6 +402,130 @@ async def test_pushed_ref_without_edition_enqueues_on_unseen_ltd_edition(
     assert _ltd_paths(mock_discovery) == [
         _MAIN_PATH,
         f"/products/{_SLUG}/editions/",
+        "/editions/3",
+    ]
+    assert await _stamps(org_id) == {}
+
+
+@pytest.mark.asyncio
+async def test_unseen_edition_of_another_ref_keeps_the_stamp(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """LTD's unseen edition tracks some other ref: no sync, stamp kept.
+
+    A dormant project can carry an edition keeper-sync has not synced
+    yet, from a branch the push did not touch. Syncing it would not
+    bring in the pushed branch's edition, which LTD has not created yet,
+    so the ref keeps its stamp and the tick after that edition appears
+    catches it.
+    """
+    pushed_at = _now() - timedelta(minutes=10)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-other-unseen")
+        await _seed_pushed_project(
+            db_session, org_id=org_id, pushed_refs={"tickets/DM-2": pushed_at}
+        )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [3, _MAIN_LTD_ID])
+    _stub_edition(
+        mock_discovery,
+        ltd_id=3,
+        slug="tickets-DM-9",
+        tracked_ref="tickets/DM-9",
+        date_rebuilt=_now() - timedelta(days=2),
+    )
+
+    jobs = await _run_tier_main()
+
+    assert jobs == []
+    assert await _stamps(org_id) == {"tickets/DM-2": pushed_at.isoformat()}
+
+
+@pytest.mark.asyncio
+async def test_unseen_editions_are_fetched_once_for_the_project(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """Two pushed refs share one listing and one fetch of each unseen edition.
+
+    Only the ref whose edition LTD has created is cleared; the other
+    ref's CI has not uploaded yet, so it keeps its stamp.
+    """
+    waiting_at = _now() - timedelta(minutes=5)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-shared-unseen")
+        await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={
+                "tickets/DM-2": _now() - timedelta(minutes=10),
+                "tickets/DM-5": waiting_at,
+            },
+        )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [3, _MAIN_LTD_ID])
+    _stub_edition(
+        mock_discovery,
+        ltd_id=3,
+        slug="tickets-DM-2",
+        tracked_ref="tickets/DM-2",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
+
+    jobs = await _run_tier_main()
+
+    assert len(jobs) == 1
+    assert _ltd_paths(mock_discovery) == [
+        _MAIN_PATH,
+        f"/products/{_SLUG}/editions/",
+        "/editions/3",
+    ]
+    assert await _stamps(org_id) == {"tickets/DM-5": waiting_at.isoformat()}
+
+
+@pytest.mark.asyncio
+async def test_unseen_edition_fetches_are_capped_newest_first(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """Only the newest unseen editions are fetched, bounding the LTD calls.
+
+    LTD lists five editions keeper-sync has not seen; the three with the
+    highest LTD ids, the most recently created, are fetched, and the
+    pushed ref's edition is the newest.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-capped-unseen")
+        await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"tickets/DM-2": _now() - timedelta(minutes=10)},
+        )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [3, 4, 5, 6, 7, _MAIN_LTD_ID])
+    for ltd_id in (3, 4, 5, 6):
+        _stub_edition(
+            mock_discovery,
+            ltd_id=ltd_id,
+            slug=f"tickets-DM-{ltd_id}0",
+            tracked_ref=f"tickets/DM-{ltd_id}0",
+            date_rebuilt=_now() - timedelta(days=2),
+        )
+    _stub_edition(
+        mock_discovery,
+        ltd_id=7,
+        slug="tickets-DM-2",
+        tracked_ref="tickets/DM-2",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
+
+    jobs = await _run_tier_main()
+
+    assert len(jobs) == 1
+    assert _ltd_paths(mock_discovery) == [
+        _MAIN_PATH,
+        f"/products/{_SLUG}/editions/",
+        "/editions/7",
+        "/editions/6",
+        "/editions/5",
     ]
     assert await _stamps(org_id) == {}
 
@@ -844,7 +977,8 @@ async def test_edition_gone_from_ltd_falls_back_to_the_listing(
     """LTD lost the ref's synced edition: the listing check decides.
 
     A branch deleted and pushed again gets a new LTD edition; the old
-    one answers 404, and the listing shows the new id unseen.
+    one answers 404, and the listing shows the new id unseen, tracking
+    the ref.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, "ks-push-gone")
@@ -866,6 +1000,13 @@ async def test_edition_gone_from_ltd_falls_back_to_the_listing(
         return_value=httpx.Response(404)
     )
     _stub_listing(mock_discovery, [6])
+    _stub_edition(
+        mock_discovery,
+        ltd_id=6,
+        slug="tickets-DM-1",
+        tracked_ref="tickets/DM-1",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
 
     jobs = await _run_tier_main()
 
@@ -874,6 +1015,7 @@ async def test_edition_gone_from_ltd_falls_back_to_the_listing(
         _MAIN_PATH,
         "/editions/2",
         f"/products/{_SLUG}/editions/",
+        "/editions/6",
     ]
     assert await _stamps(org_id) == {}
 
@@ -1327,6 +1469,13 @@ async def test_new_edition_push_check_carries_the_lag(
         )
     _stub_ltd(mock_discovery)
     _stub_listing(mock_discovery, [3, _MAIN_LTD_ID])
+    _stub_edition(
+        mock_discovery,
+        ltd_id=3,
+        slug="tickets-DM-2",
+        tracked_ref="tickets/DM-2",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
 
     jobs = await _run_tier_main(events=mock_events)
 

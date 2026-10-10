@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -112,14 +112,12 @@ class KeeperSyncPushProcessor:
         state_store: KeeperSyncStateStore,
         logger: structlog.stdlib.BoundLogger,
         enabled: bool,
-        window: timedelta,
     ) -> None:
         self._project_store = project_store
         self._org_store = org_store
         self._state_store = state_store
         self._logger = logger
         self._enabled = enabled
-        self._window = window
 
     async def process(
         self,
@@ -236,9 +234,7 @@ class KeeperSyncPushProcessor:
                 "Skipped project for keeper-sync push", reason=skip
             )
             return False
-        annotations = stamp_pushed_ref(
-            state, ref=ref, now=stamped_at, window=self._window
-        )
+        annotations = stamp_pushed_ref(state, ref=ref, now=stamped_at)
         await self._state_store.upsert(
             org_id=org.id,
             resource_type=ResourceType.project,

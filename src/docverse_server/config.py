@@ -595,8 +595,8 @@ class Configuration(BaseSettings):
             " CI run, and a ref whose window closes without an LTD"
             " rebuild drops back to the project's ordinary cadence. A"
             " repeated push to the same ref restarts its window, and"
-            " every stamp on a project prunes the refs whose window has"
-            " passed. Only read while"
+            " ``keeper_sync_tier_main`` prunes a ref whose window has"
+            " passed on its next visit. Only read while"
             " ``keeper_sync_push_hot_path_enabled`` is on."
         ),
     )

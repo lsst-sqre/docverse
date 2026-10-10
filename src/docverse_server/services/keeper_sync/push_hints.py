@@ -18,14 +18,14 @@ one shape, and so the rules can be unit-tested on in-memory
 - a stamp records a ref's push time, and a repeated push to the same ref
   overwrites it, extending the window;
 - a ref is inside the window while less than ``window`` has passed since
-  its push; the rest are pruned whenever the map is stamped;
+  its push; a stamp leaves the rest in place, for ``tier_main`` to prune;
 - the map holds at most :data:`PUSHED_REFS_CAP` refs, dropping the
   oldest pushes first, so a repository that pushes many refs at once
   cannot grow the row without bound;
 - ``tier_main`` visits each stamped ref, and settles the map afterwards:
   a ref whose sync it enqueued is cleared, unless a newer push has
   stamped it again since, and the refs whose window has passed are
-  pruned (:func:`settle_pushed_refs`).
+  pruned (:func:`settle_pushed_refs`), each reported as ``expired``.
 
 Nothing here does I/O: the callers read and write the row.
 """
@@ -70,9 +70,9 @@ class PushCheckOutcome(StrEnum):
     """
 
     new_edition = "new_edition"
-    """No synced edition tracks the ref yet, and LTD lists an edition
-    keeper-sync has not seen: most likely the one the push's CI just
-    uploaded."""
+    """No synced edition tracks the ref yet, and LTD lists one
+    keeper-sync has not seen that tracks it: the edition LTD created for
+    the push's CI upload."""
 
     rebuilt = "rebuilt"
     """LTD rebuilt the edition tracking the ref since keeper-sync last
@@ -86,8 +86,9 @@ class PushCheckOutcome(StrEnum):
     """The ref's window passed without a sync; its stamp is pruned."""
 
     not_found = "not_found"
-    """No synced edition tracks the ref, and LTD lists nothing
-    keeper-sync has not seen: LTD has not created the ref's edition yet."""
+    """No synced edition tracks the ref, and LTD lists no edition
+    keeper-sync has not seen that tracks it: LTD has not created the
+    ref's edition yet."""
 
     error = "error"
     """LTD failed to answer; the stamp is kept for the next tick."""
@@ -165,19 +166,20 @@ def prune_pushed_refs(
 
 
 def stamp_pushed_ref(
-    state: KeeperSyncState,
-    *,
-    ref: str,
-    now: datetime,
-    window: timedelta,
+    state: KeeperSyncState, *, ref: str, now: datetime
 ) -> dict[str, Any]:
     """Return a project's annotations with a push to ``ref`` stamped.
 
     The ref's push time becomes ``now``, overwriting any earlier stamp
-    for it. The map is pruned of refs whose window has passed and then
-    capped at :data:`PUSHED_REFS_CAP`, keeping the most recent pushes.
-    Every other annotation key on the row is carried over unchanged, so
-    the caller can write the result back whole.
+    for it. The map is capped at :data:`PUSHED_REFS_CAP`, keeping the
+    most recent pushes. Refs whose window has passed are left in place
+    for ``tier_main``, which prunes each one on its next visit and
+    reports it as ``expired`` (:func:`settle_pushed_refs`): pruning them
+    here would drop that report whenever another ref of the repository
+    is pushed first. They are the oldest pushes, so the cap drops them
+    before any live ref. Every other annotation key on the row is
+    carried over unchanged, so the caller can write the result back
+    whole.
 
     Parameters
     ----------
@@ -187,8 +189,6 @@ def stamp_pushed_ref(
         The pushed ref, normalized (``main``, not ``refs/heads/main``).
     now
         The time of the push.
-    window
-        How long a push keeps its ref on the fast path.
 
     Returns
     -------
@@ -198,9 +198,8 @@ def stamp_pushed_ref(
     """
     refs = read_pushed_refs(state)
     refs[ref] = now
-    kept = prune_pushed_refs(refs, now=now, window=window)
     newest = sorted(
-        kept.items(), key=lambda item: (item[1], item[0]), reverse=True
+        refs.items(), key=lambda item: (item[1], item[0]), reverse=True
     )[:PUSHED_REFS_CAP]
     prior = state.annotations or {}
     return {

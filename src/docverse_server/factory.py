@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -1039,9 +1038,9 @@ class Factory:
     def create_keeper_sync_push_processor(self) -> KeeperSyncPushProcessor:
         """Create the processor stamping keeper-sync push hints.
 
-        The hot-path switch and window are read from the process
-        configuration on every call, as the keeper-sync worker functions
-        read theirs, so a test can flip them per delivery.
+        The hot-path switch is read from the process configuration on
+        every call, as the keeper-sync worker functions read theirs, so a
+        test can flip it per delivery.
         """
         return KeeperSyncPushProcessor(
             project_store=self.create_project_store(),
@@ -1049,7 +1048,6 @@ class Factory:
             state_store=self.create_keeper_sync_state_store(),
             logger=self._logger,
             enabled=config.keeper_sync_push_hot_path_enabled,
-            window=timedelta(seconds=config.keeper_sync_push_window_seconds),
         )
 
     def create_dashboard_publisher(self) -> DashboardPublisher:

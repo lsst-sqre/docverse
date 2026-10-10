@@ -573,10 +573,10 @@ best-effort: a failed publish is logged and never stops the tick.
 
 | Outcome | What the visit found | `enqueued` and `push_lag` |
 | --- | --- | --- |
-| `new_edition` | No synced edition tracks the ref, and LTD lists one keeper-sync has not seen | Set when the project's sync was enqueued |
+| `new_edition` | No synced edition tracks the ref, and LTD lists one keeper-sync has not seen that tracks it | Set when the project's sync was enqueued |
 | `rebuilt` | LTD rebuilt the ref's edition since keeper-sync last synced it | Set when the project's sync was enqueued |
 | `unchanged` | The ref's edition is as keeper-sync last synced it | `false`, null |
-| `not_found` | No synced edition tracks the ref, and LTD lists nothing new | `false`, null |
+| `not_found` | No synced edition tracks the ref, and LTD lists nothing new that tracks it | `false`, null |
 | `error` | LTD failed to answer; the stamp is kept for the next tick | `false`, null |
 | `expired` | The ref's window passed without a sync; the stamp is pruned | `false`, null |
 

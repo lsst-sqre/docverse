@@ -69,9 +69,7 @@ def _edition_state(
 
 def test_stamp_records_ref_with_iso_push_time() -> None:
     """A first stamp adds the ref to the map as an ISO-8601 string."""
-    merged = stamp_pushed_ref(
-        _project_state(), ref="tickets/DM-1", now=_NOW, window=_WINDOW
-    )
+    merged = stamp_pushed_ref(_project_state(), ref="tickets/DM-1", now=_NOW)
 
     assert merged[ANNOTATION_GITHUB_PUSHED_REFS] == {
         "tickets/DM-1": _NOW.isoformat()
@@ -87,7 +85,7 @@ def test_stamp_repeat_push_overwrites_the_time() -> None:
         }
     )
 
-    merged = stamp_pushed_ref(state, ref="main", now=_NOW, window=_WINDOW)
+    merged = stamp_pushed_ref(state, ref="main", now=_NOW)
 
     assert merged[ANNOTATION_GITHUB_PUSHED_REFS] == {"main": _NOW.isoformat()}
 
@@ -101,7 +99,7 @@ def test_stamp_keeps_other_refs_inside_the_window() -> None:
         }
     )
 
-    merged = stamp_pushed_ref(state, ref="v1.0", now=_NOW, window=_WINDOW)
+    merged = stamp_pushed_ref(state, ref="v1.0", now=_NOW)
 
     assert merged[ANNOTATION_GITHUB_PUSHED_REFS] == {
         "main": other.isoformat(),
@@ -109,21 +107,30 @@ def test_stamp_keeps_other_refs_inside_the_window() -> None:
     }
 
 
-def test_stamp_prunes_refs_older_than_the_window() -> None:
-    """A ref pushed a full window ago or earlier is dropped on stamp."""
+def test_stamp_leaves_expired_refs_for_tier_main() -> None:
+    """A ref whose window has passed survives a stamp of another ref.
+
+    Pruning is ``tier_main``'s, which reports each ref it prunes as
+    ``expired``; a stamp that dropped it first would lose that report.
+    """
+    expired = _NOW - _WINDOW
+    ancient = _NOW - timedelta(days=3)
     state = _project_state(
         annotations={
             ANNOTATION_GITHUB_PUSHED_REFS: {
-                "expired": (_NOW - _WINDOW).isoformat(),
-                "ancient": (_NOW - timedelta(days=3)).isoformat(),
-                "live": (_NOW - _WINDOW + timedelta(seconds=1)).isoformat(),
+                "expired": expired.isoformat(),
+                "ancient": ancient.isoformat(),
             }
         }
     )
 
-    merged = stamp_pushed_ref(state, ref="main", now=_NOW, window=_WINDOW)
+    merged = stamp_pushed_ref(state, ref="main", now=_NOW)
 
-    assert set(merged[ANNOTATION_GITHUB_PUSHED_REFS]) == {"live", "main"}
+    assert merged[ANNOTATION_GITHUB_PUSHED_REFS] == {
+        "expired": expired.isoformat(),
+        "ancient": ancient.isoformat(),
+        "main": _NOW.isoformat(),
+    }
 
 
 def test_stamp_caps_the_map_dropping_the_oldest() -> None:
@@ -136,7 +143,7 @@ def test_stamp_caps_the_map_dropping_the_oldest() -> None:
         annotations={ANNOTATION_GITHUB_PUSHED_REFS: existing}
     )
 
-    merged = stamp_pushed_ref(state, ref="newest", now=_NOW, window=_WINDOW)
+    merged = stamp_pushed_ref(state, ref="newest", now=_NOW)
 
     stamped = merged[ANNOTATION_GITHUB_PUSHED_REFS]
     assert PUSHED_REFS_CAP == 20
@@ -155,7 +162,7 @@ def test_stamp_preserves_other_annotation_keys() -> None:
         }
     )
 
-    merged = stamp_pushed_ref(state, ref="main", now=_NOW, window=_WINDOW)
+    merged = stamp_pushed_ref(state, ref="main", now=_NOW)
 
     assert merged["date_main_last_polled"] == "2026-10-09T11:55:00+00:00"
     assert merged["main_edition_url"] == (
@@ -179,7 +186,7 @@ def test_stamp_replaces_a_malformed_map() -> None:
     )
 
     for state in (not_a_map, bad_entries):
-        merged = stamp_pushed_ref(state, ref="main", now=_NOW, window=_WINDOW)
+        merged = stamp_pushed_ref(state, ref="main", now=_NOW)
         assert merged[ANNOTATION_GITHUB_PUSHED_REFS] == {
             "main": _NOW.isoformat()
         }

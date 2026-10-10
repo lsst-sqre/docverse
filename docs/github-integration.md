@@ -452,11 +452,14 @@ Every stamp writes the whole map back:
 
 - **A repeated push overwrites.** A second push to the same ref replaces
   its time, so the window restarts from the latest push.
-- **Expired refs are pruned.** Refs whose window has passed are dropped
-  on every stamp.
+- **Expired refs are left for `tier_main`.** A stamp drops no ref
+  whose window has passed: `tier_main` prunes each one on its next
+  visit and reports it as `expired`, so a push to another ref of a busy
+  repository cannot drop that report first.
 - **The map is capped.** It holds at most 20 refs; a stamp that would
-  leave more drops the oldest pushes first, so a repository that pushes
-  many tags at once cannot grow the row without bound.
+  leave more drops the oldest pushes first, expired ones before any
+  live one, so a repository that pushes many tags at once cannot grow
+  the row without bound.
 - **Other keys survive.** The row is read `FOR UPDATE`, the map merged
   into its other annotations — the tier crons' own
   `date_main_last_polled` and the like — and the whole column written
@@ -537,17 +540,24 @@ call, and is pruned. Then each live ref, oldest push first:
 3. **Fall back to the listing.** When no synced edition tracks the ref,
    or LTD answers `404` for the one that did, the project's edition
    listing (`GET /products/<slug>/editions/`, read once per project per
-   tick) is checked the way `keeper_sync_tier_discovery` checks it. An
-   edition LTD lists that keeper-sync has no state row for is a
-   `new_edition`, most likely the one the push's CI just uploaded;
-   none is `not_found`: LTD has not created the ref's edition yet.
+   tick) is checked the way `keeper_sync_tier_discovery` checks it, for
+   editions keeper-sync has no state row for. Each of those, newest
+   first and at most three, is fetched (`GET /editions/<id>`, also once
+   per project per tick) to read the ref it tracks. One that tracks the
+   pushed ref is a `new_edition`: LTD created it for the push's CI
+   upload. None is `not_found`: LTD has not created the ref's edition
+   yet. An unseen edition that tracks some other ref does not count for
+   this one: a dormant project can carry one from a branch nobody
+   pushed to lately, and syncing it would not bring in the pushed ref's
+   edition. The push has put the project on discovery's fast cadence,
+   which syncs that edition.
 
 | Outcome | What the visit found | The stamp |
 | --- | --- | --- |
 | `rebuilt` | LTD rebuilt the ref's edition since its last sync | Cleared once the sync is enqueued |
-| `new_edition` | No synced edition tracks the ref, and LTD lists one keeper-sync has not seen | Cleared once the sync is enqueued |
+| `new_edition` | No synced edition tracks the ref, and LTD lists one keeper-sync has not seen that tracks it | Cleared once the sync is enqueued |
 | `unchanged` | The ref's edition is as keeper-sync last synced it | Kept |
-| `not_found` | No synced edition tracks the ref, and LTD lists nothing new | Kept |
+| `not_found` | No synced edition tracks the ref, and LTD lists nothing new that tracks it | Kept |
 | `error` | LTD failed to answer | Kept |
 | `expired` | The ref's window passed | Pruned |
 
@@ -576,8 +586,9 @@ record when they polled the project, read it `FOR UPDATE` for the same
 reason, so none of them can write back a map that predates a stamp.
 
 The check's cost is bounded: at most two LTD calls per stamped ref per
-tick (its edition, then the listing), the listing shared by the
-project's refs, and at most 20 refs per project. A dormant project the
+tick (its edition, then the listing), plus at most three fetches of the
+unseen editions the listing shows, the listing and those fetches shared
+by the project's refs, and at most 20 refs per project. A dormant project the
 push woke adds its `main` check, usually one more call per tick for the
 window, which a push to `main` itself shares. Editions that follow a
 ref by a version rule rather than by name (`lsst_doc` and the `eups`
@@ -702,8 +713,9 @@ redelivery's time.
 | `Keeper-sync push stamp failed` | warning | `error`, `error_type` |
 | `Processed push webhook` | info | `enqueued`, `projects_stamped` |
 
-`pushed_refs` counts the refs on the project's map after the stamp, and
-`pushed_at` is the time stamped. The handler's own
+`pushed_refs` counts the refs on the project's map after the stamp,
+including any whose window has passed that `tier_main` has yet to
+prune, and `pushed_at` is the time stamped. The handler's own
 `Processed push webhook` closes every push delivery: `enqueued` counts
 its `dashboard_sync` jobs, and `projects_stamped` the projects stamped,
 null when the keeper-sync step failed.
