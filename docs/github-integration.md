@@ -344,7 +344,13 @@ is `null`:
 - **No cap.** A first pass after an upgrade can enqueue a job for nearly
   every project in an organization. The maintenance pool's concurrency
   bounds how many run at once, and the resolve's own retry and backoff
-  absorb GitHub's rate limits.
+  absorb GitHub's rate limits. The pool is shared, though: the other
+  organizations' audit jobs, queued by the same tick, still run first,
+  but a maintenance job queued after the burst — the resolve for a
+  project created through the API, the next `lifecycle_eval` tick, a
+  `purgatory_cleanup` or `edition_reconcile` pass, a reaper sweep —
+  waits behind it, so after an upgrade those can start late until the
+  burst drains.
 - **Failures.** Each enqueue runs in a transaction of its own. One that
   fails is sent to Sentry and logged as
   `Failed to enqueue project_github_resolve`, with `project` and
@@ -353,7 +359,11 @@ is `null`:
   next pass enqueues it again.
 
 The pass's summary line, `Git ref audit completed for org`, counts the
-jobs it enqueued as `github_resolves_enqueued`. With
+jobs it enqueued as `github_resolves_enqueued`. Once a first pass has
+recorded the ids it can, the count is mostly the organization's
+projects on repositories the App is not installed on, so a count that
+stays above zero pass after pass, on the line's `org`, names an
+organization that still needs the App. With
 `git_ref_audit_enabled` off, a project that missed its resolve keeps
 `null` ids until an `installation` delivery reaches it.
 
