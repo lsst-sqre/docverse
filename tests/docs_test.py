@@ -41,8 +41,11 @@ from docverse.models import (
     DraftInactivityRule,
     EditionUpdate,
     KeeperSyncConfig,
+    KeeperSyncProjectStatus,
+    KeeperSyncPushedRef,
     KeeperSyncRun,
     KeeperSyncScopePreview,
+    KeeperSyncTierStatus,
     ProjectGitHubBinding,
     ProjectGitHubBindingCreate,
 )
@@ -75,6 +78,7 @@ from docverse_server.metrics import (
     ConditionalGetPrecondition,
     DocverseEvents,
     EditionReconcileCompletedEvent,
+    GitHubWebhookReceivedEvent,
     HttpMethod,
     HttpStatusClass,
     WebhookOutcome,
@@ -90,6 +94,14 @@ from docverse_server.services.keeper_sync import (
     ProjectSyncResult,
     TrackingDerivationSource,
     scheduler,
+)
+from docverse_server.services.keeper_sync.push_hints import (
+    ANNOTATION_GITHUB_PUSHED_REFS,
+    PUSHED_REFS_CAP,
+    PushCheckOutcome,
+)
+from docverse_server.services.keeper_sync_push_processor import (
+    KeeperSyncPushSkip,
 )
 from docverse_server.storage._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
@@ -162,8 +174,43 @@ every deployment.
 _GITHUB_PAGE = "github-integration.md"
 """Operations page for the GitHub App integration (PRD #721)."""
 
-_GITHUB_KNOB_PREFIXES = ("github_", "git_ref_audit")
+_GITHUB_KNOB_PREFIXES = ("github_", "git_ref_audit", "keeper_sync_push_")
 """Name prefixes of the settings the GitHub integration page tabulates."""
+
+_PUSH_HOT_PATH_SECTION = "The keeper-sync push hot path"
+"""GitHub-page section on the push hint keeper-sync reads (PRD #803)."""
+
+_PUSH_PROCESSOR_MODULE = "docverse_server.services.keeper_sync_push_processor"
+"""Module that stamps a push onto the projects of its repository."""
+
+_PUSH_HOT_SUBSECTION = "A push counts as hot"
+"""Hot-path subsection on what a push does to the tier gates (#808)."""
+
+_PUSH_CHECK_SUBSECTION = "The `tier_main` check"
+"""Hot-path subsection on what ``tier_main`` does with a stamp (#807)."""
+
+_PUSH_CHECK_LOGS_SUBSECTION = "`tier_main` log lines"
+"""Hot-path subsection tabling ``tier_main``'s pushed-ref log lines."""
+
+_PUSH_READING_SUBSECTION = "Reading a push"
+"""Hot-path subsection on where an operator sees a push at work (#809)."""
+
+_PUSH_STATUS_FIELDS = ("in_push_window", "pushed_refs")
+"""The keeper-sync status response's fields that report a push (#809)."""
+
+_PUSH_CHECK_LOG_LINES = (
+    "Tier-main: checked pushed ref",
+    "Tier-main: enqueued project sync for pushed ref",
+    "Tier-main: failed to check pushed ref",
+    "Tier-main: failed to publish pushed ref check",
+)
+"""The lines ``tier_main`` writes about the pushed refs it visits."""
+
+_PUSH_HANDLER_LOGS = (
+    "Processed push webhook",
+    "Keeper-sync push stamp failed",
+)
+"""The push handler's own log lines, which the hot-path section tables."""
 
 _DEFAULT_BRANCH_LOG_MODULES = (
     "docverse_server.services.default_branch",
@@ -1338,9 +1385,10 @@ def test_metrics_page_names_every_method() -> None:
 
 
 def test_metrics_page_has_an_example_query_per_capability() -> None:
-    """The page carries one InfluxQL query for each PRD #713 question.
+    """The page carries one InfluxQL query for each question it answers.
 
-    Sync lag, request volume, request latency, and webhook deliveries:
+    Sync lag, request volume, request latency, and webhook deliveries
+    (PRD #713), and the push hot path's catch rate and lag (PRD #803):
     each query has to read its measurement and group by the tags that
     answer its question.
     """
@@ -1363,6 +1411,10 @@ def test_metrics_page_has_an_example_query_per_capability() -> None:
         (
             "github_webhook_received",
             ('GROUP BY time(1h), "event_type", "outcome"',),
+        ),
+        (
+            "keeper_sync_push_check",
+            ('PERCENTILE("push_lag", 95)', 'GROUP BY "outcome"'),
         ),
     ]
     unanswered = [
@@ -1570,6 +1622,138 @@ def test_github_manual_fallback_documented() -> None:
     fields = {"tracking_mode", "tracking_params", "build"}
     assert fields <= set(EditionUpdate.model_fields)
     assert not _uncoded(fields, section)
+
+
+def test_github_push_hot_path_names_its_contract() -> None:
+    """The hot-path section names the stamp, its knobs, and every skip.
+
+    The annotation key is what an operator reads off a state row, the
+    two settings are how the path is tuned or switched off, and the skip
+    reasons are what the processor's log says when a push stamps nothing.
+    """
+    section = _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION)
+    knobs = {
+        name
+        for name in Configuration.model_fields
+        if name.startswith("keeper_sync_push_")
+    }
+    assert knobs, "configuration exposes no push hot-path knobs"
+    assert "projects_stamped" in GitHubWebhookReceivedEvent.model_fields
+    names = {
+        ANNOTATION_GITHUB_PUSHED_REFS,
+        "projects_stamped",
+        *knobs,
+        *(reason.value for reason in KeeperSyncPushSkip),
+    }
+    assert not _uncoded(names, section)
+    assert f"{PUSHED_REFS_CAP} refs" in section
+
+
+def test_github_push_hot_path_log_lines_match_the_code() -> None:
+    """The hot-path log table is exactly the lines the push step writes.
+
+    Checked both ways, against the processor's lines and the push
+    handler's own two, so a line added to either has to gain a row and a
+    row cannot outlive its line.
+    """
+    documented = _documented_log_lines(
+        _read(_GITHUB_PAGE), section=_PUSH_HOT_PATH_SECTION
+    )
+    handler_calls = _log_calls("docverse_server.handlers.webhooks.github")
+    emitted = {
+        **_log_calls(_PUSH_PROCESSOR_MODULE),
+        **{message: handler_calls[message] for message in _PUSH_HANDLER_LOGS},
+    }
+    assert set(documented) == set(emitted)
+    wrong = sorted(
+        message
+        for message, row in documented.items()
+        if row not in emitted[message]
+    )
+    assert not wrong
+
+
+def test_github_push_hot_path_names_the_bound_log_fields() -> None:
+    """The hot-path section names every field the processor binds."""
+    section = _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION)
+    bound = _bound_log_fields(_PUSH_PROCESSOR_MODULE)
+    assert bound, "the push processor binds no fields"
+    assert not _uncoded(bound, section)
+
+
+def test_github_push_counts_as_hot_names_every_tier_cron() -> None:
+    """The push-is-hot subsection says what a push does to each tier.
+
+    A tier cron added to the keeper-sync pool has to be covered, and the
+    status endpoint's cohort is how an operator sees a push at work.
+    """
+    subsection = _subsection(
+        _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION),
+        _PUSH_HOT_SUBSECTION,
+    )
+    tier_crons = set(_tier_cron_jobs())
+    assert tier_crons, "the keeper-sync pool registers no tier crons"
+    fields = {"tier_status", "date_next_due"}
+    assert "date_next_due" in KeeperSyncTierStatus.model_fields
+    assert not _uncoded(tier_crons | fields, subsection)
+    assert '`"cohort": "hot"`' in subsection
+
+
+def test_github_push_reading_names_the_status_fields() -> None:
+    """The reading guide names the status response's push fields.
+
+    The status endpoint is where an operator checks a push landed: the
+    subsection has to name the two fields that report it and each field
+    of a listed ref, and say which endpoints carry them.
+    """
+    reading = _subsection(
+        _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION),
+        _PUSH_READING_SUBSECTION,
+    )
+    assert set(_PUSH_STATUS_FIELDS) <= set(
+        KeeperSyncProjectStatus.model_fields
+    )
+    names = {*_PUSH_STATUS_FIELDS, *KeeperSyncPushedRef.model_fields}
+    assert not _uncoded(names, reading)
+    assert "GET /orgs/{org}/keeper-sync/projects/{ltd_slug}" in reading
+    assert "GET /orgs/{org}/keeper-sync/projects`" in reading
+
+
+def test_github_push_check_tables_every_outcome() -> None:
+    """The ``tier_main`` check's outcome table has a row per outcome.
+
+    ``outcome`` is what an operator greps the check's log lines for, so
+    an outcome added to the code has to gain a row saying what it means
+    and what it does to the stamp.
+    """
+    check = _subsection(
+        _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION),
+        _PUSH_CHECK_SUBSECTION,
+    )
+    documented = {cells[0].strip("`") for cells in _code_rows(check)}
+    assert documented == {outcome.value for outcome in PushCheckOutcome}
+
+
+def test_github_push_check_log_lines_match_the_code() -> None:
+    """The ``tier_main`` log table is exactly its pushed-ref lines.
+
+    Both ways for the curated set: every call site of each listed line
+    has a row with its level and fields, as it reads in the JSON logs,
+    and no row describes a line the worker does not write.
+    """
+    table = _subsection(
+        _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION),
+        _PUSH_CHECK_LOGS_SUBSECTION,
+    )
+    documented: dict[str, set[_LogCall]] = {}
+    for message, call in _log_rows(table):
+        documented.setdefault(message, set()).add(call)
+    calls = _log_calls("docverse_server.worker.functions.keeper_sync")
+    emitted: dict[str, set[_LogCall]] = {}
+    for message in _PUSH_CHECK_LOG_LINES:
+        assert message in calls, f"tier_main no longer logs {message!r}"
+        emitted[message] = {_as_logged(call) for call in calls[message]}
+    assert documented == emitted
 
 
 def _camel_case(name: str) -> str:

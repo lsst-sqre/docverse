@@ -24,6 +24,7 @@ from docverse_server.metrics import (
     GitHubWebhookReceivedEvent,
     HttpMethod,
     HttpStatusClass,
+    KeeperSyncPushCheckEvent,
 )
 
 
@@ -229,10 +230,14 @@ def test_github_webhook_received_fields() -> None:
     """``github_webhook_received`` carries a delivery's type and outcome.
 
     ``event_type`` and ``github_repository`` are nullable because not
-    every delivery names them; every other field is always present.
-    There is no ``organization`` or ``project``: no delivery is resolved
-    to one, and adding either as a nullable field once one is would be a
-    backward-compatible schema change, so there is nothing to reserve.
+    every delivery names them, and ``projects_stamped`` because only a
+    ``push`` whose keeper-sync step ran has a count; every other field
+    is always present. ``projects_stamped`` arrived after the event was
+    first registered (PRD #803), so it is last, as an additive change
+    must be. There is no ``organization`` or ``project``: no delivery is
+    resolved to one, and adding either as a nullable field once one is
+    would be a backward-compatible schema change, so there is nothing to
+    reserve.
     """
     fields = _avro_field_types(GitHubWebhookReceivedEvent)
 
@@ -242,11 +247,40 @@ def test_github_webhook_received_fields() -> None:
         "jobs_enqueued",
         "elapsed",
         "github_repository",
+        "projects_stamped",
     ]
-    for nullable in ("event_type", "github_repository"):
+    for nullable in ("event_type", "github_repository", "projects_stamped"):
         assert isinstance(fields[nullable], list)
         assert "null" in fields[nullable]
     for required in ("outcome", "jobs_enqueued", "elapsed"):
         assert not isinstance(fields[required], list)
     # Every union member must still be one InfluxDB can store.
     GitHubWebhookReceivedEvent.validate_structure()
+
+
+def test_keeper_sync_push_check_fields() -> None:
+    """``keeper_sync_push_check`` is a project-scoped event per pushed ref.
+
+    One point per stamped ref ``tier_main`` visits: the org and project
+    the shared base carries, the ref, what the visit found, whether it
+    enqueued the project's sync, and the time from the push to that
+    enqueue. ``push_lag`` is nullable because only an enqueue has one;
+    every other field is always present.
+    """
+    assert issubclass(KeeperSyncPushCheckEvent, DocverseEventBase)
+    fields = _avro_field_types(KeeperSyncPushCheckEvent)
+
+    assert list(fields) == [
+        "organization",
+        "project",
+        "github_ref",
+        "outcome",
+        "enqueued",
+        "push_lag",
+    ]
+    assert isinstance(fields["push_lag"], list)
+    assert "null" in fields["push_lag"]
+    for required in ("github_ref", "outcome", "enqueued"):
+        assert not isinstance(fields[required], list)
+    # Every union member must be one InfluxDB can store.
+    KeeperSyncPushCheckEvent.validate_structure()

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from docverse.models import OrganizationCreate
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
@@ -735,3 +735,56 @@ async def test_list_project_resources_hides_tombstoned_by_default(
         "dmtn-123",
         "pipelines",
     ]
+
+
+@pytest.mark.asyncio
+async def test_get_for_update_reads_the_committed_row(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A locking read refreshes a row the session already holds.
+
+    The read-modify-write callers merge into ``annotations`` and write
+    the column back whole, so a locked read that handed back the
+    session's earlier copy would drop whatever another writer committed
+    in between. The test keeps its own reference to the ORM row so the
+    session's (weakly referenced) identity map still holds the stale
+    copy when the locking read runs.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="sqr-112",
+            annotations={"first": 1},
+        )
+        held = (
+            await db_session.execute(
+                select(SqlKeeperSyncState).where(
+                    SqlKeeperSyncState.org_id == org_id
+                )
+            )
+        ).scalar_one()
+    async with db_session_factory() as other, other.begin():
+        await KeeperSyncStateStore(session=other, logger=logger).upsert(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="sqr-112",
+            annotations={"first": 1, "second": 2},
+        )
+
+    async with db_session.begin():
+        got = await store.get(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="sqr-112",
+            for_update=True,
+        )
+
+    assert got is not None
+    assert got.annotations == {"first": 1, "second": 2}
+    assert held.annotations == {"first": 1, "second": 2}

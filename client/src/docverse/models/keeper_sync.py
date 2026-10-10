@@ -39,6 +39,7 @@ __all__ = [
     "KeeperSyncProjectRefreshAccepted",
     "KeeperSyncProjectStateSummary",
     "KeeperSyncProjectStatus",
+    "KeeperSyncPushedRef",
     "KeeperSyncResourceType",
     "KeeperSyncRun",
     "KeeperSyncRunCreated",
@@ -905,6 +906,46 @@ class KeeperSyncProjectStateSummary(BaseModel):
     )
 
 
+class KeeperSyncPushedRef(BaseModel):
+    """One ref a GitHub push stamped on a keeper-synced project.
+
+    A ``push`` to the project's repository stamps the pushed branch or
+    tag, with the time Docverse received it, on the project's
+    keeper-sync state row, and the tier crons poll the project on their
+    fast path until LTD has rebuilt the ref's edition or the push window
+    passes. Each stamp still on the row is reported here.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    git_ref: str = Field(
+        description=(
+            "The pushed branch or tag, normalized: ``main`` or ``v1.2.0``,"
+            " not ``refs/heads/main``."
+        ),
+        examples=["tickets/DM-56619"],
+    )
+
+    date_pushed: datetime = Field(
+        description=(
+            "When Docverse received the ref's latest push. A repeated"
+            " push to the same ref moves it forward, restarting the"
+            " ref's window."
+        ),
+    )
+
+    in_window: bool = Field(
+        description=(
+            "Whether the push is still inside the push window, so the"
+            " tier crons poll the project on their fast path for it."
+            " ``false`` for a stamp whose window has passed but which"
+            " ``tier_main`` has not pruned yet, and for every stamp"
+            " while the push hot path is switched off."
+        ),
+        examples=[True],
+    )
+
+
 class KeeperSyncEditionStatus(BaseModel):
     """One Docverse-side edition with its keeper-sync attribution.
 
@@ -1094,6 +1135,31 @@ class KeeperSyncProjectStatus(BaseModel):
             "One entry per tier-cron in fixed order:"
             " ``main``, ``discovery``, ``other``."
         )
+    )
+
+    in_push_window: bool = Field(
+        default=False,
+        description=(
+            "Whether a GitHub push holds the project on the tier crons'"
+            " fast path: ``true`` while any of ``pushed_refs`` is"
+            " ``in_window``, when every ``tier_status`` entry reads"
+            " ``hot``. Always ``false`` while the push hot path is"
+            " switched off. Defaults to ``false`` so a response from a"
+            " server predating the field still parses."
+        ),
+        examples=[False, True],
+    )
+
+    pushed_refs: list[KeeperSyncPushedRef] = Field(
+        default_factory=list,
+        description=(
+            "The refs GitHub pushes have stamped on the project's"
+            " keeper-sync state row, newest push first. A ref leaves"
+            " the list once ``tier_main`` enqueues the project's sync"
+            " for it, or prunes it after its window. Empty for a"
+            " project no push has stamped, and for one with no state"
+            " row."
+        ),
     )
 
     main_edition: KeeperSyncEditionStatus | None = Field(

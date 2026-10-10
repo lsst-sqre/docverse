@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -565,6 +566,41 @@ class Configuration(BaseSettings):
         ),
     )
 
+    keeper_sync_push_hot_path_enabled: bool = Field(
+        True,
+        title="Keeper-sync push hot path",
+        description=(
+            "Whether a GitHub ``push`` delivery puts the keeper-synced"
+            " projects bound to the pushed repository on keeper-sync's"
+            " fast polling path (PRD #803). On, the webhook stamps the"
+            " pushed branch or tag, with the delivery's time, into the"
+            " ``github_pushed_refs`` annotation of each such project's"
+            " ``keeper_sync_state`` row, and the tier crons read the"
+            " stamp for ``keeper_sync_push_window_seconds``. Off, the"
+            " webhook logs the push and stamps nothing, and keeper-sync"
+            " polls on its ordinary cohort cadence. The dashboard-template"
+            " work a ``push`` drives is unaffected either way."
+        ),
+    )
+
+    keeper_sync_push_window_seconds: int = Field(
+        3600,
+        ge=1,
+        title="Keeper-sync push window, in seconds",
+        description=(
+            "How long a pushed ref stays on keeper-sync's fast polling"
+            " path after its latest push. The push only hints that LTD"
+            " Keeper is about to change: the repository's CI builds and"
+            " uploads the docs afterwards, so the window has to cover a"
+            " CI run, and a ref whose window closes without an LTD"
+            " rebuild drops back to the project's ordinary cadence. A"
+            " repeated push to the same ref restarts its window, and"
+            " ``keeper_sync_tier_main`` prunes a ref whose window has"
+            " passed on its next visit. Only read while"
+            " ``keeper_sync_push_hot_path_enabled`` is on."
+        ),
+    )
+
     maintenance_max_jobs: int = Field(
         10,
         ge=1,
@@ -1097,6 +1133,24 @@ class Configuration(BaseSettings):
                 " reconcile faster in a test environment."
             )
         return self
+
+    @property
+    def keeper_sync_push_window(self) -> timedelta | None:
+        """The push window the keeper-sync tier planners read, if any.
+
+        ``keeper_sync_push_window_seconds`` as a ``timedelta`` while
+        ``keeper_sync_push_hot_path_enabled`` is on, and ``None`` while it
+        is off: the form
+        :func:`~docverse_server.services.keeper_sync.scheduler.should_poll_for_tier`
+        and its explainer take, where ``None`` leaves a project's push
+        stamps unread. The three tier crons read it on every pass, to
+        treat a pushed project as hot and, for ``tier_main``, to decide
+        whether to check the stamps at all; the keeper-sync status
+        endpoint reads it to report a pushed project's cohort.
+        """
+        if not self.keeper_sync_push_hot_path_enabled:
+            return None
+        return timedelta(seconds=self.keeper_sync_push_window_seconds)
 
     @property
     def keeper_sync_reaper_threshold_requested_seconds(self) -> int | None:

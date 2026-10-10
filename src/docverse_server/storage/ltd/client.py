@@ -292,6 +292,15 @@ class LtdClient:
         payload = await self._get_json(url)
         return LtdEdition.model_validate(payload)
 
+    async def get_edition(self, ltd_id: int) -> LtdEdition:
+        """Fetch ``GET /editions/{ltd_id}``.
+
+        For a caller that knows an edition's LTD id but not its URL,
+        such as ``keeper_sync_tier_main`` checking the edition a pushed
+        ref's ``keeper_sync_state`` row records.
+        """
+        return await self.get_edition_by_url(self._url(f"/editions/{ltd_id}"))
+
     async def get_build_by_url(self, url: str) -> LtdBuild:
         """Fetch a build by its full ``self_url``."""
         payload = await self._get_json(url)

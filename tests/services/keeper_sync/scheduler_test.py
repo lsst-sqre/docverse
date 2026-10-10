@@ -18,6 +18,9 @@ import pytest
 from arq.worker import Worker
 
 from docverse_server.services.keeper_sync import scheduler
+from docverse_server.services.keeper_sync.push_hints import (
+    ANNOTATION_GITHUB_PUSHED_REFS,
+)
 from docverse_server.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
@@ -1500,3 +1503,246 @@ def test_explain_tier_status_agrees_with_gate_at_dormant_boundary(
     assert gate is True
     assert status.next_due_at is not None
     assert status.next_due_at <= now
+
+
+# ---------------------------------------------------------------------------
+# A push counts as hot (PRD #803)
+# ---------------------------------------------------------------------------
+
+
+_PUSH_WINDOW = timedelta(hours=1)
+"""The push window the push-is-hot tests pass to the planners."""
+
+
+def _pushed_dormant_state(
+    *, now: datetime, annotation_key: str, pushed_ago: timedelta
+) -> KeeperSyncState:
+    """Build a dormant, recently polled project row stamped by a push.
+
+    The project's ``main`` last rebuilt a month ago and the tier polled
+    it an hour ago, so its dormant gate alone skips it; ``tickets/DM-1``
+    was pushed ``pushed_ago`` before ``now``.
+    """
+    return _project_state(
+        date_rebuilt_seen=now - timedelta(days=30),
+        annotations={
+            annotation_key: (now - timedelta(hours=1)).isoformat(),
+            ANNOTATION_GITHUB_PUSHED_REFS: {
+                "tickets/DM-1": (now - pushed_ago).isoformat()
+            },
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _TIER_PARAMS,
+)
+def test_should_poll_for_tier_when_pushed_inside_window(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """A push inside the window wakes a dormant project on every tier.
+
+    The same row is skipped without the push window and polled with it:
+    the push, not the dormancy state, is what puts it on the fast path.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _pushed_dormant_state(
+        now=now,
+        annotation_key=annotation_key,
+        pushed_ago=timedelta(minutes=10),
+    )
+    assert should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+        push_window=_PUSH_WINDOW,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _TIER_PARAMS,
+)
+def test_should_not_poll_for_tier_once_push_window_closes(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """A push older than the window leaves the project dormant again.
+
+    Nothing has to clear the stamp first: the planner reads the push
+    time against the window, so the project falls back to its dormant
+    gate, which its recent poll keeps shut, the moment the window
+    closes. A push exactly one window old has expired.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _pushed_dormant_state(
+        now=now, annotation_key=annotation_key, pushed_ago=_PUSH_WINDOW
+    )
+    assert not should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+        push_window=_PUSH_WINDOW,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tier", "annotation_key", "hot_window", "dormant_interval"),
+    _TIER_PARAMS,
+)
+def test_should_poll_for_tier_ignores_pushes_without_a_window(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+) -> None:
+    """With the push hot path off, a stamped project keeps its gating.
+
+    Callers pass no window while ``keeper_sync_push_hot_path_enabled``
+    is off, and the stamp left on the row by an earlier push then counts
+    for nothing.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _pushed_dormant_state(
+        now=now,
+        annotation_key=annotation_key,
+        pushed_ago=timedelta(minutes=10),
+    )
+    assert not should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+        push_window=None,
+    )
+    assert not should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+    )
+
+
+def test_should_poll_main_for_project_honours_the_push_window() -> None:
+    """``tier_main``'s wrapper threads the push window to the planner."""
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    state = _pushed_dormant_state(
+        now=now,
+        annotation_key=ANNOTATION_DATE_MAIN_LAST_POLLED,
+        pushed_ago=timedelta(minutes=10),
+    )
+    assert not should_poll_main_for_project(state=state, now=now)
+    assert should_poll_main_for_project(
+        state=state, now=now, push_window=_PUSH_WINDOW
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "tier",
+        "annotation_key",
+        "hot_window",
+        "dormant_interval",
+        "cron_interval",
+    ),
+    _EXPLAIN_TIER_PARAMS,
+)
+def test_explain_tier_status_hot_when_pushed_inside_window(
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+    cron_interval: timedelta,
+) -> None:
+    """A pushed dormant project reads hot, due on the next cron tick.
+
+    The explainer agrees with the gate: the push is all that polls the
+    project, and the tier's last poll is still reported as recorded.
+    """
+    now = datetime(2026, 5, 7, 12, 7, tzinfo=UTC)
+    state = _pushed_dormant_state(
+        now=now,
+        annotation_key=annotation_key,
+        pushed_ago=timedelta(minutes=10),
+    )
+    status = explain_tier_status(
+        state,
+        now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+        cron_interval=cron_interval,
+        push_window=_PUSH_WINDOW,
+    )
+    assert status.cohort == "hot"
+    assert status.last_polled_at == now - timedelta(hours=1)
+    assert status.next_due_at == next_cron_tick_at_or_after(now, cron_interval)
+    assert should_poll_for_tier(
+        state=state,
+        now=now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+        push_window=_PUSH_WINDOW,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "tier",
+        "annotation_key",
+        "hot_window",
+        "dormant_interval",
+        "cron_interval",
+    ),
+    _EXPLAIN_TIER_PARAMS,
+)
+@pytest.mark.parametrize(
+    ("pushed_ago", "push_window"),
+    [
+        pytest.param(_PUSH_WINDOW, _PUSH_WINDOW, id="window-closed"),
+        pytest.param(timedelta(minutes=10), None, id="hot-path-off"),
+    ],
+)
+def test_explain_tier_status_dormant_when_push_does_not_count(
+    *,
+    tier: Tier,
+    annotation_key: str,
+    hot_window: timedelta,
+    dormant_interval: timedelta,
+    cron_interval: timedelta,
+    pushed_ago: timedelta,
+    push_window: timedelta | None,
+) -> None:
+    """A closed window, or the hot path off, leaves the stamp unread.
+
+    The project reads dormant and is due one dormant interval after the
+    tier's last poll, exactly as if it had never been pushed to.
+    """
+    now = datetime(2026, 5, 7, 12, 7, tzinfo=UTC)
+    state = _pushed_dormant_state(
+        now=now, annotation_key=annotation_key, pushed_ago=pushed_ago
+    )
+    status = explain_tier_status(
+        state,
+        now,
+        tier=tier,
+        hot_window=hot_window,
+        dormant_interval=dormant_interval,
+        cron_interval=cron_interval,
+        push_window=push_window,
+    )
+    assert status.cohort == "dormant"
+    assert status.next_due_at == now - timedelta(hours=1) + dormant_interval

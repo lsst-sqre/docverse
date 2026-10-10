@@ -17,6 +17,7 @@ from safir.arq import ArqQueue
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .config import config
 from .services.authorization import AuthorizationService
 from .services.build import BuildService
 from .services.cdn_purge_coalescer import CdnPurgeCoalescer
@@ -60,6 +61,7 @@ from .services.keeper_sync import (
 )
 from .services.keeper_sync_config import KeeperSyncConfigService
 from .services.keeper_sync_project import KeeperSyncProjectService
+from .services.keeper_sync_push_processor import KeeperSyncPushProcessor
 from .services.keeper_sync_run import KeeperSyncRunService
 from .services.keeper_sync_scope_preview import KeeperSyncScopePreviewService
 from .services.keeper_sync_tombstone import KeeperSyncTombstoneService
@@ -136,6 +138,7 @@ class WebhookDispatch:
     installation: InstallationEventProcessor
     ref_deleted: RefDeletedWebhookProcessor
     default_branch: DefaultBranchEventProcessor
+    keeper_sync_push: KeeperSyncPushProcessor
 
 
 class Factory:
@@ -497,7 +500,12 @@ class Factory:
     def create_keeper_sync_project_service(
         self,
     ) -> KeeperSyncProjectService:
-        """Create a :class:`KeeperSyncProjectService`."""
+        """Create a :class:`KeeperSyncProjectService`.
+
+        The push window is read from the process configuration on every
+        call, as the tier crons read it on every pass, so the cohorts the
+        service reports follow the same switch.
+        """
         return KeeperSyncProjectService(
             org_store=self.create_org_store(),
             project_store=self.create_project_store(),
@@ -505,6 +513,7 @@ class Factory:
             state_store=self.create_keeper_sync_state_store(),
             ltd_client_factory=self.create_ltd_client,
             logger=self._logger,
+            push_window=config.keeper_sync_push_window,
         )
 
     def create_keeper_sync_scope_preview_service(
@@ -1023,6 +1032,22 @@ class Factory:
             installation=installation,
             ref_deleted=ref_deleted,
             default_branch=default_branch,
+            keeper_sync_push=self.create_keeper_sync_push_processor(),
+        )
+
+    def create_keeper_sync_push_processor(self) -> KeeperSyncPushProcessor:
+        """Create the processor stamping keeper-sync push hints.
+
+        The hot-path switch is read from the process configuration on
+        every call, as the keeper-sync worker functions read theirs, so a
+        test can flip it per delivery.
+        """
+        return KeeperSyncPushProcessor(
+            project_store=self.create_project_store(),
+            org_store=self.create_org_store(),
+            state_store=self.create_keeper_sync_state_store(),
+            logger=self._logger,
+            enabled=config.keeper_sync_push_hot_path_enabled,
         )
 
     def create_dashboard_publisher(self) -> DashboardPublisher:
