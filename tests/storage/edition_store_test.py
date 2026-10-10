@@ -3397,6 +3397,107 @@ async def test_get_git_ref_tracking_edition_returns_non_default_on_main(
     assert found.slug == "stable"
 
 
+# ── list_git_ref_tracking_editions ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_list_git_ref_tracking_editions_returns_every_kind(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Every live ``git_ref``-mode edition on the ref, of any kind.
+
+    The keeper-sync push check asks which editions a pushed ref feeds:
+    ``__main`` for a push to the default branch, a draft for a branch, a
+    release for a tag, lifecycle-exempt or not. They come back in
+    creation order.
+    """
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="__main",
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="stable",
+                title="Stable",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "main"},
+                lifecycle_exempt=True,
+            ),
+        )
+        await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="v1",
+                title="v1",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "v1"},
+            ),
+        )
+        on_main = await edition_store.list_git_ref_tracking_editions(
+            project_id=project_id, git_ref="main"
+        )
+        on_tag = await edition_store.list_git_ref_tracking_editions(
+            project_id=project_id, git_ref="v1"
+        )
+        await db_session.commit()
+    assert [e.slug for e in on_main] == ["__main", "stable"]
+    assert [e.slug for e in on_tag] == ["v1"]
+
+
+@pytest.mark.asyncio
+async def test_list_git_ref_tracking_editions_excludes_non_matches(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Soft-deleted, other-ref, and other-mode editions are left out."""
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        for slug, mode, params in (
+            ("gone", TrackingMode.git_ref, {"git_ref": "tickets/DM-1"}),
+            ("other", TrackingMode.git_ref, {"git_ref": "tickets/DM-2"}),
+            (
+                "usdf-dev",
+                TrackingMode.alternate_git_ref,
+                {"git_ref": "tickets/DM-1", "alternate_name": "usdf-dev"},
+            ),
+        ):
+            await edition_store.create(
+                project_id=project_id,
+                data=EditionCreate(
+                    slug=slug,
+                    title=slug,
+                    kind=(
+                        EditionKind.alternate
+                        if mode is TrackingMode.alternate_git_ref
+                        else EditionKind.draft
+                    ),
+                    tracking_mode=mode,
+                    tracking_params=params,
+                ),
+            )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="gone",
+            reason=TombstoneReason.manual_delete,
+        )
+        found = await edition_store.list_git_ref_tracking_editions(
+            project_id=project_id, git_ref="tickets/DM-1"
+        )
+        await db_session.commit()
+    assert found == []
+
+
 async def _wait_until_a_backend_blocks(
     maker: async_sessionmaker[AsyncSession], *, timeout: float = 10.0
 ) -> None:

@@ -21,7 +21,11 @@ one shape, and so the rules can be unit-tested on in-memory
   its push; the rest are pruned whenever the map is stamped;
 - the map holds at most :data:`PUSHED_REFS_CAP` refs, dropping the
   oldest pushes first, so a repository that pushes many refs at once
-  cannot grow the row without bound.
+  cannot grow the row without bound;
+- ``tier_main`` visits each stamped ref, and settles the map afterwards:
+  a ref whose sync it enqueued is cleared, unless a newer push has
+  stamped it again since, and the refs whose window has passed are
+  pruned (:func:`settle_pushed_refs`).
 
 Nothing here does I/O: the callers read and write the row.
 """
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
 from docverse_server.storage.keeper_sync import KeeperSyncState
@@ -37,17 +42,61 @@ from docverse_server.storage.keeper_sync import KeeperSyncState
 __all__ = [
     "ANNOTATION_GITHUB_PUSHED_REFS",
     "PUSHED_REFS_CAP",
+    "PushCheckOutcome",
     "is_in_push_window",
+    "ltd_rebuilt_since_sync",
     "prune_pushed_refs",
     "read_pushed_refs",
+    "settle_pushed_refs",
     "stamp_pushed_ref",
 ]
 
 #: ``keeper_sync_state.annotations`` key on a project-resource state row
 #: holding the push hints: a JSON object mapping each normalized ref to
 #: the ISO-8601 time of its latest push. Written by the keeper-sync push
-#: processor through :func:`stamp_pushed_ref`.
+#: processor through :func:`stamp_pushed_ref`, and settled by
+#: ``tier_main`` through :func:`settle_pushed_refs`.
 ANNOTATION_GITHUB_PUSHED_REFS = "github_pushed_refs"
+
+
+class PushCheckOutcome(StrEnum):
+    """What ``tier_main``'s visit to one stamped ref found.
+
+    Logged as ``outcome`` on each visit. :attr:`new_edition` and
+    :attr:`rebuilt` are the outcomes that enqueue the project's sync
+    (:attr:`enqueues`); a ref whose sync was enqueued is cleared from
+    the map, and every other outcome but :attr:`expired` leaves its
+    stamp for the next tick.
+    """
+
+    new_edition = "new_edition"
+    """No synced edition tracks the ref yet, and LTD lists an edition
+    keeper-sync has not seen: most likely the one the push's CI just
+    uploaded."""
+
+    rebuilt = "rebuilt"
+    """LTD rebuilt the edition tracking the ref since keeper-sync last
+    synced it."""
+
+    unchanged = "unchanged"
+    """The edition tracking the ref is as keeper-sync last synced it: the
+    push's CI has not uploaded yet."""
+
+    expired = "expired"
+    """The ref's window passed without a sync; its stamp is pruned."""
+
+    not_found = "not_found"
+    """No synced edition tracks the ref, and LTD lists nothing
+    keeper-sync has not seen: LTD has not created the ref's edition yet."""
+
+    error = "error"
+    """LTD failed to answer; the stamp is kept for the next tick."""
+
+    @property
+    def enqueues(self) -> bool:
+        """Whether this outcome calls for the project's sync."""
+        return self in {PushCheckOutcome.new_edition, PushCheckOutcome.rebuilt}
+
 
 #: Most refs one project's push hints hold. A stamp that would leave
 #: more drops the oldest pushes first. Twenty is far above the handful
@@ -181,6 +230,84 @@ def is_in_push_window(
     return bool(
         prune_pushed_refs(read_pushed_refs(state), now=now, window=window)
     )
+
+
+def settle_pushed_refs(
+    state: KeeperSyncState,
+    *,
+    cleared: Mapping[str, datetime],
+    now: datetime,
+    window: timedelta,
+) -> dict[str, Any]:
+    """Return a project's annotations with a ``tier_main`` visit settled.
+
+    ``tier_main`` reads the stamps, visits each ref, and then writes the
+    map back from a fresh read of the row, which a push may have stamped
+    again in between. A ref in ``cleared`` is dropped only while its
+    stamp is still the push time the visit read: a newer push to it is
+    a newer hint, and keeps its stamp for the next tick. Refs whose
+    window has passed are pruned. Every other annotation key on the row
+    is carried over unchanged.
+
+    Parameters
+    ----------
+    state
+        The project's ``keeper_sync_state`` row, freshly read.
+    cleared
+        The refs whose sync the visit enqueued, each with the push time
+        the visit read for it.
+    now
+        The time of the visit.
+    window
+        How long a push keeps its ref on the fast path.
+
+    Returns
+    -------
+    dict of str to Any
+        The row's annotations to write back, with
+        :data:`ANNOTATION_GITHUB_PUSHED_REFS` replaced.
+    """
+    refs = {
+        ref: pushed_at
+        for ref, pushed_at in read_pushed_refs(state).items()
+        if cleared.get(ref) != pushed_at
+    }
+    kept = prune_pushed_refs(refs, now=now, window=window)
+    prior = state.annotations or {}
+    return {
+        **prior,
+        ANNOTATION_GITHUB_PUSHED_REFS: {
+            ref: pushed_at.isoformat() for ref, pushed_at in kept.items()
+        },
+    }
+
+
+def ltd_rebuilt_since_sync(
+    state: KeeperSyncState, *, ltd_date_rebuilt: datetime | None
+) -> bool:
+    """Report whether LTD rebuilt an edition since keeper-sync synced it.
+
+    The rebuild check ``tier_main`` runs on the edition tracking a
+    pushed ref. LTD's ``date_rebuilt`` is compared with the
+    ``date_rebuilt_seen`` the edition's state row recorded at its last
+    sync or, when the row recorded none, with its ``date_last_synced``.
+    An LTD edition that has never been rebuilt has nothing new to sync,
+    and a row that records neither time has never been synced, so any
+    rebuild is new to it.
+
+    Parameters
+    ----------
+    state
+        The edition's ``keeper_sync_state`` row.
+    ltd_date_rebuilt
+        The LTD edition's ``date_rebuilt``.
+    """
+    if ltd_date_rebuilt is None:
+        return False
+    reference = state.date_rebuilt_seen or state.date_last_synced
+    if reference is None:
+        return True
+    return ltd_date_rebuilt > reference
 
 
 def _parse_push_time(value: object) -> datetime | None:

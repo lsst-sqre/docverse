@@ -103,6 +103,21 @@ async def test_get_edition_by_url_returns_typed_model(
 
 
 @pytest.mark.asyncio
+async def test_get_edition_fetches_by_ltd_id(
+    http_client: httpx.AsyncClient, mock_discovery: respx.Router
+) -> None:
+    """An edition is fetched from ``/editions/<id>`` under the base URL."""
+    route = mock_discovery.get(f"{LTD_BASE}/editions/1").mock(
+        return_value=httpx.Response(
+            200, json=_load("edition_main_git_refs.json")
+        )
+    )
+    edition = await _make_client(http_client).get_edition(1)
+    assert route.call_count == 1
+    assert edition.ltd_id == 1
+
+
+@pytest.mark.asyncio
 async def test_list_editions_for_product_follows_each_url(
     http_client: httpx.AsyncClient, mock_discovery: respx.Router
 ) -> None:

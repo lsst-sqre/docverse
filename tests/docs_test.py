@@ -95,6 +95,7 @@ from docverse_server.services.keeper_sync import (
 from docverse_server.services.keeper_sync.push_hints import (
     ANNOTATION_GITHUB_PUSHED_REFS,
     PUSHED_REFS_CAP,
+    PushCheckOutcome,
 )
 from docverse_server.services.keeper_sync_push_processor import (
     KeeperSyncPushSkip,
@@ -178,6 +179,19 @@ _PUSH_HOT_PATH_SECTION = "The keeper-sync push hot path"
 
 _PUSH_PROCESSOR_MODULE = "docverse_server.services.keeper_sync_push_processor"
 """Module that stamps a push onto the projects of its repository."""
+
+_PUSH_CHECK_SUBSECTION = "The `tier_main` check"
+"""Hot-path subsection on what ``tier_main`` does with a stamp (#807)."""
+
+_PUSH_CHECK_LOGS_SUBSECTION = "`tier_main` log lines"
+"""Hot-path subsection tabling ``tier_main``'s pushed-ref log lines."""
+
+_PUSH_CHECK_LOG_LINES = (
+    "Tier-main: checked pushed ref",
+    "Tier-main: enqueued project sync for pushed ref",
+    "Tier-main: failed to check pushed ref",
+)
+"""The lines ``tier_main`` writes about the pushed refs it visits."""
 
 _PUSH_HANDLER_LOGS = (
     "Processed push webhook",
@@ -1647,6 +1661,43 @@ def test_github_push_hot_path_names_the_bound_log_fields() -> None:
     bound = _bound_log_fields(_PUSH_PROCESSOR_MODULE)
     assert bound, "the push processor binds no fields"
     assert not _uncoded(bound, section)
+
+
+def test_github_push_check_tables_every_outcome() -> None:
+    """The ``tier_main`` check's outcome table has a row per outcome.
+
+    ``outcome`` is what an operator greps the check's log lines for, so
+    an outcome added to the code has to gain a row saying what it means
+    and what it does to the stamp.
+    """
+    check = _subsection(
+        _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION),
+        _PUSH_CHECK_SUBSECTION,
+    )
+    documented = {cells[0].strip("`") for cells in _code_rows(check)}
+    assert documented == {outcome.value for outcome in PushCheckOutcome}
+
+
+def test_github_push_check_log_lines_match_the_code() -> None:
+    """The ``tier_main`` log table is exactly its pushed-ref lines.
+
+    Both ways for the curated set: every call site of each listed line
+    has a row with its level and fields, as it reads in the JSON logs,
+    and no row describes a line the worker does not write.
+    """
+    table = _subsection(
+        _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION),
+        _PUSH_CHECK_LOGS_SUBSECTION,
+    )
+    documented: dict[str, set[_LogCall]] = {}
+    for message, call in _log_rows(table):
+        documented.setdefault(message, set()).add(call)
+    calls = _log_calls("docverse_server.worker.functions.keeper_sync")
+    emitted: dict[str, set[_LogCall]] = {}
+    for message in _PUSH_CHECK_LOG_LINES:
+        assert message in calls, f"tier_main no longer logs {message!r}"
+        emitted[message] = {_as_logged(call) for call in calls[message]}
+    assert documented == emitted
 
 
 def _camel_case(name: str) -> str:

@@ -3,8 +3,10 @@
 Pure-function tests with no DB or HTTP, on in-memory
 ``KeeperSyncState`` rows like ``scheduler_test.py``. The push processor
 writes what :func:`stamp_pushed_ref` returns onto a project's state row,
-so these tests pin the shape of the ``github_pushed_refs`` annotation as
-well as the stamp, prune, cap, and window rules.
+and ``tier_main`` what :func:`settle_pushed_refs` returns, so these
+tests pin the shape of the ``github_pushed_refs`` annotation as well as
+the stamp, prune, cap, window, and settle rules, and the rebuild check
+``tier_main`` runs on each pushed ref's edition.
 """
 
 from __future__ import annotations
@@ -16,8 +18,10 @@ from docverse_server.services.keeper_sync.push_hints import (
     ANNOTATION_GITHUB_PUSHED_REFS,
     PUSHED_REFS_CAP,
     is_in_push_window,
+    ltd_rebuilt_since_sync,
     prune_pushed_refs,
     read_pushed_refs,
+    settle_pushed_refs,
     stamp_pushed_ref,
 )
 from docverse_server.storage.keeper_sync import KeeperSyncState
@@ -41,6 +45,25 @@ def _project_state(
         ltd_slug=ltd_slug,
         docverse_id=7,
         annotations=annotations,
+    )
+
+
+def _edition_state(
+    *,
+    date_rebuilt_seen: datetime | None = None,
+    date_last_synced: datetime | None = None,
+) -> KeeperSyncState:
+    """Build an edition-resource ``KeeperSyncState`` row."""
+    return KeeperSyncState(
+        id=2,
+        public_id=2,
+        org_id=1,
+        resource_type="edition",
+        ltd_id=42,
+        ltd_slug="tickets-DM-1",
+        docverse_id=8,
+        date_rebuilt_seen=date_rebuilt_seen,
+        date_last_synced=date_last_synced,
     )
 
 
@@ -221,3 +244,111 @@ def test_is_in_push_window() -> None:
     assert not is_in_push_window(expired, now=_NOW, window=_WINDOW)
     assert not is_in_push_window(_project_state(), now=_NOW, window=_WINDOW)
     assert not is_in_push_window(None, now=_NOW, window=_WINDOW)
+
+
+def test_settle_clears_a_ref_whose_stamp_has_not_moved() -> None:
+    """A ref cleared at the push time the visit read is dropped."""
+    pushed = _NOW - timedelta(minutes=20)
+    other = _NOW - timedelta(minutes=5)
+    state = _project_state(
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS: {
+                "tickets/DM-1": pushed.isoformat(),
+                "main": other.isoformat(),
+            }
+        }
+    )
+
+    settled = settle_pushed_refs(
+        state, cleared={"tickets/DM-1": pushed}, now=_NOW, window=_WINDOW
+    )
+
+    assert settled[ANNOTATION_GITHUB_PUSHED_REFS] == {
+        "main": other.isoformat()
+    }
+
+
+def test_settle_keeps_a_ref_pushed_again_since_the_visit() -> None:
+    """A ref re-stamped after the visit read it keeps its newer stamp."""
+    seen = _NOW - timedelta(minutes=20)
+    again = _NOW - timedelta(seconds=10)
+    state = _project_state(
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS: {"tickets/DM-1": again.isoformat()}
+        }
+    )
+
+    settled = settle_pushed_refs(
+        state, cleared={"tickets/DM-1": seen}, now=_NOW, window=_WINDOW
+    )
+
+    assert settled[ANNOTATION_GITHUB_PUSHED_REFS] == {
+        "tickets/DM-1": again.isoformat()
+    }
+
+
+def test_settle_prunes_expired_refs() -> None:
+    """Settling drops every ref whose window has passed."""
+    state = _project_state(
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS: {
+                "expired": (_NOW - _WINDOW).isoformat(),
+                "live": (_NOW - timedelta(minutes=5)).isoformat(),
+            }
+        }
+    )
+
+    settled = settle_pushed_refs(state, cleared={}, now=_NOW, window=_WINDOW)
+
+    assert set(settled[ANNOTATION_GITHUB_PUSHED_REFS]) == {"live"}
+
+
+def test_settle_preserves_other_annotation_keys() -> None:
+    """The tier crons' own annotation keys survive settling."""
+    state = _project_state(
+        annotations={
+            "date_main_last_polled": "2026-10-09T11:55:00+00:00",
+            ANNOTATION_GITHUB_PUSHED_REFS: {
+                "main": (_NOW - _WINDOW).isoformat()
+            },
+        }
+    )
+
+    settled = settle_pushed_refs(state, cleared={}, now=_NOW, window=_WINDOW)
+
+    assert settled == {
+        "date_main_last_polled": "2026-10-09T11:55:00+00:00",
+        ANNOTATION_GITHUB_PUSHED_REFS: {},
+    }
+
+
+def test_ltd_rebuilt_since_sync_compares_with_the_rebuild_seen() -> None:
+    """A rebuild newer than the one Docverse last saw is a change."""
+    seen = _NOW - timedelta(minutes=30)
+    state = _edition_state(date_rebuilt_seen=seen, date_last_synced=_NOW)
+
+    assert ltd_rebuilt_since_sync(state, ltd_date_rebuilt=_NOW)
+    assert not ltd_rebuilt_since_sync(state, ltd_date_rebuilt=seen)
+    assert not ltd_rebuilt_since_sync(
+        state, ltd_date_rebuilt=seen - timedelta(seconds=1)
+    )
+
+
+def test_ltd_rebuilt_since_sync_falls_back_to_the_last_sync() -> None:
+    """With no rebuild recorded, the last sync time is the reference."""
+    synced = _NOW - timedelta(minutes=30)
+    state = _edition_state(date_last_synced=synced)
+
+    assert ltd_rebuilt_since_sync(state, ltd_date_rebuilt=_NOW)
+    assert not ltd_rebuilt_since_sync(
+        state, ltd_date_rebuilt=synced - timedelta(minutes=1)
+    )
+
+
+def test_ltd_rebuilt_since_sync_edge_cases() -> None:
+    """An unbuilt LTD edition never changes; an unsynced row always does."""
+    assert not ltd_rebuilt_since_sync(
+        _edition_state(date_rebuilt_seen=_NOW), ltd_date_rebuilt=None
+    )
+    assert not ltd_rebuilt_since_sync(_edition_state(), ltd_date_rebuilt=None)
+    assert ltd_rebuilt_since_sync(_edition_state(), ltd_date_rebuilt=_NOW)

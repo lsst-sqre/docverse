@@ -400,9 +400,11 @@ LTD afterwards, and LTD then creates or rebuilds the edition. What a
 push can do is say that LTD is about to change. So a `push` delivery
 stamps the pushed ref onto each LTD-synced project bound to the
 repository, and keeper-sync's tier crons poll that project on their
-fast path for a bounded window afterwards (PRD #803). Reading the stamp
-is the tier crons' half of the hot path; the stamp alone changes no
-polling.
+fast path for a bounded window afterwards (PRD #803). The webhook writes
+the stamp; `keeper_sync_tier_main` reads it on its five-minute tick,
+checks each pushed ref's edition on LTD directly, and enqueues the
+project's sync once LTD has rebuilt it: see
+[The `tier_main` check](#the-tier_main-check).
 
 ### The stamp
 
@@ -470,17 +472,109 @@ A ref is inside the window while less than
 since its latest push. The window has to cover the repository's CI run
 and its upload to LTD; a ref whose window closes without LTD rebuilding
 it drops back to its project's ordinary cadence, and nothing retries
-it. Raising the window keeps a slow CI on the fast path longer, at the
-price of more LTD polling per push.
+it: `tier_main`'s next visit prunes it from the map with the outcome
+`expired`. Raising the window keeps a slow CI on the fast path longer,
+at the price of more LTD polling per push.
+
+### The `tier_main` check
+
+Every five-minute `keeper_sync_tier_main` tick visits the stamps of each
+in-scope project, after its own check of the project's `main` edition.
+The visit runs whatever that check's dormancy gate decided: a push says
+LTD is about to change, so a project dormant for months is checked on
+the next tick all the same.
+
+Refs whose window has passed come first. Each is `expired`, costs no LTD
+call, and is pruned. Then each live ref, oldest push first:
+
+1. **Find the edition the ref feeds.** The Docverse editions of the
+   project that track the ref (`git_ref` tracking mode, any kind: the
+   `__main` edition for a push to the default branch, a draft for a
+   branch, a release for a tag) are mapped to their `keeper_sync_state`
+   edition rows and the LTD editions those record. When several LTD
+   editions feed the ref, the newest is checked.
+2. **Ask LTD.** One `GET /editions/<id>`, skipped when the `main` check
+   already fetched that edition this tick. The edition is `rebuilt` when
+   its `date_rebuilt` is newer than the `date_rebuilt_seen` its state
+   row recorded at the last sync (or, if the row recorded none, its
+   `date_last_synced`), and `unchanged` otherwise: the push's CI has not
+   uploaded yet.
+3. **Fall back to the listing.** When no synced edition tracks the ref,
+   or LTD answers `404` for the one that did, the project's edition
+   listing (`GET /products/<slug>/editions/`, read once per project per
+   tick) is checked the way `keeper_sync_tier_discovery` checks it. An
+   edition LTD lists that keeper-sync has no state row for is a
+   `new_edition`, most likely the one the push's CI just uploaded;
+   none is `not_found`: LTD has not created the ref's edition yet.
+
+| Outcome | What the visit found | The stamp |
+| --- | --- | --- |
+| `rebuilt` | LTD rebuilt the ref's edition since its last sync | Cleared once the sync is enqueued |
+| `new_edition` | No synced edition tracks the ref, and LTD lists one keeper-sync has not seen | Cleared once the sync is enqueued |
+| `unchanged` | The ref's edition is as keeper-sync last synced it | Kept |
+| `not_found` | No synced edition tracks the ref, and LTD lists nothing new | Kept |
+| `error` | LTD failed to answer | Kept |
+| `expired` | The ref's window passed | Pruned |
+
+A `rebuilt` or `new_edition` ref enqueues the project's whole
+`keeper_sync_project`, with the tier label `main`, through the same
+per-project slot as every tier: one job per project per tick, shared
+with the `main` check and with the project's other refs, and none when
+a sync for the project is already queued or running. The refs that
+called for an enqueued job are cleared from the map; when the slot was
+taken they keep their stamps, and the next tick checks them again
+against what that job synced. An `unchanged` or `not_found` ref keeps
+its stamp until LTD rebuilds it or its window passes.
+
+An LTD failure, after the client's own retries, is logged as
+`Tier-main: failed to check pushed ref` and sent to Sentry, as the
+`main` check's failures are. The ref keeps its stamp, and the project's
+remaining live refs wait for the next tick rather than spend more LTD
+calls on an LTD that is failing. When the `main` check itself failed on
+LTD, the project's refs wait for the next tick too.
+
+The visit writes the map back only when it cleared or pruned a ref,
+reading the row `FOR UPDATE` first: a ref pushed again while the tick
+ran keeps its newer stamp, since the enqueued job may have missed what
+that push uploads. The three tier crons' own writes to the row, which
+record when they polled the project, read it `FOR UPDATE` for the same
+reason, so none of them can write back a map that predates a stamp.
+
+The check's cost is bounded: at most two LTD calls per stamped ref per
+tick (its edition, then the listing), the listing shared by the
+project's refs, and at most 20 refs per project. Editions that follow a
+ref by a version rule rather than by name (`lsst_doc` and the `eups`
+modes) are not looked up: a tag push to such a project is caught by the
+listing when LTD creates an edition for the tag, and otherwise on the
+project's ordinary cadence.
+
+### `tier_main` log lines
+
+Every visited ref writes one line; a ref whose sync was enqueued writes
+a second, with the time from its push to the enqueue.
+
+| Message | Level | Fields |
+| --- | --- | --- |
+| `Tier-main: checked pushed ref` | info | `org`, `project`, `github_ref`, `outcome`, `pushed_at`, `enqueued` |
+| `Tier-main: enqueued project sync for pushed ref` | info | `org`, `project`, `github_ref`, `outcome`, `push_lag_seconds` |
+| `Tier-main: failed to check pushed ref` | error | `org`, `project`, `github_ref`, `exception` |
+
+`project` is the project's slug, which is also its LTD product slug;
+`pushed_at` is the push time the visit read from the stamp; `enqueued`
+is whether the ref's sync was enqueued, and so its stamp cleared, this
+tick.
 
 ### Switching it off
 
 `keeper_sync_push_hot_path_enabled` (default `true`) is the hot path's
 switch. Off, a push logs
 `Keeper-sync push hot path is disabled, not stamping` and stamps
-nothing, and keeper-sync polls every project on its ordinary cadence.
-The dashboard-template work a push drives is unaffected either way.
-Stamps already written stay on their rows and age out of the window.
+nothing, `tier_main` neither checks nor prunes stamps, making exactly
+the LTD calls it made before the hot path existed, and keeper-sync polls
+every project on its ordinary cadence. The dashboard-template work a
+push drives is unaffected either way. Stamps already written stay on
+their rows untouched; turned back on, `tier_main` prunes the ones whose
+window has passed on its next visit.
 
 ### When the stamp fails
 
@@ -503,6 +597,9 @@ redelivery's time.
   [metrics catalog](metrics.md#github_webhook_received).
 - **The row.** `GET /orgs/{org}/keeper-sync/projects/{ltd_slug}` shows
   the stamp in `project_state.annotations`.
+- **The tick.** `tier_main`'s lines say what each visit found and when
+  a push's sync was enqueued: see
+  [`tier_main` log lines](#tier_main-log-lines).
 - **The log.** The processor binds `github_owner`, `github_repo`,
   `github_repo_id`, and the payload's `github_ref_raw` onto every line
   it writes, and the normalized `github_ref` once it has one; its
