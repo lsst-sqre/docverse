@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -17,6 +18,7 @@ from safir.arq import ArqQueue
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .config import config
 from .services.authorization import AuthorizationService
 from .services.build import BuildService
 from .services.cdn_purge_coalescer import CdnPurgeCoalescer
@@ -60,6 +62,7 @@ from .services.keeper_sync import (
 )
 from .services.keeper_sync_config import KeeperSyncConfigService
 from .services.keeper_sync_project import KeeperSyncProjectService
+from .services.keeper_sync_push_processor import KeeperSyncPushProcessor
 from .services.keeper_sync_run import KeeperSyncRunService
 from .services.keeper_sync_scope_preview import KeeperSyncScopePreviewService
 from .services.keeper_sync_tombstone import KeeperSyncTombstoneService
@@ -136,6 +139,7 @@ class WebhookDispatch:
     installation: InstallationEventProcessor
     ref_deleted: RefDeletedWebhookProcessor
     default_branch: DefaultBranchEventProcessor
+    keeper_sync_push: KeeperSyncPushProcessor
 
 
 class Factory:
@@ -1023,6 +1027,23 @@ class Factory:
             installation=installation,
             ref_deleted=ref_deleted,
             default_branch=default_branch,
+            keeper_sync_push=self.create_keeper_sync_push_processor(),
+        )
+
+    def create_keeper_sync_push_processor(self) -> KeeperSyncPushProcessor:
+        """Create the processor stamping keeper-sync push hints.
+
+        The hot-path switch and window are read from the process
+        configuration on every call, as the keeper-sync worker functions
+        read theirs, so a test can flip them per delivery.
+        """
+        return KeeperSyncPushProcessor(
+            project_store=self.create_project_store(),
+            org_store=self.create_org_store(),
+            state_store=self.create_keeper_sync_state_store(),
+            logger=self._logger,
+            enabled=config.keeper_sync_push_hot_path_enabled,
+            window=timedelta(seconds=config.keeper_sync_push_window_seconds),
         )
 
     def create_dashboard_publisher(self) -> DashboardPublisher:

@@ -75,6 +75,7 @@ from docverse_server.metrics import (
     ConditionalGetPrecondition,
     DocverseEvents,
     EditionReconcileCompletedEvent,
+    GitHubWebhookReceivedEvent,
     HttpMethod,
     HttpStatusClass,
     WebhookOutcome,
@@ -90,6 +91,13 @@ from docverse_server.services.keeper_sync import (
     ProjectSyncResult,
     TrackingDerivationSource,
     scheduler,
+)
+from docverse_server.services.keeper_sync.push_hints import (
+    ANNOTATION_GITHUB_PUSHED_REFS,
+    PUSHED_REFS_CAP,
+)
+from docverse_server.services.keeper_sync_push_processor import (
+    KeeperSyncPushSkip,
 )
 from docverse_server.storage._http_retry import (
     DEFAULT_BASE_BACKOFF_SECONDS,
@@ -162,8 +170,20 @@ every deployment.
 _GITHUB_PAGE = "github-integration.md"
 """Operations page for the GitHub App integration (PRD #721)."""
 
-_GITHUB_KNOB_PREFIXES = ("github_", "git_ref_audit")
+_GITHUB_KNOB_PREFIXES = ("github_", "git_ref_audit", "keeper_sync_push_")
 """Name prefixes of the settings the GitHub integration page tabulates."""
+
+_PUSH_HOT_PATH_SECTION = "The keeper-sync push hot path"
+"""GitHub-page section on the push hint keeper-sync reads (PRD #803)."""
+
+_PUSH_PROCESSOR_MODULE = "docverse_server.services.keeper_sync_push_processor"
+"""Module that stamps a push onto the projects of its repository."""
+
+_PUSH_HANDLER_LOGS = (
+    "Processed push webhook",
+    "Keeper-sync push stamp failed",
+)
+"""The push handler's own log lines, which the hot-path section tables."""
 
 _DEFAULT_BRANCH_LOG_MODULES = (
     "docverse_server.services.default_branch",
@@ -1570,6 +1590,63 @@ def test_github_manual_fallback_documented() -> None:
     fields = {"tracking_mode", "tracking_params", "build"}
     assert fields <= set(EditionUpdate.model_fields)
     assert not _uncoded(fields, section)
+
+
+def test_github_push_hot_path_names_its_contract() -> None:
+    """The hot-path section names the stamp, its knobs, and every skip.
+
+    The annotation key is what an operator reads off a state row, the
+    two settings are how the path is tuned or switched off, and the skip
+    reasons are what the processor's log says when a push stamps nothing.
+    """
+    section = _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION)
+    knobs = {
+        name
+        for name in Configuration.model_fields
+        if name.startswith("keeper_sync_push_")
+    }
+    assert knobs, "configuration exposes no push hot-path knobs"
+    assert "projects_stamped" in GitHubWebhookReceivedEvent.model_fields
+    names = {
+        ANNOTATION_GITHUB_PUSHED_REFS,
+        "projects_stamped",
+        *knobs,
+        *(reason.value for reason in KeeperSyncPushSkip),
+    }
+    assert not _uncoded(names, section)
+    assert f"{PUSHED_REFS_CAP} refs" in section
+
+
+def test_github_push_hot_path_log_lines_match_the_code() -> None:
+    """The hot-path log table is exactly the lines the push step writes.
+
+    Checked both ways, against the processor's lines and the push
+    handler's own two, so a line added to either has to gain a row and a
+    row cannot outlive its line.
+    """
+    documented = _documented_log_lines(
+        _read(_GITHUB_PAGE), section=_PUSH_HOT_PATH_SECTION
+    )
+    handler_calls = _log_calls("docverse_server.handlers.webhooks.github")
+    emitted = {
+        **_log_calls(_PUSH_PROCESSOR_MODULE),
+        **{message: handler_calls[message] for message in _PUSH_HANDLER_LOGS},
+    }
+    assert set(documented) == set(emitted)
+    wrong = sorted(
+        message
+        for message, row in documented.items()
+        if row not in emitted[message]
+    )
+    assert not wrong
+
+
+def test_github_push_hot_path_names_the_bound_log_fields() -> None:
+    """The hot-path section names every field the processor binds."""
+    section = _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION)
+    bound = _bound_log_fields(_PUSH_PROCESSOR_MODULE)
+    assert bound, "the push processor binds no fields"
+    assert not _uncoded(bound, section)
 
 
 def _camel_case(name: str) -> str:

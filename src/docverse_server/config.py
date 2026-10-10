@@ -565,6 +565,41 @@ class Configuration(BaseSettings):
         ),
     )
 
+    keeper_sync_push_hot_path_enabled: bool = Field(
+        True,
+        title="Keeper-sync push hot path",
+        description=(
+            "Whether a GitHub ``push`` delivery puts the keeper-synced"
+            " projects bound to the pushed repository on keeper-sync's"
+            " fast polling path (PRD #803). On, the webhook stamps the"
+            " pushed branch or tag, with the delivery's time, into the"
+            " ``github_pushed_refs`` annotation of each such project's"
+            " ``keeper_sync_state`` row, and the tier crons read the"
+            " stamp for ``keeper_sync_push_window_seconds``. Off, the"
+            " webhook logs the push and stamps nothing, and keeper-sync"
+            " polls on its ordinary cohort cadence. The dashboard-template"
+            " work a ``push`` drives is unaffected either way."
+        ),
+    )
+
+    keeper_sync_push_window_seconds: int = Field(
+        3600,
+        ge=1,
+        title="Keeper-sync push window, in seconds",
+        description=(
+            "How long a pushed ref stays on keeper-sync's fast polling"
+            " path after its latest push. The push only hints that LTD"
+            " Keeper is about to change: the repository's CI builds and"
+            " uploads the docs afterwards, so the window has to cover a"
+            " CI run, and a ref whose window closes without an LTD"
+            " rebuild drops back to the project's ordinary cadence. A"
+            " repeated push to the same ref restarts its window, and"
+            " every stamp on a project prunes the refs whose window has"
+            " passed. Only read while"
+            " ``keeper_sync_push_hot_path_enabled`` is on."
+        ),
+    )
+
     maintenance_max_jobs: int = Field(
         10,
         ge=1,

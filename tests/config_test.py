@@ -459,6 +459,33 @@ def test_keeper_sync_copy_retry_delay_refuses_negative(
     assert Configuration().keeper_sync_copy_retry_delay_seconds == 0.0
 
 
+def test_keeper_sync_push_hot_path_defaults() -> None:
+    """The push hot path ships on, with a one-hour window."""
+    config = Configuration()
+    assert config.keeper_sync_push_hot_path_enabled is True
+    assert config.keeper_sync_push_window_seconds == 3600
+
+
+def test_keeper_sync_push_hot_path_env_var_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both push hot-path settings are env-overridable under the prefix."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_HOT_PATH_ENABLED", "false")
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_WINDOW_SECONDS", "600")
+    config = Configuration()
+    assert config.keeper_sync_push_hot_path_enabled is False
+    assert config.keeper_sync_push_window_seconds == 600
+
+
+def test_keeper_sync_push_window_refuses_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A window of zero would expire every stamp as it is written."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_WINDOW_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        Configuration()
+
+
 def test_publish_edition_job_timeout_default() -> None:
     """The publish budget is 30 min — well above arq's 300 s default.
 

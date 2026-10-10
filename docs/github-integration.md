@@ -32,6 +32,10 @@ dispatches on the event type and its `action`. It answers:
   leaves nothing half-done — except `repository.edited`, which works
   project by project (see
   [A default-branch delivery that fails](#a-default-branch-delivery-that-fails)).
+  A `push` commits its keeper-sync step separately, after the
+  dashboard-template work, and absorbs that step's failure rather than
+  answering `500` (see
+  [When the stamp fails](#when-the-stamp-fails)).
 
 Every delivery, whatever became of it, publishes one
 `github_webhook_received` event; see the
@@ -39,7 +43,7 @@ Every delivery, whatever became of it, publishes one
 
 | Event | What Docverse does |
 | --- | --- |
-| `push` | Enqueues one `dashboard_sync` for each dashboard-template binding pinned to the pushed repository and ref whose `root_path` the push touched. The changed paths come from the payload, or from GitHub's compare API when the payload's commit list is truncated. A push never creates a build or moves an edition: builds arrive through the upload API. |
+| `push` | Enqueues one `dashboard_sync` for each dashboard-template binding pinned to the pushed repository and ref whose `root_path` the push touched. The changed paths come from the payload, or from GitHub's compare API when the payload's commit list is truncated. Then, in a transaction of its own, stamps the pushed branch or tag onto every LTD-synced project bound to the repository, putting it on keeper-sync's fast path: see [The keeper-sync push hot path](#the-keeper-sync-push-hot-path). That step never calls GitHub, and its failure does not fail the delivery. A push never creates a build or moves an edition: builds arrive through the upload API, or from LTD Keeper through keeper-sync. |
 | `delete` | For a deleted branch or tag, soft-deletes and unpublishes every live, non-exempt `draft` edition tracking it, on every project bound to the repository, then enqueues one `dashboard_build` per affected project. Release editions and `__main` are never swept. |
 | `repository.renamed` | Rewrites the repository name on bound projects and on dashboard-template bindings and templates, matched by `repository.id` — and, for a template binding that has never synced, by its old name. |
 | `repository.transferred` | Rewrites the owner, owner id, and name on the same rows, matched by `repository.id` only. |
@@ -385,6 +389,147 @@ to the same ref (see
 [Pinned `__main` editions](#pinned-__main-editions-are-left-for-operators));
 from then on it agrees with LTD, and keeper-sync mirrors LTD as before.
 
+## The keeper-sync push hot path
+
+Keeper-sync finds LTD Keeper's changes by polling it on three tier crons
+whose cadence follows how recently a project's `main` edition rebuilt,
+so a contributor's new branch edition can take half an hour to an hour
+to appear, and a dormant project's a day. A `push` cannot sync anything
+by itself: the repository's own CI builds the docs and uploads them to
+LTD afterwards, and LTD then creates or rebuilds the edition. What a
+push can do is say that LTD is about to change. So a `push` delivery
+stamps the pushed ref onto each LTD-synced project bound to the
+repository, and keeper-sync's tier crons poll that project on their
+fast path for a bounded window afterwards (PRD #803). Reading the stamp
+is the tier crons' half of the hot path; the stamp alone changes no
+polling.
+
+### The stamp
+
+The stamp lives in the `github_pushed_refs` annotation on the project's
+`keeper_sync_state` row — the project-resource row, keyed by the
+project's slug, which is also its LTD product slug. It maps each pushed
+ref, normalized to the bare branch or tag name, to the ISO-8601 time
+Docverse processed the delivery:
+
+```json
+{
+  "github_pushed_refs": {
+    "tickets/DM-56619": "2026-10-09T14:02:11.204518+00:00",
+    "v1.2.0": "2026-10-09T13:41:57.880341+00:00"
+  }
+}
+```
+
+A push is stamped when all of these hold:
+
+- its `ref` is a branch (`refs/heads/…`) or a tag (`refs/tags/…`), and
+  `deleted` is not true. A deleted ref is the `delete` event's
+  business;
+- a project is bound to the repository, found by `repository.id`, or by
+  owner and name for a project whose numeric id is not resolved yet, as
+  for `delete` and `repository.edited`;
+- the project's organization has keeper-sync enabled, and its slug is
+  inside the organization's
+  [sync scope](keeper-sync-scope.md#the-rule);
+- the project has a live project state row: keeper-sync has imported it
+  from LTD, and its row is not tombstoned.
+
+A repository bound to several such projects stamps every one of them.
+The rest are skipped with an info line naming the `reason`:
+
+| `reason` | Why the project was not stamped |
+| --- | --- |
+| `sync_disabled` | Its organization has keeper-sync off, or no keeper-sync config |
+| `out_of_scope` | Its slug is outside its organization's sync scope |
+| `no_state` | It has no live project state row: never imported from LTD, or tombstoned |
+
+Every stamp writes the whole map back:
+
+- **A repeated push overwrites.** A second push to the same ref replaces
+  its time, so the window restarts from the latest push.
+- **Expired refs are pruned.** Refs whose window has passed are dropped
+  on every stamp.
+- **The map is capped.** It holds at most 20 refs; a stamp that would
+  leave more drops the oldest pushes first, so a repository that pushes
+  many tags at once cannot grow the row without bound.
+- **Other keys survive.** The row is read `FOR UPDATE`, the map merged
+  into its other annotations — the tier crons' own
+  `date_main_last_polled` and the like — and the whole column written
+  back, so two deliveries stamping the same project, such as a branch
+  and a tag pushed together, cannot drop each other's ref.
+
+The stamp needs only the payload: the keeper-sync step never calls
+GitHub, not even the compare API the dashboard-template step falls back
+to for a truncated push.
+
+### The window
+
+A ref is inside the window while less than
+`keeper_sync_push_window_seconds` (default `3600`, one hour) has passed
+since its latest push. The window has to cover the repository's CI run
+and its upload to LTD; a ref whose window closes without LTD rebuilding
+it drops back to its project's ordinary cadence, and nothing retries
+it. Raising the window keeps a slow CI on the fast path longer, at the
+price of more LTD polling per push.
+
+### Switching it off
+
+`keeper_sync_push_hot_path_enabled` (default `true`) is the hot path's
+switch. Off, a push logs
+`Keeper-sync push hot path is disabled, not stamping` and stamps
+nothing, and keeper-sync polls every project on its ordinary cadence.
+The dashboard-template work a push drives is unaffected either way.
+Stamps already written stay on their rows and age out of the window.
+
+### When the stamp fails
+
+The keeper-sync step runs after the dashboard-template step has
+committed and handed its jobs to the queue, in a transaction of its
+own. A failure there — a database error, say — rolls back only the
+stamps, is logged as `Keeper-sync push stamp failed` and sent to Sentry,
+and the delivery still answers `200`: a lost stamp costs only that
+push's fast path, while a `500` would invite GitHub to redeliver
+dashboard work that already happened. The delivery's
+`github_webhook_received` event is recorded `dispatched` with
+`projects_stamped` null, which is how the failure shows in the metrics.
+Redelivering it from the App's settings stamps the projects with the
+redelivery's time.
+
+### Reading a push
+
+- **The event.** `github_webhook_received`'s `projects_stamped` counts
+  the projects a push stamped: see the
+  [metrics catalog](metrics.md#github_webhook_received).
+- **The row.** `GET /orgs/{org}/keeper-sync/projects/{ltd_slug}` shows
+  the stamp in `project_state.annotations`.
+- **The log.** The processor binds `github_owner`, `github_repo`,
+  `github_repo_id`, and the payload's `github_ref_raw` onto every line
+  it writes, and the normalized `github_ref` once it has one; its
+  per-project lines add `org`, `project`, and `project_id`. Every line
+  also carries the delivery's `github_event` and `github_delivery_id`.
+
+### Log lines
+
+| Message | Level | Fields |
+| --- | --- | --- |
+| `Keeper-sync push hot path is disabled, not stamping` | info | — |
+| `Ignoring push to a ref keeper-sync does not track` | info | — |
+| `Ignoring push that deleted its ref` | info | — |
+| `Ignoring push without a repository owner and name` | info | — |
+| `No projects match push for keeper-sync` | info | — |
+| `Skipped project for keeper-sync push` | info | `reason` |
+| `Stamped keeper-sync push hint` | info | `pushed_at`, `pushed_refs` |
+| `Processed push for keeper-sync` | info | `projects_matched`, `projects_stamped` |
+| `Keeper-sync push stamp failed` | warning | `error`, `error_type` |
+| `Processed push webhook` | info | `enqueued`, `projects_stamped` |
+
+`pushed_refs` counts the refs on the project's map after the stamp, and
+`pushed_at` is the time stamped. The handler's own
+`Processed push webhook` closes every push delivery: `enqueued` counts
+its `dashboard_sync` jobs, and `projects_stamped` the projects stamped,
+null when the keeper-sync step failed.
+
 ## Configuration
 
 | Setting | Environment variable | Default | Phalanx value |
@@ -393,6 +538,8 @@ from then on it agrees with LTD, and keeper-sync mirrors LTD as before.
 | `github_app_private_key` | `DOCVERSE_GITHUB_APP_PRIVATE_KEY` | unset | the `DOCVERSE_GITHUB_APP_PRIVATE_KEY` key of the application's Vault secret |
 | `github_webhook_secret` | `DOCVERSE_GITHUB_WEBHOOK_SECRET` | unset | the `DOCVERSE_GITHUB_WEBHOOK_SECRET` key of the application's Vault secret |
 | `git_ref_audit_enabled` | `DOCVERSE_GIT_REF_AUDIT_ENABLED` | `false` | `config.maintenance.gitRefAuditEnabled` |
+| `keeper_sync_push_hot_path_enabled` | `DOCVERSE_KEEPER_SYNC_PUSH_HOT_PATH_ENABLED` | `true` | `config.keeperSync.pushHotPathEnabled` |
+| `keeper_sync_push_window_seconds` | `DOCVERSE_KEEPER_SYNC_PUSH_WINDOW_SECONDS` | `3600` | `config.keeperSync.pushWindowSeconds` |
 
 Notes:
 
@@ -406,6 +553,12 @@ Notes:
   worker restart.
 - The default-branch rule has no switch of its own: it runs wherever
   its triggers do.
+- The two `keeper_sync_push_` settings shape
+  [the keeper-sync push hot path](#the-keeper-sync-push-hot-path). Their
+  defaults are the intended production values, so their Phalanx values
+  are optional: set them only to move one environment off the defaults,
+  or to switch the hot path off there. The window must be at least one
+  second; a smaller value fails configuration at startup.
 
 ## Reading an outcome
 
@@ -593,9 +746,14 @@ it the fix for a synced project whose old branch still exists; see
   `derive_tracking_source`, keeper-sync's version of the rule, and
   `map_edition_tracking`, whose `TrackingDerivation` carries the
   `tracking_source` keeper-sync logs.
+- `src/docverse_server/services/keeper_sync_push_processor.py` and
+  `src/docverse_server/services/keeper_sync/push_hints.py` — the
+  `push` delivery's keeper-sync step and the rules of the
+  `github_pushed_refs` map it writes.
 - [Metrics events](metrics.md) — `github_webhook_received`,
   `edition_lifecycle`, and `edition_published`.
 - `tests/docs_test.py` — fails when this page stops matching the event
-  router, the GitHub settings, the rule's triggers and log lines, or the
+  router, the GitHub and push hot-path settings, the rule's triggers
+  and log lines, the push step's skip reasons and log lines, or the
   edition endpoints the operators' section relies on.
 - SQR-112, the Docverse design.
