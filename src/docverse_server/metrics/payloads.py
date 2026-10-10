@@ -739,3 +739,16 @@ class GitHubWebhookReceivedEvent(EventPayload):
     ``installation``) and for a delivery whose signature did not verify,
     whose payload is not trusted.
     """
+
+    projects_stamped: int | None
+    """How many LTD-synced projects a ``push`` stamped for keeper-sync.
+
+    The projects whose ``keeper_sync_state`` row the delivery's
+    keeper-sync step stamped with the pushed ref, putting them on the
+    tier crons' fast path (PRD #803); zero for a push that matched no
+    eligible project, or arrived with the hot path switched off.
+    ``None`` for every other event type, for a delivery that was not
+    dispatched, and for a push whose keeper-sync step failed or never
+    ran — the step's failure does not fail the delivery, so a ``push``
+    recorded ``dispatched`` with no count is how that failure shows.
+    """

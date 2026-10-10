@@ -36,6 +36,9 @@ from docverse_server.services.default_branch_processor import (
     DefaultBranchProjectResult,
     DefaultBranchTarget,
 )
+from docverse_server.services.keeper_sync_push_processor import (
+    KeeperSyncPushProcessor,
+)
 from docverse_server.services.ref_deleted_processor import (
     RefDeletedWebhookProcessor,
 )
@@ -65,6 +68,13 @@ class WebhookDeliveryReport:
 
     jobs_enqueued: int = 0
     """How many background jobs the callbacks enqueued."""
+
+    projects_stamped: int | None = None
+    """How many LTD-synced projects a ``push`` stamped for keeper-sync.
+
+    Set only by a ``push`` whose keeper-sync step completed; ``None``
+    otherwise, including when that step failed.
+    """
 
 
 _UNPARSEABLE_DELIVERY_ERRORS = (gidgethub.BadRequest, LookupError, ValueError)
@@ -98,18 +108,26 @@ async def _handle_push(
     event: sansio.Event,
     *,
     push: PushEventProcessor,
+    keeper_sync_push: KeeperSyncPushProcessor,
     context: RequestContext,
     report: WebhookDeliveryReport,
     **_unused: Any,
 ) -> None:
-    """Translate a push event into ``dashboard_sync`` enqueues.
+    """Enqueue a push's ``dashboard_sync`` jobs, then stamp synced projects.
 
-    The processor owns transaction-free DB writes through the
-    enqueuer; the handler wraps both the binding lookup and the
+    Two steps, each in a transaction of its own. First the dashboard
+    templates: the processor owns transaction-free DB writes through the
+    enqueuer, and the handler wraps both the binding lookup and the
     ``queue_jobs`` inserts in a single ``session.begin()`` so a failure
     aborts the whole webhook delivery cleanly. Handing those rows to arq
     waits until after that commit (task #550). The enqueued jobs are
     counted on ``report`` for the delivery's metrics event.
+
+    Then keeper-sync's push hint (PRD #803): see
+    :func:`_stamp_keeper_sync_push`. It runs only once the dashboard
+    work is committed and dispatched, and its failure never fails the
+    delivery.
+
     ``**_unused`` absorbs the rename/installation processors that
     gidgethub's dispatcher passes to every callback uniformly.
     """
@@ -118,7 +136,55 @@ async def _handle_push(
         await context.session.commit()
     await context.factory.queue_dispatcher.dispatch()
     report.jobs_enqueued += len(jobs)
-    context.logger.info("Processed push webhook", enqueued=len(jobs))
+    await _stamp_keeper_sync_push(
+        event,
+        keeper_sync_push=keeper_sync_push,
+        context=context,
+        report=report,
+    )
+    context.logger.info(
+        "Processed push webhook",
+        enqueued=len(jobs),
+        projects_stamped=report.projects_stamped,
+    )
+
+
+async def _stamp_keeper_sync_push(
+    event: sansio.Event,
+    *,
+    keeper_sync_push: KeeperSyncPushProcessor,
+    context: RequestContext,
+    report: WebhookDeliveryReport,
+) -> None:
+    """Stamp a push onto the LTD-synced projects of its repository.
+
+    Runs :class:`KeeperSyncPushProcessor` in a transaction of its own
+    and records how many projects it stamped as ``report``'s
+    ``projects_stamped``. Nothing here calls GitHub: the stamp needs
+    only the payload.
+
+    A failure is absorbed: the transaction rolls back, the failure is
+    logged and sent to Sentry, and the delivery goes on to answer 200
+    for the dashboard work already committed. A push hint lost this way
+    costs only the fast path for that push — keeper-sync still finds the
+    change on the project's ordinary cadence — whereas a 500 would only
+    invite GitHub to redeliver dashboard work that already happened.
+    ``report.projects_stamped`` stays ``None``, which is how the metrics
+    event tells the failure from a push that stamped nothing.
+    """
+    try:
+        async with context.session.begin():
+            stamped = await keeper_sync_push.process(event.data)
+            await context.session.commit()
+    except Exception as exc:
+        context.logger.warning(
+            "Keeper-sync push stamp failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        sentry_sdk.capture_exception(exc)
+        return
+    report.projects_stamped = len(stamped)
 
 
 @_event_router.register("repository", action="renamed")
@@ -460,6 +526,7 @@ async def post_github_webhook(
                 installation=dispatch.installation,
                 ref_deleted=dispatch.ref_deleted,
                 default_branch=dispatch.default_branch,
+                keeper_sync_push=dispatch.keeper_sync_push,
                 context=context,
                 report=report,
             )
@@ -471,6 +538,7 @@ async def post_github_webhook(
             event_type=event.event,
             github_repository=github_repository,
             jobs_enqueued=report.jobs_enqueued,
+            projects_stamped=report.projects_stamped,
         )
         raise
     await _record_delivery(
@@ -480,6 +548,7 @@ async def post_github_webhook(
         event_type=event.event,
         github_repository=github_repository,
         jobs_enqueued=report.jobs_enqueued,
+        projects_stamped=report.projects_stamped,
     )
     return {"status": "ok"}
 
@@ -492,6 +561,7 @@ async def _record_delivery(
     event_type: str | None = None,
     github_repository: str | None = None,
     jobs_enqueued: int = 0,
+    projects_stamped: int | None = None,
 ) -> None:
     """Publish one delivery's ``github_webhook_received`` event.
 
@@ -515,6 +585,9 @@ async def _record_delivery(
         The verified payload's ``repository.full_name``, if any.
     jobs_enqueued
         How many jobs the delivery's callbacks enqueued.
+    projects_stamped
+        How many LTD-synced projects a ``push`` stamped for keeper-sync;
+        ``None`` unless a push's keeper-sync step completed.
     """
     try:
         await context.events.github_webhook_received.publish(
@@ -524,6 +597,7 @@ async def _record_delivery(
                 jobs_enqueued=jobs_enqueued,
                 elapsed=timedelta(seconds=time.monotonic() - started),
                 github_repository=github_repository,
+                projects_stamped=projects_stamped,
             )
         )
     except Exception:

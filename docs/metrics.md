@@ -522,6 +522,7 @@ type is on the
 | `jobs_enqueued` | integer | field | Background jobs the delivery's callbacks enqueued: the `dashboard_sync` jobs a `push` enqueues, the `dashboard_build` jobs a `delete` enqueues, or the `publish_edition` and `dashboard_build` jobs a `repository` `edited` delivery enqueues when a default-branch change moves `__main`. Zero for other event types and for a delivery that was not dispatched; on `error`, the jobs enqueued before the failure. |
 | `elapsed` | duration | field | Time from the handler receiving the delivery to its outcome. |
 | `github_repository` | string or null | tag | The signed payload's `repository.full_name` (`owner/repo`). Null for events that name no repository (`ping`, `installation`) and for a delivery that was not both verified and parsed. |
+| `projects_stamped` | integer or null | field | LTD-synced projects a `push` put on keeper-sync's fast path, by stamping the pushed ref onto their `keeper_sync_state` row (PRD #803; see [the keeper-sync push hot path](github-integration.md#the-keeper-sync-push-hot-path)). Zero for a push that matched no eligible project, or arrived with `keeper_sync_push_hot_path_enabled` off. Null for every other event type, for a delivery that was not dispatched, and for a push whose keeper-sync step failed: that failure does not fail the delivery, so a `push` recorded `dispatched` with no `projects_stamped` is how it shows. |
 
 ### `keeper_sync_run_completed`
 
@@ -697,8 +698,9 @@ carry no `event_type`, so they group under an empty one.
   `DocverseEvents.initialize`, and a section on this page. Payloads are
   scalar-only, because InfluxDB stores no nested structures.
 - **An existing event** changes only by gaining a nullable field, as
-  `edition_published` gained `ltd_lag` and `build_content_copied`
-  gained `ltd_lag_seconds`. Every consumer reads the topic through the
+  `edition_published` gained `ltd_lag`, `build_content_copied`
+  gained `ltd_lag_seconds`, and `github_webhook_received` gained
+  `projects_stamped`. Every consumer reads the topic through the
   event's registered Avro schema, so renaming, retyping, or removing a
   field breaks them.
 - **A new enum value** is appended to its enum, as `WebhookOutcome`
