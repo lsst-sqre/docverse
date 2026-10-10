@@ -48,7 +48,6 @@ def _make_processor(
     session: AsyncSession,
     *,
     enabled: bool = True,
-    window: timedelta = _WINDOW,
 ) -> KeeperSyncPushProcessor:
     return KeeperSyncPushProcessor(
         project_store=ProjectStore(session=session, logger=_logger()),
@@ -56,7 +55,6 @@ def _make_processor(
         state_store=KeeperSyncStateStore(session=session, logger=_logger()),
         logger=_logger(),
         enabled=enabled,
-        window=window,
     )
 
 
@@ -434,11 +432,13 @@ async def test_repository_bound_to_several_projects_stamps_all(
 async def test_stamp_merges_into_existing_annotations(
     db_session: AsyncSession,
 ) -> None:
-    """Other annotation keys survive; expired refs are pruned; cap holds.
+    """Other annotation keys survive, and the cap drops the oldest first.
 
     The row already carries the tier crons' keys, twenty live stamps,
-    and one stamp older than the window. The new push drops the expired
-    stamp and then the oldest live one, so the map stays at twenty.
+    and one stamp older than the window. The new push leaves twenty-two
+    refs, so the cap drops the two oldest pushes: the expired stamp,
+    which ``tier_main`` would otherwise have pruned, and then the oldest
+    live one, so the map stays at twenty.
     """
     live = {
         f"branch-{index:02d}": (
