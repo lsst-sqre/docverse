@@ -254,7 +254,9 @@ and the new branch's builds match from then on.
 
 An environment upgraded to a release with this feature starts with the
 column `null` on every project, and the webhook and the resolve fire
-only on a change. The daily `git_ref_audit` is what fills it in. Its
+only on a change. The daily `git_ref_audit` is what fills it in — and,
+through `project_github_resolve`, the numeric GitHub ids too (see
+[The id backfill](#the-id-backfill)). Its
 per-project pass already fetches each bound repository's live branches
 and tags for the `ref_deleted` rule; it also reads
 `GET /repos/{owner}/{repo}` for `default_branch` and applies the rule
@@ -284,9 +286,11 @@ delivery.
   installation's token. One without is read anonymously, which works for
   a public repository — within GitHub's unauthenticated rate limit, 60
   requests an hour per source address — and reports a private one as
-  not accessible. The audit needs the three GitHub App settings even for
-  anonymous projects: without them an organization's pass fails
-  outright.
+  not accessible. The id backfill records the installation id of every
+  project whose repository has the App installed, so from the pass
+  after its resolve such a project is read with the token. The audit
+  needs the three GitHub App settings even for anonymous projects:
+  without them an organization's pass fails outright.
 - **Failures.** A project whose ref set cannot be fetched is skipped for
   the pass. One whose ref set was fetched but whose `GET /repos` failed
   keeps its `ref_deleted` reaping and waits a day for its default
@@ -299,7 +303,9 @@ delivery.
   the pass's `ref_deleted` deletions. One organization-wide transaction
   would hold every earlier project's rows while waiting on a later
   project's `__main` lock.
-- **Cost.** One more GitHub request per bound project per day.
+- **Cost.** One more GitHub request per bound project per day, plus
+  one `project_github_resolve` job per bound project still missing its
+  ids.
 
 There is no manual entrypoint for the audit. To converge one project
 without waiting for the next tick, `PATCH /orgs/{org}/projects/{project}`
@@ -308,6 +314,48 @@ re-runs `project_github_resolve`, which records the branch and, when the
 column held a different branch that `__main` still tracks, rewrites it.
 The `PATCH` clears the three numeric GitHub ids until the resolve reads
 them back.
+
+### The id backfill
+
+A project records three numeric ids from GitHub —
+`github_installation_id`, `github_owner_id`, and `github_repo_id` —
+which webhook deliveries match on (`repository.transferred` matches by
+`repository.id` alone) and which give the audit its installation token.
+The resolve a project's creation enqueues records them (see
+[A new project](#a-new-project)), but a project can miss that resolve:
+keeper-sync created projects without one until it began resolving ids
+on creation (see [GitHub ids on creation](#github-ids-on-creation)), an
+enqueue can fail, and the `installation.created` delivery only reaches
+the projects that existed when the App was installed.
+
+So each pass, before its GitHub reads, enqueues one
+`project_github_resolve` onto the maintenance pool for every
+non-deleted bound project in the organization whose `github_repo_id`
+is `null`:
+
+- **Installed.** Where the App is installed on the repository, the
+  resolve records the three ids and the default branch, so the next
+  pass enqueues nothing for the project and reads it with its
+  installation's token.
+- **Not installed.** Where it is not, the resolve ends `not_installed`
+  and the ids stay `null`, so every pass enqueues the project again, at
+  the cost of one GitHub request, until the App is installed and its
+  `installation` delivery records them.
+- **No cap.** A first pass after an upgrade can enqueue a job for nearly
+  every project in an organization. The maintenance pool's concurrency
+  bounds how many run at once, and the resolve's own retry and backoff
+  absorb GitHub's rate limits.
+- **Failures.** Each enqueue runs in a transaction of its own. One that
+  fails is sent to Sentry and logged as
+  `Failed to enqueue project_github_resolve`, with `project` and
+  `project_id`. The project is still audited in the same pass, the
+  failure does not turn the queue job `completed_with_errors`, and the
+  next pass enqueues it again.
+
+The pass's summary line, `Git ref audit completed for org`, counts the
+jobs it enqueued as `github_resolves_enqueued`. With
+`git_ref_audit_enabled` off, a project that missed its resolve keeps
+`null` ids until an `installation` delivery reaches it.
 
 ## Keeper-synced projects
 
@@ -400,15 +448,16 @@ installation's token.
 
 - Only the visit that creates the project enqueues. Re-syncing an
   existing project enqueues nothing, so a project synced before this
-  behaviour existed learns its default branch from the audit instead
-  (see [The audit is the backfill](#the-audit-is-the-backfill)).
+  behaviour existed — or one whose enqueue failed — gets its resolve
+  from the audit instead (see [The id backfill](#the-id-backfill)).
 - A product whose `doc_repo` is not on github.com becomes a project
   with a `source_url` and no binding, and enqueues nothing.
 - The enqueue is best-effort. A failure is sent to Sentry and logged as
   `Failed to enqueue project_github_resolve`, with the `project_id`, and
   the sync carries on to the project's editions.
 - A repository the App is not installed on resolves `not_installed`: the
-  ids stay `null` until an `installation` delivery records them.
+  ids stay `null` until an `installation` delivery records them, and
+  each audit pass enqueues the project's resolve again meanwhile.
 
 ## Configuration
 
@@ -488,7 +537,7 @@ the line to count. The rule's other lines say why it did what it did.
 | `Resolve: GitHub ref fetch failed, recording default branch without live refs` | warning | `error`, `error_type` |
 | `Git ref audit: GitHub repository metadata fetch failed, skipping default branch for this pass` | warning | `owner`, `repo`, `installation_id`, `error`, `error_type` |
 | `Git ref audit: default branch convergence failed, skipping project for this pass` | warning | `error`, `error_type` |
-| `Git ref audit completed for org` | info | `had_failures`, `default_branch_updates`, `main_rewrites`, `default_branch_errors` |
+| `Git ref audit completed for org` | info | `had_failures`, `default_branch_updates`, `main_rewrites`, `default_branch_errors`, `github_resolves_enqueued` |
 
 `drafts_retired` counts the drafts step 3 retired; `main_rewritten_from`
 is the ref `__main` tracked before, or null when it was left alone. The
@@ -503,7 +552,9 @@ Usually that failure is the rule raising and rolling back; when the
 rule committed and only the hand-off of its `publish_edition` job to
 the queue failed, the project counts toward the other two as well, and
 the job's row is left for the reapers' orphan sweep, as after any failed
-hand-off.
+hand-off. `github_resolves_enqueued` counts the `project_github_resolve`
+jobs the pass's id backfill enqueued (see
+[The id backfill](#the-id-backfill)).
 
 The resolve commits the numeric ids and then applies the branch in a
 second transaction, re-reading the binding in between. When a `PATCH`

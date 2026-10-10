@@ -11,6 +11,7 @@ the parent ``git_ref_audit_runs`` row.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -20,7 +21,7 @@ import pytest
 import respx
 import structlog
 from pydantic import SecretStr
-from safir.arq import MockArqQueue
+from safir.arq import JobMetadata, MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from sqlalchemy import select, update
@@ -81,8 +82,16 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.git_ref_audit import git_ref_audit
+from docverse_server.worker.functions.project_github_resolve import (
+    project_github_resolve,
+)
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
-from tests.support.arq_testing import count_jobs_by_name, get_jobs_by_name
+from tests.support.arq_testing import (
+    count_jobs_by_name,
+    get_jobs_by_name,
+    register_queue,
+)
 from tests.support.github_mock import GitHubMock
 from tests.worker.conftest import make_worker_ctx
 
@@ -120,8 +129,14 @@ async def _seed_github_project(
     owner: str,
     repo: str,
     installation_id: int | None = None,
+    repo_id: int | None = None,
 ) -> int:
-    """Seed a GitHub-bound project with optional captured installation_id."""
+    """Seed a GitHub-bound project with optional captured GitHub ids.
+
+    ``installation_id`` and ``repo_id`` stand in for what a completed
+    ``project_github_resolve`` records; left out, the project is one the
+    audit's id backfill (PRD #803) enqueues a resolve for.
+    """
     project_store = ProjectStore(session=db_session, logger=_logger())
     project = await project_store.create(
         org_id=org_id,
@@ -138,6 +153,12 @@ async def _seed_github_project(
             update(SqlProject)
             .where(SqlProject.id == project.id)
             .values(github_installation_id=installation_id)
+        )
+    if repo_id is not None:
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project.id)
+            .values(github_repo_id=repo_id)
         )
     return project.id
 
@@ -276,6 +297,18 @@ def _seed_refs_500(router: respx.Router, *, owner: str, repo: str) -> None:
     ).mock(return_value=httpx.Response(500, json={"message": "boom"}))
 
 
+def _maintenance_queue() -> MockArqQueue:
+    """Return a mock queue that also accepts the maintenance pool's jobs.
+
+    Each pass enqueues ``project_github_resolve`` onto that pool for the
+    projects missing their GitHub ids (PRD #803); a bare
+    ``MockArqQueue`` would refuse every one of those enqueues.
+    """
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    register_queue(arq_queue, MAINTENANCE_QUEUE_NAME)
+    return arq_queue
+
+
 def _make_ctx(
     *,
     http_client: httpx.AsyncClient,
@@ -284,6 +317,7 @@ def _make_ctx(
 ) -> dict[str, object]:
     return make_worker_ctx(
         http_client=http_client,
+        arq_queue=_maintenance_queue(),
         github_app_id=mock_github.app_id,
         github_app_private_key=SecretStr(mock_github.private_key_pem),
         github_webhook_secret=SecretStr("webhook-secret"),
@@ -1079,7 +1113,7 @@ async def _run_audit(
     async with httpx.AsyncClient() as http_client:
         ctx = make_worker_ctx(
             http_client=http_client,
-            arq_queue=arq_queue,
+            arq_queue=arq_queue or _maintenance_queue(),
             github_app_id=mock_github.app_id,
             github_app_private_key=SecretStr(mock_github.private_key_pem),
             github_webhook_secret=SecretStr("webhook-secret"),
@@ -1245,7 +1279,7 @@ async def test_git_ref_audit_rewrites_main_tracking_a_gone_ref(
     logs carries ``trigger=audit``.
     """
     manager, events = await build_event_manager(Configuration())
-    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    arq_queue = _maintenance_queue()
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session, slug="gra-db-rewrite")
         installation_id = mock_github.seed_installation(
@@ -1356,7 +1390,7 @@ async def test_git_ref_audit_leaves_main_on_a_live_ref(
     queued or announced.
     """
     manager, events = await build_event_manager(Configuration())
-    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    arq_queue = _maintenance_queue()
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session, slug="gra-db-pinned")
         installation_id = mock_github.seed_installation(
@@ -1917,7 +1951,7 @@ async def test_git_ref_audit_drops_a_failed_convergence_publish_job(
     two converged projects' publishes are handed to arq, each naming a
     row that exists.
     """
-    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    arq_queue = _maintenance_queue()
     seeded = await _seed_convergence_failure_org(
         db_session, mock_github, org_slug="gra-conv-discard"
     )
@@ -2001,3 +2035,275 @@ async def test_git_ref_audit_cancel_fails_the_row_and_finalises_the_run(
             ).get(run_id)
             assert run is not None
             assert run.status == GitRefAuditRunStatus.partial_failure
+
+
+def _audit_summary(
+    captured: list[MutableMapping[str, Any]],
+) -> MutableMapping[str, Any]:
+    """Return the pass's one ``Git ref audit completed for org`` line."""
+    [summary] = [
+        entry
+        for entry in captured
+        if entry["event"] == "Git ref audit completed for org"
+    ]
+    return summary
+
+
+def _resolved_project_ids(arq_queue: MockArqQueue) -> list[int]:
+    """Return the project ids of the ``project_github_resolve`` jobs.
+
+    Asserts each job went onto the maintenance pool with the plain
+    ``{"project_id": ...}`` payload a create enqueues.
+    """
+    jobs = get_jobs_by_name(arq_queue, "project_github_resolve")
+    assert {job.queue_name for job in jobs} <= {MAINTENANCE_QUEUE_NAME}
+    assert all(set(job.kwargs["payload"]) == {"project_id"} for job in jobs)
+    return sorted(job.kwargs["payload"]["project_id"] for job in jobs)
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_enqueues_github_resolve_for_missing_ids(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A pass resolves each bound project still missing its GitHub ids.
+
+    1375 of 1376 prod synced projects lack ``github_repo_id`` (PRD
+    #803): keeper-sync created them without a resolve, and the
+    ``installation.created`` backfill only reached the projects that
+    existed at install time. Each pass therefore enqueues one
+    ``project_github_resolve`` onto the maintenance pool for every
+    non-deleted bound project whose ``github_repo_id`` is ``NULL``, and
+    counts them on its summary line. A project that already has its ids,
+    one with no GitHub binding, and a soft-deleted one enqueue nothing.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-ids")
+        missing = [
+            await _seed_github_project(
+                db_session, org_id=org_id, slug=slug, owner="acme", repo=slug
+            )
+            for slug in ("ids-a", "ids-b")
+        ]
+        await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="ids-known",
+            owner="acme",
+            repo="ids-known",
+            installation_id=mock_github.seed_installation(
+                "acme", "ids-known", installation_id=71, owner_id=555
+            ),
+            repo_id=7100,
+        )
+        await _seed_non_github_project(
+            db_session, org_id=org_id, slug="ids-gitlab"
+        )
+        deleted_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="ids-deleted",
+            owner="acme",
+            repo="ids-deleted",
+        )
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == deleted_id)
+            .values(date_deleted=datetime.now(tz=UTC))
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    for repo in ("ids-a", "ids-b", "ids-known"):
+        _seed_refs(mock_github.router, owner="acme", repo=repo)
+    arq_queue = _maintenance_queue()
+
+    with capture_logs() as captured:
+        result = await _run_audit(
+            mock_github=mock_github,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            queue_job_id=queue_job_id,
+            arq_queue=arq_queue,
+        )
+
+    assert result == "completed"
+    assert _resolved_project_ids(arq_queue) == sorted(missing)
+    assert _audit_summary(captured)["github_resolves_enqueued"] == 2
+
+
+async def _run_resolves(
+    *, mock_github: GitHubMock, arq_queue: MockArqQueue
+) -> list[str]:
+    """Run every queued ``project_github_resolve`` job, as the pool would."""
+    async with httpx.AsyncClient() as http_client:
+        ctx = _make_ctx(http_client=http_client, mock_github=mock_github)
+        return sorted(
+            [
+                await project_github_resolve(ctx, job.kwargs["payload"])
+                for job in get_jobs_by_name(
+                    arq_queue, "project_github_resolve"
+                )
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_id_backfill_is_idempotent(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A repeat pass re-enqueues only the projects still missing ids.
+
+    Both projects lack ids on the first pass. Their resolves then run:
+    the App is installed on one repository, which records its ids, and
+    not on the other, which ends ``not_installed`` with its ids still
+    ``NULL``. The second pass enqueues nothing for the resolved project
+    and enqueues the uninstalled one again.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-ids-again")
+        installed_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="ids-installed",
+            owner="acme",
+            repo="ids-installed",
+        )
+        uninstalled_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="ids-uninstalled",
+            owner="acme",
+            repo="ids-uninstalled",
+        )
+    mock_github.seed_installation(
+        "acme", "ids-installed", installation_id=72, owner_id=555
+    )
+    mock_github.seed_repo("acme", "ids-installed", repo_id=7200, owner_id=555)
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="ids-installed",
+        default_branch=None,
+    )
+    mock_github.router.get(
+        f"{GITHUB_API_BASE_URL}/repos/acme/ids-uninstalled/installation"
+    ).mock(return_value=httpx.Response(404, json={"message": "Not Found"}))
+    _seed_refs(mock_github.router, owner="acme", repo="ids-uninstalled")
+
+    passes = []
+    for _tick in range(2):
+        async with db_session.begin():
+            run_id, queue_job_id = await _seed_run_and_queue_job(
+                db_session, org_id=org_id, org_slug=org_slug
+            )
+        arq_queue = _maintenance_queue()
+        with capture_logs() as captured:
+            result = await _run_audit(
+                mock_github=mock_github,
+                org_id=org_id,
+                org_slug=org_slug,
+                run_id=run_id,
+                queue_job_id=queue_job_id,
+                arq_queue=arq_queue,
+            )
+        assert result == "completed"
+        passes.append(
+            (
+                _resolved_project_ids(arq_queue),
+                _audit_summary(captured)["github_resolves_enqueued"],
+                await _run_resolves(
+                    mock_github=mock_github, arq_queue=arq_queue
+                ),
+            )
+        )
+
+    assert passes == [
+        (
+            sorted([installed_id, uninstalled_id]),
+            2,
+            ["completed", "not_installed"],
+        ),
+        ([uninstalled_id], 1, ["not_installed"]),
+    ]
+    assert (await _load_project(installed_id)).github_repo_id == 7200
+    assert (await _load_project(uninstalled_id)).github_repo_id is None
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_id_backfill_survives_an_enqueue_failure(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed resolve enqueue is logged and the pass carries on.
+
+    The queue refuses the first project's resolve. That failure is
+    logged with the project's id, the second project's resolve is still
+    enqueued, and the pass's ref audit still runs to completion: the
+    failing project's draft on a deleted branch is soft-deleted. Only
+    the job that landed counts on the summary line, and the pass ends
+    ``completed``, since the next pass enqueues the project again.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-ids-fail")
+        failing_id, queued_id = [
+            await _seed_github_project(
+                db_session, org_id=org_id, slug=slug, owner="acme", repo=slug
+            )
+            for slug in ("ids-fail-a", "ids-fail-b")
+        ]
+        gone_draft_id = await _seed_draft_edition(
+            db_session,
+            project_id=failing_id,
+            slug="gone-branch",
+            git_ref="tickets/DM-gone",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    for repo in ("ids-fail-a", "ids-fail-b"):
+        _seed_refs(mock_github.router, owner="acme", repo=repo)
+
+    arq_queue = _maintenance_queue()
+    real_enqueue = arq_queue.enqueue
+
+    async def _enqueue(
+        task_name: str, *args: Any, **kwargs: Any
+    ) -> JobMetadata:
+        if (
+            task_name == "project_github_resolve"
+            and kwargs["payload"]["project_id"] == failing_id
+        ):
+            msg = "maintenance queue unavailable"
+            raise RuntimeError(msg)
+        return await real_enqueue(task_name, *args, **kwargs)
+
+    monkeypatch.setattr(arq_queue, "enqueue", _enqueue)
+
+    with capture_logs() as captured:
+        result = await _run_audit(
+            mock_github=mock_github,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            queue_job_id=queue_job_id,
+            arq_queue=arq_queue,
+        )
+
+    assert result == "completed"
+    assert _resolved_project_ids(arq_queue) == [queued_id]
+    [failure] = [
+        entry
+        for entry in captured
+        if entry["event"] == "Failed to enqueue project_github_resolve"
+    ]
+    assert failure["project_id"] == failing_id
+    assert failure["project"] == "ids-fail-a"
+    assert await _load_edition(gone_draft_id) is None
+    assert _audit_summary(captured)["github_resolves_enqueued"] == 1

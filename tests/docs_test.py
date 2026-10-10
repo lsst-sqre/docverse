@@ -1479,6 +1479,33 @@ def test_github_audit_backfill_names_the_feature_flag() -> None:
     assert not _uncoded({"git_ref_audit_enabled"}, section)
 
 
+def test_github_audit_backfill_covers_the_id_backfill() -> None:
+    """The backfill section says how the audit resolves missing ids.
+
+    Most keeper-synced projects predate keeper-sync's resolve on
+    creation (PRD #803), so the audit's enqueue is how they get their
+    GitHub ids. The section names the job it enqueues, the column that
+    selects a project, the outcome that leaves the ids ``NULL``, and the
+    summary field that counts the jobs — the field the audit's summary
+    line actually logs.
+    """
+    section = _section(_read(_GITHUB_PAGE), "The audit is the backfill")
+    backfill = _subsection(section, "The id backfill")
+    [summary] = _log_calls("docverse_server.worker.functions.git_ref_audit")[
+        "Git ref audit completed for org"
+    ]
+    assert "github_resolves_enqueued" in summary.fields
+    assert not _uncoded(
+        {
+            "project_github_resolve",
+            "github_repo_id",
+            "not_installed",
+            "github_resolves_enqueued",
+        },
+        backfill,
+    )
+
+
 def test_github_log_lines_exist_in_the_code() -> None:
     """Every row of the log table is a line the code writes, exactly.
 
