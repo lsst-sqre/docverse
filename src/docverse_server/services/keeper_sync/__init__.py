@@ -35,6 +35,7 @@ from .service import (
     EditionSyncOutcome,
     KeeperSyncContext,
     KeeperSyncService,
+    ProjectCreatedCallback,
     ProjectSyncResult,
 )
 
@@ -53,6 +54,7 @@ __all__ = [
     "KeeperSyncContext",
     "KeeperSyncService",
     "KindDerivationSource",
+    "ProjectCreatedCallback",
     "ProjectSyncResult",
     "SliceBudget",
     "SliceProgress",

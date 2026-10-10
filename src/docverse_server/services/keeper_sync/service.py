@@ -153,6 +153,7 @@ __all__ = [
     "KeeperSyncContext",
     "KeeperSyncService",
     "ManifestCallable",
+    "ProjectCreatedCallback",
     "ProjectSyncResult",
 ]
 
@@ -397,6 +398,12 @@ class BuildCopyReport:
 #: :class:`BuildCopyReport` per build copy. The keeper-sync worker's
 #: hook publishes it as a metrics event.
 BuildCopiedCallback = Callable[[BuildCopyReport], Awaitable[None]]
+
+#: Type alias for the ``on_project_created`` hook: awaited with each
+#: Docverse project a sync creates, once the transaction that created
+#: it has committed. ``Factory.create_keeper_sync_service`` wires it to
+#: enqueue ``project_github_resolve`` for the new project.
+ProjectCreatedCallback = Callable[[Project], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -1029,6 +1036,7 @@ class KeeperSyncService:
         copy_retry_delay_seconds: float = DEFAULT_COPY_RETRY_DELAY_SECONDS,
         on_build_copied: BuildCopiedCallback | None = None,
         draft_retirer: DuplicateDraftRetirer | None = None,
+        on_project_created: ProjectCreatedCallback | None = None,
     ) -> None:
         self._session = session
         self._org_store = context.org_store
@@ -1049,6 +1057,7 @@ class KeeperSyncService:
         self._copy_retry_delay_seconds = copy_retry_delay_seconds
         self._on_build_copied = on_build_copied
         self._draft_retirer = draft_retirer
+        self._on_project_created = on_project_created
 
     @property
     def copy_retry_delay_seconds(self) -> float:
@@ -1232,9 +1241,11 @@ class KeeperSyncService:
 
         ltd_product = await self._ltd_client.get_product(ltd_slug)
         async with self._session.begin():
-            org, project = await self._ensure_project(
+            org, project, created = await self._ensure_project(
                 org_id=org_id, ltd_product=ltd_product
             )
+        if created:
+            await self._report_project_created(project)
         # Resolved once per project and threaded through both kind
         # derivation call sites (the proactive pass and sync_edition)
         # so the rule set is parsed a single time per sync.
@@ -1821,10 +1832,35 @@ class KeeperSyncService:
             return None
         return ref_set.all
 
+    async def _report_project_created(self, project: Project) -> None:
+        """Hand ``on_project_created`` a project this sync created, if wired.
+
+        Called once the transaction that created the project has
+        committed, so the hook may open transactions of its own and any
+        job it enqueues finds the row. Like ``on_build_copied``, the hook
+        is a side channel that may not decide the sync's fate: whatever
+        it raises is sent to Sentry and logged, and the sync carries on
+        to the project's editions.
+        """
+        if self._on_project_created is None:
+            return
+        try:
+            await self._on_project_created(project)
+        except Exception as exc:
+            sentry_sdk.capture_exception(exc)
+            self._logger.exception(
+                "on_project_created callback raised; continuing",
+                project_id=project.id,
+                project=project.slug,
+            )
+
     async def _ensure_project(
         self, *, org_id: int, ltd_product: LtdProduct
-    ) -> tuple[Organization, Project]:
-        """Return ``(org, project)``, creating the project if missing."""
+    ) -> tuple[Organization, Project, bool]:
+        """Return ``(org, project, created)``, creating the project if missing.
+
+        ``created`` is `True` only when this call created the project.
+        """
         org = await self._org_store.get_by_id(org_id)
         if org is None:
             msg = f"Organization id={org_id} not found"
@@ -1870,7 +1906,7 @@ class KeeperSyncService:
             docverse_id=project.id,
             date_last_synced=_now(),
         )
-        return org, project
+        return org, project, existing is None
 
     async def sync_edition(
         self,
