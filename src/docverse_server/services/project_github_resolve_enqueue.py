@@ -35,7 +35,7 @@ async def try_enqueue_project_github_resolve_by_id(
     logger: structlog.stdlib.BoundLogger,
     project_id: int,
     previous_default_branch: str | None = None,
-) -> None:
+) -> bool:
     """Enqueue one ``project_github_resolve`` job in its own transaction.
 
     Exceptions are logged but never re-raised, so the caller's flow is
@@ -55,6 +55,11 @@ async def try_enqueue_project_github_resolve_by_id(
     default is rewritten onto the new one's. Without it — a create, or a
     rebind of a project whose branch was never learned — the payload is
     ``project_id`` alone.
+
+    Returns `True` when the job was enqueued, and `False` when it was
+    skipped or the enqueue failed, so a caller enqueueing in bulk — the
+    ``git_ref_audit`` id backfill (PRD #803) — can count the jobs it
+    actually queued.
     """
     try:
         async with session.begin():
@@ -65,7 +70,7 @@ async def try_enqueue_project_github_resolve_by_id(
                 or project.github_owner is None
                 or project.github_repo is None
             ):
-                return
+                return False
             payload: dict[str, Any] = {"project_id": project_id}
             if previous_default_branch is not None:
                 payload["previous_default_branch"] = previous_default_branch
@@ -85,3 +90,5 @@ async def try_enqueue_project_github_resolve_by_id(
             "Failed to enqueue project_github_resolve",
             project_id=project_id,
         )
+        return False
+    return True
