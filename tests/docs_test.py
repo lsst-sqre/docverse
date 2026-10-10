@@ -43,6 +43,7 @@ from docverse.models import (
     KeeperSyncConfig,
     KeeperSyncRun,
     KeeperSyncScopePreview,
+    KeeperSyncTierStatus,
     ProjectGitHubBinding,
     ProjectGitHubBindingCreate,
 )
@@ -179,6 +180,9 @@ _PUSH_HOT_PATH_SECTION = "The keeper-sync push hot path"
 
 _PUSH_PROCESSOR_MODULE = "docverse_server.services.keeper_sync_push_processor"
 """Module that stamps a push onto the projects of its repository."""
+
+_PUSH_HOT_SUBSECTION = "A push counts as hot"
+"""Hot-path subsection on what a push does to the tier gates (#808)."""
 
 _PUSH_CHECK_SUBSECTION = "The `tier_main` check"
 """Hot-path subsection on what ``tier_main`` does with a stamp (#807)."""
@@ -1661,6 +1665,24 @@ def test_github_push_hot_path_names_the_bound_log_fields() -> None:
     bound = _bound_log_fields(_PUSH_PROCESSOR_MODULE)
     assert bound, "the push processor binds no fields"
     assert not _uncoded(bound, section)
+
+
+def test_github_push_counts_as_hot_names_every_tier_cron() -> None:
+    """The push-is-hot subsection says what a push does to each tier.
+
+    A tier cron added to the keeper-sync pool has to be covered, and the
+    status endpoint's cohort is how an operator sees a push at work.
+    """
+    subsection = _subsection(
+        _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION),
+        _PUSH_HOT_SUBSECTION,
+    )
+    tier_crons = set(_tier_cron_jobs())
+    assert tier_crons, "the keeper-sync pool registers no tier crons"
+    fields = {"tier_status", "date_next_due"}
+    assert "date_next_due" in KeeperSyncTierStatus.model_fields
+    assert not _uncoded(tier_crons | fields, subsection)
+    assert '`"cohort": "hot"`' in subsection
 
 
 def test_github_push_check_tables_every_outcome() -> None:

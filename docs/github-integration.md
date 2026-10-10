@@ -404,7 +404,9 @@ fast path for a bounded window afterwards (PRD #803). The webhook writes
 the stamp; `keeper_sync_tier_main` reads it on its five-minute tick,
 checks each pushed ref's edition on LTD directly, and enqueues the
 project's sync once LTD has rebuilt it: see
-[The `tier_main` check](#the-tier_main-check).
+[The `tier_main` check](#the-tier_main-check). For the window, all
+three tier crons also treat the project as hot: see
+[A push counts as hot](#a-push-counts-as-hot).
 
 ### The stamp
 
@@ -476,13 +478,45 @@ it: `tier_main`'s next visit prunes it from the map with the outcome
 `expired`. Raising the window keeps a slow CI on the fast path longer,
 at the price of more LTD polling per push.
 
+### A push counts as hot
+
+The tier crons gate each project on how recently its LTD `main` rebuilt:
+a project rebuilt within 14 days is hot, and polled on every tick of
+each tier; a dormant one is polled about once a day per tier. A project
+with a ref inside the window is hot too, on all three tiers, whenever
+its `main` last rebuilt. So for the window after a contributor pushes to
+a project dormant for months:
+
+- `keeper_sync_tier_main` checks its `main` edition every five minutes.
+  A push to the default branch is caught by that check, which records
+  the rebuild on the project row and so keeps the project hot for the
+  14 days after.
+- `keeper_sync_tier_discovery` lists its LTD editions every 30 minutes,
+  and enqueues its sync for any it has not seen.
+- `keeper_sync_tier_other` lists them every hour, and enqueues its sync
+  for any non-`main` edition last synced an hour or more ago.
+
+When the window closes, the project drops back to its cohort and nothing
+else has to change: the stamp left on the row counts for nothing once
+its push is a window old, and each tier's own last-poll time, which its
+visits kept fresh, holds the project to the dormant cadence from there.
+A ref cleared by an enqueue (see below) stops counting at once, so a
+project whose every pushed ref has had its sync enqueued is back in its
+cohort on the next tick.
+
+`GET /orgs/{org}/keeper-sync/projects/{ltd_slug}`, and the listing at
+`GET /orgs/{org}/keeper-sync/projects`, report the same: while a ref is
+inside the window, each `tier_status` entry of the project reads
+`"cohort": "hot"`, with `date_next_due` the tier's next cron tick.
+
 ### The `tier_main` check
 
 Every five-minute `keeper_sync_tier_main` tick visits the stamps of each
 in-scope project, after its own check of the project's `main` edition.
-The visit runs whatever that check's dormancy gate decided: a push says
-LTD is about to change, so a project dormant for months is checked on
-the next tick all the same.
+While a ref is live the push has made the project hot, so that check
+runs too; the visit itself runs whatever the check's dormancy gate
+decided, so a ref whose window has passed is pruned even from a project
+that is dormant again.
 
 Refs whose window has passed come first. Each is `expired`, costs no LTD
 call, and is pruned. Then each live ref, oldest push first:
@@ -542,7 +576,9 @@ reason, so none of them can write back a map that predates a stamp.
 
 The check's cost is bounded: at most two LTD calls per stamped ref per
 tick (its edition, then the listing), the listing shared by the
-project's refs, and at most 20 refs per project. Editions that follow a
+project's refs, and at most 20 refs per project. A dormant project the
+push woke adds its `main` check, usually one more call per tick for the
+window, which a push to `main` itself shares. Editions that follow a
 ref by a version rule rather than by name (`lsst_doc` and the `eups`
 modes) are not looked up: a tag push to such a project is caught by the
 listing when LTD creates an edition for the tag, and otherwise on the
@@ -571,7 +607,8 @@ switch. Off, a push logs
 `Keeper-sync push hot path is disabled, not stamping` and stamps
 nothing, `tier_main` neither checks nor prunes stamps, making exactly
 the LTD calls it made before the hot path existed, and keeper-sync polls
-every project on its ordinary cadence. The dashboard-template work a
+every project on its ordinary cadence: a stamp makes no project hot,
+on any tier or on the status endpoint. The dashboard-template work a
 push drives is unaffected either way. Stamps already written stay on
 their rows untouched; turned back on, `tier_main` prunes the ones whose
 window has passed on its next visit.
@@ -596,7 +633,8 @@ redelivery's time.
   the projects a push stamped: see the
   [metrics catalog](metrics.md#github_webhook_received).
 - **The row.** `GET /orgs/{org}/keeper-sync/projects/{ltd_slug}` shows
-  the stamp in `project_state.annotations`.
+  the stamp in `project_state.annotations`, and `"cohort": "hot"` on
+  each `tier_status` entry while a ref is inside the window.
 - **The tick.** `tier_main`'s lines say what each visit found and when
   a push's sync was enqueued: see
   [`tier_main` log lines](#tier_main-log-lines).

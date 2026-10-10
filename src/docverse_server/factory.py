@@ -501,7 +501,12 @@ class Factory:
     def create_keeper_sync_project_service(
         self,
     ) -> KeeperSyncProjectService:
-        """Create a :class:`KeeperSyncProjectService`."""
+        """Create a :class:`KeeperSyncProjectService`.
+
+        The push window is read from the process configuration on every
+        call, as the tier crons read it on every pass, so the cohorts the
+        service reports follow the same switch.
+        """
         return KeeperSyncProjectService(
             org_store=self.create_org_store(),
             project_store=self.create_project_store(),
@@ -509,6 +514,7 @@ class Factory:
             state_store=self.create_keeper_sync_state_store(),
             ltd_client_factory=self.create_ltd_client,
             logger=self._logger,
+            push_window=config.keeper_sync_push_window,
         )
 
     def create_keeper_sync_scope_preview_service(

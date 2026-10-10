@@ -9,10 +9,13 @@ it, or when the ref has no edition yet and LTD lists one keeper-sync has
 not seen. These tests seed the stamp directly, run one tick against the
 ``respx`` LTD mock, and assert on the enqueued jobs and the stamps left.
 
-Unless a test says otherwise, the seeded project is *dormant* on
-``main``: its LTD ``main`` rebuilt a month ago and was polled an hour
-ago, so ``tier_main``'s own ``main``-edition check skips it and every
-LTD call the tick makes is the push check's.
+Unless a test says otherwise, the seeded project is *dormant*: its LTD
+``main`` rebuilt a month ago and every tier polled it an hour ago, so
+only a push inside the window puts it on the fast path. A live stamp
+therefore wakes ``tier_main``'s own ``main``-edition check too, which
+fetches the unchanged ``main`` edition (``/editions/1``) before the push
+check makes its calls; the push also wakes ``tier_discovery`` and
+``tier_other``, which otherwise skip the project.
 """
 
 from __future__ import annotations
@@ -47,6 +50,11 @@ from docverse_server.config import config
 from docverse_server.services.keeper_sync.push_hints import (
     ANNOTATION_GITHUB_PUSHED_REFS,
 )
+from docverse_server.services.keeper_sync.scheduler import (
+    ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
+    ANNOTATION_DATE_MAIN_LAST_POLLED,
+    ANNOTATION_DATE_OTHER_LAST_POLLED,
+)
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
@@ -72,6 +80,9 @@ _SLUG = "sqr-112"
 
 _MAIN_LTD_ID = 1
 """LTD id of the seeded project's ``main`` edition."""
+
+_MAIN_PATH = f"/editions/{_MAIN_LTD_ID}"
+"""LTD path of the ``main`` edition ``tier_main``'s own check fetches."""
 
 _SYNCED_AT = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 """When the seeded editions were last synced, and the rebuild they saw."""
@@ -109,10 +120,12 @@ async def _seed_pushed_project(
 ) -> int:
     """Create a synced project stamped with ``pushed_refs``.
 
-    Returns the Docverse project id. A ``dormant`` project's LTD
-    ``main`` rebuilt a month ago and was polled an hour ago, so
-    ``tier_main``'s ``main``-edition check skips it; otherwise its
-    ``main`` rebuilt a day ago and the check runs.
+    Returns the Docverse project id. The project's ``__main`` edition is
+    synced as LTD's ``main`` edition, ``_MAIN_LTD_ID``, last rebuilt
+    ``_SYNCED_AT`` (see :func:`_stub_ltd`). A ``dormant`` project's LTD
+    ``main`` rebuilt a month ago and every tier polled it an hour ago,
+    so each tier skips it unless a push holds it inside the window;
+    otherwise its ``main`` rebuilt a day ago and every tier polls it.
     """
     project = await ProjectStore(session=session, logger=_logger()).create(
         org_id=org_id,
@@ -134,12 +147,28 @@ async def _seed_pushed_project(
         ),
         annotations={
             "main_edition_url": f"{LTD_BASE}/editions/{_MAIN_LTD_ID}",
-            "date_main_last_polled": (now - timedelta(hours=1)).isoformat(),
+            **dict.fromkeys(
+                (
+                    ANNOTATION_DATE_MAIN_LAST_POLLED,
+                    ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
+                    ANNOTATION_DATE_OTHER_LAST_POLLED,
+                ),
+                (now - timedelta(hours=1)).isoformat(),
+            ),
             ANNOTATION_GITHUB_PUSHED_REFS: {
                 ref: pushed_at.isoformat()
                 for ref, pushed_at in pushed_refs.items()
             },
         },
+    )
+    await _seed_synced_edition(
+        session,
+        org_id=org_id,
+        project_id=project.id,
+        slug="__main",
+        git_ref="main",
+        ltd_id=_MAIN_LTD_ID,
+        kind=EditionKind.main,
     )
     return project.id
 
@@ -177,7 +206,19 @@ async def _seed_synced_edition(
     )
 
 
-def _stub_products(mock: respx.Router) -> None:
+def _stub_ltd(mock: respx.Router) -> None:
+    """Stub LTD's product listing and the project's unchanged ``main``.
+
+    A test that needs ``main`` to answer otherwise stubs
+    ``/editions/1`` again; respx replaces a route with the same pattern.
+    """
+    _stub_edition(
+        mock,
+        ltd_id=_MAIN_LTD_ID,
+        slug="main",
+        tracked_ref="main",
+        date_rebuilt=_SYNCED_AT,
+    )
     mock.get(f"{LTD_BASE}/products/").mock(
         return_value=httpx.Response(
             200,
@@ -279,7 +320,7 @@ async def test_rebuilt_pushed_ref_enqueues_and_clears_its_stamp(
 ) -> None:
     """LTD rebuilt the pushed branch's edition: one sync, stamp cleared.
 
-    The project is dormant on ``main``, so the sync comes from the push
+    The project's ``main`` is unchanged, so the sync comes from the push
     check alone, through one ``GET /editions/<id>`` of the edition the
     ref's Docverse edition maps to.
     """
@@ -297,7 +338,7 @@ async def test_rebuilt_pushed_ref_enqueues_and_clears_its_stamp(
             git_ref="tickets/DM-1",
             ltd_id=2,
         )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_edition(
         mock_discovery,
         ltd_id=2,
@@ -311,7 +352,7 @@ async def test_rebuilt_pushed_ref_enqueues_and_clears_its_stamp(
     assert len(jobs) == 1
     assert jobs[0].kwargs["payload"]["ltd_slug"] == _SLUG
     assert "run_id" not in jobs[0].kwargs["payload"]
-    assert _ltd_paths(mock_discovery) == ["/editions/2"]
+    assert _ltd_paths(mock_discovery) == [_MAIN_PATH, "/editions/2"]
     assert await _stamps(org_id) == {}
 
 
@@ -326,27 +367,21 @@ async def test_pushed_ref_without_edition_enqueues_on_unseen_ltd_edition(
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, "ks-push-new")
-        project_id = await _seed_pushed_project(
+        await _seed_pushed_project(
             db_session,
             org_id=org_id,
             pushed_refs={"tickets/DM-2": _now() - timedelta(minutes=10)},
         )
-        await _seed_synced_edition(
-            db_session,
-            org_id=org_id,
-            project_id=project_id,
-            slug="__main",
-            git_ref="main",
-            ltd_id=_MAIN_LTD_ID,
-            kind=EditionKind.main,
-        )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_listing(mock_discovery, [3, _MAIN_LTD_ID])
 
     jobs = await _run_tier_main()
 
     assert len(jobs) == 1
-    assert _ltd_paths(mock_discovery) == [f"/products/{_SLUG}/editions/"]
+    assert _ltd_paths(mock_discovery) == [
+        _MAIN_PATH,
+        f"/products/{_SLUG}/editions/",
+    ]
     assert await _stamps(org_id) == {}
 
 
@@ -358,19 +393,10 @@ async def test_pushed_ref_without_edition_or_unseen_edition_keeps_stamp(
     pushed_at = _now() - timedelta(minutes=10)
     async with db_session.begin():
         org_id = await _seed_org(db_session, "ks-push-not-found")
-        project_id = await _seed_pushed_project(
+        await _seed_pushed_project(
             db_session, org_id=org_id, pushed_refs={"tickets/DM-2": pushed_at}
         )
-        await _seed_synced_edition(
-            db_session,
-            org_id=org_id,
-            project_id=project_id,
-            slug="__main",
-            git_ref="main",
-            ltd_id=_MAIN_LTD_ID,
-            kind=EditionKind.main,
-        )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_listing(mock_discovery, [_MAIN_LTD_ID])
 
     jobs = await _run_tier_main()
@@ -398,7 +424,7 @@ async def test_unchanged_pushed_ref_keeps_its_stamp(
             git_ref="tickets/DM-1",
             ltd_id=2,
         )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_edition(
         mock_discovery,
         ltd_id=2,
@@ -410,7 +436,7 @@ async def test_unchanged_pushed_ref_keeps_its_stamp(
     jobs = await _run_tier_main()
 
     assert jobs == []
-    assert _ltd_paths(mock_discovery) == ["/editions/2"]
+    assert _ltd_paths(mock_discovery) == [_MAIN_PATH, "/editions/2"]
     assert await _stamps(org_id) == {"tickets/DM-1": pushed_at.isoformat()}
 
 
@@ -438,7 +464,7 @@ async def test_expired_pushed_ref_is_pruned_without_ltd_call(
             git_ref="tickets/DM-3",
             ltd_id=4,
         )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_edition(
         mock_discovery,
         ltd_id=4,
@@ -450,7 +476,7 @@ async def test_expired_pushed_ref_is_pruned_without_ltd_call(
     jobs = await _run_tier_main()
 
     assert jobs == []
-    assert _ltd_paths(mock_discovery) == ["/editions/4"]
+    assert _ltd_paths(mock_discovery) == [_MAIN_PATH, "/editions/4"]
     assert await _stamps(org_id) == {"tickets/DM-3": live_at.isoformat()}
 
 
@@ -486,7 +512,7 @@ async def test_ltd_error_keeps_the_stamp_and_reports_to_sentry(
                 git_ref=ref,
                 ltd_id=ltd_id,
             )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     # 403 is not retried, so the failure surfaces without backoff.
     mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
         return_value=httpx.Response(403)
@@ -497,7 +523,7 @@ async def test_ltd_error_keeps_the_stamp_and_reports_to_sentry(
     assert jobs == []
     assert len(captured) == 1
     assert isinstance(captured[0], LtdClientError)
-    assert _ltd_paths(mock_discovery) == ["/editions/2"]
+    assert _ltd_paths(mock_discovery) == [_MAIN_PATH, "/editions/2"]
     assert await _stamps(org_id) == {
         "tickets/DM-1": first_at.isoformat(),
         "tickets/DM-3": second_at.isoformat(),
@@ -535,7 +561,7 @@ async def test_main_check_ltd_failure_defers_the_pushed_refs(
             git_ref="tickets/DM-1",
             ltd_id=2,
         )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     mock_discovery.get(f"{LTD_BASE}/editions/{_MAIN_LTD_ID}").mock(
         return_value=httpx.Response(403)
     )
@@ -544,7 +570,7 @@ async def test_main_check_ltd_failure_defers_the_pushed_refs(
 
     assert jobs == []
     assert len(captured) == 1
-    assert _ltd_paths(mock_discovery) == [f"/editions/{_MAIN_LTD_ID}"]
+    assert _ltd_paths(mock_discovery) == [_MAIN_PATH]
     assert await _stamps(org_id) == {"tickets/DM-1": pushed_at.isoformat()}
 
 
@@ -575,20 +601,11 @@ async def test_hot_path_off_leaves_tier_main_as_it_was(
             db_session,
             org_id=org_id,
             project_id=project_id,
-            slug="__main",
-            git_ref="main",
-            ltd_id=_MAIN_LTD_ID,
-            kind=EditionKind.main,
-        )
-        await _seed_synced_edition(
-            db_session,
-            org_id=org_id,
-            project_id=project_id,
             slug="tickets-DM-1",
             git_ref="tickets/DM-1",
             ltd_id=2,
         )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_edition(
         mock_discovery,
         ltd_id=_MAIN_LTD_ID,
@@ -607,7 +624,7 @@ async def test_hot_path_off_leaves_tier_main_as_it_was(
     jobs = await _run_tier_main()
 
     assert jobs == []
-    assert _ltd_paths(mock_discovery) == [f"/editions/{_MAIN_LTD_ID}"]
+    assert _ltd_paths(mock_discovery) == [_MAIN_PATH]
     assert await _stamps(org_id) == {
         ref: pushed_at.isoformat() for ref, pushed_at in stamps.items()
     }
@@ -644,7 +661,7 @@ async def test_active_job_skips_the_enqueue_and_keeps_the_stamp(
             subject_label=_SLUG,
             backend_job_id="arq-job-prior",
         )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_edition(
         mock_discovery,
         ltd_id=2,
@@ -680,7 +697,7 @@ async def test_rebuilt_tag_release_edition_enqueues(
             ltd_id=5,
             kind=EditionKind.release,
         )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_edition(
         mock_discovery,
         ltd_id=5,
@@ -692,7 +709,7 @@ async def test_rebuilt_tag_release_edition_enqueues(
     jobs = await _run_tier_main()
 
     assert len(jobs) == 1
-    assert _ltd_paths(mock_discovery) == ["/editions/5"]
+    assert _ltd_paths(mock_discovery) == [_MAIN_PATH, "/editions/5"]
     assert await _stamps(org_id) == {}
 
 
@@ -708,22 +725,13 @@ async def test_pushed_main_shares_the_main_check(
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, "ks-push-main")
-        project_id = await _seed_pushed_project(
+        await _seed_pushed_project(
             db_session,
             org_id=org_id,
             pushed_refs={"main": _now() - timedelta(minutes=10)},
             dormant=False,
         )
-        await _seed_synced_edition(
-            db_session,
-            org_id=org_id,
-            project_id=project_id,
-            slug="__main",
-            git_ref="main",
-            ltd_id=_MAIN_LTD_ID,
-            kind=EditionKind.main,
-        )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_edition(
         mock_discovery,
         ltd_id=_MAIN_LTD_ID,
@@ -735,7 +743,7 @@ async def test_pushed_main_shares_the_main_check(
     jobs = await _run_tier_main()
 
     assert len(jobs) == 1
-    assert _ltd_paths(mock_discovery) == [f"/editions/{_MAIN_LTD_ID}"]
+    assert _ltd_paths(mock_discovery) == [_MAIN_PATH]
     assert await _stamps(org_id) == {}
 
 
@@ -802,7 +810,7 @@ async def test_push_during_the_visit_keeps_its_newer_stamp(
             git_ref="tickets/DM-1",
             ltd_id=2,
         )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_edition(
         mock_discovery,
         ltd_id=2,
@@ -841,7 +849,7 @@ async def test_edition_gone_from_ltd_falls_back_to_the_listing(
             git_ref="tickets/DM-1",
             ltd_id=2,
         )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
         return_value=httpx.Response(404)
     )
@@ -851,6 +859,7 @@ async def test_edition_gone_from_ltd_falls_back_to_the_listing(
 
     assert len(jobs) == 1
     assert _ltd_paths(mock_discovery) == [
+        _MAIN_PATH,
         "/editions/2",
         f"/products/{_SLUG}/editions/",
     ]
@@ -881,7 +890,7 @@ async def test_visit_and_enqueue_are_logged(
             git_ref="tickets/DM-1",
             ltd_id=2,
         )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_edition(
         mock_discovery,
         ltd_id=2,
@@ -968,19 +977,10 @@ async def test_tier_poll_stamp_keeps_a_concurrent_push(
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, "ks-push-race")
-        project_id = await _seed_pushed_project(
+        await _seed_pushed_project(
             db_session, org_id=org_id, pushed_refs={}, dormant=False
         )
-        await _seed_synced_edition(
-            db_session,
-            org_id=org_id,
-            project_id=project_id,
-            slug="__main",
-            git_ref="main",
-            ltd_id=_MAIN_LTD_ID,
-            kind=EditionKind.main,
-        )
-    _stub_products(mock_discovery)
+    _stub_ltd(mock_discovery)
     _stub_listing(mock_discovery, [_MAIN_LTD_ID])
     _stub_edition(
         mock_discovery,
@@ -1028,3 +1028,174 @@ async def test_tier_poll_stamp_keeps_a_concurrent_push(
         await http_client.aclose()
 
     assert await _stamps(org_id) == {"tickets/DM-1": pushed_at.isoformat()}
+
+
+async def _run_tier(
+    tier_cron: Callable[[dict[str, Any]], Coroutine[Any, Any, str]],
+) -> None:
+    """Run one tick of ``tier_cron`` against the respx LTD mock."""
+    http_client = httpx.AsyncClient()
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+    try:
+        assert await tier_cron(ctx) == "completed"
+    finally:
+        await http_client.aclose()
+
+
+_SLOW_TIERS = [
+    pytest.param(keeper_sync_tier_discovery, id="discovery"),
+    pytest.param(keeper_sync_tier_other, id="other"),
+]
+"""The tiers a dormant project leaves to their daily gate until pushed."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier_cron", _SLOW_TIERS)
+@pytest.mark.parametrize(
+    ("pushed_ago", "visited"),
+    [
+        pytest.param(None, False, id="before-push"),
+        pytest.param(timedelta(minutes=10), True, id="inside-window"),
+        pytest.param(timedelta(hours=2), False, id="after-window"),
+    ],
+)
+async def test_push_wakes_a_dormant_project_on_the_slower_tiers(
+    *,
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    tier_cron: Callable[[dict[str, Any]], Coroutine[Any, Any, str]],
+    pushed_ago: timedelta | None,
+    visited: bool,
+) -> None:
+    """Discovery and ``tier_other`` visit a pushed project on their cadence.
+
+    The project is dormant and both tiers polled it an hour ago, so their
+    daily gate skips it. A push inside the window makes it hot: the tier
+    lists its LTD editions this tick. Once the window has passed, the
+    stamp left on the row counts for nothing and the gate skips it again.
+    """
+    pushed_refs = (
+        {"tickets/DM-1": _now() - pushed_ago} if pushed_ago is not None else {}
+    )
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-slow-tiers")
+        await _seed_pushed_project(
+            db_session, org_id=org_id, pushed_refs=pushed_refs
+        )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [_MAIN_LTD_ID])
+
+    await _run_tier(tier_cron)
+
+    expected = [f"/products/{_SLUG}/editions/"] if visited else []
+    assert _ltd_paths(mock_discovery) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tier_cron",
+    [
+        pytest.param(keeper_sync_tier_main, id="main"),
+        *_SLOW_TIERS,
+    ],
+)
+async def test_hot_path_off_leaves_a_pushed_dormant_project_dormant(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    tier_cron: Callable[[dict[str, Any]], Coroutine[Any, Any, str]],
+) -> None:
+    """With the hot path off, a live stamp wakes no tier.
+
+    Every tier gates the project on its dormancy alone, so none of them
+    calls LTD for it this tick, and the stamp stays as it was.
+    """
+    monkeypatch.setattr(config, "keeper_sync_push_hot_path_enabled", False)
+    pushed_at = _now() - timedelta(minutes=10)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-off-dormant")
+        await _seed_pushed_project(
+            db_session, org_id=org_id, pushed_refs={"main": pushed_at}
+        )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [_MAIN_LTD_ID])
+
+    await _run_tier(tier_cron)
+
+    assert _ltd_paths(mock_discovery) == []
+    assert await _stamps(org_id) == {"main": pushed_at.isoformat()}
+
+
+@pytest.mark.asyncio
+async def test_push_wakes_the_main_check_of_a_dormant_project(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """A push to a dormant project's ``main`` rides ``tier_main``'s check.
+
+    The push makes the project hot, so the ``main`` check fetches LTD's
+    ``main`` edition, finds it rebuilt and records the rebuild on the
+    project row, which keeps the project hot once the window closes. The
+    pushed ref reuses that fetch and is cleared by the one enqueue.
+    """
+    rebuilt_at = _now() - timedelta(minutes=1)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-main-dormant")
+        await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"main": _now() - timedelta(minutes=10)},
+        )
+    _stub_ltd(mock_discovery)
+    _stub_edition(
+        mock_discovery,
+        ltd_id=_MAIN_LTD_ID,
+        slug="main",
+        tracked_ref="main",
+        date_rebuilt=rebuilt_at,
+    )
+
+    jobs = await _run_tier_main()
+
+    assert len(jobs) == 1
+    assert _ltd_paths(mock_discovery) == [_MAIN_PATH]
+    assert await _stamps(org_id) == {}
+    async for session in db_session_dependency():
+        async with session.begin():
+            state = await KeeperSyncStateStore(
+                session=session, logger=_logger()
+            ).get(
+                org_id=org_id,
+                resource_type=ResourceType.project,
+                ltd_slug=_SLUG,
+            )
+        assert state is not None
+        assert state.date_rebuilt_seen == rebuilt_at
+
+
+@pytest.mark.asyncio
+async def test_expired_stamps_leave_a_dormant_project_unpolled(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """Once every push has left the window, ``tier_main`` is dormant again.
+
+    The ``main`` check's daily gate skips the project, so the tick makes
+    no LTD call; it still prunes the expired stamp.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-all-expired")
+        await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"tickets/DM-1": _now() - timedelta(hours=2)},
+        )
+    _stub_ltd(mock_discovery)
+
+    jobs = await _run_tier_main()
+
+    assert jobs == []
+    assert _ltd_paths(mock_discovery) == []
+    assert await _stamps(org_id) == {}

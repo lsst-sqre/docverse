@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Literal
 
+from docverse_server.services.keeper_sync.push_hints import is_in_push_window
 from docverse_server.storage.keeper_sync import KeeperSyncState
 
 __all__ = [
@@ -58,11 +59,12 @@ __all__ = [
 
 
 #: Tier-cohort labels surfaced to operators by :func:`explain_tier_status`.
-#: ``hot`` mirrors the planner's rules 2 and 3 (no recorded rebuild yet, or
-#: rebuilt within ``hot_window``); ``dormant`` mirrors rule 4 (older than
-#: ``hot_window``); ``unseen`` is the explainer-only label for "no state row
-#: exists" — the planner returns True (poll) for that case but the operator
-#: cohort is "we have never observed this project on this tier".
+#: ``hot`` mirrors the planner's rules 2 to 4 (no recorded rebuild yet,
+#: rebuilt within ``hot_window``, or pushed within ``push_window``);
+#: ``dormant`` mirrors rule 5 (none of those); ``unseen`` is the
+#: explainer-only label for "no state row exists" — the planner returns
+#: True (poll) for that case but the operator cohort is "we have never
+#: observed this project on this tier".
 TierCohort = Literal["hot", "dormant", "unseen"]
 
 #: How long a non-``main`` edition's local state may lag LTD before
@@ -302,6 +304,7 @@ def should_poll_for_tier(
     hot_window: timedelta,
     dormant_interval: timedelta,
     jitter_window: timedelta = timedelta(0),
+    push_window: timedelta | None = None,
 ) -> bool:
     """Decide whether a tier-cron should fetch LTD for a project this tick.
 
@@ -323,15 +326,25 @@ def should_poll_for_tier(
        date to gate on.
     3. ``now - state.date_rebuilt_seen < hot_window`` — the project is
        hot. Always poll on the tier's fast cadence.
-    4. Otherwise (dormant): consult the per-tier last-polled
+    4. A push holds the project inside ``push_window`` — it is hot too.
+       Any ref in the row's ``github_pushed_refs`` annotation pushed
+       less than ``push_window`` ago counts
+       (:func:`~docverse_server.services.keeper_sync.push_hints.is_in_push_window`),
+       so a dormant project a contributor pushes to is polled on every
+       tier's fast cadence until the window closes, and falls back to
+       rule 5 then without anything clearing its stamp. ``None`` (the
+       default) is the push hot path switched off: callers pass the
+       window only while ``keeper_sync_push_hot_path_enabled`` is on,
+       and a stamped row is then gated as if it carried no stamp.
+    5. Otherwise (dormant): consult the per-tier last-polled
        annotation. If absent, malformed, or older than the effective
        dormant interval, poll. Otherwise skip.
 
-    ``jitter_window`` (default zero) widens the rule-4 effective
+    ``jitter_window`` (default zero) widens the rule-5 effective
     interval to ``dormant_interval + (stable_hash_fraction(ltd_slug) *
     jitter_window)`` so the dormant cohort does not all become due on
     the same tick after a deploy or load shed. Only the dormant gate
-    is jittered; rules 1-3 are unaffected so the hot-cohort SLO is
+    is jittered; rules 1-4 are unaffected so the hot-cohort SLO is
     preserved.
     """
     if state is None:
@@ -339,6 +352,8 @@ def should_poll_for_tier(
     if state.date_rebuilt_seen is None:
         return True
     if (now - state.date_rebuilt_seen) < hot_window:
+        return True
+    if _is_pushed(state, now=now, push_window=push_window):
         return True
     annotations = state.annotations or {}
     last_polled_raw = annotations.get(_TIER_ANNOTATION_KEYS[tier])
@@ -349,6 +364,19 @@ def should_poll_for_tier(
         stable_hash_fraction(state.ltd_slug) * jitter_window
     )
     return (now - last_polled) >= effective_interval
+
+
+def _is_pushed(
+    state: KeeperSyncState, *, now: datetime, push_window: timedelta | None
+) -> bool:
+    """Report whether a push holds a project on the fast path at ``now``.
+
+    ``push_window`` is ``None`` while the push hot path is switched off,
+    and the project's push hints then count for nothing.
+    """
+    if push_window is None:
+        return False
+    return is_in_push_window(state, now=now, window=push_window)
 
 
 def next_cron_tick_at_or_after(now: datetime, interval: timedelta) -> datetime:
@@ -396,6 +424,7 @@ def should_poll_main_for_project(
     hot_window: timedelta = TIER_MAIN_HOT_WINDOW,
     dormant_interval: timedelta = TIER_MAIN_DORMANT_INTERVAL,
     jitter_window: timedelta = TIER_MAIN_DORMANT_JITTER,
+    push_window: timedelta | None = None,
 ) -> bool:
     """Decide whether tier_main should fetch LTD for a project this tick.
 
@@ -413,6 +442,7 @@ def should_poll_main_for_project(
         hot_window=hot_window,
         dormant_interval=dormant_interval,
         jitter_window=jitter_window,
+        push_window=push_window,
     )
 
 
@@ -542,6 +572,7 @@ def explain_tier_status(
     dormant_interval: timedelta,
     cron_interval: timedelta,
     jitter_window: timedelta = timedelta(0),
+    push_window: timedelta | None = None,
 ) -> TierStatus:
     """Explain the planner's tier-cron decision for one project state row.
 
@@ -562,10 +593,13 @@ def explain_tier_status(
        purposes. ``next_due_at`` is the next cron tick.
     3. ``now - state.date_rebuilt_seen < hot_window`` → ``cohort=
        'hot'``. ``next_due_at`` is the next cron tick.
-    4. Dormant without a per-tier last-polled annotation →
+    4. A push holds the project inside ``push_window`` → ``cohort=
+       'hot'``. ``next_due_at`` is the next cron tick. ``push_window``
+       is ``None`` while the push hot path is off, as for the gate.
+    5. Dormant without a per-tier last-polled annotation →
        ``cohort='dormant'``. ``next_due_at`` is the next cron tick
        — the gate's "missing annotation" branch polls on first sight.
-    5. Dormant with a parsed last-polled annotation → ``cohort=
+    6. Dormant with a parsed last-polled annotation → ``cohort=
        'dormant'``. ``next_due_at`` is ``last_polled + (dormant_
        interval + stable_hash_fraction(slug) * jitter_window)`` —
        the calendar-gated deadline.
@@ -590,7 +624,9 @@ def explain_tier_status(
             last_polled_at=last_polled,
             next_due_at=next_cron_tick_at_or_after(now, cron_interval),
         )
-    if (now - state.date_rebuilt_seen) < hot_window:
+    if (now - state.date_rebuilt_seen) < hot_window or _is_pushed(
+        state, now=now, push_window=push_window
+    ):
         return TierStatus(
             cohort="hot",
             last_polled_at=last_polled,
