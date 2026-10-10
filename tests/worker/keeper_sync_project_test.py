@@ -116,6 +116,7 @@ from docverse_server.worker.functions.keeper_sync import (
     keeper_sync_tier_discovery,
 )
 from docverse_server.worker.functions.publish_edition import publish_edition
+from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.arq_testing import get_jobs_by_name, register_queue
 from tests.support.lock_service_spy import install_recording_lock_service
@@ -448,6 +449,166 @@ async def test_keeper_sync_project_runs_service_and_enqueues_publish(
     # Build content actually landed in the destination object store.
     assert any(k.endswith("/index.html") for k in object_store.objects)
     assert any(k.endswith("/app.js") for k in object_store.objects)
+
+
+@dataclass
+class _NewProjectSync:
+    """One ``keeper_sync_project`` job that created its project."""
+
+    result: str
+    mock_arq: MockArqQueue
+    project_id: int
+    logs: list[MutableMapping[str, Any]]
+
+
+async def _sync_new_project(
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    doc_repo: str | None = None,
+    fail_resolve_enqueue: bool = False,
+) -> _NewProjectSync:
+    """Run one ``keeper_sync_project`` job that creates its project.
+
+    ``doc_repo`` replaces the LTD product's own (a github.com URL), and
+    ``fail_resolve_enqueue`` makes the mock queue raise for
+    ``project_github_resolve`` while it accepts every other job — the
+    forced enqueue failure. The maintenance queue is registered, so an
+    enqueue onto it lands unless forced to fail.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+        queue_job_id = await _seed_project_queue_job(
+            db_session, org_id=org_id, run_id=run_id
+        )
+    _seed_ltd(mock_discovery)
+    if doc_repo is not None:
+        product = _load("product_pipelines.json")
+        product["doc_repo"] = doc_repo
+        mock_discovery.get(f"{LTD_BASE}/products/pipelines").mock(
+            return_value=httpx.Response(200, json=product)
+        )
+    _patch_factory_io(
+        monkeypatch,
+        object_store=MockObjectStore(),
+        source_objects={"pipelines/builds/42/index.html": b"<html>v1</html>"},
+    )
+
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    register_queue(mock_arq, MAINTENANCE_QUEUE_NAME)
+    if fail_resolve_enqueue:
+        real_enqueue = mock_arq.enqueue
+
+        async def _enqueue(
+            task_name: str, *args: Any, **kwargs: Any
+        ) -> JobMetadata:
+            if task_name == "project_github_resolve":
+                msg = "maintenance queue unavailable"
+                raise RuntimeError(msg)
+            return await real_enqueue(task_name, *args, **kwargs)
+
+        monkeypatch.setattr(mock_arq, "enqueue", _enqueue)
+
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), arq_queue=mock_arq)
+    with capture_logs() as logs:
+        result = await keeper_sync_project(
+            ctx,
+            {
+                "org_id": org_id,
+                "org_slug": org_slug,
+                "run_id": run_id,
+                "queue_job_id": queue_job_id,
+                "ltd_slug": "pipelines",
+                "ltd_base_url": LTD_BASE,
+            },
+        )
+    await ctx["http_client"].aclose()
+    return _NewProjectSync(
+        result=result,
+        mock_arq=mock_arq,
+        project_id=await _project_id_for(org_id=org_id),
+        logs=logs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_enqueues_github_resolve_for_new_project(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A project created for a github.com ``doc_repo`` gets its ids resolved.
+
+    Keeper-sync creates the project as the REST create handler does, so
+    it enqueues the same one ``project_github_resolve`` job onto the
+    maintenance pool (PRD #803), and the project learns its
+    installation, owner and repository ids and default branch within
+    minutes instead of waiting on the daily audit.
+    """
+    sync = await _sync_new_project(db_session, mock_discovery, monkeypatch)
+
+    assert sync.result == "completed"
+    resolves = get_jobs_by_name(sync.mock_arq, "project_github_resolve")
+    assert [job.queue_name for job in resolves] == [MAINTENANCE_QUEUE_NAME]
+    assert resolves[0].kwargs["payload"] == {"project_id": sync.project_id}
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_skips_github_resolve_for_non_github_repo(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A project created for a non-GitHub ``doc_repo`` enqueues no resolve.
+
+    Its repository goes into ``source_url`` and the project has no
+    GitHub binding, so a resolve could only ever answer ``skipped``.
+    """
+    sync = await _sync_new_project(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        doc_repo="https://gitlab.com/lsst/pipelines_lsst_io",
+    )
+
+    assert sync.result == "completed"
+    assert get_jobs_by_name(sync.mock_arq, "project_github_resolve") == []
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_completes_when_github_resolve_enqueue_fails(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolve enqueue that fails is logged; the project still syncs.
+
+    The resolve is opportunistic — the daily audit is its backstop — so
+    a queue failure costs only the enqueue: the job imports the
+    project's editions, hands their publishes to the queue, and
+    finishes ``completed``.
+    """
+    sync = await _sync_new_project(
+        db_session, mock_discovery, monkeypatch, fail_resolve_enqueue=True
+    )
+
+    assert sync.result == "completed"
+    assert get_jobs_by_name(sync.mock_arq, "project_github_resolve") == []
+    assert len(get_jobs_by_name(sync.mock_arq, "publish_edition")) == 1
+    failures = [
+        entry
+        for entry in sync.logs
+        if entry["event"] == "Failed to enqueue project_github_resolve"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["log_level"] == "error"
+    assert failures[0]["project_id"] == sync.project_id
 
 
 @pytest.mark.asyncio

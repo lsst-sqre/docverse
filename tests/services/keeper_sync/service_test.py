@@ -96,6 +96,7 @@ from docverse_server.services.keeper_sync.service import (
     EditionSyncOutcome,
     KeeperSyncContext,
     KeeperSyncService,
+    ProjectCreatedCallback,
     ProjectSyncResult,
     _measure_ltd_lag_seconds,
     _now,
@@ -237,6 +238,7 @@ def _build_service(
     copy_retry_delay_seconds: float | None = None,
     on_build_copied: BuildCopiedCallback | None = None,
     draft_retirer: DuplicateDraftRetirer | None = None,
+    on_project_created: ProjectCreatedCallback | None = None,
 ) -> KeeperSyncService:
     """Construct a real ``KeeperSyncService`` against the test DB.
 
@@ -262,7 +264,8 @@ def _build_service(
     ``on_build_copied`` receives one report per build copy (see
     :func:`_record_copy_reports`). ``draft_retirer`` retires the drafts
     duplicating a ``__main`` keeper-sync moves onto the default branch
-    (see :func:`_build_draft_retirer`).
+    (see :func:`_build_draft_retirer`). ``on_project_created`` receives
+    each project the sync creates, once its row has committed.
     """
     logger = structlog.get_logger("test")
     org_store = OrganizationStore(session=session, logger=logger)
@@ -333,6 +336,7 @@ def _build_service(
         ),
         on_build_copied=on_build_copied,
         draft_retirer=draft_retirer,
+        on_project_created=on_project_created,
     )
 
 
@@ -582,6 +586,137 @@ async def test_sync_project_creates_project_edition_and_build(
     # Build content landed in the destination object store.
     assert any(k.endswith("/index.html") for k in object_store.objects)
     assert any(k.endswith("/app.js") for k in object_store.objects)
+
+
+@pytest.mark.asyncio
+async def test_sync_project_reports_a_created_project_after_commit(
+    db_session: AsyncSession,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A project the sync creates reaches ``on_project_created`` committed.
+
+    The factory wires the hook to enqueue ``project_github_resolve``
+    (PRD #803), and that job reads the project from a session of its
+    own. So the hook may only run once the creating transaction has
+    committed: no transaction is open on the sync's session, and a
+    second session already sees the row. The project it receives
+    carries the GitHub binding parsed from LTD's ``doc_repo``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+
+    created: list[Project] = []
+
+    async def on_project_created(project: Project) -> None:
+        assert not db_session.in_transaction()
+        async with db_session_factory() as other, other.begin():
+            row = await other.get(SqlProject, project.id)
+        assert row is not None
+        created.append(project)
+
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        on_project_created=on_project_created,
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert [project.id for project in created] == [result.docverse_project_id]
+    assert (created[0].github_owner, created[0].github_repo) == (
+        "lsst",
+        "pipelines_lsst_io",
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_project_does_not_report_an_existing_project(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A re-sync of a project the sync already created reports nothing.
+
+    Only the creating visit hands the project to ``on_project_created``,
+    so a project's ``project_github_resolve`` is enqueued once rather
+    than on every tier-cron visit.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+    source_objects = {"pipelines/builds/42/index.html": b"<html>v1</html>"}
+    object_store = MockObjectStore()
+    await _build_service(
+        db_session, http_client, object_store, source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    created: list[Project] = []
+
+    async def on_project_created(project: Project) -> None:
+        created.append(project)
+
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        source_objects,
+        on_project_created=on_project_created,
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_sync_project_continues_when_on_project_created_raises(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising ``on_project_created`` is reported, never fatal.
+
+    The hook is a best-effort side channel — enqueueing the new
+    project's GitHub resolve — so a failure in it is sent to Sentry and
+    logged, and the sync goes on to import the project's editions.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    _seed_ltd(mock_discovery)
+
+    async def on_project_created(project: Project) -> None:
+        msg = "enqueue boom"
+        raise RuntimeError(msg)
+
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        on_project_created=on_project_created,
+    )
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert [o.docverse_slug for o in result.edition_outcomes] == ["__main"]
+    assert result.edition_failures == ()
+    assert [str(exc) for exc in captured] == ["enqueue boom"]
+    failures = [
+        entry
+        for entry in logs
+        if entry["event"] == "on_project_created callback raised; continuing"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["log_level"] == "error"
+    assert failures[0]["project_id"] == result.docverse_project_id
 
 
 @pytest.mark.asyncio

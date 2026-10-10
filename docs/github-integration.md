@@ -193,9 +193,9 @@ audit does:
   fails. The next audit tick is the backstop.
 
 A resolve on a project whose column is already set spends nothing on
-the ref set; the column's previous value is its evidence. Keeper-sync
-enqueues no resolve, so a keeper-synced project learns its branch from
-the audit instead.
+the ref set; the column's previous value is its evidence. A project
+keeper-sync creates gets the same resolve; see
+[GitHub ids on creation](#github-ids-on-creation).
 
 ### What a rewrite announces
 
@@ -262,8 +262,9 @@ with the live set as its evidence. The first tick after an upgrade:
 
 - fills the column on every bound project it can read, in every
   organization the audit covers. Keeper-synced projects are included,
-  and for them the audit is the usual seed: keeper-sync creates projects
-  without enqueueing a resolve;
+  and for one synced before keeper-sync enqueued a resolve on creation
+  (see [GitHub ids on creation](#github-ids-on-creation)) the audit is
+  the usual seed;
 - rewrites any `__main` tracking a ref that no longer exists — a
   default branch renamed before the upgrade, or a project created before
   it on a `master` repository whose `__main` got the `main` fallback and
@@ -384,6 +385,30 @@ LTD's `main` edition tracks is not applied either. To have a synced
 to the same ref (see
 [Pinned `__main` editions](#pinned-__main-editions-are-left-for-operators));
 from then on it agrees with LTD, and keeper-sync mirrors LTD as before.
+
+### GitHub ids on creation
+
+When a sync creates the Docverse project for an LTD product whose
+`doc_repo` is a github.com URL, it binds the project to that repository
+and, once the project's row has committed, enqueues one
+`project_github_resolve` onto the maintenance pool — the job the REST
+create handler enqueues (see [A new project](#a-new-project)). Within
+minutes the project has its `github_installation_id`, `github_owner_id`,
+`github_repo_id`, and `github_default_branch`, so deliveries that match
+by `repository.id` find it, and the audit reads it with its
+installation's token.
+
+- Only the visit that creates the project enqueues. Re-syncing an
+  existing project enqueues nothing, so a project synced before this
+  behaviour existed learns its default branch from the audit instead
+  (see [The audit is the backfill](#the-audit-is-the-backfill)).
+- A product whose `doc_repo` is not on github.com becomes a project
+  with a `source_url` and no binding, and enqueues nothing.
+- The enqueue is best-effort. A failure is sent to Sentry and logged as
+  `Failed to enqueue project_github_resolve`, with the `project_id`, and
+  the sync carries on to the project's editions.
+- A repository the App is not installed on resolves `not_installed`: the
+  ids stay `null` until an `installation` delivery records them.
 
 ## Configuration
 
