@@ -63,9 +63,10 @@ that back each of them up.
   repository's default branch across a rename, from the webhook, the
   `project_github_resolve` worker, and the daily `git_ref_audit`; the
   guarded rewrite and what it never touches; the audit as the
-  post-upgrade backfill; how keeper-sync keeps synced projects
-  converged; and the manual `PATCH` for a `__main` the rule leaves
-  pinned.
+  post-upgrade backfill of default branches and GitHub ids; how
+  keeper-sync keeps synced projects converged and resolves their GitHub
+  ids on creation; and the manual `PATCH` for a `__main` the rule
+  leaves pinned.
 - [Memory diagnostics](memory-diagnostics.md) — the opt-in sampler
   every Docverse process carries: what each `Memory sample` field
   means, the five `DOCVERSE_MEMORY_DIAGNOSTICS_*` settings and their

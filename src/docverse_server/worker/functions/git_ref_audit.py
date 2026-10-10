@@ -6,11 +6,13 @@ row per in-scope org with ``kind='git_ref_audit'`` and
 ``subject_label=org.slug`` (mirroring the ``lifecycle_eval`` per-org
 worker so an operator inspecting the queue sees a meaningful
 subject). This worker is the per-org body of that fan-out: for one
-org it lists every non-deleted GitHub-bound project, resolves each
-project's GitHub binding, fetches the live ref set and the default
-branch against GitHub, converges each project's ``__main`` on its
-default branch (PRD #721), runs :func:`evaluate_lifecycle` with
-``live_refs`` populated, and soft-deletes the matched editions.
+org it lists every non-deleted GitHub-bound project, enqueues
+``project_github_resolve`` for each one still missing its GitHub ids
+(the id backfill, PRD #803), resolves each project's GitHub binding,
+fetches the live ref set and the default branch against GitHub,
+converges each project's ``__main`` on its default branch (PRD #721),
+runs :func:`evaluate_lifecycle` with ``live_refs`` populated, and
+soft-deletes the matched editions.
 
 The worker owns the ``queue_jobs`` row lifecycle: it transitions to
 ``in_progress`` on entry and to ``completed`` /
@@ -76,6 +78,9 @@ from docverse_server.services.lifecycle.evaluator import (
     filter_rule_set,
     resolve_rule_set,
 )
+from docverse_server.services.project_github_resolve_enqueue import (
+    try_enqueue_project_github_resolve_by_id,
+)
 from docverse_server.storage.github import (
     RepositoryNotAccessibleError,
     RepositoryRefFetchError,
@@ -106,6 +111,9 @@ class _AuditSummary:
 
     default_branch_errors: int = 0
     """Projects whose default-branch convergence failed this pass."""
+
+    github_resolves_enqueued: int = 0
+    """``project_github_resolve`` jobs the id backfill queued this pass."""
 
 
 @dataclass(slots=True)
@@ -241,6 +249,7 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 default_branch_updates=summary.default_branch_updates,
                 main_rewrites=summary.main_rewrites,
                 default_branch_errors=summary.default_branch_errors,
+                github_resolves_enqueued=summary.github_resolves_enqueued,
             )
             # Publish one lifecycle_action per reaped edition after the
             # commit. Best-effort: production runs raise_on_error=False so
@@ -294,22 +303,25 @@ async def _audit_org(
 
     Splits into a single read transaction that loads the org + every
     GitHub-bound project + every project's editions in one batched
-    read, then per-project fetches the live ref set and the default
-    branch against GitHub (transaction-less network calls), then
-    converges each project's ``__main`` on its default branch (one
-    transaction per project, PRD #721), and finally a write transaction
-    that flips ``date_deleted`` on every matched edition. The deletion
-    transaction is one atomic commit per org so a crash mid-loop cannot
-    leave the org half-deleted; the next day's discovery tick will
-    re-evaluate from a consistent state.
+    read, then enqueues ``project_github_resolve`` for each project
+    missing its GitHub ids (:func:`_enqueue_github_id_backfill`, one
+    small transaction per job), then per-project fetches the live ref
+    set and the default branch against GitHub (transaction-less network
+    calls), then converges each project's ``__main`` on its default
+    branch (one transaction per project, PRD #721), and finally a write
+    transaction that flips ``date_deleted`` on every matched edition.
+    The deletion transaction is one atomic commit per org so a crash
+    mid-loop cannot leave the org half-deleted; the next day's discovery
+    tick will re-evaluate from a consistent state.
 
     Returns the pass's :class:`_AuditSummary`; its ``had_failures`` is
     ``True`` if at least one project's fetch or convergence failed
-    (``completed_with_errors`` for the parent queue-job row). Neither
-    kind of per-project failure bubbles out of this function — the
-    audit's failure-isolation contract is that one project, whether its
-    installation is rate-limited or its convergence raised, cannot
-    block the audit for every other project.
+    (``completed_with_errors`` for the parent queue-job row). A failed
+    id-backfill enqueue does not count: the next pass enqueues the
+    project again. None of these per-project failures bubbles out of
+    this function — the audit's failure-isolation contract is that one
+    project, whether its installation is rate-limited or its
+    convergence raised, cannot block the audit for every other project.
     """
     state = await _load_org_state(
         session=session, factory=factory, org_id=org_id
@@ -323,6 +335,12 @@ async def _audit_org(
         logger.debug("Git ref audit: no GitHub-bound projects for org")
         return _AuditSummary()
 
+    resolves_enqueued = await _enqueue_github_id_backfill(
+        session=session,
+        factory=factory,
+        projects=projects,
+        logger=logger,
+    )
     fetches = await _fetch_per_project(
         factory=factory,
         projects=projects,
@@ -342,6 +360,7 @@ async def _audit_org(
         default_branch_updates=tally.default_branch_updates,
         main_rewrites=tally.main_rewrites,
         default_branch_errors=tally.default_branch_errors,
+        github_resolves_enqueued=resolves_enqueued,
     )
     refs_by_project = fetches.refs_by_project
 
@@ -371,6 +390,49 @@ async def _audit_org(
         logger=logger,
     )
     return summary
+
+
+async def _enqueue_github_id_backfill(
+    *,
+    session: AsyncSession,
+    factory: Factory,
+    projects: list[Project],
+    logger: structlog.stdlib.BoundLogger,
+) -> int:
+    """Enqueue ``project_github_resolve`` for each project missing its ids.
+
+    The backfill for the GitHub ids keeper-sync never resolved (PRD
+    #803): every bound project whose ``github_repo_id`` is still
+    ``NULL`` gets one resolve onto the maintenance pool, once per pass
+    and before the pass's own GitHub reads. The resolve records the
+    installation, owner and repository ids where the App is installed;
+    where it is not, it ends ``not_installed`` with the ids still
+    ``NULL``, so the project is enqueued again on the next pass. A
+    project that has its ids enqueues nothing, which keeps a repeat pass
+    inert. There is no cap: the maintenance pool's concurrency bounds
+    the burst, and the resolve's own retry and backoff absorb GitHub's
+    rate limits.
+
+    Each enqueue runs in its own transaction through
+    :func:`try_enqueue_project_github_resolve_by_id`, which sends a
+    failure to Sentry and logs it. A failed enqueue is not a failure of
+    the pass: the project is still audited, and the next pass enqueues
+    it again.
+
+    Returns the number of jobs enqueued, for the pass's summary line.
+    """
+    enqueued = 0
+    for project in projects:
+        if project.github_repo_id is not None:
+            continue
+        if await try_enqueue_project_github_resolve_by_id(
+            factory=factory,
+            session=session,
+            logger=logger.bind(project=project.slug),
+            project_id=project.id,
+        ):
+            enqueued += 1
+    return enqueued
 
 
 async def _fetch_per_project(
