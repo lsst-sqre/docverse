@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -1132,6 +1133,24 @@ class Configuration(BaseSettings):
                 " reconcile faster in a test environment."
             )
         return self
+
+    @property
+    def keeper_sync_push_window(self) -> timedelta | None:
+        """The push window the keeper-sync tier planners read, if any.
+
+        ``keeper_sync_push_window_seconds`` as a ``timedelta`` while
+        ``keeper_sync_push_hot_path_enabled`` is on, and ``None`` while it
+        is off: the form
+        :func:`~docverse_server.services.keeper_sync.scheduler.should_poll_for_tier`
+        and its explainer take, where ``None`` leaves a project's push
+        stamps unread. The three tier crons read it on every pass, to
+        treat a pushed project as hot and, for ``tier_main``, to decide
+        whether to check the stamps at all; the keeper-sync status
+        endpoint reads it to report a pushed project's cohort.
+        """
+        if not self.keeper_sync_push_hot_path_enabled:
+            return None
+        return timedelta(seconds=self.keeper_sync_push_window_seconds)
 
     @property
     def keeper_sync_reaper_threshold_requested_seconds(self) -> int | None:

@@ -25,8 +25,14 @@ from httpx import AsyncClient
 from safir.dependencies.db_session import db_session_dependency
 
 from docverse.models import OrgRole
+from docverse_server.config import config
+from docverse_server.services.keeper_sync.push_hints import (
+    ANNOTATION_GITHUB_PUSHED_REFS,
+)
 from docverse_server.services.keeper_sync.scheduler import (
+    ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
+    ANNOTATION_DATE_OTHER_LAST_POLLED,
     TIER_DISCOVERY_CRON_INTERVAL,
     TIER_MAIN_CRON_INTERVAL,
     TIER_MAIN_DORMANT_INTERVAL,
@@ -429,6 +435,113 @@ async def test_get_status_stub_when_no_state_row(
         # UTC midnight and is at most one interval ahead of "now-ish".
         anchor = next_due.replace(hour=0, minute=0, second=0, microsecond=0)
         assert (next_due - anchor) % interval == timedelta(0)
+
+
+# ---------------------------------------------------------------------------
+# A push counts as hot (PRD #803)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_pushed_dormant_project(
+    client: AsyncClient, *, pushed_at: datetime
+) -> datetime:
+    """Seed a dormant, recently polled project stamped by a push.
+
+    The project's ``main`` last rebuilt in January and every tier polled
+    it an hour ago, so its dormant gate alone skips it on every tier.
+    Returns the time of those polls.
+    """
+    await _setup_org(client)
+    await _enable_sync(client, project_slugs=[_LTD_SLUG])
+    project_id = await _create_project(client, slug=_LTD_SLUG)
+    org_id = await _get_org_id()
+    last_polled = datetime.now(tz=UTC) - timedelta(hours=1)
+    await _seed_state(
+        org_id=org_id,
+        resource_type=ResourceType.project,
+        ltd_slug=_LTD_SLUG,
+        docverse_id=project_id,
+        date_last_synced=datetime(2026, 5, 1, tzinfo=UTC),
+        date_rebuilt_seen=datetime(2026, 1, 1, tzinfo=UTC),
+        annotations={
+            **dict.fromkeys(
+                (
+                    ANNOTATION_DATE_MAIN_LAST_POLLED,
+                    ANNOTATION_DATE_DISCOVERY_LAST_POLLED,
+                    ANNOTATION_DATE_OTHER_LAST_POLLED,
+                ),
+                last_polled.isoformat(),
+            ),
+            ANNOTATION_GITHUB_PUSHED_REFS: {
+                "tickets/DM-1": pushed_at.isoformat()
+            },
+        },
+    )
+    return last_polled
+
+
+@pytest.mark.asyncio
+async def test_get_status_reports_pushed_dormant_project_hot(
+    client: AsyncClient,
+) -> None:
+    """A push inside the window reads ``hot`` on all three tiers.
+
+    Each tier is due on its next cron tick, as the tier crons will poll
+    the project then; its last poll is reported as recorded.
+    """
+    last_polled = await _seed_pushed_dormant_project(
+        client, pushed_at=datetime.now(tz=UTC) - timedelta(minutes=10)
+    )
+    before = datetime.now(tz=UTC)
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+
+    assert response.status_code == 200
+    tiers = {entry["tier"]: entry for entry in response.json()["tier_status"]}
+    cron_intervals = {
+        "main": TIER_MAIN_CRON_INTERVAL,
+        "discovery": TIER_DISCOVERY_CRON_INTERVAL,
+        "other": TIER_OTHER_CRON_INTERVAL,
+    }
+    assert set(tiers) == set(cron_intervals)
+    for tier, interval in cron_intervals.items():
+        entry = tiers[tier]
+        assert entry["cohort"] == "hot", tier
+        assert datetime.fromisoformat(entry["date_last_polled"]) == last_polled
+        next_due = datetime.fromisoformat(entry["date_next_due"])
+        assert before <= next_due <= before + interval, tier
+        anchor = next_due.replace(hour=0, minute=0, second=0, microsecond=0)
+        assert (next_due - anchor) % interval == timedelta(0), tier
+
+
+@pytest.mark.asyncio
+async def test_get_status_ignores_push_with_hot_path_off(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the push hot path off, a stamped project keeps its cohort."""
+    monkeypatch.setattr(config, "keeper_sync_push_hot_path_enabled", False)
+    await _seed_pushed_dormant_project(
+        client, pushed_at=datetime.now(tz=UTC) - timedelta(minutes=10)
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+
+    assert response.status_code == 200
+    cohorts = {
+        entry["tier"]: entry["cohort"]
+        for entry in response.json()["tier_status"]
+    }
+    assert cohorts == {
+        "main": "dormant",
+        "discovery": "dormant",
+        "other": "dormant",
+    }
 
 
 # ---------------------------------------------------------------------------

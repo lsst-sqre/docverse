@@ -161,7 +161,17 @@ class LtdClientFactory(Protocol):
 
 
 class KeeperSyncProjectService:
-    """Read-only project-status service for the org-admin GET endpoint."""
+    """Read-only project-status service for the org-admin GET endpoint.
+
+    Parameters
+    ----------
+    push_window
+        The keeper-sync push window the tier crons read, or ``None``
+        while the push hot path is off
+        (``Configuration.keeper_sync_push_window``). A project with a ref
+        pushed inside it reports ``hot`` on every tier, as the tier crons
+        poll it.
+    """
 
     def __init__(
         self,
@@ -172,6 +182,7 @@ class KeeperSyncProjectService:
         state_store: KeeperSyncStateStore,
         ltd_client_factory: LtdClientFactory,
         logger: structlog.stdlib.BoundLogger,
+        push_window: timedelta | None,
     ) -> None:
         self._org_store = org_store
         self._project_store = project_store
@@ -179,6 +190,7 @@ class KeeperSyncProjectService:
         self._state_store = state_store
         self._ltd_client_factory = ltd_client_factory
         self._logger = logger
+        self._push_window = push_window
 
     async def get_project_status(
         self,
@@ -209,7 +221,9 @@ class KeeperSyncProjectService:
             resource_type=ResourceType.project,
             ltd_slug=ltd_slug,
         )
-        tier_status = _explain_all_tiers(state=project_state, now=now)
+        tier_status = _explain_all_tiers(
+            state=project_state, now=now, push_window=self._push_window
+        )
 
         main_edition_row: KeeperSyncEditionStatusRow | None = None
         product_state_rows: list[KeeperSyncState] = []
@@ -458,7 +472,11 @@ class KeeperSyncProjectService:
                     docverse_project_slug=docverse_project_slug,
                     in_scope=state_row.ltd_slug in in_scope_slugs,
                     project_state=_summarise_project_state(state_row),
-                    tier_status=_explain_all_tiers(state=state_row, now=now),
+                    tier_status=_explain_all_tiers(
+                        state=state_row,
+                        now=now,
+                        push_window=self._push_window,
+                    ),
                     main_edition_row=main_edition_row,
                     edition_diff=None,
                 )
@@ -593,13 +611,15 @@ def _explain_all_tiers(
     *,
     state: KeeperSyncState | None,
     now: datetime,
+    push_window: timedelta | None,
 ) -> list[KeeperSyncTierStatus]:
     """Compute the per-tier explainer for a project's state row.
 
     The per-tier ``hot_window`` / ``dormant_interval`` / ``jitter_
     window`` constants live in :mod:`scheduler`; this helper threads
     each tier's triple in so the explainer and the gate planner pull
-    from the same source of truth.
+    from the same source of truth. ``push_window`` is shared by the
+    three tiers, as it is by their crons.
     """
     return [
         _build_tier_status(
@@ -607,6 +627,7 @@ def _explain_all_tiers(
             tier_name="main",
             state=state,
             now=now,
+            push_window=push_window,
             hot_window_dormant_jitter=(
                 TIER_MAIN_HOT_WINDOW,
                 TIER_MAIN_DORMANT_INTERVAL,
@@ -619,6 +640,7 @@ def _explain_all_tiers(
             tier_name="discovery",
             state=state,
             now=now,
+            push_window=push_window,
             hot_window_dormant_jitter=(
                 TIER_DISCOVERY_HOT_WINDOW,
                 TIER_DISCOVERY_DORMANT_INTERVAL,
@@ -631,6 +653,7 @@ def _explain_all_tiers(
             tier_name="other",
             state=state,
             now=now,
+            push_window=push_window,
             hot_window_dormant_jitter=(
                 TIER_OTHER_HOT_WINDOW,
                 TIER_OTHER_DORMANT_INTERVAL,
@@ -649,6 +672,7 @@ def _build_tier_status(
     now: datetime,
     hot_window_dormant_jitter: tuple[timedelta, timedelta, timedelta],
     cron_interval: timedelta,
+    push_window: timedelta | None,
 ) -> KeeperSyncTierStatus:
     """Compose a :class:`KeeperSyncTierStatus` from the planner output."""
     hot_window, dormant_interval, jitter_window = hot_window_dormant_jitter
@@ -660,6 +684,7 @@ def _build_tier_status(
         dormant_interval=dormant_interval,
         cron_interval=cron_interval,
         jitter_window=jitter_window,
+        push_window=push_window,
     )
     return KeeperSyncTierStatus(
         tier=tier_name,

@@ -24,6 +24,8 @@ product.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from pydantic import ValidationError
 
@@ -484,6 +486,22 @@ def test_keeper_sync_push_window_refuses_zero(
     monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_WINDOW_SECONDS", "0")
     with pytest.raises(ValidationError):
         Configuration()
+
+
+def test_keeper_sync_push_window_reads_the_hot_path_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window the tier planners take is the setting, as a timedelta."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_WINDOW_SECONDS", "600")
+    assert Configuration().keeper_sync_push_window == timedelta(seconds=600)
+
+
+def test_keeper_sync_push_window_is_none_with_the_hot_path_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Off, there is no window, and the planners ignore push stamps."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_HOT_PATH_ENABLED", "false")
+    assert Configuration().keeper_sync_push_window is None
 
 
 def test_publish_edition_job_timeout_default() -> None:

@@ -2698,14 +2698,19 @@ async def _tier_main_for_org(
     ``TIER_MAIN_DORMANT_INTERVAL`` instead of one per 5-minute cron
     tick. Hot projects continue to poll on the 5-min SLO.
 
-    While ``keeper_sync_push_hot_path_enabled`` is on, each project's
-    stamped push hints are visited after its ``main`` check, whatever
-    that check's dormancy gate decided (:func:`_visit_pushed_refs`): a
-    push says LTD is about to change, so the ref is checked on every
-    tick until its sync is enqueued or its window passes. The ``main``
-    check and the pushed refs share one enqueue per project, and the
-    stamps are settled afterwards (:func:`_settle_pushed_refs`). With
-    the hot path off, the stamps are neither read nor written.
+    While ``keeper_sync_push_hot_path_enabled`` is on, a ref pushed
+    inside the window makes the project hot, so its ``main`` check runs
+    on every tick until the window closes, and a push to a dormant
+    project's ``main`` is caught there, with the rebuild recorded on the
+    project row. The project's stamps are then visited after its
+    ``main`` check, whatever that check's gate decided
+    (:func:`_visit_pushed_refs`): a push says LTD is about to change, so
+    each live ref is checked on every tick until its sync is enqueued or
+    its window passes, and an expired ref is pruned even once the
+    project is dormant again. The ``main`` check and the pushed refs
+    share one enqueue per project, and the stamps are settled afterwards
+    (:func:`_settle_pushed_refs`). With the hot path off, the stamps are
+    neither read nor written, and count for nothing in the gate.
     """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
@@ -2726,7 +2731,10 @@ async def _tier_main_for_org(
     queue_job_store = factory.create_queue_job_store()
     edition_store = factory.create_edition_store()
     arq_queue = ctx["arq_queue"]
-    push_window = _push_hot_path_window()
+    # ``None`` while the push hot path is off: the pass then neither
+    # reads nor settles the stamps, and makes exactly the LTD calls it
+    # made before the hot path existed.
+    push_window = config.keeper_sync_push_window
     now = datetime.now(tz=UTC)
     enqueued = 0
     for ltd_slug in progress.walk(in_scope):
@@ -2737,7 +2745,9 @@ async def _tier_main_for_org(
                 ltd_slug=ltd_slug,
             )
         main_check = _MainEditionCheck()
-        if should_poll_main_for_project(state=project_state, now=now):
+        if should_poll_main_for_project(
+            state=project_state, now=now, push_window=push_window
+        ):
             main_check = await _check_main_edition(
                 session=session,
                 state_store=state_store,
@@ -2801,20 +2811,6 @@ async def _tier_main_for_org(
                 logger=logger,
             )
     return enqueued
-
-
-def _push_hot_path_window() -> timedelta | None:
-    """Return the push window ``tier_main`` checks stamps in, if it does.
-
-    ``None`` while ``keeper_sync_push_hot_path_enabled`` is off: the
-    pass then neither reads nor settles the stamps, and makes exactly
-    the LTD calls it made before the hot path existed. Read from the
-    process configuration on every pass, as the other keeper-sync
-    settings are.
-    """
-    if not config.keeper_sync_push_hot_path_enabled:
-        return None
-    return timedelta(seconds=config.keeper_sync_push_window_seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3172,6 +3168,11 @@ async def _tier_discovery_for_org(
     keep the 30-min cadence; dormant projects fall back to one pass per
     ``TIER_DISCOVERY_DORMANT_INTERVAL``.
 
+    While ``keeper_sync_push_hot_path_enabled`` is on, a project with a
+    ref pushed inside the window is hot too, so a contributor's push to
+    a dormant project has discovery list its editions on every tick
+    until the window closes.
+
     A polled project with a state row costs one LTD call, its edition
     URL listing; :func:`_project_needs_discovery` reads the edition ids
     off the URLs and fetches no edition payload. One without a state
@@ -3195,6 +3196,7 @@ async def _tier_discovery_for_org(
     state_store = factory.create_keeper_sync_state_store()
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
+    push_window = config.keeper_sync_push_window
     now = datetime.now(tz=UTC)
     # Hoist the org-wide edition-state read out of the per-slug loop.
     # The previous shape called ``list_for_org`` from inside
@@ -3232,6 +3234,7 @@ async def _tier_discovery_for_org(
             hot_window=TIER_DISCOVERY_HOT_WINDOW,
             dormant_interval=TIER_DISCOVERY_DORMANT_INTERVAL,
             jitter_window=TIER_DISCOVERY_DORMANT_JITTER,
+            push_window=push_window,
         ):
             continue
         try:
@@ -3309,7 +3312,9 @@ async def _tier_other_for_org(
     branches haven't been touched in months stops driving an hourly
     LTD fetch. Hot and dormant-due projects continue to list their
     edition URLs and re-enqueue when state lags past
-    :data:`TIER_OTHER_REFRESH_THRESHOLD`.
+    :data:`TIER_OTHER_REFRESH_THRESHOLD`. While
+    ``keeper_sync_push_hot_path_enabled`` is on, a project with a ref
+    pushed inside the window is hot too.
 
     The listing is the only LTD call per polled project: the check
     needs each edition's LTD id, which the URL carries, and which id is
@@ -3342,6 +3347,7 @@ async def _tier_other_for_org(
     state_store = factory.create_keeper_sync_state_store()
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
+    push_window = config.keeper_sync_push_window
     now = datetime.now(tz=UTC)
     # Hoist the org-wide edition-state read out of the per-slug loop,
     # as ``_tier_discovery_for_org`` does. ``_list_in_scope_slugs``
@@ -3373,6 +3379,7 @@ async def _tier_other_for_org(
             hot_window=TIER_OTHER_HOT_WINDOW,
             dormant_interval=TIER_OTHER_DORMANT_INTERVAL,
             jitter_window=TIER_OTHER_DORMANT_JITTER,
+            push_window=push_window,
         ):
             continue
         try:
