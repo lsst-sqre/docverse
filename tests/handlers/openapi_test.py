@@ -347,3 +347,33 @@ async def test_ltd_slug_path_parameter_documents_its_constraints(
     assert [schema.get("pattern") for schema in schemas] == [
         LTD_SLUG_PATTERN
     ] * len(operations)
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_status_documents_push_fields(
+    client: AsyncClient,
+) -> None:
+    """The explain response publishes the push hot path's fields (#809).
+
+    ``pushed_refs`` lists ``KeeperSyncPushedRef`` entries, each with its
+    ref, push time and window flag, and ``in_push_window`` is a boolean;
+    every one carries a description, so an operator reading the served
+    spec learns what a stamp is without the operations docs.
+    """
+    spec = (await client.get("/docverse/openapi.json")).json()
+    schemas = spec["components"]["schemas"]
+
+    status = schemas["KeeperSyncProjectStatus"]["properties"]
+    assert status["in_push_window"]["type"] == "boolean"
+    assert status["in_push_window"]["description"]
+    assert status["pushed_refs"]["type"] == "array"
+    assert status["pushed_refs"]["items"] == {
+        "$ref": "#/components/schemas/KeeperSyncPushedRef"
+    }
+    assert status["pushed_refs"]["description"]
+
+    pushed = schemas["KeeperSyncPushedRef"]
+    assert set(pushed["required"]) == {"git_ref", "date_pushed", "in_window"}
+    assert pushed["properties"]["date_pushed"]["format"] == "date-time"
+    for name, field in pushed["properties"].items():
+        assert field.get("description"), name

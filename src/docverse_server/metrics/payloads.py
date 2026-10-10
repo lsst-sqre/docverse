@@ -27,6 +27,7 @@ from .enums import (
     EditionPublishTrigger,
     HttpMethod,
     HttpStatusClass,
+    KeeperSyncPushCheckOutcome,
     LifecycleAction,
     LifecycleActionTrigger,
     LifecycleReapAction,
@@ -49,6 +50,7 @@ __all__ = [
     "EditionPublishedEvent",
     "EditionReconcileCompletedEvent",
     "GitHubWebhookReceivedEvent",
+    "KeeperSyncPushCheckEvent",
     "KeeperSyncRunCompletedEvent",
     "LifecycleActionEvent",
     "MembershipChangedEvent",
@@ -320,6 +322,52 @@ class KeeperSyncRunCompletedEvent(DocverseEventBase):
 
     elapsed: timedelta
     """Wall-clock time from the run starting to its terminal transition."""
+
+
+class KeeperSyncPushCheckEvent(DocverseEventBase):
+    """``tier_main`` visited one ref a GitHub push stamped on a project.
+
+    A ``push`` stamps the pushed ref onto each LTD-synced project bound
+    to the repository, and every five-minute ``keeper_sync_tier_main``
+    tick visits each stamped ref until LTD has rebuilt its edition or
+    its window passes (PRD #803). One event per ref per visit, published
+    once the visit's stamps are settled, so the stream counts how often
+    a push is caught (``rebuilt``, ``new_edition``) or missed
+    (``expired``), and ``push_lag`` times how long a contributor's push
+    takes to reach a sync.
+
+    ``project`` is the project's slug, which is also its LTD product
+    slug. Never ``None``: the hot path is per project.
+    """
+
+    github_ref: str
+    """The pushed branch or tag, normalized (``main``, not
+    ``refs/heads/main``).
+
+    A field, never a tag: branch names are minted per ticket, so as a
+    tag they would grow a series per branch ever pushed.
+    """
+
+    outcome: KeeperSyncPushCheckOutcome
+    """What the visit found."""
+
+    enqueued: bool
+    """Whether the visit enqueued the project's sync for this ref.
+
+    ``True`` only for ``rebuilt`` and ``new_edition``, and not even then
+    when a sync for the project already held its slot; the ref then
+    keeps its stamp and is checked again next tick.
+    """
+
+    push_lag: timedelta | None
+    """Time from the ref's push to the enqueue of the project's sync.
+
+    The push time is when Docverse processed the ``push`` delivery, and
+    the enqueue is the one this visit made, so the lag spans the
+    repository's CI run, its upload to LTD, and the wait for the next
+    ``tier_main`` tick. Set exactly when ``enqueued`` is, and ``None``
+    for every other visit.
+    """
 
 
 class BuildContentCopiedEvent(DocverseEventBase):

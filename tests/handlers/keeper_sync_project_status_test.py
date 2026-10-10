@@ -410,6 +410,8 @@ async def test_get_status_stub_when_no_state_row(
     assert body["project_state"] is None
     assert body["main_edition"] is None
     assert body.get("edition_diff") is None
+    assert body["pushed_refs"] == []
+    assert body["in_push_window"] is False
     cohorts = {entry["tier"]: entry["cohort"] for entry in body["tier_status"]}
     assert cohorts == {
         "main": "unseen",
@@ -443,14 +445,21 @@ async def test_get_status_stub_when_no_state_row(
 
 
 async def _seed_pushed_dormant_project(
-    client: AsyncClient, *, pushed_at: datetime
+    client: AsyncClient,
+    *,
+    pushed_at: datetime | None = None,
+    pushed_refs: dict[str, datetime] | None = None,
 ) -> datetime:
     """Seed a dormant, recently polled project stamped by a push.
 
     The project's ``main`` last rebuilt in January and every tier polled
     it an hour ago, so its dormant gate alone skips it on every tier.
-    Returns the time of those polls.
+    The stamps are ``pushed_refs``, or ``tickets/DM-1`` pushed at
+    ``pushed_at``. Returns the time of those polls.
     """
+    if pushed_refs is None:
+        assert pushed_at is not None
+        pushed_refs = {"tickets/DM-1": pushed_at}
     await _setup_org(client)
     await _enable_sync(client, project_slugs=[_LTD_SLUG])
     project_id = await _create_project(client, slug=_LTD_SLUG)
@@ -473,7 +482,8 @@ async def _seed_pushed_dormant_project(
                 last_polled.isoformat(),
             ),
             ANNOTATION_GITHUB_PUSHED_REFS: {
-                "tickets/DM-1": pushed_at.isoformat()
+                ref: stamped_at.isoformat()
+                for ref, stamped_at in pushed_refs.items()
             },
         },
     )
@@ -521,10 +531,80 @@ async def test_get_status_reports_pushed_dormant_project_hot(
 async def test_get_status_ignores_push_with_hot_path_off(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With the push hot path off, a stamped project keeps its cohort."""
+    """With the push hot path off, a stamped project keeps its cohort.
+
+    The stamp is still listed, as it is still on the row, but it counts
+    for nothing: neither the ref nor the project is inside the window.
+    """
     monkeypatch.setattr(config, "keeper_sync_push_hot_path_enabled", False)
+    pushed_at = datetime.now(tz=UTC) - timedelta(minutes=10)
+    await _seed_pushed_dormant_project(client, pushed_at=pushed_at)
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    cohorts = {entry["tier"]: entry["cohort"] for entry in body["tier_status"]}
+    assert cohorts == {
+        "main": "dormant",
+        "discovery": "dormant",
+        "other": "dormant",
+    }
+    assert body["in_push_window"] is False
+    assert [
+        (entry["git_ref"], entry["in_window"]) for entry in body["pushed_refs"]
+    ] == [("tickets/DM-1", False)]
+
+
+@pytest.mark.asyncio
+async def test_get_status_lists_pushed_refs_newest_first(
+    client: AsyncClient,
+) -> None:
+    """The stamped refs are listed with their push times and window.
+
+    Newest push first. A ref pushed inside the window reads
+    ``in_window: true`` and puts the project ``in_push_window``; a stamp
+    whose window has passed but which ``tier_main`` has not pruned yet
+    is still listed, outside it.
+    """
+    now = datetime.now(tz=UTC)
+    pushed_refs = {
+        "tickets/DM-1": now - timedelta(minutes=20),
+        "v1.2.0": now - timedelta(minutes=5),
+        "old": now - timedelta(hours=2),
+    }
+    await _seed_pushed_dormant_project(client, pushed_refs=pushed_refs)
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["in_push_window"] is True
+    listed = body["pushed_refs"]
+    assert [entry["git_ref"] for entry in listed] == [
+        "v1.2.0",
+        "tickets/DM-1",
+        "old",
+    ]
+    for entry in listed:
+        pushed_at = datetime.fromisoformat(entry["date_pushed"])
+        assert pushed_at == pushed_refs[entry["git_ref"]]
+    assert [entry["in_window"] for entry in listed] == [True, True, False]
+
+
+@pytest.mark.asyncio
+async def test_get_status_expired_stamps_leave_the_project_out_of_window(
+    client: AsyncClient,
+) -> None:
+    """Stamps whose window has passed put the project in no window."""
     await _seed_pushed_dormant_project(
-        client, pushed_at=datetime.now(tz=UTC) - timedelta(minutes=10)
+        client, pushed_at=datetime.now(tz=UTC) - timedelta(hours=2)
     )
 
     response = await client.get(
@@ -533,15 +613,27 @@ async def test_get_status_ignores_push_with_hot_path_off(
     )
 
     assert response.status_code == 200
-    cohorts = {
-        entry["tier"]: entry["cohort"]
-        for entry in response.json()["tier_status"]
-    }
-    assert cohorts == {
-        "main": "dormant",
-        "discovery": "dormant",
-        "other": "dormant",
-    }
+    body = response.json()
+    assert body["in_push_window"] is False
+    assert [entry["in_window"] for entry in body["pushed_refs"]] == [False]
+
+
+@pytest.mark.asyncio
+async def test_get_status_unstamped_project_lists_no_pushed_refs(
+    client: AsyncClient,
+) -> None:
+    """A synced project no push has stamped: an empty list, no window."""
+    await _seed_pushed_dormant_project(client, pushed_refs={})
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects/{_LTD_SLUG}",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pushed_refs"] == []
+    assert body["in_push_window"] is False
 
 
 # ---------------------------------------------------------------------------

@@ -507,7 +507,8 @@ cohort on the next tick.
 `GET /orgs/{org}/keeper-sync/projects/{ltd_slug}`, and the listing at
 `GET /orgs/{org}/keeper-sync/projects`, report the same: while a ref is
 inside the window, each `tier_status` entry of the project reads
-`"cohort": "hot"`, with `date_next_due` the tier's next cron tick.
+`"cohort": "hot"`, with `date_next_due` the tier's next cron tick, and
+`in_push_window` is true; see [Reading a push](#reading-a-push).
 
 ### The `tier_main` check
 
@@ -594,11 +595,26 @@ a second, with the time from its push to the enqueue.
 | `Tier-main: checked pushed ref` | info | `org`, `project`, `github_ref`, `outcome`, `pushed_at`, `enqueued` |
 | `Tier-main: enqueued project sync for pushed ref` | info | `org`, `project`, `github_ref`, `outcome`, `push_lag_seconds` |
 | `Tier-main: failed to check pushed ref` | error | `org`, `project`, `github_ref`, `exception` |
+| `Tier-main: failed to publish pushed ref check` | error | `org`, `project`, `github_ref`, `exception` |
 
 `project` is the project's slug, which is also its LTD product slug;
 `pushed_at` is the push time the visit read from the stamp; `enqueued`
 is whether the ref's sync was enqueued, and so its stamp cleared, this
 tick.
+
+### The metrics event
+
+Each visited ref is also one `keeper_sync_push_check` event, carrying
+what its `Tier-main: checked pushed ref` line does: the organization,
+the project, the `github_ref`, the `outcome`, whether the visit
+`enqueued` the project's sync, and, when it did, the `push_lag` from the
+push to that enqueue. The event is published after the tick has settled
+the project's stamps, so a dashboard reads the same outcomes as the log.
+Publishing is best-effort: a failure is sent to Sentry and logged as
+`Tier-main: failed to publish pushed ref check`, and the tick carries on
+with the enqueue and the stamps already settled. The event's fields,
+tags and an example query are in the [metrics
+catalog](metrics.md#keeper_sync_push_check).
 
 ### Switching it off
 
@@ -629,12 +645,39 @@ redelivery's time.
 
 ### Reading a push
 
-- **The event.** `github_webhook_received`'s `projects_stamped` counts
-  the projects a push stamped: see the
-  [metrics catalog](metrics.md#github_webhook_received).
-- **The row.** `GET /orgs/{org}/keeper-sync/projects/{ltd_slug}` shows
-  the stamp in `project_state.annotations`, and `"cohort": "hot"` on
-  each `tier_status` entry while a ref is inside the window.
+- **The events.** `github_webhook_received`'s `projects_stamped` counts
+  the projects a push stamped, and `keeper_sync_push_check` records
+  each of `tier_main`'s visits to a stamped ref, with the push lag of
+  the visits that enqueued a sync: see the
+  [metrics catalog](metrics.md#github_webhook_received) and
+  [The metrics event](#the-metrics-event).
+- **The status endpoint.** `GET /orgs/{org}/keeper-sync/projects/{ltd_slug}`
+  lists the project's stamps in `pushed_refs`, newest push first, and
+  says in `in_push_window` whether any of them holds the project on the
+  fast path, when each `tier_status` entry reads `"cohort": "hot"`. Each
+  entry gives the `git_ref`, its `date_pushed`, and `in_window`, false
+  for a stamp whose window has passed but that `tier_main` has not
+  pruned yet. A project no push has stamped, or with no state row,
+  reads `"pushed_refs": []` and `"in_push_window": false`. With the hot
+  path off, the stamps are still listed, as they are still on the row,
+  but none is `in_window`. Each entry of the listing at
+  `GET /orgs/{org}/keeper-sync/projects` carries the same two fields:
+
+  ```json
+  {
+    "in_push_window": true,
+    "pushed_refs": [
+      {
+        "git_ref": "tickets/DM-56619",
+        "date_pushed": "2026-10-09T14:02:11.204518Z",
+        "in_window": true
+      }
+    ]
+  }
+  ```
+
+- **The row.** The same response shows the raw stamp in
+  `project_state.annotations`.
 - **The tick.** `tier_main`'s lines say what each visit found and when
   a push's sync was enqueued: see
   [`tier_main` log lines](#tier_main-log-lines).

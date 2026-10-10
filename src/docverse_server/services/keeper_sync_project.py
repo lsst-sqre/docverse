@@ -32,10 +32,15 @@ from docverse.models import (
     EditionKind,
     KeeperSyncEditionDiff,
     KeeperSyncProjectStateSummary,
+    KeeperSyncPushedRef,
     KeeperSyncTierName,
     KeeperSyncTierStatus,
 )
 from docverse_server.domain.edition import Edition
+from docverse_server.services.keeper_sync.push_hints import (
+    prune_pushed_refs,
+    read_pushed_refs,
+)
 from docverse_server.services.keeper_sync.scheduler import (
     TIER_DISCOVERY_CRON_INTERVAL,
     TIER_DISCOVERY_DORMANT_INTERVAL,
@@ -112,8 +117,14 @@ class KeeperSyncProjectStatusResult:
     in_scope: bool
     project_state: KeeperSyncProjectStateSummary | None
     tier_status: list[KeeperSyncTierStatus]
+    pushed_refs: list[KeeperSyncPushedRef]
     main_edition_row: KeeperSyncEditionStatusRow | None
     edition_diff: KeeperSyncEditionDiff | None
+
+    @property
+    def in_push_window(self) -> bool:
+        """Whether any stamped ref holds the project on the fast path."""
+        return any(pushed.in_window for pushed in self.pushed_refs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +280,9 @@ class KeeperSyncProjectService:
             in_scope=True,
             project_state=_summarise_project_state(project_state),
             tier_status=tier_status,
+            pushed_refs=_summarise_pushed_refs(
+                state=project_state, now=now, push_window=self._push_window
+            ),
             main_edition_row=main_edition_row,
             edition_diff=edition_diff,
         )
@@ -477,6 +491,11 @@ class KeeperSyncProjectService:
                         now=now,
                         push_window=self._push_window,
                     ),
+                    pushed_refs=_summarise_pushed_refs(
+                        state=state_row,
+                        now=now,
+                        push_window=self._push_window,
+                    ),
                     main_edition_row=main_edition_row,
                     edition_diff=None,
                 )
@@ -605,6 +624,40 @@ def _summarise_project_state(
         date_rebuilt_seen=state.date_rebuilt_seen,
         annotations=state.annotations,
     )
+
+
+def _summarise_pushed_refs(
+    *,
+    state: KeeperSyncState | None,
+    now: datetime,
+    push_window: timedelta | None,
+) -> list[KeeperSyncPushedRef]:
+    """List the refs GitHub pushes stamped on a project, newest first.
+
+    Every stamp on the row is listed, including one whose window has
+    passed but which ``tier_main`` has not pruned yet; ``in_window``
+    says which still hold the project on the fast path, by the same
+    rule the tier crons apply
+    (:func:`~docverse_server.services.keeper_sync.push_hints.prune_pushed_refs`).
+    ``push_window`` is ``None`` while the push hot path is off, and no
+    stamp is then in its window.
+    """
+    stamped = read_pushed_refs(state)
+    live = (
+        prune_pushed_refs(stamped, now=now, window=push_window)
+        if push_window is not None
+        else {}
+    )
+    return [
+        KeeperSyncPushedRef(
+            git_ref=ref, date_pushed=pushed_at, in_window=ref in live
+        )
+        for ref, pushed_at in sorted(
+            stamped.items(),
+            key=lambda item: (item[1], item[0]),
+            reverse=True,
+        )
+    ]
 
 
 def _explain_all_tiers(

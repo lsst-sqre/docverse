@@ -34,6 +34,7 @@ import sentry_sdk
 import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
@@ -47,6 +48,11 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.config import config
+from docverse_server.metrics import (
+    DocverseEvents,
+    KeeperSyncPushCheckEvent,
+    KeeperSyncPushCheckOutcome,
+)
 from docverse_server.services.keeper_sync.push_hints import (
     ANNOTATION_GITHUB_PUSHED_REFS,
 )
@@ -278,12 +284,18 @@ def _ltd_paths(mock: respx.Router) -> list[str]:
     ]
 
 
-async def _run_tier_main() -> list[Any]:
-    """Run one ``tier_main`` tick; return its ``keeper_sync_project`` jobs."""
+async def _run_tier_main(events: DocverseEvents | None = None) -> list[Any]:
+    """Run one ``tier_main`` tick; return its ``keeper_sync_project`` jobs.
+
+    Pass ``events`` to record the tick's metrics events; left out, the
+    worker publishes none.
+    """
     http_client = httpx.AsyncClient()
     mock_arq = MockArqQueue(default_queue_name="docverse:queue")
     register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
-    ctx = make_worker_ctx(http_client=http_client, arq_queue=mock_arq)
+    ctx = make_worker_ctx(
+        http_client=http_client, arq_queue=mock_arq, events=events
+    )
     try:
         assert await keeper_sync_tier_main(ctx) == "completed"
     finally:
@@ -1199,3 +1211,316 @@ async def test_expired_stamps_leave_a_dormant_project_unpolled(
     assert jobs == []
     assert _ltd_paths(mock_discovery) == []
     assert await _stamps(org_id) == {}
+
+
+# ---------------------------------------------------------------------------
+# The keeper_sync_push_check event (#809)
+# ---------------------------------------------------------------------------
+
+
+def _push_checks(
+    events: DocverseEvents,
+) -> dict[str, KeeperSyncPushCheckEvent]:
+    """Return the tick's ``keeper_sync_push_check`` events, keyed by ref.
+
+    Asserts that no ref was reported twice: each visit publishes one.
+    """
+    publisher = events.keeper_sync_push_check
+    assert isinstance(publisher, MockEventPublisher)
+    published = [
+        event
+        for event in publisher.published
+        if isinstance(event, KeeperSyncPushCheckEvent)
+    ]
+    by_ref = {event.github_ref: event for event in published}
+    assert len(by_ref) == len(published), "a ref was reported twice"
+    return by_ref
+
+
+@pytest.mark.asyncio
+async def test_each_visited_ref_publishes_one_push_check(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    mock_events: DocverseEvents,
+) -> None:
+    """Every stamped ref a tick visits is one event, tagged by outcome.
+
+    The rebuilt ref enqueued the project's sync, so it carries the time
+    from its push to that enqueue; the unchanged ref and the expired one
+    enqueued nothing and carry no lag.
+    """
+    rebuilt_at = _now() - timedelta(minutes=10)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-event")
+        project_id = await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={
+                "tickets/DM-1": rebuilt_at,
+                "tickets/DM-3": _now() - timedelta(minutes=5),
+                "old": _now() - timedelta(hours=2),
+            },
+        )
+        for ref, ltd_id in (("tickets/DM-1", 2), ("tickets/DM-3", 4)):
+            await _seed_synced_edition(
+                db_session,
+                org_id=org_id,
+                project_id=project_id,
+                slug=ref.replace("/", "-"),
+                git_ref=ref,
+                ltd_id=ltd_id,
+            )
+    _stub_ltd(mock_discovery)
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="tickets-DM-1",
+        tracked_ref="tickets/DM-1",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
+    _stub_edition(
+        mock_discovery,
+        ltd_id=4,
+        slug="tickets-DM-3",
+        tracked_ref="tickets/DM-3",
+        date_rebuilt=_SYNCED_AT,
+    )
+    before = _now()
+
+    jobs = await _run_tier_main(events=mock_events)
+
+    assert len(jobs) == 1
+    checks = _push_checks(mock_events)
+    assert set(checks) == {"tickets/DM-1", "tickets/DM-3", "old"}
+    for check in checks.values():
+        assert check.organization == "ks-push-event"
+        assert check.project == _SLUG
+    rebuilt = checks["tickets/DM-1"]
+    assert rebuilt.outcome is KeeperSyncPushCheckOutcome.rebuilt
+    assert rebuilt.enqueued is True
+    assert rebuilt.push_lag is not None
+    assert before - rebuilt_at <= rebuilt.push_lag <= _now() - rebuilt_at
+    unchanged = checks["tickets/DM-3"]
+    assert unchanged.outcome is KeeperSyncPushCheckOutcome.unchanged
+    assert unchanged.enqueued is False
+    assert unchanged.push_lag is None
+    expired = checks["old"]
+    assert expired.outcome is KeeperSyncPushCheckOutcome.expired
+    assert expired.enqueued is False
+    assert expired.push_lag is None
+
+
+@pytest.mark.asyncio
+async def test_new_edition_push_check_carries_the_lag(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    mock_events: DocverseEvents,
+) -> None:
+    """A ref whose first LTD edition is caught reports a positive lag."""
+    pushed_at = _now() - timedelta(minutes=10)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-event-new")
+        await _seed_pushed_project(
+            db_session, org_id=org_id, pushed_refs={"tickets/DM-2": pushed_at}
+        )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [3, _MAIN_LTD_ID])
+
+    jobs = await _run_tier_main(events=mock_events)
+
+    assert len(jobs) == 1
+    check = _push_checks(mock_events)["tickets/DM-2"]
+    assert check.outcome is KeeperSyncPushCheckOutcome.new_edition
+    assert check.enqueued is True
+    assert check.push_lag is not None
+    assert check.push_lag >= timedelta(minutes=10)
+
+
+@pytest.mark.asyncio
+async def test_skipped_enqueue_reports_rebuilt_without_a_lag(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    mock_events: DocverseEvents,
+) -> None:
+    """A rebuilt ref whose project already holds a sync is not enqueued.
+
+    The event still says what LTD showed, but ``enqueued`` is false and
+    there is no enqueue to measure a lag to; the ref keeps its stamp.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-event-mutex")
+        project_id = await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"tickets/DM-1": _now() - timedelta(minutes=10)},
+        )
+        await _seed_synced_edition(
+            db_session,
+            org_id=org_id,
+            project_id=project_id,
+            slug="tickets-DM-1",
+            git_ref="tickets/DM-1",
+            ltd_id=2,
+        )
+        await QueueJobStore(session=db_session, logger=_logger()).create(
+            kind=JobKind.keeper_sync_project,
+            org_id=org_id,
+            keeper_sync_run_id=None,
+            subject_label=_SLUG,
+            backend_job_id="arq-job-prior",
+        )
+    _stub_ltd(mock_discovery)
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="tickets-DM-1",
+        tracked_ref="tickets/DM-1",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
+
+    jobs = await _run_tier_main(events=mock_events)
+
+    assert jobs == []
+    check = _push_checks(mock_events)["tickets/DM-1"]
+    assert check.outcome is KeeperSyncPushCheckOutcome.rebuilt
+    assert check.enqueued is False
+    assert check.push_lag is None
+
+
+@pytest.mark.asyncio
+async def test_ltd_error_reports_only_the_ref_it_visited(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    mock_events: DocverseEvents,
+) -> None:
+    """An LTD failure is one ``error``; the refs it left unvisited are none.
+
+    The failure stops the project's visit, so the ref after it waits for
+    the next tick without being reported as checked.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-event-error")
+        project_id = await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={
+                "tickets/DM-1": _now() - timedelta(minutes=20),
+                "tickets/DM-3": _now() - timedelta(minutes=10),
+            },
+        )
+        for ref, ltd_id in (("tickets/DM-1", 2), ("tickets/DM-3", 4)):
+            await _seed_synced_edition(
+                db_session,
+                org_id=org_id,
+                project_id=project_id,
+                slug=ref.replace("/", "-"),
+                git_ref=ref,
+                ltd_id=ltd_id,
+            )
+    _stub_ltd(mock_discovery)
+    # 403 is not retried, so the failure surfaces without backoff.
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(403)
+    )
+
+    await _run_tier_main(events=mock_events)
+
+    checks = _push_checks(mock_events)
+    assert set(checks) == {"tickets/DM-1"}
+    assert checks["tickets/DM-1"].outcome is KeeperSyncPushCheckOutcome.error
+    assert checks["tickets/DM-1"].push_lag is None
+
+
+@pytest.mark.asyncio
+async def test_hot_path_off_publishes_no_push_check(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    mock_events: DocverseEvents,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the hot path off, ``tier_main`` visits no stamp to report."""
+    monkeypatch.setattr(config, "keeper_sync_push_hot_path_enabled", False)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-event-off")
+        await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={
+                "tickets/DM-1": _now() - timedelta(minutes=10),
+                "old": _now() - timedelta(hours=2),
+            },
+            dormant=False,
+        )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [_MAIN_LTD_ID])
+
+    await _run_tier_main(events=mock_events)
+
+    assert _push_checks(mock_events) == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_publish_leaves_the_tick_to_finish(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    mock_events: DocverseEvents,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metrics failure is logged and sent to Sentry, nothing more.
+
+    The publish comes after the enqueue and the settled stamps, so the
+    sync still runs and the ref's stamp is still cleared.
+    """
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    async def fail(payload: KeeperSyncPushCheckEvent) -> None:
+        msg = "metrics backend down"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(mock_events.keeper_sync_push_check, "publish", fail)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-event-fail")
+        project_id = await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"tickets/DM-1": _now() - timedelta(minutes=10)},
+        )
+        await _seed_synced_edition(
+            db_session,
+            org_id=org_id,
+            project_id=project_id,
+            slug="tickets-DM-1",
+            git_ref="tickets/DM-1",
+            ltd_id=2,
+        )
+    _stub_ltd(mock_discovery)
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="tickets-DM-1",
+        tracked_ref="tickets/DM-1",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
+
+    with capture_logs() as logs:
+        jobs = await _run_tier_main(events=mock_events)
+
+    assert len(jobs) == 1
+    assert await _stamps(org_id) == {}
+    assert len(captured) == 1
+    assert isinstance(captured[0], RuntimeError)
+    failures = [
+        entry
+        for entry in logs
+        if entry["event"] == "Tier-main: failed to publish pushed ref check"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["github_ref"] == "tickets/DM-1"
+    assert failures[0]["log_level"] == "error"

@@ -41,6 +41,8 @@ from docverse.models import (
     DraftInactivityRule,
     EditionUpdate,
     KeeperSyncConfig,
+    KeeperSyncProjectStatus,
+    KeeperSyncPushedRef,
     KeeperSyncRun,
     KeeperSyncScopePreview,
     KeeperSyncTierStatus,
@@ -190,10 +192,17 @@ _PUSH_CHECK_SUBSECTION = "The `tier_main` check"
 _PUSH_CHECK_LOGS_SUBSECTION = "`tier_main` log lines"
 """Hot-path subsection tabling ``tier_main``'s pushed-ref log lines."""
 
+_PUSH_READING_SUBSECTION = "Reading a push"
+"""Hot-path subsection on where an operator sees a push at work (#809)."""
+
+_PUSH_STATUS_FIELDS = ("in_push_window", "pushed_refs")
+"""The keeper-sync status response's fields that report a push (#809)."""
+
 _PUSH_CHECK_LOG_LINES = (
     "Tier-main: checked pushed ref",
     "Tier-main: enqueued project sync for pushed ref",
     "Tier-main: failed to check pushed ref",
+    "Tier-main: failed to publish pushed ref check",
 )
 """The lines ``tier_main`` writes about the pushed refs it visits."""
 
@@ -1376,9 +1385,10 @@ def test_metrics_page_names_every_method() -> None:
 
 
 def test_metrics_page_has_an_example_query_per_capability() -> None:
-    """The page carries one InfluxQL query for each PRD #713 question.
+    """The page carries one InfluxQL query for each question it answers.
 
-    Sync lag, request volume, request latency, and webhook deliveries:
+    Sync lag, request volume, request latency, and webhook deliveries
+    (PRD #713), and the push hot path's catch rate and lag (PRD #803):
     each query has to read its measurement and group by the tags that
     answer its question.
     """
@@ -1401,6 +1411,10 @@ def test_metrics_page_has_an_example_query_per_capability() -> None:
         (
             "github_webhook_received",
             ('GROUP BY time(1h), "event_type", "outcome"',),
+        ),
+        (
+            "keeper_sync_push_check",
+            ('PERCENTILE("push_lag", 95)', 'GROUP BY "outcome"'),
         ),
     ]
     unanswered = [
@@ -1683,6 +1697,26 @@ def test_github_push_counts_as_hot_names_every_tier_cron() -> None:
     assert "date_next_due" in KeeperSyncTierStatus.model_fields
     assert not _uncoded(tier_crons | fields, subsection)
     assert '`"cohort": "hot"`' in subsection
+
+
+def test_github_push_reading_names_the_status_fields() -> None:
+    """The reading guide names the status response's push fields.
+
+    The status endpoint is where an operator checks a push landed: the
+    subsection has to name the two fields that report it and each field
+    of a listed ref, and say which endpoints carry them.
+    """
+    reading = _subsection(
+        _section(_read(_GITHUB_PAGE), _PUSH_HOT_PATH_SECTION),
+        _PUSH_READING_SUBSECTION,
+    )
+    assert set(_PUSH_STATUS_FIELDS) <= set(
+        KeeperSyncProjectStatus.model_fields
+    )
+    names = {*_PUSH_STATUS_FIELDS, *KeeperSyncPushedRef.model_fields}
+    assert not _uncoded(names, reading)
+    assert "GET /orgs/{org}/keeper-sync/projects/{ltd_slug}" in reading
+    assert "GET /orgs/{org}/keeper-sync/projects`" in reading
 
 
 def test_github_push_check_tables_every_outcome() -> None:

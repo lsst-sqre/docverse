@@ -129,13 +129,21 @@ because it will become one. The list tags these events today:
 | `status_class` | `api_request` | PRD #713 |
 | `authenticated` | `api_request` | PRD #713 |
 | `event_type` | `github_webhook_received` | PRD #713 |
-| `outcome` | `conditional_get`, `github_webhook_received` | PRD #713 |
+| `outcome` | `conditional_get`, `github_webhook_received`, `keeper_sync_push_check` | PRD #713 |
 
 `outcome` is the one PRD #713 tag that reaches an older event: it also
 tags `conditional_get`'s `not_modified`/`modified` outcome, which is
 what a cache hit-rate panel wants to group by anyway.
 `build_content_copied` reports its result as `succeeded`, not
 `success`, so it is not tagged by `success`.
+
+`keeper_sync_push_check` (PRD #803) needs no change to the list. The
+fields it is meant to be grouped by, `organization`, `project`, and
+`outcome`, are names already on it, so it is tagged from its first
+point, and the Phalanx change that ships the push hot path touches only
+its `keeperSync` values, not `influxTags`. Its `github_ref` is
+deliberately left off the list; see the [cardinality
+rule](#cardinality-rule).
 
 ### Cardinality rule
 
@@ -168,6 +176,10 @@ The events are built so that the tag list above keeps to that rule:
 - The identifiers the rule excludes stay fields: `build_uploaded`'s
   `uploader`, `commit_sha`, `github_run_id`, and `github_actor`, and
   `membership_changed`'s `principal`. Keep them off the tag list.
+- `keeper_sync_push_check`'s `github_ref` stays a field too. Branch
+  names are minted per ticket (`tickets/DM-56619`), so as a tag it
+  would add a series for every branch ever pushed. Filter on it in a
+  `WHERE` clause for drill-down instead.
 
 `api_request`'s `organization` and `project` are the slugs as the
 caller wrote them in the path, including on a `404` for a slug that
@@ -267,6 +279,7 @@ and `github_webhook_received` has neither field.
 | [`api_request`](#api_request) | API middleware | optional |
 | [`github_webhook_received`](#github_webhook_received) | GitHub webhook handler | none |
 | [`keeper_sync_run_completed`](#keeper_sync_run_completed) | keeper-sync run finalisation | organization |
+| [`keeper_sync_push_check`](#keeper_sync_push_check) | `keeper_sync_tier_main` worker | project |
 | [`lifecycle_action`](#lifecycle_action) | `lifecycle_eval`, `git_ref_audit`, `purgatory_cleanup` workers | project |
 | [`purgatory_cleanup_completed`](#purgatory_cleanup_completed) | `purgatory_cleanup` worker | organization |
 | [`edition_reconcile_completed`](#edition_reconcile_completed) | `edition_reconcile` worker | organization |
@@ -542,6 +555,47 @@ or the keeper-sync reaper.
 | `failed_count` | integer | field | Attributed jobs that failed or soft-failed. |
 | `elapsed` | duration | field | Time from the run starting to its terminal status. |
 
+### `keeper_sync_push_check`
+
+Measurement: `lsst.square.metrics.events.docverse.keeper_sync_push_check`
+
+`keeper_sync_tier_main` visited one ref that a GitHub `push` stamped on
+an LTD-synced project, on the [keeper-sync push hot
+path](github-integration.md#the-keeper-sync-push-hot-path) (PRD #803).
+Published once per stamped ref on every five-minute tick, after the
+tick has settled the project's stamps, until the ref's sync is enqueued
+or its window passes. A push whose CI uploads to LTD therefore reports
+`unchanged` or `not_found` on the ticks while the CI runs and then one
+`rebuilt` or `new_edition`, with the push lag; one whose CI never
+uploads ends with one `expired`. With `keeper_sync_push_hot_path_enabled`
+off, `tier_main` visits no stamps and publishes none. Publishing is
+best-effort: a failed publish is logged and never stops the tick.
+
+| Outcome | What the visit found | `enqueued` and `push_lag` |
+| --- | --- | --- |
+| `new_edition` | No synced edition tracks the ref, and LTD lists one keeper-sync has not seen | Set when the project's sync was enqueued |
+| `rebuilt` | LTD rebuilt the ref's edition since keeper-sync last synced it | Set when the project's sync was enqueued |
+| `unchanged` | The ref's edition is as keeper-sync last synced it | `false`, null |
+| `not_found` | No synced edition tracks the ref, and LTD lists nothing new | `false`, null |
+| `error` | LTD failed to answer; the stamp is kept for the next tick | `false`, null |
+| `expired` | The ref's window passed without a sync; the stamp is pruned | `false`, null |
+
+A `rebuilt` or `new_edition` ref is not enqueued when a sync of the
+project already holds its slot: it then reports `enqueued` false with no
+`push_lag`, keeps its stamp, and is checked again on the next tick.
+Counting `outcome` over a day says how often a push is caught
+(`rebuilt`, `new_edition`) against how often its window closes on
+nothing (`expired`).
+
+| Field | Type | Stored as | Meaning |
+| --- | --- | --- | --- |
+| `organization` | string | tag | Organization slug. |
+| `project` | string or null | tag | Project slug, which is also its LTD product slug; always set on this event. |
+| `github_ref` | string | field | The pushed branch or tag, normalized: `main` or `v1.2.0`, not `refs/heads/main`. A field, not a tag; see the [cardinality rule](#cardinality-rule). |
+| `outcome` | enum | tag | What the visit found: `new_edition`, `rebuilt`, `unchanged`, `expired`, `not_found`, or `error`. |
+| `enqueued` | boolean | field | Whether the visit enqueued the project's `keeper_sync_project` for this ref, and so cleared its stamp. |
+| `push_lag` | duration or null | field | Time from the push, as Docverse stamped it on receiving the delivery, to the enqueue this visit made: the repository's CI run, its upload to LTD, and the wait for the tick. Set exactly when `enqueued` is true. |
+
 ### `lifecycle_action`
 
 Measurement: `lsst.square.metrics.events.docverse.lifecycle_action`
@@ -631,7 +685,8 @@ it is soft-deleted but not yet purged, never in both.
 
 ## Example queries
 
-One InfluxQL query for each question PRD #713 added events to answer.
+One InfluxQL query for each question PRD #713 added events to answer,
+and one for the push hot path PRD #803 added.
 They assume the tag list above is in effect; replace `rubin` with the
 organization's slug. Every time value comes back in seconds.
 
@@ -691,6 +746,20 @@ GROUP BY time(1h), "event_type", "outcome"
 `invalid_signature`, `malformed`, and `not_configured` deliveries
 carry no `event_type`, so they group under an empty one.
 
+### Push hot path: checks by `outcome`, and p95 `push_lag`
+
+```sql
+SELECT COUNT("enqueued") AS "checks", PERCENTILE("push_lag", 95) AS "p95_push_lag"
+FROM "lsst.square.metrics.events.docverse.keeper_sync_push_check"
+WHERE "organization" = 'rubin' AND time > now() - 24h
+GROUP BY "outcome"
+```
+
+Only the enqueueing visits carry `push_lag`, so the percentile reads
+from the `rebuilt` and `new_edition` groups alone, and is the time from
+a contributor's push to Docverse starting its sync. `COUNT("enqueued")`
+counts every visit, since every point carries `enqueued`.
+
 ## Changing the catalog
 
 - **A new event** is a payload class in
@@ -730,7 +799,7 @@ carry no `event_type`, so they group under an empty one.
   its event's section;
 - a `github_webhook_received` outcome has no row in its outcome table,
   or the row names no response status;
-- one of the four example queries is missing;
+- one of the five example queries is missing;
 - `index.md`, the transport page's metrics-event section, or the API
   conventions page's conditional GET section stops linking here.
 
@@ -751,6 +820,9 @@ hand.
   publishes `github_webhook_received`.
 - [Keeper-sync transport resilience](keeper-sync-transport.md#the-metrics-event):
   reading `build_content_copied` over a sync campaign.
+- [The keeper-sync push hot path](github-integration.md#the-keeper-sync-push-hot-path):
+  the stamps and the `tier_main` check that `keeper_sync_push_check`
+  reports on (PRD #803).
 - [Edition reconciliation](edition-reconcile.md#the-metrics-event):
   reading `edition_reconcile_completed`.
 - [REST API conventions](api-conventions.md#conditional-get-the-etag-validator):
