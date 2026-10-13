@@ -32,10 +32,15 @@ from docverse.models import (
     EditionKind,
     KeeperSyncEditionDiff,
     KeeperSyncProjectStateSummary,
+    KeeperSyncPushedRef,
     KeeperSyncTierName,
     KeeperSyncTierStatus,
 )
 from docverse_server.domain.edition import Edition
+from docverse_server.services.keeper_sync.push_hints import (
+    prune_pushed_refs,
+    read_pushed_refs,
+)
 from docverse_server.services.keeper_sync.scheduler import (
     TIER_DISCOVERY_CRON_INTERVAL,
     TIER_DISCOVERY_DORMANT_INTERVAL,
@@ -112,8 +117,14 @@ class KeeperSyncProjectStatusResult:
     in_scope: bool
     project_state: KeeperSyncProjectStateSummary | None
     tier_status: list[KeeperSyncTierStatus]
+    pushed_refs: list[KeeperSyncPushedRef]
     main_edition_row: KeeperSyncEditionStatusRow | None
     edition_diff: KeeperSyncEditionDiff | None
+
+    @property
+    def in_push_window(self) -> bool:
+        """Whether any stamped ref holds the project on the fast path."""
+        return any(pushed.in_window for pushed in self.pushed_refs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +172,17 @@ class LtdClientFactory(Protocol):
 
 
 class KeeperSyncProjectService:
-    """Read-only project-status service for the org-admin GET endpoint."""
+    """Read-only project-status service for the org-admin GET endpoint.
+
+    Parameters
+    ----------
+    push_window
+        The keeper-sync push window the tier crons read, or ``None``
+        while the push hot path is off
+        (``Configuration.keeper_sync_push_window``). A project with a ref
+        pushed inside it reports ``hot`` on every tier, as the tier crons
+        poll it.
+    """
 
     def __init__(
         self,
@@ -172,6 +193,7 @@ class KeeperSyncProjectService:
         state_store: KeeperSyncStateStore,
         ltd_client_factory: LtdClientFactory,
         logger: structlog.stdlib.BoundLogger,
+        push_window: timedelta | None,
     ) -> None:
         self._org_store = org_store
         self._project_store = project_store
@@ -179,6 +201,7 @@ class KeeperSyncProjectService:
         self._state_store = state_store
         self._ltd_client_factory = ltd_client_factory
         self._logger = logger
+        self._push_window = push_window
 
     async def get_project_status(
         self,
@@ -209,7 +232,9 @@ class KeeperSyncProjectService:
             resource_type=ResourceType.project,
             ltd_slug=ltd_slug,
         )
-        tier_status = _explain_all_tiers(state=project_state, now=now)
+        tier_status = _explain_all_tiers(
+            state=project_state, now=now, push_window=self._push_window
+        )
 
         main_edition_row: KeeperSyncEditionStatusRow | None = None
         product_state_rows: list[KeeperSyncState] = []
@@ -255,6 +280,9 @@ class KeeperSyncProjectService:
             in_scope=True,
             project_state=_summarise_project_state(project_state),
             tier_status=tier_status,
+            pushed_refs=_summarise_pushed_refs(
+                state=project_state, now=now, push_window=self._push_window
+            ),
             main_edition_row=main_edition_row,
             edition_diff=edition_diff,
         )
@@ -458,7 +486,16 @@ class KeeperSyncProjectService:
                     docverse_project_slug=docverse_project_slug,
                     in_scope=state_row.ltd_slug in in_scope_slugs,
                     project_state=_summarise_project_state(state_row),
-                    tier_status=_explain_all_tiers(state=state_row, now=now),
+                    tier_status=_explain_all_tiers(
+                        state=state_row,
+                        now=now,
+                        push_window=self._push_window,
+                    ),
+                    pushed_refs=_summarise_pushed_refs(
+                        state=state_row,
+                        now=now,
+                        push_window=self._push_window,
+                    ),
                     main_edition_row=main_edition_row,
                     edition_diff=None,
                 )
@@ -589,17 +626,53 @@ def _summarise_project_state(
     )
 
 
+def _summarise_pushed_refs(
+    *,
+    state: KeeperSyncState | None,
+    now: datetime,
+    push_window: timedelta | None,
+) -> list[KeeperSyncPushedRef]:
+    """List the refs GitHub pushes stamped on a project, newest first.
+
+    Every stamp on the row is listed, including one whose window has
+    passed but which ``tier_main`` has not pruned yet; ``in_window``
+    says which still hold the project on the fast path, by the same
+    rule the tier crons apply
+    (:func:`~docverse_server.services.keeper_sync.push_hints.prune_pushed_refs`).
+    ``push_window`` is ``None`` while the push hot path is off, and no
+    stamp is then in its window.
+    """
+    stamped = read_pushed_refs(state)
+    live = (
+        prune_pushed_refs(stamped, now=now, window=push_window)
+        if push_window is not None
+        else {}
+    )
+    return [
+        KeeperSyncPushedRef(
+            git_ref=ref, date_pushed=pushed_at, in_window=ref in live
+        )
+        for ref, pushed_at in sorted(
+            stamped.items(),
+            key=lambda item: (item[1], item[0]),
+            reverse=True,
+        )
+    ]
+
+
 def _explain_all_tiers(
     *,
     state: KeeperSyncState | None,
     now: datetime,
+    push_window: timedelta | None,
 ) -> list[KeeperSyncTierStatus]:
     """Compute the per-tier explainer for a project's state row.
 
     The per-tier ``hot_window`` / ``dormant_interval`` / ``jitter_
     window`` constants live in :mod:`scheduler`; this helper threads
     each tier's triple in so the explainer and the gate planner pull
-    from the same source of truth.
+    from the same source of truth. ``push_window`` is shared by the
+    three tiers, as it is by their crons.
     """
     return [
         _build_tier_status(
@@ -607,6 +680,7 @@ def _explain_all_tiers(
             tier_name="main",
             state=state,
             now=now,
+            push_window=push_window,
             hot_window_dormant_jitter=(
                 TIER_MAIN_HOT_WINDOW,
                 TIER_MAIN_DORMANT_INTERVAL,
@@ -619,6 +693,7 @@ def _explain_all_tiers(
             tier_name="discovery",
             state=state,
             now=now,
+            push_window=push_window,
             hot_window_dormant_jitter=(
                 TIER_DISCOVERY_HOT_WINDOW,
                 TIER_DISCOVERY_DORMANT_INTERVAL,
@@ -631,6 +706,7 @@ def _explain_all_tiers(
             tier_name="other",
             state=state,
             now=now,
+            push_window=push_window,
             hot_window_dormant_jitter=(
                 TIER_OTHER_HOT_WINDOW,
                 TIER_OTHER_DORMANT_INTERVAL,
@@ -649,6 +725,7 @@ def _build_tier_status(
     now: datetime,
     hot_window_dormant_jitter: tuple[timedelta, timedelta, timedelta],
     cron_interval: timedelta,
+    push_window: timedelta | None,
 ) -> KeeperSyncTierStatus:
     """Compose a :class:`KeeperSyncTierStatus` from the planner output."""
     hot_window, dormant_interval, jitter_window = hot_window_dormant_jitter
@@ -660,6 +737,7 @@ def _build_tier_status(
         dormant_interval=dormant_interval,
         cron_interval=cron_interval,
         jitter_window=jitter_window,
+        push_window=push_window,
     )
     return KeeperSyncTierStatus(
         tier=tier_name,

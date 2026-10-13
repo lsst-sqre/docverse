@@ -89,6 +89,12 @@ class KeeperSyncState(BaseModel):
         so dormant projects (those whose LTD ``main`` rebuild predates
         the hot window) cap their LTD load at one fetch per
         ``TIER_MAIN_DORMANT_INTERVAL``.
+
+        ``github_pushed_refs`` — the push hints: a map from each
+        normalized ref a GitHub ``push`` updated to the ISO-8601 time
+        Docverse stamped it, written by the keeper-sync push processor.
+        Its rules (overwrite, window pruning, the cap) live in
+        :mod:`docverse_server.services.keeper_sync.push_hints`.
     Edition-resource rows
         ``ltd_mode`` / ``ltd_tracked_refs`` — the LTD-side edition
         mode / refs preserved for reversibility (used by the ``manual``
@@ -215,6 +221,7 @@ class KeeperSyncStateStore:
         ltd_id: int | None = None,
         ltd_slug: str | None = None,
         include_tombstoned: bool = False,
+        for_update: bool = False,
     ) -> KeeperSyncState | None:
         """Fetch a row by its per-resource idempotency key.
 
@@ -224,6 +231,12 @@ class KeeperSyncStateStore:
         treat a tombstoned LTD resource as "not present"; pass
         ``include_tombstoned=True`` for the tombstone-service write
         path and admin endpoints that need to see them.
+
+        Pass ``for_update=True`` to lock the row (``SELECT ... FOR
+        UPDATE``) until the caller's transaction ends, for a
+        read-modify-write of ``annotations``: ``upsert`` replaces the
+        column whole, so two unlocked writers that read the same row
+        would each drop the other's keys.
         """
         clauses = _key_clauses(
             org_id=org_id,
@@ -234,6 +247,13 @@ class KeeperSyncStateStore:
         if not include_tombstoned:
             clauses.append(SqlKeeperSyncState.date_tombstoned.is_(None))
         stmt = select(SqlKeeperSyncState).where(*clauses)
+        if for_update:
+            # ``populate_existing`` so a row already in the session's
+            # identity map is refreshed from the locked read rather
+            # than returned as it was first loaded.
+            stmt = stmt.with_for_update().execution_options(
+                populate_existing=True
+            )
         result = await self._session.execute(stmt)
         row = result.scalar_one_or_none()
         if row is None:

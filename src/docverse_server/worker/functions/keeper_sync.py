@@ -64,7 +64,12 @@ from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.domain.organization import Organization
 from docverse_server.domain.queue import QueueJob
 from docverse_server.factory import Factory
-from docverse_server.metrics import BuildContentCopiedEvent, DocverseEvents
+from docverse_server.metrics import (
+    BuildContentCopiedEvent,
+    DocverseEvents,
+    KeeperSyncPushCheckEvent,
+    KeeperSyncPushCheckOutcome,
+)
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
 )
@@ -73,6 +78,13 @@ from docverse_server.services.keeper_sync.budget import (
     SliceProgress,
 )
 from docverse_server.services.keeper_sync.mappers import is_ltd_main
+from docverse_server.services.keeper_sync.push_hints import (
+    PushCheckOutcome,
+    ltd_rebuilt_since_sync,
+    prune_pushed_refs,
+    read_pushed_refs,
+    settle_pushed_refs,
+)
 from docverse_server.services.keeper_sync.scheduler import (
     _TIER_ANNOTATION_KEYS,
     ANNOTATION_DATE_MAIN_LAST_POLLED,
@@ -174,6 +186,15 @@ _LEGACY_MAIN_EDITION_LTD_ID_KEY = "main_edition_ltd_id"
 #: tier crons cap the URL list of their unparsable-edition-URL warning
 #: (:func:`_list_edition_ltd_ids`) at the same size, for the same reason.
 _MAX_RECORDED_EDITION_FAILURES = 20
+
+#: Most editions ``tier_main``'s pushed-ref fallback fetches from a
+#: project's LTD edition listing per tick, to see which ref each one
+#: tracks (:meth:`_PushedRefChecker._unseen_editions`). Only editions
+#: keeper-sync has no state row for are fetched, newest (highest LTD id)
+#: first: the edition a push's CI just made LTD create is the newest, and
+#: three covers a handful of branches uploading at once while bounding
+#: the LTD calls of a project that has accumulated unsynced editions.
+_MAX_UNSEEN_EDITIONS_FETCHED = 3
 
 #: Tracking modes that identify a semver aggregate edition (``15`` /
 #: ``15.2``). These rows are not LTD resources, so they never appear as
@@ -2690,6 +2711,22 @@ async def _tier_main_for_org(
     most ticks, capping their LTD load at one fetch per
     ``TIER_MAIN_DORMANT_INTERVAL`` instead of one per 5-minute cron
     tick. Hot projects continue to poll on the 5-min SLO.
+
+    While ``keeper_sync_push_hot_path_enabled`` is on, a ref pushed
+    inside the window makes the project hot, so its ``main`` check runs
+    on every tick until the window closes, and a push to a dormant
+    project's ``main`` is caught there, with the rebuild recorded on the
+    project row. The project's stamps are then visited after its
+    ``main`` check, whatever that check's gate decided
+    (:func:`_visit_pushed_refs`): a push says LTD is about to change, so
+    each live ref is checked on every tick until its sync is enqueued or
+    its window passes, and an expired ref is pruned even once the
+    project is dormant again. The ``main`` check and the pushed refs
+    share one enqueue per project, and the stamps are settled afterwards
+    (:func:`_settle_pushed_refs`), which publishes one
+    ``keeper_sync_push_check`` metrics event per visited ref. With the hot
+    path off, the stamps are neither read nor written, and count for
+    nothing in the gate.
     """
     config_snapshot = org.keeper_sync_config
     if config_snapshot is None:
@@ -2708,7 +2745,12 @@ async def _tier_main_for_org(
     )
     state_store = factory.create_keeper_sync_state_store()
     queue_job_store = factory.create_queue_job_store()
+    edition_store = factory.create_edition_store()
     arq_queue = ctx["arq_queue"]
+    # ``None`` while the push hot path is off: the pass then neither
+    # reads nor settles the stamps, and makes exactly the LTD calls it
+    # made before the hot path existed.
+    push_window = config.keeper_sync_push_window
     now = datetime.now(tz=UTC)
     enqueued = 0
     for ltd_slug in progress.walk(in_scope):
@@ -2718,58 +2760,46 @@ async def _tier_main_for_org(
                 resource_type=ResourceType.project,
                 ltd_slug=ltd_slug,
             )
-        if not should_poll_main_for_project(state=project_state, now=now):
-            continue
-        try:
-            main_edition = await _find_main_edition(
+        main_check = _MainEditionCheck()
+        if should_poll_main_for_project(
+            state=project_state, now=now, push_window=push_window
+        ):
+            main_check = await _check_main_edition(
+                session=session,
+                state_store=state_store,
                 ltd_client=ltd_client,
-                state_store=state_store,
-                session=session,
-                org_id=org.id,
-                ltd_slug=ltd_slug,
-            )
-        except LtdClientError as exc:
-            sentry_sdk.capture_exception(exc)
-            logger.exception(
-                "Tier-main: failed to fetch main edition",
-                org=org.slug,
-                ltd_slug=ltd_slug,
-            )
-            # Mark the visit polled even on error — otherwise a flaky
-            # LTD endpoint would defeat dormancy gating by re-polling
-            # every 5 min for dormant projects.
-            await _record_main_polled(
-                session=session,
-                state_store=state_store,
-                org_id=org.id,
+                org=org,
                 ltd_slug=ltd_slug,
                 now=now,
-                main_edition=None,
+                logger=logger,
             )
-            continue
-        # Refresh the cached pointer + rate-limit annotation on every
-        # successful resolve. The merge-and-upsert handles the cold-
-        # cache case (no prior annotations), the steady-state hit case
-        # (re-write the same pointer), and the rare maintainer-rename
-        # case (walk discovered a different ltd_id than was cached).
-        await _record_main_polled(
-            session=session,
-            state_store=state_store,
-            org_id=org.id,
-            ltd_slug=ltd_slug,
-            now=now,
-            main_edition=main_edition,
+        push_checks: list[_PushedRefCheck] = []
+        if push_window is not None and not main_check.ltd_failed:
+            push_checks = await _visit_pushed_refs(
+                checker=_PushedRefChecker(
+                    session=session,
+                    state_store=state_store,
+                    edition_store=edition_store,
+                    ltd_client=ltd_client,
+                    org=org,
+                    ltd_slug=ltd_slug,
+                    project_id=(
+                        project_state.docverse_id
+                        if project_state is not None
+                        else None
+                    ),
+                    fetched=main_check.fetched,
+                    logger=logger,
+                ),
+                project_state=project_state,
+                now=now,
+                window=push_window,
+            )
+        wants_enqueue = main_check.wants_enqueue or any(
+            check.outcome.enqueues for check in push_checks
         )
-        if main_edition is None:
-            continue
-        if not await _tier_main_should_enqueue_edition(
-            state_store=state_store,
-            session=session,
-            org_id=org.id,
-            main_edition=main_edition,
-        ):
-            continue
-        if await _enqueue_tier_project_sync(
+        enqueued_at: datetime | None = None
+        if wants_enqueue and await _enqueue_tier_project_sync(
             ctx=ctx,
             started=started,
             session=session,
@@ -2783,7 +2813,436 @@ async def _tier_main_for_org(
             tier="main",
         ):
             enqueued += 1
+            enqueued_at = datetime.now(tz=UTC)
+        if push_window is not None and push_checks:
+            await _settle_pushed_refs(
+                session=session,
+                state_store=state_store,
+                org=org,
+                ltd_slug=ltd_slug,
+                checks=push_checks,
+                enqueued_at=enqueued_at,
+                now=now,
+                window=push_window,
+                events=ctx.get("events"),
+                logger=logger,
+            )
     return enqueued
+
+
+@dataclass(frozen=True, slots=True)
+class _MainEditionCheck:
+    """What ``tier_main``'s check of one project's ``main`` edition found.
+
+    The default is the check that did not run: the dormancy gate
+    skipped the project this tick.
+    """
+
+    fetched: Mapping[int, LtdEdition] = field(default_factory=dict)
+    """The LTD ``main`` edition the check fetched, keyed by LTD id, so
+    the pushed-ref check of the ref ``main`` tracks reuses it rather
+    than fetching it again."""
+
+    wants_enqueue: bool = False
+    """Whether LTD rebuilt ``main`` since keeper-sync last synced it."""
+
+    ltd_failed: bool = False
+    """Whether LTD failed to answer; the pushed refs then wait a tick."""
+
+
+async def _check_main_edition(
+    *,
+    session: AsyncSession,
+    state_store: KeeperSyncStateStore,
+    ltd_client: LtdClient,
+    org: Organization,
+    ltd_slug: str,
+    now: datetime,
+    logger: structlog.stdlib.BoundLogger,
+) -> _MainEditionCheck:
+    """Check one polled project's LTD ``main`` edition for a rebuild.
+
+    Fetches the edition (:func:`_find_main_edition`), records the poll
+    (:func:`_record_main_polled`), and reports whether the rebuild
+    calls for the project's sync (:func:`_tier_main_should_enqueue_edition`).
+    An LTD failure is logged, sent to Sentry, and still recorded as a
+    poll, so a flaky LTD endpoint cannot defeat the dormancy gate by
+    re-polling a dormant project every five minutes.
+    """
+    try:
+        main_edition = await _find_main_edition(
+            ltd_client=ltd_client,
+            state_store=state_store,
+            session=session,
+            org_id=org.id,
+            ltd_slug=ltd_slug,
+        )
+    except LtdClientError as exc:
+        sentry_sdk.capture_exception(exc)
+        logger.exception(
+            "Tier-main: failed to fetch main edition",
+            org=org.slug,
+            ltd_slug=ltd_slug,
+        )
+        await _record_main_polled(
+            session=session,
+            state_store=state_store,
+            org_id=org.id,
+            ltd_slug=ltd_slug,
+            now=now,
+            main_edition=None,
+        )
+        return _MainEditionCheck(ltd_failed=True)
+    # Refresh the cached pointer + rate-limit annotation on every
+    # successful resolve. The merge-and-upsert handles the cold-
+    # cache case (no prior annotations), the steady-state hit case
+    # (re-write the same pointer), and the rare maintainer-rename
+    # case (walk discovered a different ltd_id than was cached).
+    await _record_main_polled(
+        session=session,
+        state_store=state_store,
+        org_id=org.id,
+        ltd_slug=ltd_slug,
+        now=now,
+        main_edition=main_edition,
+    )
+    if main_edition is None:
+        return _MainEditionCheck()
+    return _MainEditionCheck(
+        fetched={main_edition.ltd_id: main_edition},
+        wants_enqueue=await _tier_main_should_enqueue_edition(
+            state_store=state_store,
+            session=session,
+            org_id=org.id,
+            main_edition=main_edition,
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PushedRefCheck:
+    """``tier_main``'s visit to one stamped ref of a project."""
+
+    ref: str
+    """The pushed ref, normalized (``main``, not ``refs/heads/main``)."""
+
+    pushed_at: datetime
+    """The ref's push time as the visit read it from the stamp."""
+
+    outcome: PushCheckOutcome
+    """What the visit found."""
+
+
+@dataclass(slots=True)
+class _PushedRefChecker:
+    """Checks a project's pushed refs against LTD for one ``tier_main`` tick.
+
+    Each ref costs at most two LTD calls of its own: the edition the
+    ref's Docverse edition maps to, and, when the ref has no such edition
+    or LTD no longer has it, the project's edition listing, with the
+    newest editions on it that keeper-sync has not seen (at most
+    :data:`_MAX_UNSEEN_EDITIONS_FETCHED`). The listing and those editions
+    are fetched once per project per tick and shared by every ref, and
+    an edition the ``main`` check already fetched this tick is not
+    fetched again.
+    """
+
+    session: AsyncSession
+    state_store: KeeperSyncStateStore
+    edition_store: EditionStore
+    ltd_client: LtdClient
+    org: Organization
+    ltd_slug: str
+    project_id: int | None
+    """The Docverse project the slug syncs into, from its state row."""
+
+    fetched: Mapping[int, LtdEdition]
+    """LTD editions the ``main`` check already fetched this tick."""
+
+    logger: structlog.stdlib.BoundLogger
+    _editions: dict[int, LtdEdition] = field(default_factory=dict, init=False)
+    _unseen: list[LtdEdition] | None = field(default=None, init=False)
+
+    async def check(self, ref: str) -> PushCheckOutcome:
+        """Return what LTD says about the edition a pushed ref feeds.
+
+        ``rebuilt`` or ``unchanged`` when a synced edition tracks the
+        ref and LTD still has it (:func:`ltd_rebuilt_since_sync`);
+        otherwise ``new_edition`` when LTD lists an edition keeper-sync
+        has not seen that tracks the ref, and ``not_found`` when it lists
+        none. An LTD failure is logged, sent to Sentry, and reported as
+        ``error``.
+        """
+        state = await self._tracking_state(ref)
+        try:
+            if state is not None and state.ltd_id is not None:
+                ltd_edition = await self._fetch(state.ltd_id)
+                if ltd_edition is not None:
+                    if ltd_rebuilt_since_sync(
+                        state, ltd_date_rebuilt=ltd_edition.date_rebuilt
+                    ):
+                        return PushCheckOutcome.rebuilt
+                    return PushCheckOutcome.unchanged
+            if await self._lists_unseen_edition_of(ref):
+                return PushCheckOutcome.new_edition
+        except LtdClientError as exc:
+            sentry_sdk.capture_exception(exc)
+            self.logger.exception(
+                "Tier-main: failed to check pushed ref",
+                org=self.org.slug,
+                project=self.ltd_slug,
+                github_ref=ref,
+            )
+            return PushCheckOutcome.error
+        return PushCheckOutcome.not_found
+
+    async def _tracking_state(self, ref: str) -> KeeperSyncState | None:
+        """Return the state row of the synced edition tracking ``ref``.
+
+        Every live ``git_ref``-mode Docverse edition of the project
+        tracking the ref is mapped to its untombstoned edition state
+        rows; when several LTD editions feed the ref, the newest (the
+        highest LTD id) is the one checked.
+        """
+        if self.project_id is None:
+            return None
+        async with self.session.begin():
+            editions = await self.edition_store.list_git_ref_tracking_editions(
+                project_id=self.project_id, git_ref=ref
+            )
+            states = await self.state_store.list_for_org(
+                org_id=self.org.id,
+                resource_type=ResourceType.edition,
+                docverse_ids=[edition.id for edition in editions],
+            )
+        synced = [state for state in states if state.ltd_id is not None]
+        return max(synced, key=lambda state: state.ltd_id or 0, default=None)
+
+    async def _fetch(self, ltd_id: int) -> LtdEdition | None:
+        """Return LTD's edition ``ltd_id``, or ``None`` if LTD lost it."""
+        edition = self.fetched.get(ltd_id) or self._editions.get(ltd_id)
+        if edition is None:
+            try:
+                edition = await self.ltd_client.get_edition(ltd_id)
+            except LtdNotFoundError:
+                return None
+            self._editions[ltd_id] = edition
+        return edition
+
+    async def _lists_unseen_edition_of(self, ref: str) -> bool:
+        """Return whether LTD lists an unseen edition that tracks ``ref``.
+
+        An unseen edition tracking some other ref is not the push's: a
+        dormant project can carry one from a branch nobody pushed to
+        lately, and a sync enqueued on it would not bring in the pushed
+        ref's edition, which LTD has yet to create. Discovery syncs that
+        edition on its own cadence, which the push has made the fast
+        one.
+        """
+        return any(
+            ref in (edition.tracked_refs or ())
+            for edition in await self._unseen_editions()
+        )
+
+    async def _unseen_editions(self) -> list[LtdEdition]:
+        """Return the newest LTD editions keeper-sync has not seen.
+
+        The discovery tier's listing check (:func:`_project_needs_discovery`)
+        on one project — its edition listing's LTD ids against the org's
+        edition state rows, tombstoned ones counting as seen — followed
+        by a fetch of each unseen edition, so the caller can read the
+        ref it tracks. The state rows are read for the listed ids only,
+        as ``tier_main`` does not load the org's whole edition-state
+        map. At most :data:`_MAX_UNSEEN_EDITIONS_FETCHED` editions are
+        fetched, highest LTD id first, and one LTD no longer has is left
+        out. Answered once per project per tick.
+        """
+        if self._unseen is None:
+            ltd_edition_ids = await _list_edition_ltd_ids(
+                ltd_client=self.ltd_client,
+                org_slug=self.org.slug,
+                ltd_slug=self.ltd_slug,
+                tier=Tier.main,
+                logger=self.logger,
+            )
+            async with self.session.begin():
+                states = await self.state_store.list_for_org(
+                    org_id=self.org.id,
+                    resource_type=ResourceType.edition,
+                    ltd_ids=ltd_edition_ids,
+                    include_tombstoned=True,
+                )
+            unseen_ids = _unseen_edition_ltd_ids(
+                ltd_edition_ids=ltd_edition_ids,
+                edition_state_by_ltd_id={
+                    state.ltd_id: state
+                    for state in states
+                    if state.ltd_id is not None
+                },
+            )
+            unseen: list[LtdEdition] = []
+            for ltd_id in sorted(set(unseen_ids), reverse=True)[
+                :_MAX_UNSEEN_EDITIONS_FETCHED
+            ]:
+                edition = await self._fetch(ltd_id)
+                if edition is not None:
+                    unseen.append(edition)
+            self._unseen = unseen
+        return self._unseen
+
+
+async def _visit_pushed_refs(
+    *,
+    checker: _PushedRefChecker,
+    project_state: KeeperSyncState | None,
+    now: datetime,
+    window: timedelta,
+) -> list[_PushedRefCheck]:
+    """Visit every ref stamped on a project and say what each found.
+
+    A ref whose window has passed is ``expired`` and costs no LTD call.
+    The live refs are checked oldest push first
+    (:meth:`_PushedRefChecker.check`); after an LTD failure the rest of
+    the project's live refs wait for the next tick unvisited, since the
+    failure has already ridden out the LTD client's retries and the
+    next call would most likely do the same.
+    """
+    stamped = read_pushed_refs(project_state)
+    live = prune_pushed_refs(stamped, now=now, window=window)
+    checks: list[_PushedRefCheck] = []
+    for ref, pushed_at in sorted(
+        stamped.items(), key=lambda item: (item[0] in live, item[1], item[0])
+    ):
+        if ref in live:
+            outcome = await checker.check(ref)
+        else:
+            outcome = PushCheckOutcome.expired
+        checks.append(
+            _PushedRefCheck(ref=ref, pushed_at=pushed_at, outcome=outcome)
+        )
+        if outcome is PushCheckOutcome.error:
+            break
+    return checks
+
+
+async def _settle_pushed_refs(
+    *,
+    session: AsyncSession,
+    state_store: KeeperSyncStateStore,
+    org: Organization,
+    ltd_slug: str,
+    checks: Sequence[_PushedRefCheck],
+    enqueued_at: datetime | None,
+    now: datetime,
+    window: timedelta,
+    events: DocverseEvents | None,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Write a project's pushed-ref visit back to its state row and report it.
+
+    Once the project's sync is enqueued (at ``enqueued_at``), every ref
+    whose outcome called for it is cleared, and its push-to-enqueue lag
+    logged; when the enqueue was skipped (``enqueued_at`` is ``None``:
+    an active job for the project already holds its slot) those refs
+    keep their stamps and are checked again next tick. Expired refs are
+    pruned. The row is re-read ``FOR UPDATE`` and settled by
+    :func:`settle_pushed_refs`, so a push stamped since the visit read
+    the row keeps its stamp, and the write is skipped when nothing is
+    cleared or pruned.
+
+    Each visited ref is then logged and published as one
+    ``keeper_sync_push_check`` event (:func:`_publish_push_check`), after
+    the write, so the event reports what the tick settled.
+    """
+    cleared = {
+        check.ref: check.pushed_at
+        for check in checks
+        if enqueued_at is not None and check.outcome.enqueues
+    }
+    if cleared or any(
+        check.outcome is PushCheckOutcome.expired for check in checks
+    ):
+        async with session.begin():
+            state = await state_store.get(
+                org_id=org.id,
+                resource_type=ResourceType.project,
+                ltd_slug=ltd_slug,
+                for_update=True,
+            )
+            if state is not None:
+                await state_store.upsert(
+                    org_id=org.id,
+                    resource_type=ResourceType.project,
+                    ltd_slug=ltd_slug,
+                    annotations=settle_pushed_refs(
+                        state, cleared=cleared, now=now, window=window
+                    ),
+                )
+    for check in checks:
+        enqueued = check.ref in cleared
+        push_lag = (
+            enqueued_at - check.pushed_at
+            if enqueued_at is not None and enqueued
+            else None
+        )
+        logger.info(
+            "Tier-main: checked pushed ref",
+            org=org.slug,
+            project=ltd_slug,
+            github_ref=check.ref,
+            outcome=check.outcome.value,
+            pushed_at=check.pushed_at.isoformat(),
+            enqueued=enqueued,
+        )
+        if push_lag is not None:
+            logger.info(
+                "Tier-main: enqueued project sync for pushed ref",
+                org=org.slug,
+                project=ltd_slug,
+                github_ref=check.ref,
+                outcome=check.outcome.value,
+                push_lag_seconds=round(push_lag.total_seconds(), 1),
+            )
+        await _publish_push_check(
+            events=events,
+            event=KeeperSyncPushCheckEvent(
+                organization=org.slug,
+                project=ltd_slug,
+                github_ref=check.ref,
+                outcome=KeeperSyncPushCheckOutcome.from_domain(check.outcome),
+                enqueued=enqueued,
+                push_lag=push_lag,
+            ),
+            logger=logger,
+        )
+
+
+async def _publish_push_check(
+    *,
+    events: DocverseEvents | None,
+    event: KeeperSyncPushCheckEvent,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Publish one ``keeper_sync_push_check`` event, best-effort.
+
+    Skips silently when the worker has no metrics events (tests that do
+    not ask for them). A failed publish is sent to Sentry and logged,
+    and never raised: the tick has already enqueued and settled the
+    project, and an exception here would abandon the org's remaining
+    projects for a metrics hiccup.
+    """
+    if events is None:
+        return
+    try:
+        await events.keeper_sync_push_check.publish(event)
+    except Exception as exc:
+        sentry_sdk.capture_exception(exc)
+        logger.exception(
+            "Tier-main: failed to publish pushed ref check",
+            org=event.organization,
+            project=event.project,
+            github_ref=event.github_ref,
+        )
 
 
 async def _tier_discovery_for_org(
@@ -2804,6 +3263,11 @@ async def _tier_discovery_for_org(
     projects (LTD ``main`` rebuilt within ``TIER_DISCOVERY_HOT_WINDOW``)
     keep the 30-min cadence; dormant projects fall back to one pass per
     ``TIER_DISCOVERY_DORMANT_INTERVAL``.
+
+    While ``keeper_sync_push_hot_path_enabled`` is on, a project with a
+    ref pushed inside the window is hot too, so a contributor's push to
+    a dormant project has discovery list its editions on every tick
+    until the window closes.
 
     A polled project with a state row costs one LTD call, its edition
     URL listing; :func:`_project_needs_discovery` reads the edition ids
@@ -2828,6 +3292,7 @@ async def _tier_discovery_for_org(
     state_store = factory.create_keeper_sync_state_store()
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
+    push_window = config.keeper_sync_push_window
     now = datetime.now(tz=UTC)
     # Hoist the org-wide edition-state read out of the per-slug loop.
     # The previous shape called ``list_for_org`` from inside
@@ -2865,6 +3330,7 @@ async def _tier_discovery_for_org(
             hot_window=TIER_DISCOVERY_HOT_WINDOW,
             dormant_interval=TIER_DISCOVERY_DORMANT_INTERVAL,
             jitter_window=TIER_DISCOVERY_DORMANT_JITTER,
+            push_window=push_window,
         ):
             continue
         try:
@@ -2942,7 +3408,9 @@ async def _tier_other_for_org(
     branches haven't been touched in months stops driving an hourly
     LTD fetch. Hot and dormant-due projects continue to list their
     edition URLs and re-enqueue when state lags past
-    :data:`TIER_OTHER_REFRESH_THRESHOLD`.
+    :data:`TIER_OTHER_REFRESH_THRESHOLD`. While
+    ``keeper_sync_push_hot_path_enabled`` is on, a project with a ref
+    pushed inside the window is hot too.
 
     The listing is the only LTD call per polled project: the check
     needs each edition's LTD id, which the URL carries, and which id is
@@ -2975,6 +3443,7 @@ async def _tier_other_for_org(
     state_store = factory.create_keeper_sync_state_store()
     queue_job_store = factory.create_queue_job_store()
     arq_queue = ctx["arq_queue"]
+    push_window = config.keeper_sync_push_window
     now = datetime.now(tz=UTC)
     # Hoist the org-wide edition-state read out of the per-slug loop,
     # as ``_tier_discovery_for_org`` does. ``_list_in_scope_slugs``
@@ -3006,6 +3475,7 @@ async def _tier_other_for_org(
             hot_window=TIER_OTHER_HOT_WINDOW,
             dormant_interval=TIER_OTHER_DORMANT_INTERVAL,
             jitter_window=TIER_OTHER_DORMANT_JITTER,
+            push_window=push_window,
         ):
             continue
         try:
@@ -3276,10 +3746,12 @@ async def _record_main_polled(
       next tick's :func:`should_poll_main_for_project` can decide hot
       vs dormant from this same row.
 
-    Existing unrelated annotation keys are preserved by merge — no
-    other writers exist today on the project-resource state row's
-    annotations, but the forward-compatible posture costs nothing and
-    avoids a future drive-by writer being blindsided. The one exception
+    Existing unrelated annotation keys are preserved by merge, and the
+    row is read ``FOR UPDATE`` so the merge cannot lose a concurrent
+    writer's key: the keeper-sync push processor stamps
+    ``github_pushed_refs`` onto this row whenever a push arrives, and
+    an unlocked read taken before its stamp would write the map back
+    without it. The one exception
     is the retired ``main_edition_ltd_id`` key: releases before #799
     wrote it beside ``main_edition_url`` and nothing reads it, so it is
     dropped on every write rather than carried forward where a later
@@ -3290,6 +3762,7 @@ async def _record_main_polled(
             org_id=org_id,
             resource_type=ResourceType.project,
             ltd_slug=ltd_slug,
+            for_update=True,
         )
         prior = (
             existing.annotations
@@ -3327,9 +3800,11 @@ async def _record_tier_polled(
 
     Used by ``_tier_discovery_for_org`` and ``_tier_other_for_org`` to
     clamp dormant projects to one LTD pass per tier-specific
-    ``dormant_interval``. Read-modify-write inside one transaction so
-    other writers' annotation keys (the cached ``main_edition_*`` /
-    ``date_main_last_polled``) are preserved by merge.
+    ``dormant_interval``. Read-modify-write inside one transaction, the
+    row read ``FOR UPDATE``, so other writers' annotation keys (the
+    cached ``main_edition_url``, ``date_main_last_polled``, and the
+    push processor's ``github_pushed_refs``, which a push can stamp at
+    any moment) are preserved by merge.
 
     Unlike :func:`_record_main_polled`, this helper does *not* update
     ``date_rebuilt_seen``; ``tier_main`` is the only writer of that
@@ -3342,6 +3817,7 @@ async def _record_tier_polled(
             org_id=org_id,
             resource_type=ResourceType.project,
             ltd_slug=ltd_slug,
+            for_update=True,
         )
         prior = (
             existing.annotations
@@ -3459,10 +3935,47 @@ async def _project_needs_discovery(
         tier=Tier.discovery,
         logger=logger,
     )
-    return any(
-        is_unknown_resource(edition_state_by_ltd_id.get(ltd_id))
-        for ltd_id in ltd_edition_ids
+    return _has_unseen_edition(
+        ltd_edition_ids=ltd_edition_ids,
+        edition_state_by_ltd_id=edition_state_by_ltd_id,
     )
+
+
+def _has_unseen_edition(
+    *,
+    ltd_edition_ids: Sequence[int],
+    edition_state_by_ltd_id: Mapping[int, Any],
+) -> bool:
+    """Return whether any listed LTD edition has no state row.
+
+    The rule of discovery's listing check
+    (:func:`_project_needs_discovery`); :func:`_unseen_edition_ltd_ids`
+    names the editions it finds.
+    """
+    return bool(
+        _unseen_edition_ltd_ids(
+            ltd_edition_ids=ltd_edition_ids,
+            edition_state_by_ltd_id=edition_state_by_ltd_id,
+        )
+    )
+
+
+def _unseen_edition_ltd_ids(
+    *,
+    ltd_edition_ids: Sequence[int],
+    edition_state_by_ltd_id: Mapping[int, Any],
+) -> list[int]:
+    """Return the listed LTD edition ids that have no state row.
+
+    The editions discovery's listing check counts as unseen, in listing
+    order, for ``tier_main``'s pushed-ref fallback
+    (:meth:`_PushedRefChecker._unseen_editions`) to fetch.
+    """
+    return [
+        ltd_id
+        for ltd_id in ltd_edition_ids
+        if is_unknown_resource(edition_state_by_ltd_id.get(ltd_id))
+    ]
 
 
 def _has_stale_non_main_edition(

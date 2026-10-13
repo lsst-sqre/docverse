@@ -13,6 +13,7 @@ from docverse.models import (
     KeeperSyncConfigUpdate,
     KeeperSyncConfigWrite,
     KeeperSyncProjectStatus,
+    KeeperSyncPushedRef,
     KeeperSyncRun,
     KeeperSyncScopePreview,
     KeeperSyncScopePreviewRequest,
@@ -719,6 +720,41 @@ def test_project_status_in_scope_defaults_to_true() -> None:
     """
     status = KeeperSyncProjectStatus.model_validate(_project_status_payload())
     assert status.in_scope is True
+
+
+def test_project_status_push_fields_default_to_no_push() -> None:
+    """A body without the push fields reads as a project nobody pushed.
+
+    ``pushed_refs`` and ``in_push_window`` are new, so a response from a
+    server that predates them carries neither key; it parses as an empty
+    list and ``false``, which is what such a server's project was.
+    """
+    status = KeeperSyncProjectStatus.model_validate(_project_status_payload())
+    assert status.pushed_refs == []
+    assert status.in_push_window is False
+
+
+def test_project_status_pushed_refs_round_trip() -> None:
+    """A stamped ref keeps its name, push time and window flag."""
+    pushed_at = datetime(2026, 10, 9, 14, 2, 11, tzinfo=UTC)
+    status = KeeperSyncProjectStatus.model_validate(
+        _project_status_payload(
+            in_push_window=True,
+            pushed_refs=[
+                {
+                    "git_ref": "tickets/DM-56619",
+                    "date_pushed": pushed_at.isoformat(),
+                    "in_window": True,
+                }
+            ],
+        )
+    )
+    assert status.in_push_window is True
+    (pushed,) = status.pushed_refs
+    assert isinstance(pushed, KeeperSyncPushedRef)
+    assert pushed.git_ref == "tickets/DM-56619"
+    assert pushed.date_pushed == pushed_at
+    assert pushed.in_window is True
 
 
 def test_project_status_in_scope_round_trips_false() -> None:

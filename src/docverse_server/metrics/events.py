@@ -23,6 +23,7 @@ from .payloads import (
     EditionPublishedEvent,
     EditionReconcileCompletedEvent,
     GitHubWebhookReceivedEvent,
+    KeeperSyncPushCheckEvent,
     KeeperSyncRunCompletedEvent,
     LifecycleActionEvent,
     MembershipChangedEvent,
@@ -59,6 +60,7 @@ class DocverseEvents(EventMaker):
     build_content_copied: EventPublisher[BuildContentCopiedEvent]
     api_request: EventPublisher[ApiRequestEvent]
     github_webhook_received: EventPublisher[GitHubWebhookReceivedEvent]
+    keeper_sync_push_check: EventPublisher[KeeperSyncPushCheckEvent]
 
     async def initialize(self, manager: EventManager) -> None:
         """Register a publisher for every Docverse event type.
@@ -115,4 +117,7 @@ class DocverseEvents(EventMaker):
         )
         self.github_webhook_received = await manager.create_publisher(
             "github_webhook_received", GitHubWebhookReceivedEvent
+        )
+        self.keeper_sync_push_check = await manager.create_publisher(
+            "keeper_sync_push_check", KeeperSyncPushCheckEvent
         )

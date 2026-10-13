@@ -1384,6 +1384,42 @@ class EditionStore:
         edition_row, build_public_id, build_git_ref = row_tuple
         return self._validate(edition_row, build_public_id, build_git_ref)
 
+    async def list_git_ref_tracking_editions(
+        self, *, project_id: int, git_ref: str
+    ) -> list[Edition]:
+        """List every live ``git_ref``-mode edition tracking ``git_ref``.
+
+        The keeper-sync push check's lookup: which editions does a push
+        to this ref feed? Unlike :meth:`list_draft_editions_by_git_ref`
+        and :meth:`get_git_ref_tracking_edition`, no kind is excluded, so
+        the auto-created ``__main`` edition answers a push to the
+        default branch, a draft one to a branch, and a release one to a
+        tag, lifecycle-exempt or not. Like
+        :meth:`get_git_ref_tracking_edition`, only ``tracking_mode =
+        git_ref`` qualifies, the only mode keeper-sync maps a
+        ref-tracking LTD edition onto, and soft-deleted rows are
+        ignored. The ``tracking_params->>'git_ref'`` equality is applied
+        in the database.
+
+        Returns the matches in creation order (``date_created``, then
+        ``id``); usually one.
+        """
+        stmt = (
+            self._base_query()
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.tracking_mode == TrackingMode.git_ref,
+                SqlEdition.date_deleted.is_(None),
+                SqlEdition.tracking_params["git_ref"].astext == git_ref,
+            )
+            .order_by(SqlEdition.date_created, SqlEdition.id)
+        )
+        result = await self._session.execute(stmt)
+        return [
+            self._validate(edition_row, build_public_id, build_git_ref)
+            for edition_row, build_public_id, build_git_ref in result.all()
+        ]
+
     async def find_matching_editions(
         self,
         *,

@@ -24,6 +24,8 @@ product.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from pydantic import ValidationError
 
@@ -457,6 +459,49 @@ def test_keeper_sync_copy_retry_delay_refuses_negative(
 
     monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_COPY_RETRY_DELAY_SECONDS", "0")
     assert Configuration().keeper_sync_copy_retry_delay_seconds == 0.0
+
+
+def test_keeper_sync_push_hot_path_defaults() -> None:
+    """The push hot path ships on, with a one-hour window."""
+    config = Configuration()
+    assert config.keeper_sync_push_hot_path_enabled is True
+    assert config.keeper_sync_push_window_seconds == 3600
+
+
+def test_keeper_sync_push_hot_path_env_var_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both push hot-path settings are env-overridable under the prefix."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_HOT_PATH_ENABLED", "false")
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_WINDOW_SECONDS", "600")
+    config = Configuration()
+    assert config.keeper_sync_push_hot_path_enabled is False
+    assert config.keeper_sync_push_window_seconds == 600
+
+
+def test_keeper_sync_push_window_refuses_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A window of zero would expire every stamp as it is written."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_WINDOW_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        Configuration()
+
+
+def test_keeper_sync_push_window_reads_the_hot_path_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window the tier planners take is the setting, as a timedelta."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_WINDOW_SECONDS", "600")
+    assert Configuration().keeper_sync_push_window == timedelta(seconds=600)
+
+
+def test_keeper_sync_push_window_is_none_with_the_hot_path_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Off, there is no window, and the planners ignore push stamps."""
+    monkeypatch.setenv("DOCVERSE_KEEPER_SYNC_PUSH_HOT_PATH_ENABLED", "false")
+    assert Configuration().keeper_sync_push_window is None
 
 
 def test_publish_edition_job_timeout_default() -> None:

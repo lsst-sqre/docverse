@@ -18,10 +18,12 @@ from docverse.models import (
 from docverse_server.metrics import (
     HttpMethod,
     HttpStatusClass,
+    KeeperSyncPushCheckOutcome,
     LifecycleActionTrigger,
     LifecycleReapAction,
     WebhookOutcome,
 )
+from docverse_server.services.keeper_sync.push_hints import PushCheckOutcome
 
 
 def test_purgatory_cleanup_is_a_lifecycle_action_trigger() -> None:
@@ -155,3 +157,35 @@ def test_webhook_outcome_values() -> None:
         "error",
         "malformed",
     ]
+
+
+def test_keeper_sync_push_check_outcome_values() -> None:
+    """The push-check outcomes are pinned by the value dashboards group on.
+
+    ``outcome`` is an InfluxDB tag, so on ``keeper_sync_push_check`` these
+    values are what a query's ``GROUP BY`` and ``WHERE`` clauses quote. A
+    new outcome is appended, so every existing symbol keeps its index in
+    the Avro enum.
+    """
+    assert [member.value for member in KeeperSyncPushCheckOutcome] == [
+        "new_edition",
+        "rebuilt",
+        "unchanged",
+        "expired",
+        "not_found",
+        "error",
+    ]
+
+
+@pytest.mark.parametrize("outcome", list(PushCheckOutcome))
+def test_keeper_sync_push_check_outcome_from_domain(
+    outcome: PushCheckOutcome,
+) -> None:
+    """Every ``tier_main`` check outcome maps to its metrics member.
+
+    The metrics enum is the published contract and the domain enum is
+    ``tier_main``'s own, so an outcome added to the check has to gain a
+    member here before the worker can report it.
+    """
+    mapped = KeeperSyncPushCheckOutcome.from_domain(outcome)
+    assert mapped.value == outcome.value

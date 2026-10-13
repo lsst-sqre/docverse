@@ -8,6 +8,7 @@ know an LTD slug.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import pytest
@@ -19,6 +20,9 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import OrgRole
+from docverse_server.services.keeper_sync.push_hints import (
+    ANNOTATION_GITHUB_PUSHED_REFS,
+)
 from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
@@ -508,6 +512,49 @@ async def test_list_projects_project_url_null_when_no_docverse_project(
     entry = response.json()[0]
     assert entry["project_url"] is None
     assert entry["main_edition"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_projects_reports_each_projects_pushed_refs(
+    client: AsyncClient,
+) -> None:
+    """Each entry carries its project's push stamps and window.
+
+    The listing shares the per-project response, so a project a push put
+    on the fast path can be spotted without fetching each one.
+    """
+    await _setup_org(client)
+    await _enable_sync(client)
+    org_id = await _get_org_id()
+    pushed_at = datetime.now(tz=UTC) - timedelta(minutes=10)
+    await _seed_state(
+        org_id=org_id,
+        resource_type=ResourceType.project,
+        ltd_slug="pipelines",
+    )
+    await _seed_state(
+        org_id=org_id,
+        resource_type=ResourceType.project,
+        ltd_slug="sqr-112",
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS: {"main": pushed_at.isoformat()}
+        },
+    )
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/projects",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+
+    assert response.status_code == 200
+    entries = {entry["ltd_slug"]: entry for entry in response.json()}
+    assert entries["pipelines"]["pushed_refs"] == []
+    assert entries["pipelines"]["in_push_window"] is False
+    assert entries["sqr-112"]["in_push_window"] is True
+    (pushed,) = entries["sqr-112"]["pushed_refs"]
+    assert pushed["git_ref"] == "main"
+    assert datetime.fromisoformat(pushed["date_pushed"]) == pushed_at
+    assert pushed["in_window"] is True
 
 
 # ---------------------------------------------------------------------------
