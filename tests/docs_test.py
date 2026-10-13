@@ -1654,6 +1654,31 @@ def test_github_keeper_sync_section_names_the_tracking_log() -> None:
     assert not _uncoded(fields | sources, section)
 
 
+def test_github_keeper_sync_section_covers_the_tokenless_skip() -> None:
+    """The keeper-sync section says sync-time live refs need the App.
+
+    A project without an installation id is not read (PRD #817), so the
+    section has to name the column that decides it, the debug line a
+    skipped visit writes, and the warning it no longer writes — both
+    lines the service actually logs, at those levels.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Keeper-synced projects")
+    calls = _log_calls(_KEEPER_SYNC_SERVICE_MODULE)
+    skip_line = (
+        "Keeper sync: project has no GitHub App installation, live refs"
+        " unavailable for this pass"
+    )
+    failed_line = (
+        "Keeper sync: GitHub ref fetch failed, live refs unavailable for"
+        " this pass"
+    )
+    assert [call.level for call in calls[skip_line]] == ["debug"]
+    assert [call.level for call in calls[failed_line]] == ["warning"]
+    assert not _uncoded(
+        {"github_installation_id", skip_line, failed_line}, section
+    )
+
+
 def test_github_manual_fallback_documented() -> None:
     """The operators' section quotes the edition endpoints it relies on.
 

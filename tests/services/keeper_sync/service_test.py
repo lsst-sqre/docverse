@@ -7808,6 +7808,68 @@ async def test_sync_aggregate_rereads_pointer_under_edition_lock(
     )
 
 
+_NO_INSTALLATION_MESSAGE = (
+    "Keeper sync: project has no GitHub App installation, live refs"
+    " unavailable for this pass"
+)
+"""The debug line ``_fetch_live_refs`` logs in place of a tokenless read."""
+
+
+def _github_api_calls(mock_github: GitHubMock) -> list[httpx.Request]:
+    """Return the requests the shared router saw for the GitHub API.
+
+    The router also serves LTD and discovery, so the GitHub calls are
+    picked out by host.
+    """
+    github_host = httpx.URL(GITHUB_API_BASE_URL).host
+    return [
+        call.request
+        for call in mock_github.router.calls
+        if call.request.url.host == github_host
+    ]
+
+
+async def _record_installation(
+    session: AsyncSession, *, project_id: int, installation_id: int
+) -> None:
+    """Record the ids a resolve would for the ``pipelines`` project."""
+    project_store = ProjectStore(
+        session=session, logger=structlog.get_logger("test")
+    )
+    async with session.begin():
+        recorded = await project_store.update_github_metadata(
+            project_id=project_id,
+            expected_owner=_LSST_OWNER,
+            expected_repo=_LSST_REPO,
+            installation_id=installation_id,
+            owner_id=1,
+            repo_id=1,
+        )
+    assert recorded
+
+
+def _record_installation_on_create(
+    session: AsyncSession, mock_github: GitHubMock
+) -> ProjectCreatedCallback:
+    """Install the App on each project the sync creates, at once.
+
+    Production's ``on_project_created`` enqueues the resolve that
+    records a new project's installation id within minutes; this one
+    records it before the sync carries on, so the creating visit already
+    reads the live ref set with the installation's token. A project
+    without an installation id is not read at all (PRD #817), so every
+    test of the fetched-ref paths wires this in.
+    """
+    installation_id = mock_github.seed_installation(_LSST_OWNER, _LSST_REPO)
+
+    async def record(project: Project) -> None:
+        await _record_installation(
+            session, project_id=project.id, installation_id=installation_id
+        )
+
+    return record
+
+
 @pytest.mark.asyncio
 async def test_proactive_ref_deleted_tombstones_and_skips_sync_edition(
     db_session: AsyncSession,
@@ -7818,12 +7880,12 @@ async def test_proactive_ref_deleted_tombstones_and_skips_sync_edition(
     """A draft tracking a missing GitHub branch is tombstoned pre-import.
 
     Seeds an org with ``RefDeletedRule`` configured, an LTD product
-    whose ``doc_repo`` is a public GitHub repo, and a draft edition
-    tracking a branch that no longer exists on GitHub. The proactive
-    evaluator must tombstone the draft ``lifecycle_preemptive``, skip
-    its ``sync_edition`` call entirely (no Docverse edition row, no
-    LTD build endpoint hit, no bytes in the destination store), and
-    sync the main edition normally.
+    whose ``doc_repo`` is a GitHub repo the App is installed on, and a
+    draft edition tracking a branch that no longer exists on GitHub.
+    The proactive evaluator must tombstone the draft
+    ``lifecycle_preemptive``, skip its ``sync_edition`` call entirely
+    (no Docverse edition row, no LTD build endpoint hit, no bytes in the
+    destination store), and sync the main edition normally.
     """
     async with db_session.begin():
         org_id = await _seed_org(
@@ -7866,6 +7928,9 @@ async def test_proactive_ref_deleted_tombstones_and_skips_sync_edition(
         binding_resolver=resolver,
         ref_set_fetcher=fetcher,
         tombstone_service=tombstone_service,
+        on_project_created=_record_installation_on_create(
+            db_session, mock_github
+        ),
     )
 
     result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
@@ -8152,6 +8217,9 @@ async def test_proactive_keep_proceeds_through_sync_edition(
         binding_resolver=resolver,
         ref_set_fetcher=fetcher,
         tombstone_service=tombstone_service,
+        on_project_created=_record_installation_on_create(
+            db_session, mock_github
+        ),
     )
 
     result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
@@ -8278,7 +8346,8 @@ async def test_proactive_fetch_failure_disables_ref_deleted_only(
     leaves ``live_refs`` unset, which disables ``ref_deleted`` for
     this project pass. The draft tracking a ref that would otherwise
     look deleted is therefore kept (and synced); the regular
-    ``git_ref_audit`` cron catches up later if needed.
+    ``git_ref_audit`` cron catches up later if needed. The failure is
+    the installed project's one warning, naming its installation.
     """
     async with db_session.begin():
         org_id = await _seed_org(
@@ -8317,12 +8386,30 @@ async def test_proactive_fetch_failure_disables_ref_deleted_only(
         binding_resolver=resolver,
         ref_set_fetcher=fetcher,
         tombstone_service=tombstone_service,
+        on_project_created=_record_installation_on_create(
+            db_session, mock_github
+        ),
     )
 
-    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
 
     # Both editions synced — fetch failure did not abort the pass.
     assert len(result.edition_outcomes) == 2
+    assert [
+        (log["log_level"], log["installation_id"], log["project"])
+        for log in logs
+        if log["event"]
+        == (
+            "Keeper sync: GitHub ref fetch failed, live refs unavailable"
+            " for this pass"
+        )
+    ] == [("warning", mock_github.default_installation_id, "pipelines")]
+    assert not [
+        log for log in logs if log["event"] == _NO_INSTALLATION_MESSAGE
+    ]
     state_store = KeeperSyncStateStore(
         session=db_session, logger=structlog.get_logger("test")
     )
@@ -8434,6 +8521,171 @@ async def test_proactive_no_binding_skips_fetch_and_syncs(
 
 
 @pytest.mark.asyncio
+async def test_proactive_no_installation_skips_fetch_and_syncs(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A bound project without an installation id is never read.
+
+    The project is bound to a GitHub repository, but nothing has
+    recorded its ``github_installation_id`` — the App is not installed
+    there, or the resolve has not run yet — so there is no token to read
+    with. An anonymous read would draw on the 60-an-hour budget every
+    pod behind the NAT address shares (PRD #817), so the pre-fetch makes
+    no GitHub request at all. ``ref_deleted`` stays inert, the draft
+    tracking a ref GitHub no longer lists syncs, and the skip leaves one
+    debug line rather than a ``GitHub ref fetch failed`` warning.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-no-installation",
+            lifecycle_rules=LifecycleRuleSet(root=[RefDeletedRule()]),
+        )
+
+    draft_payload = _load("edition_branch_git_refs.json")
+    draft_payload["tracked_refs"] = ["tickets/DM-deleted"]
+    _seed_two_editions_main_and_draft(
+        mock_discovery, draft_payload=draft_payload
+    )
+    _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main"],
+    )
+
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {
+            "pipelines/builds/42/index.html": b"<html>main</html>",
+            "pipelines/builds/43/index.html": b"<html>draft</html>",
+        },
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert _github_api_calls(mock_github) == []
+    assert len(result.edition_outcomes) == 2
+    skips = [log for log in logs if log["event"] == _NO_INSTALLATION_MESSAGE]
+    assert [
+        (
+            log["log_level"],
+            log["project"],
+            log["project_id"],
+            log["owner"],
+            log["repo"],
+        )
+        for log in skips
+    ] == [
+        (
+            "debug",
+            "pipelines",
+            result.docverse_project_id,
+            _LSST_OWNER,
+            _LSST_REPO,
+        )
+    ]
+    assert not [
+        log
+        for log in logs
+        if log["event"].startswith("Keeper sync: GitHub ref fetch failed")
+    ]
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        draft_state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            include_tombstoned=True,
+        )
+    assert draft_state is not None
+    assert draft_state.date_tombstoned is None
+
+
+@pytest.mark.asyncio
+async def test_proactive_fetch_resumes_once_the_installation_is_recorded(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """The sync after a resolve records the installation reads the refs.
+
+    The first visit has no token and skips the fetch. Once the App is
+    installed and the project's resolve records its installation id, the
+    next visit reads the ref set with that installation's token — the
+    skip needs no other intervention to undo.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-installed-later",
+            lifecycle_rules=LifecycleRuleSet(root=[RefDeletedRule()]),
+        )
+    _seed_two_editions_main_and_draft(mock_discovery)
+    heads_route, tags_route = _seed_github_refs(
+        mock_github.router,
+        owner=_LSST_OWNER,
+        repo=_LSST_REPO,
+        branches=["main", "u/jsick/feature"],
+    )
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {
+            "pipelines/builds/42/index.html": b"<html>main</html>",
+            "pipelines/builds/43/index.html": b"<html>draft</html>",
+        },
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+    )
+    first = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert first.docverse_project_id is not None
+    assert heads_route.call_count == 0
+    installation_id = mock_github.seed_installation(
+        _LSST_OWNER, _LSST_REPO, token="ghs_installed_later"
+    )
+    await _record_installation(
+        db_session,
+        project_id=first.docverse_project_id,
+        installation_id=installation_id,
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert heads_route.call_count == 1
+    assert tags_route.call_count == 1
+    assert heads_route.calls.last.request.headers["authorization"] == (
+        "Bearer ghs_installed_later"
+    )
+
+
+@pytest.mark.asyncio
 async def test_proactive_ref_set_fetched_once_per_sync_project(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
@@ -8518,6 +8770,9 @@ async def test_proactive_ref_set_fetched_once_per_sync_project(
         binding_resolver=resolver,
         ref_set_fetcher=fetcher,
         tombstone_service=tombstone_service,
+        on_project_created=_record_installation_on_create(
+            db_session, mock_github
+        ),
     )
 
     result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
@@ -9153,7 +9408,11 @@ def _build_ref_aware_service(
     http_client: httpx.AsyncClient,
     mock_github: GitHubMock,
 ) -> KeeperSyncService:
-    """Build a service wired with the GitHub ref-fetch collaborators."""
+    """Build a service wired with the GitHub ref-fetch collaborators.
+
+    The project it creates gets an installation id at once (see
+    :func:`_record_installation_on_create`), so its ref set is read.
+    """
     resolver, fetcher, tombstone_service = _make_proactive_deps(
         session=db_session,
         http_client=http_client,
@@ -9167,6 +9426,9 @@ def _build_ref_aware_service(
         binding_resolver=resolver,
         ref_set_fetcher=fetcher,
         tombstone_service=tombstone_service,
+        on_project_created=_record_installation_on_create(
+            db_session, mock_github
+        ),
     )
 
 

@@ -414,8 +414,8 @@ Docverse stores it and decides, in order:
 
 Otherwise LTD's value stands. A ref that still exists is deliberate
 non-default tracking, a `null` column has nothing to follow, and a ref
-fetch that failed — or a project with no binding — is no evidence that
-the ref is gone. A `__main` still tracking LTD's ref after a failed
+fetch that failed — or a project with no binding, or no installation
+id (see below) — is no evidence that the ref is gone. A `__main` still tracking LTD's ref after a failed
 fetch keeps it for that visit, and the next visit with a live set
 converges it; a `__main` already on the default branch is not moved
 back by a failed fetch.
@@ -443,6 +443,26 @@ The live set is fetched at most once per visit and shared with the
 proactive lifecycle pass. A project with neither a `ref_deleted` nor a
 `draft_inactivity` rule pays for the fetch only when LTD's `main`
 differs from a known default branch.
+
+Sync-time live refs need the GitHub App installed on the repository:
+the set is read only with an installation token. A project without a
+`github_installation_id` skips the fetch before any GitHub request and
+visits as it would after a failed fetch — `ref_deleted` retires none of
+its drafts at import, and `__main` keeps LTD's ref unless another
+trigger already moved it onto the default branch. The skip is the
+debug line
+`Keeper sync: project has no GitHub App installation, live refs unavailable for this pass`,
+with `owner`, `repo`, `project`, and `project_id`; it does not log the
+warning
+`Keeper sync: GitHub ref fetch failed, live refs unavailable for this pass`,
+which stays for a project with an installation whose read fails. Once
+the App is installed, the project's resolve records its installation id
+— each audit pass enqueues it meanwhile (see
+[The id backfill](#the-id-backfill)) — and the next visit reads the set
+with the token, with nothing else to do. An older release read such a
+project anonymously instead, and once GitHub's unauthenticated limit of
+60 requests an hour, shared by every pod behind the cluster's NAT
+address, ran out, logged that warning on every visit.
 
 LTD's own view is kept: `annotations.ltd_tracked_refs` on the edition's
 `keeper_sync_state` row still records what LTD said. Which way a visit
@@ -489,7 +509,9 @@ installation's token.
   the sync carries on to the project's editions.
 - A repository the App is not installed on resolves `not_installed`: the
   ids stay `null` until an `installation` delivery records them, and
-  each audit pass enqueues the project's resolve again meanwhile.
+  each audit pass enqueues the project's resolve again meanwhile. Until
+  then its syncs skip the live ref set (see
+  [Keeper-synced projects](#keeper-synced-projects)).
 
 ## The keeper-sync push hot path
 
