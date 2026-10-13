@@ -1216,6 +1216,107 @@ async def test_project_github_resolve_known_default_branch_fetches_no_refs(
     await manager.aclose()
 
 
+_NO_INSTALLATION_MESSAGE = (
+    "Resolve: project has no GitHub App installation, skipping live ref fetch"
+)
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_first_learn_skips_a_tokenless_binding(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first learn never reads refs anonymously (PRD #817).
+
+    A ``PATCH`` rebind landing after the default-branch step's first
+    binding check, but before the live ref fetch resolves its auth,
+    clears the installation id the resolve just committed. The fetch
+    then sees the new binding without a token and skips it without a
+    GitHub request, rather than spending GitHub's unauthenticated budget
+    on a repository whose answer the write transaction would discard.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-tokenless-fetch",
+        stored_default_branch=None,
+        main_ref="main",
+        branch="master",
+        ids_stored=False,
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+    old_heads, old_tags = mock_github.seed_refs(
+        "acme", "templates", branches=["master"]
+    )
+    new_heads, new_tags = mock_github.seed_refs(
+        "acme", "moved", branches=["master"]
+    )
+
+    fetch_live_refs: Callable[..., Awaitable[frozenset[str] | None]] = (
+        _RESOLVE_MODULE._fetch_live_refs
+    )
+
+    async def rebind_then_fetch(**kwargs: Any) -> frozenset[str] | None:
+        async for session in db_session_dependency():
+            async with session.begin():
+                await ProjectService(
+                    store=ProjectStore(session=session, logger=_logger()),
+                    org_store=OrganizationStore(
+                        session=session, logger=_logger()
+                    ),
+                    edition_store=EditionStore(
+                        session=session, logger=_logger()
+                    ),
+                    logger=_logger(),
+                ).update(
+                    org_slug="pgr-tokenless-fetch",
+                    slug="pgr-proj",
+                    data=ProjectUpdate(
+                        github=ProjectGitHubBindingCreate(
+                            owner="acme", repo="moved"
+                        )
+                    ),
+                )
+        return await fetch_live_refs(**kwargs)
+
+    monkeypatch.setattr(_RESOLVE_MODULE, "_fetch_live_refs", rebind_then_fetch)
+
+    with capture_logs() as captured:
+        result = await _resolve_with(
+            mock_github=mock_github,
+            project_id=seeded.project_id,
+            events=events,
+            arq_queue=arq_queue,
+        )
+
+    assert result == "metadata_only"
+    assert (new_heads.call_count, new_tags.call_count) == (0, 0)
+    assert (old_heads.call_count, old_tags.call_count) == (0, 0)
+    assert await _fetch_project_default_branch(seeded.project_id) is None
+    [skip_log] = [
+        entry
+        for entry in captured
+        if entry["event"] == _NO_INSTALLATION_MESSAGE
+    ]
+    assert skip_log["log_level"] == "debug"
+    assert (skip_log["owner"], skip_log["repo"]) == ("acme", "moved")
+    messages = [entry["event"] for entry in captured]
+    assert _REF_FETCH_FAILED_MESSAGE not in messages
+    await manager.aclose()
+
+
 @pytest.mark.asyncio
 async def test_project_github_resolve_rebound_mid_resolve_records_nothing(
     app: None,

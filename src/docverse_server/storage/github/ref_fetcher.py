@@ -16,9 +16,10 @@ and keeper-sync's sync-time live-refs pre-fetch
 (``KeeperSyncService._fetch_live_refs``) both skip a project without
 an installation token before calling the fetcher, and
 ``project_github_resolve`` reads refs only after recording an
-installation id. An anonymous read draws on GitHub's unauthenticated
-budget of 60 requests an hour per source address, which every pod
-behind one Cloud NAT address shares.
+installation id, skipping the read if a rebind has cleared it since.
+An anonymous read draws on GitHub's unauthenticated budget of 60
+requests an hour per source address, which every pod behind one Cloud
+NAT address shares.
 """
 
 from __future__ import annotations

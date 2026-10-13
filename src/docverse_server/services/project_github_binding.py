@@ -103,10 +103,11 @@ class ProjectGitHubBindingResolver:
         """Resolve a project to its GitHub binding + auth record.
 
         Returns ``None`` for non-GitHub or missing projects;
-        otherwise returns a :class:`ResolvedProjectGitHubBinding`. The
-        anonymous-vs-installation auth choice is reflected on the
-        returned record's ``auth`` field, not on the return type, so
-        callers walk one ladder rather than two.
+        otherwise returns a :class:`ResolvedProjectGitHubBinding`. Its
+        ``auth`` field is ``None`` when no installation id is recorded,
+        and callers skip such a binding rather than read it anonymously
+        (PRD #817). Reporting that on the record, not the return type,
+        lets callers walk one ladder rather than two.
 
         The binding lookup is wrapped in this resolver's own short
         read transaction; the caller must therefore **not** wrap the

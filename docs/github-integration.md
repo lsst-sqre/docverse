@@ -178,9 +178,8 @@ creation does not wait on GitHub. Its resolve job then learns the real
 default branch, and since the column is still `null` it has no old
 default to offer as evidence. So a first learn — a new project, or one whose rebind cleared the
 column — also fetches the repository's live branches and tags, once,
-with the installation token for the ids the job has just recorded (or
-anonymously without an installation), and hands them to the rule as the
-audit does:
+with the installation token for the ids the job has just recorded, and
+hands them to the rule as the audit does:
 
 - On a `master` repository with no `main` branch, `__main`'s `main` is
   gone: the resolve rewrites `__main` to `master`, retires the `master`
@@ -195,6 +194,10 @@ audit does:
   records the branch without the live set, and completes: the ref set
   is extra evidence, not the job's purpose, so it neither retries nor
   fails. The next audit tick is the backstop.
+- The fetch is never anonymous. If a rebind clears the installation id
+  after the job records it but before the fetch, the job skips the
+  fetch without a GitHub request; the rebind's own resolve reads the
+  new binding.
 
 A resolve on a project whose column is already set spends nothing on
 the ref set; the column's previous value is its evidence. A project
