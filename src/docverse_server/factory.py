@@ -17,6 +17,7 @@ from safir.arq import ArqQueue
 from safir.github import GitHubAppClientFactory
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .domain.project import Project
 from .services.authorization import AuthorizationService
 from .services.build import BuildService
 from .services.cdn_purge_coalescer import CdnPurgeCoalescer
@@ -67,6 +68,9 @@ from .services.lock_service import LockService
 from .services.organization import OrganizationService
 from .services.project import ProjectService
 from .services.project_github_binding import ProjectGitHubBindingResolver
+from .services.project_github_resolve_enqueue import (
+    try_enqueue_project_github_resolve_by_id,
+)
 from .services.purgatory import PurgatoryService
 from .services.queue_dispatch import QueueDispatcher
 from .services.ref_deleted_processor import RefDeletedWebhookProcessor
@@ -1406,6 +1410,13 @@ class Factory:
         Also wires a :class:`DuplicateDraftRetirer`, so a visit that moves
         a synced ``__main`` onto the project's default branch retires the
         ``draft`` tracking that branch, as the default-branch rule does.
+
+        And wires ``on_project_created`` to enqueue
+        ``project_github_resolve`` for each project the sync creates, as
+        the REST create handler does (PRD #803), so a synced project
+        learns its GitHub ids and default branch without waiting on the
+        daily audit. The enqueue is best-effort and is skipped for a
+        project with no GitHub binding.
         """
         ltd_client = self.create_ltd_client(base_url=ltd_base_url)
 
@@ -1428,6 +1439,14 @@ class Factory:
                 return await copier.compute_manifest_hash(
                     source_prefix=source_prefix
                 )
+
+        async def on_project_created(project: Project) -> None:
+            await try_enqueue_project_github_resolve_by_id(
+                factory=self,
+                session=self._session,
+                logger=self._logger,
+                project_id=project.id,
+            )
 
         context = KeeperSyncContext(
             org_store=self.create_org_store(),
@@ -1468,6 +1487,7 @@ class Factory:
             copy_retry_delay_seconds=self._keeper_sync_copy_retry_delay_seconds,
             on_build_copied=on_build_copied,
             draft_retirer=self.create_duplicate_draft_retirer(),
+            on_project_created=on_project_created,
         )
 
 

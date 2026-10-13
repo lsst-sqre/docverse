@@ -203,6 +203,13 @@ A wave is three steps, in this order:
 2. **Save it** — `PATCH /orgs/{org}/keeper-sync`
 3. **Launch a backfill** — `POST /orgs/{org}/keeper-sync/runs`
 
+Each project a wave creates — by the backfill or by a tier cron — for an
+LTD product whose `doc_repo` is on github.com resolves its GitHub ids on
+creation: the sync enqueues one `project_github_resolve` once the
+project has committed, so the project gains its installation, owner and
+repository ids and its default branch within minutes. See
+[GitHub ids on creation](github-integration.md#github-ids-on-creation).
+
 ### Why preview first
 
 Because **saving a wider scope is not inert**. The tier crons act on
@@ -752,6 +759,9 @@ row:
 - [Keeper-sync time budget](keeper-sync-budget.md) — how a wave's
   largest products sync across a chain of sliced jobs, and what a job
   records when arq cancels it.
+- [GitHub integration](github-integration.md#keeper-synced-projects) —
+  how a synced project's `__main` follows its repository's default
+  branch, and how a project a sync creates resolves its GitHub ids.
 - `client/src/docverse/models/keeper_sync.py` — `KeeperSyncConfig`,
   where the scope rule and its validation are defined once,
   `KeeperSyncScopePreviewRequest` (the preview body, which is a
