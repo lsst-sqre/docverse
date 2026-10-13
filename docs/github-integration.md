@@ -266,7 +266,8 @@ and tags for the `ref_deleted` rule; it also reads
 `GET /repos/{owner}/{repo}` for `default_branch` and applies the rule
 with the live set as its evidence. The first tick after an upgrade:
 
-- fills the column on every bound project it can read, in every
+- fills the column on every bound project it can read — one with an
+  installation id (see **Auth** below) — in every
   organization the audit covers. Keeper-synced projects are included,
   and for one synced before keeper-sync enqueued a resolve on creation
   (see [GitHub ids on creation](#github-ids-on-creation)) the audit is
@@ -277,8 +278,9 @@ with the live set as its evidence. The first tick after an upgrade:
   that has no `main` branch. A project created since converges in its
   own resolve (see [A new project](#a-new-project)); the audit is the
   backstop for one whose resolve could not list its refs;
-- converges what the webhook cannot reach: repositories without the App
-  installed, and deliveries that were lost or failed.
+- converges what the webhook cannot reach: deliveries that were lost or
+  failed. A repository without the App installed gets neither, until the
+  App is installed on it.
 
 The audit runs only while `git_ref_audit_enabled` is on. The setting
 ships off, and Phalanx turns it on per environment with
@@ -287,14 +289,26 @@ as webhooks and resolves happen to arrive, and nothing heals a lost
 delivery.
 
 - **Auth.** A project with an installation id is read with that
-  installation's token. One without is read anonymously, which works for
-  a public repository — within GitHub's unauthenticated rate limit, 60
-  requests an hour per source address — and reports a private one as
-  not accessible. The id backfill records the installation id of every
-  project whose repository has the App installed, so from the pass
-  after its resolve such a project is read with the token. The audit
-  needs the three GitHub App settings even for anonymous projects:
-  without them an organization's pass fails outright.
+  installation's token. One without is skipped before any GitHub
+  request: the pass reads neither its refs nor its repository, so it
+  reaps none of the project's drafts and leaves its column as it is.
+  The skip is not a failure and does not turn the queue job
+  `completed_with_errors`. The summary line counts the organization's
+  skipped projects as `projects_skipped_no_installation`, and one more
+  line, `Git ref audit: skipped projects without a GitHub App installation`,
+  names up to ten of them (see [Reading an outcome](#reading-an-outcome)),
+  so its `org` is an organization that still needs the App. The id
+  backfill runs before the pass's reads: once the App is installed on
+  the repository, the project's resolve records its installation id,
+  and the next pass reads it with the token, with nothing else to do.
+  An older release read such a project anonymously instead, and its
+  symptom is a `GitHub refs fetch returned non-2xx` warning with
+  `status_code` 403 or 429 for project after project, because
+  anonymous reads share GitHub's unauthenticated limit of 60 requests an
+  hour per source address across every pod behind the cluster's NAT
+  address, which an organization with more than about 30 such projects
+  exhausts on every pass. The audit needs the three GitHub App
+  settings: without them an organization's pass fails outright.
 - **Failures.** A project whose ref set cannot be fetched is skipped for
   the pass. One whose ref set was fetched but whose `GET /repos` failed
   keeps its `ref_deleted` reaping and waits a day for its default
@@ -307,9 +321,9 @@ delivery.
   the pass's `ref_deleted` deletions. One organization-wide transaction
   would hold every earlier project's rows while waiting on a later
   project's `__main` lock.
-- **Cost.** One more GitHub request per bound project per day, plus
-  one `project_github_resolve` job per bound project still missing its
-  ids.
+- **Cost.** One more GitHub request per day per bound project with an
+  installation id, plus one `project_github_resolve` job per bound
+  project still missing its ids.
 
 There is no manual entrypoint for the audit. To converge one project
 without waiting for the next tick, `PATCH /orgs/{org}/projects/{project}`
@@ -344,7 +358,8 @@ is `null`:
 - **Not installed.** Where it is not, the resolve ends `not_installed`
   and the ids stay `null`, so every pass enqueues the project again, at
   the cost of one GitHub request, until the App is installed and its
-  `installation` delivery records them.
+  `installation` delivery records them. Meanwhile each pass skips the
+  project's reads (see **Auth** above).
 - **No cap.** A first pass after an upgrade can enqueue a job for nearly
   every project in an organization. The maintenance pool's concurrency
   bounds how many run at once, and the resolve's own retry and backoff
@@ -367,7 +382,10 @@ jobs it enqueued as `github_resolves_enqueued`. Once a first pass has
 recorded the ids it can, the count is mostly the organization's
 projects on repositories the App is not installed on, so a count that
 stays above zero pass after pass, on the line's `org`, names an
-organization that still needs the App. With
+organization that still needs the App. Its
+`projects_skipped_no_installation` says the same from the read side,
+and the `skipped projects without a GitHub App installation` line names
+up to ten of those projects. With
 `git_ref_audit_enabled` off, a project that missed its resolve keeps
 `null` ids until an `installation` delivery reaches it.
 
@@ -890,7 +908,8 @@ the line to count. The rule's other lines say why it did what it did.
 | `Resolve: GitHub ref fetch failed, recording default branch without live refs` | warning | `error`, `error_type` |
 | `Git ref audit: GitHub repository metadata fetch failed, skipping default branch for this pass` | warning | `owner`, `repo`, `installation_id`, `error`, `error_type` |
 | `Git ref audit: default branch convergence failed, skipping project for this pass` | warning | `error`, `error_type` |
-| `Git ref audit completed for org` | info | `had_failures`, `default_branch_updates`, `main_rewrites`, `default_branch_errors`, `github_resolves_enqueued` |
+| `Git ref audit: skipped projects without a GitHub App installation` | info | `org`, `count`, `examples` |
+| `Git ref audit completed for org` | info | `had_failures`, `default_branch_updates`, `main_rewrites`, `default_branch_errors`, `github_resolves_enqueued`, `projects_skipped_no_installation` |
 
 `drafts_retired` counts the drafts step 3 retired; `main_rewritten_from`
 is the ref `__main` tracked before, or null when it was left alone. The
@@ -907,7 +926,15 @@ the queue failed, the project counts toward the other two as well, and
 the job's row is left for the reapers' orphan sweep, as after any failed
 hand-off. `github_resolves_enqueued` counts the `project_github_resolve`
 jobs the pass's id backfill enqueued (see
-[The id backfill](#the-id-backfill)).
+[The id backfill](#the-id-backfill)), and
+`projects_skipped_no_installation` the bound projects the pass skipped
+unread because they have no installation id (see
+[The audit is the backfill](#the-audit-is-the-backfill)). When that
+count is not zero, the pass writes one more line before its summary,
+`Git ref audit: skipped projects without a GitHub App installation`,
+with the same number as `count` and up to ten of the projects' slugs,
+in slug order, as `examples`; no line above debug names a skipped
+project on its own.
 
 The resolve commits the numeric ids and then applies the branch in a
 second transaction, re-reading the binding in between. When a `PATCH`

@@ -1558,6 +1558,27 @@ def test_github_audit_backfill_covers_the_id_backfill() -> None:
     )
 
 
+def test_github_audit_backfill_covers_the_tokenless_skip() -> None:
+    """The backfill section says what the audit does without a token.
+
+    A project with no installation id is skipped unread (PRD #817), so
+    an operator looking for why its drafts are not reaped has to find
+    there the summary field that counts the skips and the line that
+    names them — both of which the audit actually logs.
+    """
+    section = _section(_read(_GITHUB_PAGE), "The audit is the backfill")
+    calls = _log_calls("docverse_server.worker.functions.git_ref_audit")
+    [summary] = calls["Git ref audit completed for org"]
+    skip_line = (
+        "Git ref audit: skipped projects without a GitHub App installation"
+    )
+    assert skip_line in calls
+    assert "projects_skipped_no_installation" in summary.fields
+    assert not _uncoded(
+        {"projects_skipped_no_installation", skip_line}, section
+    )
+
+
 def test_github_log_lines_exist_in_the_code() -> None:
     """Every row of the log table is a line the code writes, exactly.
 
