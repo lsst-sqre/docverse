@@ -21,6 +21,14 @@ updates:
       npm:
         patterns:
           - "*"
+    ignore:
+      # @cloudflare/vitest-pool-workers pins vitest as a ^4 peer dependency, so
+      # a vitest major inside the npm group makes `npm ci` fail on ERESOLVE and
+      # blocks every other bump in the group. Take vitest majors deliberately,
+      # once the pool package supports them.
+      - dependency-name: "vitest"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: "docker"
     directory: "/"
