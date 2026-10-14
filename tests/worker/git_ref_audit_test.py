@@ -2641,3 +2641,346 @@ async def test_git_ref_audit_reads_a_project_once_it_gains_an_installation(
         )
 
     assert skipped == [(1, 0, False), (0, 3, True)]
+
+
+_EMPTY_LINE = (
+    "Git ref audit: GitHub repository is empty, skipping project for this pass"
+)
+"""The per-project line naming a project skipped for an empty repository."""
+
+
+def _seed_empty_repository(router: respx.Router, *, repo: str) -> None:
+    """Answer ``acme/{repo}`` as GitHub answers a repository with no commits.
+
+    Its git-data ref endpoints answer ``409 Conflict`` ("Git Repository is
+    empty"), while ``GET /repos`` still answers 200 with a default branch
+    — seeded so that a pass which read it would be seen doing so.
+    """
+    _seed_refs(router, owner="acme", repo=repo, default_branch="main")
+    base = f"{GITHUB_API_BASE_URL}/repos/acme/{repo}/git/matching-refs"
+    for kind in ("heads", "tags"):
+        router.get(f"{base}/{kind}").mock(
+            return_value=httpx.Response(
+                409, json={"message": "Git Repository is empty."}
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_skips_an_empty_repository(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A repository with no commits is skipped quietly (PRD #821).
+
+    Its ref read answers 409, so the pass reads nothing more for it — not
+    its default branch — and leaves its draft on a vanished branch and
+    its default-branch column alone. One info line names the repository
+    and its installation; no warning is logged for it.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-empty")
+        project_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="empty",
+            owner="acme",
+            repo="empty",
+            installation_id=mock_github.seed_installation(
+                "acme", "empty", installation_id=91, owner_id=555
+            ),
+        )
+        draft_id = await _seed_draft_edition(
+            db_session,
+            project_id=project_id,
+            slug="gone-branch",
+            git_ref="tickets/DM-gone",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    _seed_empty_repository(mock_github.router, repo="empty")
+
+    with capture_logs() as captured:
+        await _run_audit(
+            mock_github=mock_github,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            queue_job_id=queue_job_id,
+        )
+
+    assert {
+        request.url.path for request in _repo_calls(mock_github, "empty")
+    } == {"/repos/acme/empty/git/matching-refs/heads"}
+    [empty_line] = [
+        entry for entry in captured if entry["event"] == _EMPTY_LINE
+    ]
+    assert empty_line["log_level"] == "info"
+    assert empty_line["owner"] == "acme"
+    assert empty_line["repo"] == "empty"
+    assert empty_line["installation_id"] == 91
+    assert empty_line["project"] == "empty"
+    assert not [entry for entry in captured if entry["log_level"] == "warning"]
+    assert await _load_edition(draft_id) is not None
+    assert (await _load_project(project_id)).github_default_branch is None
+
+
+async def _load_run_statuses(
+    *, queue_job_id: int, run_id: int
+) -> tuple[JobStatus, GitRefAuditRunStatus]:
+    """Return the pass's queue-job status and its parent run's status."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job_id
+            )
+            run = await GitRefAuditRunStore(
+                session=session, logger=_logger()
+            ).get(run_id)
+        assert qj is not None
+        assert run is not None
+        return qj.status, run.status
+    msg = "No database session available"
+    raise RuntimeError(msg)
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_empty_repository_skip_is_not_a_failure(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A pass whose only unread projects are empty or tokenless ends clean.
+
+    Neither skip is a failed read: the queue job ends ``completed`` and
+    the run ``succeeded``, and the summary line counts each kind of skip
+    on its own field.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-empty-ok")
+        await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="empty-ok",
+            owner="acme",
+            repo="empty-ok",
+            installation_id=mock_github.seed_installation(
+                "acme", "empty-ok", installation_id=92, owner_id=555
+            ),
+        )
+        await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="empty-ok-bare",
+            owner="acme",
+            repo="empty-ok-bare",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    _seed_empty_repository(mock_github.router, repo="empty-ok")
+
+    with capture_logs() as captured:
+        result = await _run_audit(
+            mock_github=mock_github,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            queue_job_id=queue_job_id,
+        )
+
+    assert result == "completed"
+    summary = _audit_summary(captured)
+    assert summary["had_failures"] is False
+    assert summary["projects_skipped_empty_repository"] == 1
+    assert summary["projects_skipped_no_installation"] == 1
+    assert await _load_run_statuses(
+        queue_job_id=queue_job_id, run_id=run_id
+    ) == (JobStatus.completed, GitRefAuditRunStatus.succeeded)
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_empty_repository_beside_a_failed_read(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A genuine fetch failure elsewhere still makes the pass a partial one.
+
+    The empty repository is skipped and counted; its neighbour's 500 is a
+    failed read, so the queue job ends ``completed_with_errors`` and the
+    run ``partial_failure``, as before.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-empty-500")
+        for repo, installation_id in (("empty-500", 93), ("flaky-500", 94)):
+            await _seed_github_project(
+                db_session,
+                org_id=org_id,
+                slug=repo,
+                owner="acme",
+                repo=repo,
+                installation_id=mock_github.seed_installation(
+                    "acme", repo, installation_id=installation_id, owner_id=555
+                ),
+            )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    _seed_empty_repository(mock_github.router, repo="empty-500")
+    _seed_refs_500(mock_github.router, owner="acme", repo="flaky-500")
+
+    with capture_logs() as captured:
+        result = await _run_audit(
+            mock_github=mock_github,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            queue_job_id=queue_job_id,
+        )
+
+    assert result == "completed_with_errors"
+    summary = _audit_summary(captured)
+    assert summary["had_failures"] is True
+    assert summary["projects_skipped_empty_repository"] == 1
+    assert await _load_run_statuses(
+        queue_job_id=queue_job_id, run_id=run_id
+    ) == (
+        JobStatus.completed_with_errors,
+        GitRefAuditRunStatus.partial_failure,
+    )
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_audits_the_neighbours_of_an_empty_repository(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """An empty repository changes nothing for the rest of its org.
+
+    The neighbouring project's draft on a vanished branch is reaped and
+    its ``NULL`` default branch filled, exactly as in a pass without the
+    empty repository.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-empty-mixed")
+        await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="empty-mixed",
+            owner="acme",
+            repo="empty-mixed",
+            installation_id=mock_github.seed_installation(
+                "acme", "empty-mixed", installation_id=95, owner_id=555
+            ),
+        )
+        healthy_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="healthy-mixed",
+            owner="acme",
+            repo="healthy-mixed",
+            installation_id=mock_github.seed_installation(
+                "acme", "healthy-mixed", installation_id=96, owner_id=555
+            ),
+        )
+        reaped_id = await _seed_draft_edition(
+            db_session,
+            project_id=healthy_id,
+            slug="gone-branch",
+            git_ref="tickets/DM-gone",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    _seed_empty_repository(mock_github.router, repo="empty-mixed")
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="healthy-mixed",
+        branches=["master"],
+        default_branch="master",
+    )
+
+    result = await _run_audit(
+        mock_github=mock_github,
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        queue_job_id=queue_job_id,
+    )
+
+    assert result == "completed"
+    assert await _load_edition(reaped_id) is None
+    assert (await _load_project(healthy_id)).github_default_branch == "master"
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_reads_an_empty_repository_after_its_first_commit(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """The pass after a repository's first push audits it as any other.
+
+    The first pass skips the empty repository. Once its ref endpoints
+    answer 200, the next pass reads it — reaping its draft on a vanished
+    branch and filling its default branch — with nothing else changed.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-empty-push")
+        project_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="empty-push",
+            owner="acme",
+            repo="empty-push",
+            installation_id=mock_github.seed_installation(
+                "acme", "empty-push", installation_id=97, owner_id=555
+            ),
+        )
+        draft_id = await _seed_draft_edition(
+            db_session,
+            project_id=project_id,
+            slug="gone-branch",
+            git_ref="tickets/DM-gone",
+        )
+    _seed_empty_repository(mock_github.router, repo="empty-push")
+
+    passes = []
+    for tick in range(2):
+        if tick == 1:
+            _seed_refs(
+                mock_github.router,
+                owner="acme",
+                repo="empty-push",
+                branches=["main"],
+            )
+        async with db_session.begin():
+            run_id, queue_job_id = await _seed_run_and_queue_job(
+                db_session, org_id=org_id, org_slug=org_slug
+            )
+        with capture_logs() as captured:
+            result = await _run_audit(
+                mock_github=mock_github,
+                org_id=org_id,
+                org_slug=org_slug,
+                run_id=run_id,
+                queue_job_id=queue_job_id,
+            )
+        passes.append(
+            (
+                result,
+                _audit_summary(captured)["projects_skipped_empty_repository"],
+                await _load_edition(draft_id) is None,
+                (await _load_project(project_id)).github_default_branch,
+            )
+        )
+
+    assert passes == [
+        ("completed", 1, False, None),
+        ("completed", 0, True, "main"),
+    ]

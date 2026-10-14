@@ -10,6 +10,22 @@ paginates :data:`GITHUB_API_BASE_URL`'s ``git/matching-refs/heads`` and
 mirrors :class:`GitHubTreeFetcher`'s no-mutation, per-request-auth
 contract and adds pagination handling the tree fetcher does not need.
 
+A read that yields no ref set ends in one of three typed errors, so each
+caller can tell a repository it cannot see from one that has nothing to
+read yet and from a read that failed:
+
+- :class:`RepositoryNotAccessibleError` — GitHub answered 404: the
+  repository was deleted, transferred out of the installation's scope,
+  or never selected for it.
+- :class:`EmptyRepositoryError` — a ref endpoint answered 409 ("Git
+  Repository is empty"): the repository exists but has no commits yet
+  (PRD #821). It is a state of the repository, not a failed read, so the
+  fetcher logs nothing for it and callers skip the project quietly until
+  its first push.
+- :class:`RepositoryRefFetchError` — anything else: a transport error,
+  a rate limit (403 / 429), a 5xx or other unexpected status, or a body
+  the fetcher cannot read.
+
 Anonymous reads (``auth=None``) remain supported here, but no
 production caller makes them (PRD #817): the ``git_ref_audit`` worker
 and keeper-sync's sync-time live-refs pre-fetch
@@ -33,6 +49,7 @@ import structlog
 from .app_client import GITHUB_API_BASE_URL, InstallationAuth
 
 __all__ = [
+    "EmptyRepositoryError",
     "GitHubRefSetFetcher",
     "RepositoryNotAccessibleError",
     "RepositoryRefFetchError",
@@ -96,14 +113,41 @@ class RepositoryNotAccessibleError(Exception):
         self.repo = repo
 
 
+class EmptyRepositoryError(Exception):
+    """GitHub returned 409 for the repository's ref endpoints.
+
+    GitHub answers ``409 Conflict`` ("Git Repository is empty") on the
+    git-data ref endpoints of a repository that has no commits yet, so
+    there is no ref set to read. The status alone decides; the body is
+    not parsed. Only the ref-set reads raise it:
+    :meth:`GitHubRefSetFetcher.fetch_default_branch` reads
+    ``GET /repos/{owner}/{repo}``, which answers 200 for an empty
+    repository, and keeps treating any 409 as a
+    :class:`RepositoryRefFetchError`.
+
+    Like the other two fetcher errors, deliberately a plain
+    ``Exception`` rather than a :class:`DocverseSlackException`: an
+    empty repository is expected, not a fault to page on, and the
+    fetcher logs nothing when it raises this. Callers skip the project
+    for the pass, and read it normally once the repository gains its
+    first commit.
+    """
+
+    def __init__(self, *, owner: str, repo: str) -> None:
+        super().__init__(f"GitHub repository {owner}/{repo} is empty")
+        self.owner = owner
+        self.repo = repo
+
+
 class RepositoryRefFetchError(Exception):
     """A GitHub ref fetch failed with a non-404 error.
 
     Covers transport errors (:class:`httpx.HTTPError`), rate-limit
     responses (403 / 429), 5xx, and any other unexpected status that
-    the fetcher cannot translate into a refset. The audit worker
-    catches this per-project, logs it with the owner / repo, and
-    continues to the next project so a single rate-limited
+    the fetcher cannot translate into a refset. An empty repository's
+    409 on a ref endpoint is :class:`EmptyRepositoryError` instead.
+    The audit worker catches this per-project, logs it with the owner /
+    repo, and continues to the next project so a single rate-limited
     installation does not block the audit for every other project.
     Like :class:`RepositoryNotAccessibleError` this is deliberately a
     plain ``Exception`` so individual transient failures do not
@@ -166,10 +210,11 @@ class GitHubRefSetFetcher:
     ) -> RepositoryRefSet:
         """Return the live branches and tags for ``owner/repo``.
 
-        Both endpoints paginate independently; an empty repo (no
-        branches, no tags) returns
+        Both endpoints paginate independently; a repository whose
+        endpoints answer with no branches and no tags returns
         ``RepositoryRefSet(frozenset(), frozenset())`` without
-        raising.
+        raising. A repository with no commits at all answers 409
+        instead, which raises :class:`EmptyRepositoryError`.
 
         Parameters
         ----------
@@ -192,6 +237,9 @@ class GitHubRefSetFetcher:
             out of the installation's scope, private and queried
             anonymously, or never matched by a "Only select
             repositories" install.
+        EmptyRepositoryError
+            Either endpoint returned 409: the repository has no commits
+            yet. Nothing is logged for it.
         RepositoryRefFetchError
             Any other failure (network error, 5xx, rate-limit 403/429,
             malformed JSON).
@@ -315,6 +363,7 @@ class GitHubRefSetFetcher:
                 subject="refs",
                 auth=auth,
                 logger=logger.bind(ref_kind=ref_kind),
+                empty_on_conflict=True,
             )
             if not isinstance(payload, list):
                 raise RepositoryRefFetchError(
@@ -355,6 +404,7 @@ class GitHubRefSetFetcher:
         subject: str,
         auth: InstallationAuth | None,
         logger: structlog.stdlib.BoundLogger,
+        empty_on_conflict: bool = False,
     ) -> tuple[httpx.Response, Any]:
         """Issue one GitHub ``GET`` and translate its failures.
 
@@ -364,6 +414,12 @@ class GitHubRefSetFetcher:
         any other non-200, or a body that is not JSON is
         :class:`RepositoryRefFetchError`. ``subject`` names what was
         fetched in the log lines and error messages.
+
+        ``empty_on_conflict`` is set by the ref-set pages only: there a
+        409 is GitHub's answer for a repository with no commits, raised
+        as :class:`EmptyRepositoryError` with no warning logged. The
+        repository read leaves it off, so a 409 there stays an
+        unexpected status.
 
         Returns the response, for its ``Link`` header, and its decoded
         JSON body, whose shape the caller checks.
@@ -391,6 +447,8 @@ class GitHubRefSetFetcher:
 
         if response.status_code == httpx.codes.NOT_FOUND:
             raise RepositoryNotAccessibleError(owner=owner, repo=repo)
+        if empty_on_conflict and response.status_code == httpx.codes.CONFLICT:
+            raise EmptyRepositoryError(owner=owner, repo=repo)
         if response.status_code != httpx.codes.OK:
             logger.warning(
                 f"GitHub {subject} fetch returned non-2xx",

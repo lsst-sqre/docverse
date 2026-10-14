@@ -15,6 +15,7 @@ from .changed_paths import (
     fetch_changed_paths_from_compare,
 )
 from .ref_fetcher import (
+    EmptyRepositoryError,
     GitHubRefSetFetcher,
     RepositoryNotAccessibleError,
     RepositoryRefFetchError,
@@ -26,6 +27,7 @@ from .web_url import build_github_browse_url
 
 __all__ = [
     "GITHUB_API_BASE_URL",
+    "EmptyRepositoryError",
     "FetchedTree",
     "FetchedTreeFile",
     "GitHubAppClient",

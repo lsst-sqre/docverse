@@ -6,9 +6,11 @@ import httpx
 import pytest
 import respx
 import structlog
+from structlog.testing import capture_logs
 
 from docverse_server.storage.github import (
     GITHUB_API_BASE_URL,
+    EmptyRepositoryError,
     GitHubRefSetFetcher,
     InstallationAuth,
     RepositoryNotAccessibleError,
@@ -289,6 +291,41 @@ async def test_anonymous_404_raises_repository_not_accessible(
 
 
 @pytest.mark.asyncio
+async def test_409_raises_empty_repository_without_a_warning(
+    mock_github: GitHubMock,
+) -> None:
+    """A ref-endpoint 409 is ``EmptyRepositoryError``, with no warning.
+
+    GitHub answers ``409 Conflict`` ("Git Repository is empty") on the
+    git-data ref endpoints of a repository with no commits yet. That is
+    a state of the repository, not a failed read, so the fetcher raises
+    its own typed error and writes no ``non-2xx`` warning for it.
+    """
+    for url in (_heads_url("acme", "empty"), _tags_url("acme", "empty")):
+        mock_github.router.get(url).mock(
+            return_value=httpx.Response(
+                409, json={"message": "Git Repository is empty."}
+            )
+        )
+
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubRefSetFetcher(http_client=http_client)
+        with (
+            capture_logs() as captured,
+            pytest.raises(EmptyRepositoryError) as exc_info,
+        ):
+            await fetcher.fetch(
+                owner="acme",
+                repo="empty",
+                auth=InstallationAuth(token="ghs_test", installation_id=42),
+                logger=_logger(),
+            )
+
+    assert (exc_info.value.owner, exc_info.value.repo) == ("acme", "empty")
+    assert not [entry for entry in captured if entry["log_level"] == "warning"]
+
+
+@pytest.mark.asyncio
 async def test_5xx_raises_repository_ref_fetch_error(
     mock_github: GitHubMock,
 ) -> None:
@@ -551,4 +588,29 @@ async def test_fetch_default_branch_network_error_raises_ref_fetch_error(
         with pytest.raises(RepositoryRefFetchError):
             await fetcher.fetch_default_branch(
                 owner="acme", repo="docs", logger=_logger()
+            )
+
+
+@pytest.mark.asyncio
+async def test_fetch_default_branch_409_stays_a_ref_fetch_error(
+    mock_github: GitHubMock,
+) -> None:
+    """Only the ref-set reads treat 409 as an empty repository.
+
+    ``GET /repos`` answers 200 for an empty repository, so a 409 there is
+    an unexpected status like any other: ``RepositoryRefFetchError``,
+    never the ``EmptyRepositoryError`` a caller would skip quietly.
+    """
+    mock_github.router.get(_repo_url("acme", "docs")).mock(
+        return_value=httpx.Response(409, json={"message": "Conflict"})
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        fetcher = GitHubRefSetFetcher(http_client=http_client)
+        with pytest.raises(RepositoryRefFetchError):
+            await fetcher.fetch_default_branch(
+                owner="acme",
+                repo="docs",
+                auth=InstallationAuth(token="ghs_test", installation_id=42),
+                logger=_logger(),
             )
