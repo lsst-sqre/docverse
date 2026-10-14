@@ -34,6 +34,14 @@ without a GitHub App installation`` line, and reads the project from the
 first pass after its installation id is recorded — the id backfill
 enqueues its resolve ahead of every pass's reads.
 
+A project whose repository has no commits yet is skipped the same way
+(PRD #821): GitHub answers its ref endpoints with ``409``, which the
+fetcher raises as :class:`EmptyRepositoryError`, and the pass reads
+nothing more for it. The skip is not a failure either: the pass names
+the repository on one info line, counts it on its summary line as
+``projects_skipped_empty_repository``, and reads it normally from the
+first pass after its first push.
+
 A per-project fetch failure — of the ref set or of the default branch —
 is caught, logged with org/project/error, and the per-org pass
 continues with the next project — one
@@ -95,6 +103,7 @@ from docverse_server.services.project_github_resolve_enqueue import (
     try_enqueue_project_github_resolve_by_id,
 )
 from docverse_server.storage.github import (
+    EmptyRepositoryError,
     RepositoryNotAccessibleError,
     RepositoryRefFetchError,
     RepositoryRefSet,
@@ -134,6 +143,9 @@ class _AuditSummary:
     projects_skipped_no_installation: int = 0
     """Bound projects skipped unread for want of an installation id."""
 
+    projects_skipped_empty_repository: int = 0
+    """Bound projects skipped because their repository has no commits."""
+
 
 @dataclass(slots=True)
 class _ConvergenceTally:
@@ -157,6 +169,9 @@ class _ProjectFetches:
     default_branches: dict[int, str] = field(default_factory=dict)
     skipped_no_installation: list[int] = field(default_factory=list)
     """Projects skipped unread because they have no installation id."""
+
+    skipped_empty_repository: list[int] = field(default_factory=list)
+    """Projects skipped because their repository has no commits yet."""
 
     had_failures: bool = False
 
@@ -274,6 +289,9 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 github_resolves_enqueued=summary.github_resolves_enqueued,
                 projects_skipped_no_installation=(
                     summary.projects_skipped_no_installation
+                ),
+                projects_skipped_empty_repository=(
+                    summary.projects_skipped_empty_repository
                 ),
             )
             # Publish one lifecycle_action per reaped edition after the
@@ -393,6 +411,9 @@ async def _audit_org(
         default_branch_errors=tally.default_branch_errors,
         github_resolves_enqueued=resolves_enqueued,
         projects_skipped_no_installation=len(fetches.skipped_no_installation),
+        projects_skipped_empty_repository=len(
+            fetches.skipped_empty_repository
+        ),
     )
     refs_by_project = fetches.refs_by_project
 
@@ -480,11 +501,15 @@ async def _fetch_per_project(
     **not** flip ``had_failures``. Nor does a binding without an
     installation token (PRD #817): the project is skipped before any
     GitHub call, rather than read anonymously, and its id is collected
-    on ``skipped_no_installation`` for the org's summary. A 404 from
-    GitHub or a transport error on the ref set skips the project for
-    this pass and flips ``had_failures`` so the per-org queue-job row
-    transitions to ``completed_with_errors`` and the parent run rolls to
-    ``partial_failure``.
+    on ``skipped_no_installation`` for the org's summary. Nor does an
+    empty repository (PRD #821): a ``409`` on the ref set
+    (:class:`EmptyRepositoryError`) skips the project before its default
+    branch is read, logs one info line naming it, and collects its id on
+    ``skipped_empty_repository``. A 404 from GitHub, or any other failure
+    of the ref-set read — a transport error, a rate limit, a 5xx —
+    skips the project for this pass and flips ``had_failures`` so the
+    per-org queue-job row transitions to ``completed_with_errors`` and
+    the parent run rolls to ``partial_failure``.
 
     The default branch is read after the ref set, with the same
     installation token (PRD #721). A failure there flips
@@ -536,6 +561,19 @@ async def _fetch_per_project(
                 installation_id=binding.installation_id,
             )
             fetches.had_failures = True
+            continue
+        except EmptyRepositoryError as exc:
+            # Caught ahead of the generic fetch error: a repository with
+            # no commits has nothing to audit yet, which is not a failed
+            # read. Its next pass reads it again (PRD #821).
+            project_logger.info(
+                "Git ref audit: GitHub repository is empty, skipping "
+                "project for this pass",
+                owner=exc.owner,
+                repo=exc.repo,
+                installation_id=binding.installation_id,
+            )
+            fetches.skipped_empty_repository.append(project.id)
             continue
         except RepositoryRefFetchError as exc:
             project_logger.warning(

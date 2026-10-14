@@ -1579,6 +1579,29 @@ def test_github_audit_backfill_covers_the_tokenless_skip() -> None:
     )
 
 
+def test_github_log_table_covers_the_empty_repository_skip() -> None:
+    """The log table names the audit's empty-repository skip (PRD #821).
+
+    A project whose repository has no commits is skipped, not failed, so
+    an operator reading why it was not reaped has to find in the table
+    the info line the audit writes for it and the summary field that
+    counts it — both of which the audit actually logs.
+    """
+    documented = _documented_log_lines(_read(_GITHUB_PAGE))
+    calls = _log_calls("docverse_server.worker.functions.git_ref_audit")
+    empty_line = (
+        "Git ref audit: GitHub repository is empty, skipping project for "
+        "this pass"
+    )
+    [summary] = calls["Git ref audit completed for org"]
+    assert documented[empty_line] in calls[empty_line]
+    assert "projects_skipped_empty_repository" in summary.fields
+    assert (
+        "projects_skipped_empty_repository"
+        in documented["Git ref audit completed for org"].fields
+    )
+
+
 def test_github_log_lines_exist_in_the_code() -> None:
     """Every row of the log table is a line the code writes, exactly.
 

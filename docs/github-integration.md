@@ -933,8 +933,9 @@ the line to count. The rule's other lines say why it did what it did.
 | `Resolve: GitHub ref fetch failed, recording default branch without live refs` | warning | `error`, `error_type` |
 | `Git ref audit: GitHub repository metadata fetch failed, skipping default branch for this pass` | warning | `owner`, `repo`, `installation_id`, `error`, `error_type` |
 | `Git ref audit: default branch convergence failed, skipping project for this pass` | warning | `error`, `error_type` |
+| `Git ref audit: GitHub repository is empty, skipping project for this pass` | info | `owner`, `repo`, `installation_id` |
 | `Git ref audit: skipped projects without a GitHub App installation` | info | `org`, `count`, `examples` |
-| `Git ref audit completed for org` | info | `had_failures`, `default_branch_updates`, `main_rewrites`, `default_branch_errors`, `github_resolves_enqueued`, `projects_skipped_no_installation` |
+| `Git ref audit completed for org` | info | `had_failures`, `default_branch_updates`, `main_rewrites`, `default_branch_errors`, `github_resolves_enqueued`, `projects_skipped_no_installation`, `projects_skipped_empty_repository` |
 
 `drafts_retired` counts the drafts step 3 retired; `main_rewritten_from`
 is the ref `__main` tracked before, or null when it was left alone. The
@@ -958,8 +959,19 @@ unread because they have no installation id (see
 count is not zero, the pass writes one more line before its summary,
 `Git ref audit: skipped projects without a GitHub App installation`,
 with the same number as `count` and up to ten of the projects' slugs,
-in slug order, as `examples`; no line above debug names a skipped
+in slug order, as `examples`; no line above debug names a tokenless
 project on its own.
+
+`projects_skipped_empty_repository` counts the bound projects the pass
+skipped because their repository has no commits yet: GitHub answers its
+ref endpoints with `409`, so the pass reads neither its refs nor its
+default branch. Empty repositories are rare, so each one gets its own
+info line,
+`Git ref audit: GitHub repository is empty, skipping project for this pass`,
+with `project` and `project_id`, and there is no per-organization line
+for them. Like the tokenless skip, it is not a
+failure: it does not set `had_failures` or turn the queue job
+`completed_with_errors`.
 
 The resolve commits the numeric ids and then applies the branch in a
 second transaction, re-reading the binding in between. When a `PATCH`
