@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 
 import httpx
 import pytest
+import respx
 import sentry_sdk
 import structlog
 from arq import Retry
@@ -49,6 +50,7 @@ from docverse_server.services.default_branch import DefaultBranchOutcome
 from docverse_server.services.project import ProjectService
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.github import EmptyRepositoryError
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.worker.functions._cancellation import (
@@ -1173,6 +1175,123 @@ async def test_project_github_resolve_first_learn_ref_fetch_failure(
     assert warning["log_level"] == "warning"
     assert captured_exceptions == []
     await manager.aclose()
+
+
+_EMPTY_REPOSITORY_MESSAGE = (
+    "Resolve: GitHub repository is empty, recording default branch without "
+    "live refs"
+)
+
+
+def _empty_repository(mock_github: GitHubMock) -> respx.Route:
+    """Answer the ref endpoints as for a repository without commits.
+
+    GitHub's ``409 Conflict`` ("Git Repository is empty", PRD #821).
+    Returns the heads route, the one the fetcher reads first.
+    """
+    heads, _tags = (
+        mock_github.router.get(
+            "https://api.github.com/repos/acme/templates/git/matching-refs/"
+            f"{ref_kind}"
+        ).mock(
+            return_value=httpx.Response(
+                409, json={"message": "Git Repository is empty."}
+            )
+        )
+        for ref_kind in ("heads", "tags")
+    )
+    return heads
+
+
+@pytest.mark.asyncio
+async def test_project_github_resolve_first_learn_empty_repository(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first learn on a repository without commits records it quietly.
+
+    ``GET /repos`` answers an empty repository with its default branch,
+    but the ref endpoints answer 409 (PRD #821). The resolve records the
+    ids and the branch without live refs, as after a failed fetch, and
+    leaves ``__main`` alone — but logs one info line rather than a
+    warning, because an empty repository is not a failed read.
+    """
+    manager, events = await build_event_manager(Configuration())
+    arq_queue = MockArqQueue(default_queue_name=Configuration().arq_queue_name)
+    seeded = await _seed_converging_project(
+        db_session,
+        org_slug="pgr-empty-repo",
+        stored_default_branch=None,
+        main_ref="main",
+        branch="master",
+        ids_stored=False,
+    )
+    mock_github.seed_installation(
+        "acme", "templates", installation_id=42, owner_id=111
+    )
+    mock_github.seed_repo(
+        "acme",
+        "templates",
+        repo_id=12345,
+        owner_id=111,
+        default_branch="master",
+    )
+    heads = _empty_repository(mock_github)
+    captured_exceptions: list[BaseException] = []
+    monkeypatch.setattr(
+        sentry_sdk, "capture_exception", captured_exceptions.append
+    )
+
+    with capture_logs() as captured:
+        result = await _resolve_with(
+            mock_github=mock_github,
+            project_id=seeded.project_id,
+            events=events,
+            arq_queue=arq_queue,
+        )
+
+    assert result == "completed"
+    assert heads.call_count == 1
+    assert await _fetch_project_github_ids(seeded.project_id) == (
+        "acme",
+        "templates",
+        111,
+        12345,
+        42,
+    )
+    assert await _fetch_project_default_branch(seeded.project_id) == "master"
+    main = await _load_edition(seeded.main_id)
+    assert main is not None
+    assert main.tracking_params == {"git_ref": "main"}
+    assert main.current_build_id is None
+    assert await _load_edition(seeded.draft_id) is not None
+    assert count_jobs_by_name(arq_queue, "publish_edition") == 0
+    assert count_jobs_by_name(arq_queue, "dashboard_build") == 0
+    [skip_log] = [
+        entry
+        for entry in captured
+        if entry["event"] == _EMPTY_REPOSITORY_MESSAGE
+    ]
+    assert skip_log["log_level"] == "info"
+    assert (skip_log["owner"], skip_log["repo"]) == ("acme", "templates")
+    assert not [entry for entry in captured if entry["log_level"] == "warning"]
+    assert captured_exceptions == []
+    await manager.aclose()
+
+
+def test_live_ref_fetch_errors_leave_out_the_empty_repository() -> None:
+    """An empty repository is not one of the fetch failures (PRD #821).
+
+    ``_fetch_live_refs`` catches :class:`EmptyRepositoryError` ahead of
+    ``_LIVE_REF_FETCH_ERRORS`` to log it at info; were it (or a base of
+    it) in the tuple, reordering the two handlers would silently turn
+    the skip back into the failed-fetch warning.
+    """
+    assert not issubclass(
+        EmptyRepositoryError, _RESOLVE_MODULE._LIVE_REF_FETCH_ERRORS
+    )
 
 
 @pytest.mark.asyncio

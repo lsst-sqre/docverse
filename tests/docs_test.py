@@ -1602,6 +1602,64 @@ def test_github_log_table_covers_the_empty_repository_skip() -> None:
     )
 
 
+def test_github_audit_backfill_covers_the_empty_repository_skip() -> None:
+    """The backfill section says an empty repository is skipped, not failed.
+
+    A repository with no commits answers its ref endpoints with ``409``
+    (PRD #821), so an operator looking for why a project was not audited
+    has to find there the status and the summary field that counts the
+    skip — the field the audit's summary line actually logs.
+    """
+    section = _section(_read(_GITHUB_PAGE), "The audit is the backfill")
+    [summary] = _log_calls("docverse_server.worker.functions.git_ref_audit")[
+        "Git ref audit completed for org"
+    ]
+    assert "projects_skipped_empty_repository" in summary.fields
+    assert not _uncoded({"409", "projects_skipped_empty_repository"}, section)
+
+
+def test_github_keeper_sync_section_covers_the_empty_repository_skip() -> None:
+    """The keeper-sync section names the empty-repository debug line.
+
+    A sync of a project whose repository has no commits yet visits as
+    after a failed fetch but writes a debug line instead of the warning
+    (PRD #821), so the section has to quote that line, which the service
+    actually logs at debug.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Keeper-synced projects")
+    calls = _log_calls(_KEEPER_SYNC_SERVICE_MODULE)
+    empty_line = (
+        "Keeper sync: GitHub repository is empty, live refs unavailable for"
+        " this pass"
+    )
+    assert [call.level for call in calls[empty_line]] == ["debug"]
+    assert not _uncoded({"409", empty_line}, section)
+
+
+def test_github_new_project_covers_the_empty_repository_fetch() -> None:
+    """The new-project section and the log table name the resolve's skip.
+
+    A first learn on a repository without commits records the branch
+    without live refs and logs an info line rather than the failed-fetch
+    warning (PRD #821); the section has to quote that line and the log
+    table has to list it as the resolve writes it.
+    """
+    page = _read(_GITHUB_PAGE)
+    section = _subsection(
+        _section(page, "The default branch"), "A new project"
+    )
+    calls = _log_calls(
+        "docverse_server.worker.functions.project_github_resolve"
+    )
+    empty_line = (
+        "Resolve: GitHub repository is empty, recording default branch"
+        " without live refs"
+    )
+    assert _documented_log_lines(page)[empty_line] in calls[empty_line]
+    assert [call.level for call in calls[empty_line]] == ["info"]
+    assert not _uncoded({"409", empty_line}, section)
+
+
 def test_github_log_lines_exist_in_the_code() -> None:
     """Every row of the log table is a line the code writes, exactly.
 

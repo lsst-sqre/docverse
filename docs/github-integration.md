@@ -194,6 +194,12 @@ hands them to the rule as the audit does:
   records the branch without the live set, and completes: the ref set
   is extra evidence, not the job's purpose, so it neither retries nor
   fails. The next audit tick is the backstop.
+- A repository with no commits yet has a default branch but no refs,
+  and GitHub answers the ref fetch with `409`. The job goes as after a
+  failed fetch, but logs
+  `Resolve: GitHub repository is empty, recording default branch without live refs`
+  at info instead of the warning: an empty repository is not a failed
+  read.
 - The fetch is never anonymous. If a rebind clears the installation id
   after the job records it but before the fetch, the job skips the
   fetch without a GitHub request; the rebind's own resolve reads the
@@ -312,6 +318,12 @@ delivery.
   address, which an organization with more than about 30 such projects
   exhausts on every pass. The audit needs the three GitHub App
   settings: without them an organization's pass fails outright.
+- **Empty repositories.** A project whose repository has no commits
+  yet, which GitHub's ref endpoints answer with `409`, is skipped
+  rather than failed — it counts toward
+  `projects_skipped_empty_repository`, not toward
+  `completed_with_errors` — until it gains its first commit, after
+  which the next pass reads it with no other change.
 - **Failures.** A project whose ref set cannot be fetched is skipped for
   the pass. One whose ref set was fetched but whose `GET /repos` failed
   keeps its `ref_deleted` reaping and waits a day for its default
@@ -466,6 +478,14 @@ with the token, with nothing else to do. An older release read such a
 project anonymously instead, and once GitHub's unauthenticated limit of
 60 requests an hour, shared by every pod behind the cluster's NAT
 address, ran out, logged that warning on every visit.
+
+A project whose repository has no commits yet visits the same way: GitHub
+answers its ref endpoints with `409`, so there is no live set to read.
+That is not a failed read either, so the visit logs the debug line
+`Keeper sync: GitHub repository is empty, live refs unavailable for this pass`,
+with `owner`, `repo`, `installation_id`, `project`, and `project_id`,
+in place of the warning. The first visit after the repository's first
+push reads the set, with nothing else to do.
 
 LTD's own view is kept: `annotations.ltd_tracked_refs` on the edition's
 `keeper_sync_state` row still records what LTD said. Which way a visit
@@ -931,6 +951,7 @@ the line to count. The rule's other lines say why it did what it did.
 | `Resolved project GitHub metadata` | info | `github_installation_id`, `github_owner_id`, `github_repo_id`, `github_default_branch`, `default_branch_changed`, `main_rewritten` |
 | `Recorded GitHub ids but skipped default branch: project rebound or deleted after the ids were committed` | info | `github_installation_id`, `github_owner_id`, `github_repo_id`, `github_default_branch` |
 | `Resolve: GitHub ref fetch failed, recording default branch without live refs` | warning | `error`, `error_type` |
+| `Resolve: GitHub repository is empty, recording default branch without live refs` | info | `owner`, `repo` |
 | `Git ref audit: GitHub repository metadata fetch failed, skipping default branch for this pass` | warning | `owner`, `repo`, `installation_id`, `error`, `error_type` |
 | `Git ref audit: default branch convergence failed, skipping project for this pass` | warning | `error`, `error_type` |
 | `Git ref audit: GitHub repository is empty, skipping project for this pass` | info | `owner`, `repo`, `installation_id` |

@@ -8620,6 +8620,128 @@ async def test_proactive_no_installation_skips_fetch_and_syncs(
     assert draft_state.date_tombstoned is None
 
 
+_EMPTY_REPOSITORY_MESSAGE = (
+    "Keeper sync: GitHub repository is empty, live refs unavailable for"
+    " this pass"
+)
+"""The debug line ``_fetch_live_refs`` logs for an empty repository."""
+
+
+def _seed_empty_github_repository(router: respx.Router) -> respx.Route:
+    """Answer the ``pipelines`` repository's ref endpoints with 409.
+
+    GitHub's answer on the git-data ref endpoints of a repository that
+    has no commits yet ("Git Repository is empty", PRD #821). Returns the
+    heads route, the one the fetcher reads first.
+    """
+    routes = [
+        router.get(
+            f"{GITHUB_API_BASE_URL}/repos/{_LSST_OWNER}/{_LSST_REPO}"
+            f"/git/matching-refs/{ref_kind}"
+        ).mock(
+            return_value=httpx.Response(
+                409, json={"message": "Git Repository is empty."}
+            )
+        )
+        for ref_kind in ("heads", "tags")
+    ]
+    return routes[0]
+
+
+@pytest.mark.asyncio
+async def test_proactive_empty_repository_skips_quietly_and_syncs(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A repository without commits leaves live refs unknown, quietly.
+
+    GitHub answers the ref endpoints of a repository that has no commits
+    yet with 409 (PRD #821). The visit goes exactly as after a failed
+    fetch — ``ref_deleted`` stays inert and the draft tracking a ref
+    GitHub does not list syncs — but the skip is one debug line, not a
+    warning: an empty repository is a state of the repository, not a
+    failed read.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(
+            db_session,
+            slug="ks-proactive-empty-repo",
+            lifecycle_rules=LifecycleRuleSet(root=[RefDeletedRule()]),
+        )
+
+    draft_payload = _load("edition_branch_git_refs.json")
+    draft_payload["tracked_refs"] = ["tickets/DM-deleted"]
+    _seed_two_editions_main_and_draft(
+        mock_discovery, draft_payload=draft_payload
+    )
+    heads_route = _seed_empty_github_repository(mock_github.router)
+
+    resolver, fetcher, tombstone_service = _make_proactive_deps(
+        session=db_session,
+        http_client=http_client,
+        mock_github=mock_github,
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {
+            "pipelines/builds/42/index.html": b"<html>main</html>",
+            "pipelines/builds/43/index.html": b"<html>draft</html>",
+        },
+        binding_resolver=resolver,
+        ref_set_fetcher=fetcher,
+        tombstone_service=tombstone_service,
+        on_project_created=_record_installation_on_create(
+            db_session, mock_github
+        ),
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        result = await service.sync_project(
+            org_id=org_id, ltd_slug="pipelines"
+        )
+
+    assert heads_route.call_count == 1
+    assert len(result.edition_outcomes) == 2
+    skips = [log for log in logs if log["event"] == _EMPTY_REPOSITORY_MESSAGE]
+    assert [
+        (
+            log["log_level"],
+            log["owner"],
+            log["repo"],
+            log["installation_id"],
+            log["project_id"],
+            log["project"],
+        )
+        for log in skips
+    ] == [
+        (
+            "debug",
+            _LSST_OWNER,
+            _LSST_REPO,
+            mock_github.default_installation_id,
+            result.docverse_project_id,
+            "pipelines",
+        )
+    ]
+    assert not [log for log in logs if log["log_level"] == "warning"]
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        draft_state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            include_tombstoned=True,
+        )
+    assert draft_state is not None
+    assert draft_state.date_tombstoned is None
+
+
 @pytest.mark.asyncio
 async def test_proactive_fetch_resumes_once_the_installation_is_recorded(
     db_session: AsyncSession,
@@ -9487,6 +9609,40 @@ async def test_sync_project_converges_main_with_one_ref_fetch(
     assert main.tracking_params == {"git_ref": "main"}
     assert heads_route.call_count - heads_before == 1
     assert tags_route.call_count - tags_before == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_project_keeps_ltd_main_tracking_on_an_empty_repository(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A 409 from the ref endpoints is no evidence LTD's ref is gone.
+
+    ``GET /repos`` reports a default branch even for a repository with
+    no commits yet, so the column can say ``main`` while LTD's ``main``
+    edition tracks ``master``. The ref endpoints answer 409 (PRD #821),
+    so the visit has no live ref set and ``__main`` keeps LTD's
+    ``master``, exactly as after a failed fetch.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-default-branch-empty")
+    _seed_ltd_main_tracking_master(mock_discovery)
+    heads_route = _seed_empty_github_repository(mock_github.router)
+    service = _build_ref_aware_service(
+        db_session=db_session, http_client=http_client, mock_github=mock_github
+    )
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    project = await _learn_default_branch(
+        db_session, org_id=org_id, value="main"
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert heads_route.call_count == 1
+    main = await _read_main_edition(db_session, project_id=project.id)
+    assert main.tracking_params == {"git_ref": "master"}
 
 
 @pytest.mark.asyncio
