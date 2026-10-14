@@ -1558,6 +1558,27 @@ def test_github_audit_backfill_covers_the_id_backfill() -> None:
     )
 
 
+def test_github_audit_backfill_covers_the_tokenless_skip() -> None:
+    """The backfill section says what the audit does without a token.
+
+    A project with no installation id is skipped unread (PRD #817), so
+    an operator looking for why its drafts are not reaped has to find
+    there the summary field that counts the skips and the line that
+    names them — both of which the audit actually logs.
+    """
+    section = _section(_read(_GITHUB_PAGE), "The audit is the backfill")
+    calls = _log_calls("docverse_server.worker.functions.git_ref_audit")
+    [summary] = calls["Git ref audit completed for org"]
+    skip_line = (
+        "Git ref audit: skipped projects without a GitHub App installation"
+    )
+    assert skip_line in calls
+    assert "projects_skipped_no_installation" in summary.fields
+    assert not _uncoded(
+        {"projects_skipped_no_installation", skip_line}, section
+    )
+
+
 def test_github_log_lines_exist_in_the_code() -> None:
     """Every row of the log table is a line the code writes, exactly.
 
@@ -1631,6 +1652,31 @@ def test_github_keeper_sync_section_names_the_tracking_log() -> None:
     assert f"`{_KEEPER_SYNC_TRACKING_MESSAGE}`" in section
     sources = {source.value for source in TrackingDerivationSource}
     assert not _uncoded(fields | sources, section)
+
+
+def test_github_keeper_sync_section_covers_the_tokenless_skip() -> None:
+    """The keeper-sync section says sync-time live refs need the App.
+
+    A project without an installation id is not read (PRD #817), so the
+    section has to name the column that decides it, the debug line a
+    skipped visit writes, and the warning it no longer writes — both
+    lines the service actually logs, at those levels.
+    """
+    section = _section(_read(_GITHUB_PAGE), "Keeper-synced projects")
+    calls = _log_calls(_KEEPER_SYNC_SERVICE_MODULE)
+    skip_line = (
+        "Keeper sync: project has no GitHub App installation, live refs"
+        " unavailable for this pass"
+    )
+    failed_line = (
+        "Keeper sync: GitHub ref fetch failed, live refs unavailable for"
+        " this pass"
+    )
+    assert [call.level for call in calls[skip_line]] == ["debug"]
+    assert [call.level for call in calls[failed_line]] == ["warning"]
+    assert not _uncoded(
+        {"github_installation_id", skip_line, failed_line}, section
+    )
 
 
 def test_github_manual_fallback_documented() -> None:

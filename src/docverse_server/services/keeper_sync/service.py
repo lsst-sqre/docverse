@@ -1637,7 +1637,9 @@ class KeeperSyncService:
         ``RepositoryRefFetchError`` is caught, logged, and downgrades
         the pass — ``ref_deleted`` cannot match without ``live_refs``,
         so those projects fall through to KEEP and the regular
-        ``git_ref_audit`` cron catches up on its own schedule.
+        ``git_ref_audit`` cron catches up on its own schedule. A project
+        without an installation token is downgraded the same way, but
+        without a GitHub request (see :meth:`_fetch_live_refs`).
         """
         if (
             self._tombstone_service is None
@@ -1784,6 +1786,16 @@ class KeeperSyncService:
         not read ``live_refs``, and ``__main`` keeps LTD's tracked ref
         because a missing set is no evidence that ref is gone.
 
+        A binding without an installation token (no
+        ``github_installation_id`` recorded yet) also returns ``None``,
+        before any GitHub request and with only a debug line (PRD #817).
+        Reading it anonymously would draw on GitHub's unauthenticated
+        budget of 60 requests an hour per source address, which every
+        pod behind the same Cloud NAT address shares, and fail as a
+        403/429 warning once that budget is spent. The project's ref set
+        is read from the first sync after its resolve records an
+        installation id, as ``git_ref_audit`` does.
+
         ``ProjectGitHubBindingResolver.resolve`` owns its own short
         read transaction and mints the GitHub installation token
         *after* that transaction has closed; the caller must therefore
@@ -1799,6 +1811,16 @@ class KeeperSyncService:
             raise KeeperSyncInvariantError(msg)
         binding = await self._binding_resolver.resolve(project.id)
         if binding is None:
+            return None
+        if binding.auth is None:
+            self._logger.debug(
+                "Keeper sync: project has no GitHub App installation, live"
+                " refs unavailable for this pass",
+                owner=binding.owner,
+                repo=binding.repo,
+                project_id=project.id,
+                project=project.slug,
+            )
             return None
         try:
             ref_set = await self._ref_set_fetcher.fetch(

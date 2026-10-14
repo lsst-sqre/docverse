@@ -781,11 +781,12 @@ class Factory:
     ) -> ProjectGitHubBindingResolver:
         """Create a :class:`ProjectGitHubBindingResolver`.
 
-        Used by the future ``git_ref_audit`` worker (PRD #346) and by
-        the proactive ``sync_project`` pre-fetch (PRD #332). Both
-        callers need the same "installation > anonymous > skip" decision
-        before calling :class:`GitHubRefSetFetcher`, so the resolver is
-        the one place that ladder lives.
+        Used by the ``git_ref_audit`` worker (PRD #346) and by the
+        proactive ``sync_project`` pre-fetch (PRD #332). Both callers
+        need the same "installation > no token > skip" decision before
+        calling :class:`GitHubRefSetFetcher`, so the resolver is the one
+        place that ladder lives; both skip a project without a token
+        (PRD #817).
 
         Raises
         ------

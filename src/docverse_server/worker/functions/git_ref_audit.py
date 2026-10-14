@@ -21,6 +21,19 @@ The worker owns the ``queue_jobs`` row lifecycle: it transitions to
 ``git_ref_audit_runs`` row rolls to its terminal status once every
 per-org child is terminal.
 
+Only a project with a ``github_installation_id`` is read, with that
+installation's token (PRD #817). One without is skipped before any
+GitHub call. Reading it anonymously would draw on GitHub's
+unauthenticated budget of 60 requests an hour per source address, which
+every pod behind the same Cloud NAT address shares, so an organization
+with more than about 30 such projects exhausted it on every pass and
+logged a pair of 403/429 warnings per project while reaping nothing for
+them. The skip is not a failure: the pass counts it on its summary line,
+names up to ten of the org's skipped projects on one ``skipped projects
+without a GitHub App installation`` line, and reads the project from the
+first pass after its installation id is recorded — the id backfill
+enqueues its resolve ahead of every pass's reads.
+
 A per-project fetch failure — of the ref set or of the default branch —
 is caught, logged with org/project/error, and the per-org pass
 continues with the next project — one
@@ -95,6 +108,9 @@ from docverse_server.worker.functions._cancellation import (
 
 __all__ = ["git_ref_audit"]
 
+_SKIPPED_EXAMPLES_LIMIT = 10
+"""Most project slugs the per-org skipped-projects line names."""
+
 
 @dataclass(frozen=True, slots=True)
 class _AuditSummary:
@@ -114,6 +130,9 @@ class _AuditSummary:
 
     github_resolves_enqueued: int = 0
     """``project_github_resolve`` jobs the id backfill queued this pass."""
+
+    projects_skipped_no_installation: int = 0
+    """Bound projects skipped unread for want of an installation id."""
 
 
 @dataclass(slots=True)
@@ -136,6 +155,9 @@ class _ProjectFetches:
 
     refs_by_project: dict[int, RepositoryRefSet] = field(default_factory=dict)
     default_branches: dict[int, str] = field(default_factory=dict)
+    skipped_no_installation: list[int] = field(default_factory=list)
+    """Projects skipped unread because they have no installation id."""
+
     had_failures: bool = False
 
 
@@ -250,6 +272,9 @@ async def git_ref_audit(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                 main_rewrites=summary.main_rewrites,
                 default_branch_errors=summary.default_branch_errors,
                 github_resolves_enqueued=summary.github_resolves_enqueued,
+                projects_skipped_no_installation=(
+                    summary.projects_skipped_no_installation
+                ),
             )
             # Publish one lifecycle_action per reaped edition after the
             # commit. Best-effort: production runs raise_on_error=False so
@@ -346,6 +371,12 @@ async def _audit_org(
         projects=projects,
         logger=logger,
     )
+    _log_skipped_no_installation(
+        projects=projects,
+        skipped_ids=fetches.skipped_no_installation,
+        org_slug=org_slug,
+        logger=logger,
+    )
     tally = await _converge_default_branches(
         session=session,
         factory=factory,
@@ -361,6 +392,7 @@ async def _audit_org(
         main_rewrites=tally.main_rewrites,
         default_branch_errors=tally.default_branch_errors,
         github_resolves_enqueued=resolves_enqueued,
+        projects_skipped_no_installation=len(fetches.skipped_no_installation),
     )
     refs_by_project = fetches.refs_by_project
 
@@ -445,14 +477,17 @@ async def _fetch_per_project(
 
     A project whose resolver returns ``None`` is treated as a graceful
     skip (no binding any more, or a race with a soft-delete) and does
-    **not** flip ``had_failures``. A 404 from GitHub or a transport
-    error on the ref set skips the project for this pass and flips
-    ``had_failures`` so the per-org queue-job row transitions to
-    ``completed_with_errors`` and the parent run rolls to
+    **not** flip ``had_failures``. Nor does a binding without an
+    installation token (PRD #817): the project is skipped before any
+    GitHub call, rather than read anonymously, and its id is collected
+    on ``skipped_no_installation`` for the org's summary. A 404 from
+    GitHub or a transport error on the ref set skips the project for
+    this pass and flips ``had_failures`` so the per-org queue-job row
+    transitions to ``completed_with_errors`` and the parent run rolls to
     ``partial_failure``.
 
-    The default branch is read after the ref set, through the same
-    installation-or-anonymous auth (PRD #721). A failure there flips
+    The default branch is read after the ref set, with the same
+    installation token (PRD #721). A failure there flips
     ``had_failures`` the same way but keeps the ref set: the project's
     ``ref_deleted`` reaping still runs, and only its default-branch
     convergence waits for the next pass.
@@ -475,6 +510,15 @@ async def _fetch_per_project(
             project_logger.debug(
                 "Git ref audit: project has no GitHub binding, skipping"
             )
+            continue
+        if binding.auth is None:
+            project_logger.debug(
+                "Git ref audit: project has no GitHub App installation, "
+                "skipping",
+                owner=binding.owner,
+                repo=binding.repo,
+            )
+            fetches.skipped_no_installation.append(project.id)
             continue
         try:
             ref_set = await ref_fetcher.fetch(
@@ -526,6 +570,32 @@ async def _fetch_per_project(
             continue
         fetches.default_branches[project.id] = default_branch
     return fetches
+
+
+def _log_skipped_no_installation(
+    *,
+    projects: list[Project],
+    skipped_ids: list[int],
+    org_slug: str,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Name the org's projects skipped for want of a token, once.
+
+    One info line per org pass, and only when the pass skipped any, so an
+    operator can tell which organization still needs the GitHub App
+    without a line per project. ``examples`` holds up to
+    :data:`_SKIPPED_EXAMPLES_LIMIT` slugs, in the pass's (slug) order.
+    """
+    if not skipped_ids:
+        return
+    skipped = set(skipped_ids)
+    examples = [project.slug for project in projects if project.id in skipped]
+    logger.info(
+        "Git ref audit: skipped projects without a GitHub App installation",
+        org=org_slug,
+        count=len(skipped_ids),
+        examples=examples[:_SKIPPED_EXAMPLES_LIMIT],
+    )
 
 
 async def _converge_default_branches(

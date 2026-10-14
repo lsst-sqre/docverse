@@ -9,6 +9,17 @@ paginates :data:`GITHUB_API_BASE_URL`'s ``git/matching-refs/heads`` and
 ``/tags`` endpoints and returns the stripped bare-name ref set. It
 mirrors :class:`GitHubTreeFetcher`'s no-mutation, per-request-auth
 contract and adds pagination handling the tree fetcher does not need.
+
+Anonymous reads (``auth=None``) remain supported here, but no
+production caller makes them (PRD #817): the ``git_ref_audit`` worker
+and keeper-sync's sync-time live-refs pre-fetch
+(``KeeperSyncService._fetch_live_refs``) both skip a project without
+an installation token before calling the fetcher, and
+``project_github_resolve`` reads refs only after recording an
+installation id, skipping the read if a rebind has cleared it since.
+An anonymous read draws on GitHub's unauthenticated budget of 60
+requests an hour per source address, which every pod behind one Cloud
+NAT address shares.
 """
 
 from __future__ import annotations

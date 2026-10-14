@@ -3,10 +3,11 @@
 Two PRD #346 callers (the daily ``git_ref_audit`` worker) and one
 PRD #332 caller (the proactive ``sync_project`` pre-fetch) share the
 same pre-flight: take a ``project_id``, find its GitHub coordinates,
-and decide whether to use installation auth, anonymous auth, or skip
-the project entirely. Centralising that decision here keeps the
-auth-source ladder ("installation > anonymous > skip") consistent
-across the two paths.
+and mint installation auth when the project has an installation.
+Centralising that decision here keeps the auth-source ladder
+("installation > no token > skip") consistent across the two paths.
+Both callers skip a project the resolver returns without a token
+rather than read it anonymously (PRD #817).
 """
 
 from __future__ import annotations
@@ -32,11 +33,12 @@ class ResolvedProjectGitHubBinding:
     ``owner`` / ``repo`` are the operator-supplied source-of-truth
     strings from ``projects.github_owner`` / ``github_repo``.
     ``installation_id`` is the captured GitHub App installation id;
-    ``None`` signals anonymous mode (story 13: a public repo with no
-    App installation can still benefit from the daily audit by hitting
-    the public API). ``auth`` is the minted :class:`InstallationAuth`
-    when an installation is available, ``None`` otherwise — the
-    caller passes it through to :class:`GitHubRefSetFetcher` as-is.
+    ``None`` when no installation has been recorded. ``auth`` is the
+    minted :class:`InstallationAuth` when an installation is available,
+    ``None`` otherwise. Production callers skip a binding whose
+    ``auth`` is ``None`` rather than read it anonymously (PRD #817):
+    GitHub's unauthenticated budget is shared by every pod behind one
+    NAT address.
     """
 
     owner: str
@@ -48,8 +50,8 @@ class ResolvedProjectGitHubBinding:
 class ProjectGitHubBindingResolver:
     """Resolve ``project_id`` to a :class:`ResolvedProjectGitHubBinding`.
 
-    Encapsulates the "use installation auth if available, fall back to
-    anonymous, return ``None`` if the project has no GitHub binding"
+    Encapsulates the "use installation auth if available, no token
+    otherwise, return ``None`` if the project has no GitHub binding"
     decision so the periodic ``git_ref_audit`` worker (PRD #346) and
     the proactive ``sync_project`` pre-fetch (PRD #332) do not each
     re-derive it.
@@ -62,9 +64,10 @@ class ProjectGitHubBindingResolver:
     * ``github_owner`` / ``github_repo`` NULL (non-GitHub
       ``source_url``) → ``None``. ``ref_deleted`` does not apply.
     * Binding present, ``github_installation_id`` NULL →
-      :class:`ResolvedProjectGitHubBinding` with ``auth=None``. The
-      fetcher uses the anonymous public path. A later installation
-      webhook backfills the id and the next tick authenticates.
+      :class:`ResolvedProjectGitHubBinding` with ``auth=None``. Both
+      callers skip the project without a GitHub request (PRD #817). A
+      later resolve or installation webhook backfills the id and the
+      next tick authenticates.
     * Binding present, ``github_installation_id`` populated →
       :class:`ResolvedProjectGitHubBinding` with a freshly-minted
       :class:`InstallationAuth`. Token exchange happens on every
@@ -100,10 +103,11 @@ class ProjectGitHubBindingResolver:
         """Resolve a project to its GitHub binding + auth record.
 
         Returns ``None`` for non-GitHub or missing projects;
-        otherwise returns a :class:`ResolvedProjectGitHubBinding`. The
-        anonymous-vs-installation auth choice is reflected on the
-        returned record's ``auth`` field, not on the return type, so
-        callers walk one ladder rather than two.
+        otherwise returns a :class:`ResolvedProjectGitHubBinding`. Its
+        ``auth`` field is ``None`` when no installation id is recorded,
+        and callers skip such a binding rather than read it anonymously
+        (PRD #817). Reporting that on the record, not the return type,
+        lets callers walk one ladder rather than two.
 
         The binding lookup is wrapped in this resolver's own short
         read transaction; the caller must therefore **not** wrap the

@@ -333,16 +333,16 @@ async def test_git_ref_audit_soft_deletes_missing_refs_only(
 ) -> None:
     """Editions whose tracked ref is absent from GitHub are soft-deleted.
 
-    Seeds two GitHub-bound projects (one with an installation, one
-    anonymous) and one non-GitHub project. For the installed project,
-    the mocked GitHub response carries one live branch (``main``) and
-    one live tag (``v1.0``); the project has four draft editions —
-    one matching the live branch (kept), one matching the live tag
-    (kept), one tracking a deleted branch (soft-deleted), and one
-    matching the deleted branch but ``lifecycle_exempt=True`` (kept).
-    The anonymous project has one draft tracking a branch missing
-    from the mocked anon-path response (soft-deleted). The non-GitHub
-    project's draft is never touched.
+    Seeds two GitHub-bound projects, each with an installation, and
+    one non-GitHub project. For the first project, the mocked GitHub
+    response carries one live branch (``main``) and one live tag
+    (``v1.0``); the project has four draft editions — one matching
+    the live branch (kept), one matching the live tag (kept), one
+    tracking a deleted branch (soft-deleted), and one matching the
+    deleted branch but ``lifecycle_exempt=True`` (kept). The second
+    project has one draft tracking a branch missing from its mocked
+    response (soft-deleted). The non-GitHub project's draft is never
+    touched.
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
@@ -357,13 +357,15 @@ async def test_git_ref_audit_soft_deletes_missing_refs_only(
             repo="docs",
             installation_id=installation_id,
         )
-        proj_anon = await _seed_github_project(
+        proj_public = await _seed_github_project(
             db_session,
             org_id=org_id,
             slug="acme-public",
             owner="acme",
             repo="public",
-            installation_id=None,
+            installation_id=mock_github.seed_installation(
+                "acme", "public", installation_id=43, owner_id=111
+            ),
         )
         proj_non_github = await _seed_non_github_project(
             db_session, org_id=org_id, slug="gitlab-mirror"
@@ -394,11 +396,11 @@ async def test_git_ref_audit_soft_deletes_missing_refs_only(
             git_ref="tickets/DM-also-deleted",
             lifecycle_exempt=True,
         )
-        anon_deleted_id = await _seed_draft_edition(
+        public_deleted_id = await _seed_draft_edition(
             db_session,
-            project_id=proj_anon,
-            slug="anon-deleted-branch",
-            git_ref="tickets/DM-anon-old",
+            project_id=proj_public,
+            slug="public-deleted-branch",
+            git_ref="tickets/DM-public-old",
         )
         non_github_draft_id = await _seed_draft_edition(
             db_session,
@@ -464,7 +466,7 @@ async def test_git_ref_audit_soft_deletes_missing_refs_only(
             assert non_github is not None
             assert non_github.id == non_github_draft_id
 
-            for deleted_id in (deleted_branch_id, anon_deleted_id):
+            for deleted_id in (deleted_branch_id, public_deleted_id):
                 result_row = await session.execute(
                     select(SqlEdition.date_deleted).where(
                         SqlEdition.id == deleted_id
@@ -679,8 +681,8 @@ async def test_git_ref_audit_404_is_per_pass_skip(
 ) -> None:
     """A 404 from GitHub logs + skips the project for this pass.
 
-    Anonymous-mode audit: a public-repo project whose GitHub URL has
-    started returning 404 (repo deleted, transferred out, App lost
+    A project whose repository has started returning 404 to its
+    installation's token (repo deleted, transferred out, App lost
     access). Acceptance criterion: "a 404 logs and skips for that
     pass". The 404 counts as a per-project failure so the queue-job
     rolls to ``completed_with_errors`` and the parent run to
@@ -694,7 +696,9 @@ async def test_git_ref_audit_404_is_per_pass_skip(
             slug="gone-project",
             owner="acme",
             repo="gone",
-            installation_id=None,
+            installation_id=mock_github.seed_installation(
+                "acme", "gone", installation_id=44, owner_id=111
+            ),
         )
         edition_id = await _seed_draft_edition(
             db_session,
@@ -1564,57 +1568,6 @@ async def test_git_ref_audit_isolates_a_repository_metadata_failure(
 
 
 @pytest.mark.asyncio
-async def test_git_ref_audit_reads_an_anonymous_default_branch(
-    app: None,
-    db_session: AsyncSession,
-    mock_github: GitHubMock,
-) -> None:
-    """A project with no installation reads ``GET /repos`` anonymously.
-
-    The same public-API path its ref set takes, so a public repository
-    the App was never installed on still gets its column filled.
-    """
-    async with db_session.begin():
-        org_id, org_slug = await _seed_org(db_session, slug="gra-db-anon")
-        project_id = await _seed_github_project(
-            db_session,
-            org_id=org_id,
-            slug="anon-project",
-            owner="acme",
-            repo="anon",
-            installation_id=None,
-        )
-        run_id, queue_job_id = await _seed_run_and_queue_job(
-            db_session, org_id=org_id, org_slug=org_slug
-        )
-
-    _seed_refs(
-        mock_github.router,
-        owner="acme",
-        repo="anon",
-        branches=["master"],
-        default_branch="master",
-    )
-
-    result = await _run_audit(
-        mock_github=mock_github,
-        org_id=org_id,
-        org_slug=org_slug,
-        run_id=run_id,
-        queue_job_id=queue_job_id,
-    )
-
-    assert result == "completed"
-    assert (await _load_project(project_id)).github_default_branch == "master"
-    [request] = [
-        call.request
-        for call in mock_github.router.calls
-        if call.request.url.path == "/repos/acme/anon"
-    ]
-    assert "authorization" not in {k.lower() for k in request.headers}
-
-
-@pytest.mark.asyncio
 async def test_git_ref_audit_summary_counts_default_branch_work(
     app: None,
     db_session: AsyncSession,
@@ -2115,8 +2068,7 @@ async def test_git_ref_audit_enqueues_github_resolve_for_missing_ids(
         run_id, queue_job_id = await _seed_run_and_queue_job(
             db_session, org_id=org_id, org_slug=org_slug
         )
-    for repo in ("ids-a", "ids-b", "ids-known"):
-        _seed_refs(mock_github.router, owner="acme", repo=repo)
+    _seed_refs(mock_github.router, owner="acme", repo="ids-known")
     arq_queue = _maintenance_queue()
 
     with capture_logs() as captured:
@@ -2193,7 +2145,6 @@ async def test_git_ref_audit_id_backfill_is_idempotent(
     mock_github.router.get(
         f"{GITHUB_API_BASE_URL}/repos/acme/ids-uninstalled/installation"
     ).mock(return_value=httpx.Response(404, json={"message": "Not Found"}))
-    _seed_refs(mock_github.router, owner="acme", repo="ids-uninstalled")
 
     passes = []
     for _tick in range(2):
@@ -2252,12 +2203,26 @@ async def test_git_ref_audit_id_backfill_survives_an_enqueue_failure(
     """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session, slug="gra-ids-fail")
-        failing_id, queued_id = [
-            await _seed_github_project(
-                db_session, org_id=org_id, slug=slug, owner="acme", repo=slug
-            )
-            for slug in ("ids-fail-a", "ids-fail-b")
-        ]
+        # An installation id but no repository id: the pass reads the
+        # project with its token, and the backfill, which keys on the
+        # repository id, still enqueues its resolve.
+        failing_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="ids-fail-a",
+            owner="acme",
+            repo="ids-fail-a",
+            installation_id=mock_github.seed_installation(
+                "acme", "ids-fail-a", installation_id=73, owner_id=555
+            ),
+        )
+        queued_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="ids-fail-b",
+            owner="acme",
+            repo="ids-fail-b",
+        )
         gone_draft_id = await _seed_draft_edition(
             db_session,
             project_id=failing_id,
@@ -2267,8 +2232,7 @@ async def test_git_ref_audit_id_backfill_survives_an_enqueue_failure(
         run_id, queue_job_id = await _seed_run_and_queue_job(
             db_session, org_id=org_id, org_slug=org_slug
         )
-    for repo in ("ids-fail-a", "ids-fail-b"):
-        _seed_refs(mock_github.router, owner="acme", repo=repo)
+    _seed_refs(mock_github.router, owner="acme", repo="ids-fail-a")
 
     arq_queue = _maintenance_queue()
     real_enqueue = arq_queue.enqueue
@@ -2307,3 +2271,373 @@ async def test_git_ref_audit_id_backfill_survives_an_enqueue_failure(
     assert failure["project"] == "ids-fail-a"
     assert await _load_edition(gone_draft_id) is None
     assert _audit_summary(captured)["github_resolves_enqueued"] == 1
+
+
+_SKIP_LINE = (
+    "Git ref audit: skipped projects without a GitHub App installation"
+)
+"""The per-org line naming the projects a pass skipped for want of a token."""
+
+
+def _repo_calls(mock_github: GitHubMock, repo: str) -> list[httpx.Request]:
+    """Return every request the pass sent about ``acme/{repo}``."""
+    prefix = f"/repos/acme/{repo}"
+    return [
+        call.request
+        for call in mock_github.router.calls
+        if call.request.url.path == prefix
+        or call.request.url.path.startswith(f"{prefix}/")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_skips_a_project_without_an_installation(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A bound project with no installation id is never read (PRD #817).
+
+    An anonymous read shares GitHub's 60-an-hour budget per source
+    address with every pod behind the same NAT, so an organization with
+    more than a few dozen such projects exhausts it every pass. The
+    audit therefore sends no request at all for a tokenless project —
+    neither its ref set nor its repository — and leaves its draft on a
+    vanished branch alone, since it has no evidence the ref is gone.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-tokenless")
+        project_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="tokenless",
+            owner="acme",
+            repo="tokenless",
+        )
+        draft_id = await _seed_draft_edition(
+            db_session,
+            project_id=project_id,
+            slug="gone-branch",
+            git_ref="tickets/DM-gone",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    _seed_refs(
+        mock_github.router,
+        owner="acme",
+        repo="tokenless",
+        branches=["main"],
+        default_branch="main",
+    )
+
+    await _run_audit(
+        mock_github=mock_github,
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        queue_job_id=queue_job_id,
+    )
+
+    assert _repo_calls(mock_github, "tokenless") == []
+    assert await _load_edition(draft_id) is not None
+    assert (await _load_project(project_id)).github_default_branch is None
+
+
+def _seed_rate_limited(router: respx.Router, *, repo: str) -> None:
+    """Answer every read of ``acme/{repo}`` with GitHub's 429 rate limit.
+
+    What an anonymous read gets once the shared per-address budget is
+    spent, so a pass that still read the repository would fail on it.
+    """
+    for path in ("", "/git/matching-refs/heads", "/git/matching-refs/tags"):
+        router.get(f"{GITHUB_API_BASE_URL}/repos/acme/{repo}{path}").mock(
+            return_value=httpx.Response(
+                429, json={"message": "API rate limit exceeded"}
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_tokenless_skip_is_not_a_failure(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A pass whose only unread projects were tokenless ends clean.
+
+    The skip is deliberate, not a failed read: the queue job ends
+    ``completed`` and the run ``succeeded``, rather than the
+    ``completed_with_errors`` / ``partial_failure`` the rate-limited
+    anonymous reads used to leave every pass.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-tl-clean")
+        await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="tl-clean",
+            owner="acme",
+            repo="tl-clean",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    _seed_rate_limited(mock_github.router, repo="tl-clean")
+
+    with capture_logs() as captured:
+        result = await _run_audit(
+            mock_github=mock_github,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            queue_job_id=queue_job_id,
+        )
+
+    assert result == "completed"
+    assert _audit_summary(captured)["had_failures"] is False
+    async for session in db_session_dependency():
+        async with session.begin():
+            qj = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job_id
+            )
+            assert qj is not None
+            assert qj.status == JobStatus.completed
+            run = await GitRefAuditRunStore(
+                session=session, logger=_logger()
+            ).get(run_id)
+            assert run is not None
+            assert run.status is GitRefAuditRunStatus.succeeded
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_reports_tokenless_projects_once_per_org(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """One info line per org names the skipped count and ten examples.
+
+    Twelve tokenless projects are counted on the pass's summary line as
+    ``projects_skipped_no_installation`` and named, the first ten by
+    slug, on a single ``skipped projects`` line that carries the org —
+    the organization that needs the App. No line above debug names a
+    skipped project individually.
+    """
+    slugs = [f"tl-many-{index:02d}" for index in range(12)]
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-tl-many")
+        for slug in slugs:
+            await _seed_github_project(
+                db_session, org_id=org_id, slug=slug, owner="acme", repo=slug
+            )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+
+    with capture_logs() as captured:
+        await _run_audit(
+            mock_github=mock_github,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            queue_job_id=queue_job_id,
+        )
+
+    assert _audit_summary(captured)["projects_skipped_no_installation"] == 12
+    [skip_line] = [entry for entry in captured if entry["event"] == _SKIP_LINE]
+    assert skip_line["log_level"] == "info"
+    assert skip_line["org"] == org_slug
+    assert skip_line["count"] == 12
+    assert skip_line["examples"] == slugs[:10]
+    assert not [
+        entry
+        for entry in captured
+        if entry.get("project") in slugs and entry["log_level"] != "debug"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_omits_the_skip_line_without_tokenless_projects(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """An org whose every bound project has a token logs no skip line.
+
+    The summary line still carries ``projects_skipped_no_installation``,
+    as zero, so the field is there to chart whatever the pass did.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-tl-none")
+        await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="tl-none",
+            owner="acme",
+            repo="tl-none",
+            installation_id=mock_github.seed_installation(
+                "acme", "tl-none", installation_id=88, owner_id=555
+            ),
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    _seed_refs(mock_github.router, owner="acme", repo="tl-none")
+
+    with capture_logs() as captured:
+        await _run_audit(
+            mock_github=mock_github,
+            org_id=org_id,
+            org_slug=org_slug,
+            run_id=run_id,
+            queue_job_id=queue_job_id,
+        )
+
+    assert _audit_summary(captured)["projects_skipped_no_installation"] == 0
+    assert not [entry for entry in captured if entry["event"] == _SKIP_LINE]
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_mixed_org_reads_only_tokened_projects(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A tokenless neighbour changes nothing for a tokened project.
+
+    The tokened project is read with its installation's token: its
+    draft on a vanished branch is reaped and its ``NULL`` default branch
+    filled, exactly as before. Its tokenless neighbour is never read,
+    so its own draft and column stay as they were.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-tl-mixed")
+        tokened_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="tl-mixed-app",
+            owner="acme",
+            repo="tl-mixed-app",
+            installation_id=mock_github.seed_installation(
+                "acme", "tl-mixed-app", installation_id=89, owner_id=555
+            ),
+        )
+        tokenless_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="tl-mixed-bare",
+            owner="acme",
+            repo="tl-mixed-bare",
+        )
+        reaped_id = await _seed_draft_edition(
+            db_session,
+            project_id=tokened_id,
+            slug="gone-branch",
+            git_ref="tickets/DM-gone",
+        )
+        kept_id = await _seed_draft_edition(
+            db_session,
+            project_id=tokenless_id,
+            slug="gone-branch",
+            git_ref="tickets/DM-gone",
+        )
+        run_id, queue_job_id = await _seed_run_and_queue_job(
+            db_session, org_id=org_id, org_slug=org_slug
+        )
+    for repo in ("tl-mixed-app", "tl-mixed-bare"):
+        _seed_refs(
+            mock_github.router,
+            owner="acme",
+            repo=repo,
+            branches=["master"],
+            default_branch="master",
+        )
+
+    result = await _run_audit(
+        mock_github=mock_github,
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        queue_job_id=queue_job_id,
+    )
+
+    assert result == "completed"
+    tokened_calls = _repo_calls(mock_github, "tl-mixed-app")
+    assert {request.url.path for request in tokened_calls} == {
+        "/repos/acme/tl-mixed-app",
+        "/repos/acme/tl-mixed-app/git/matching-refs/heads",
+        "/repos/acme/tl-mixed-app/git/matching-refs/tags",
+    }
+    assert all("authorization" in request.headers for request in tokened_calls)
+    assert _repo_calls(mock_github, "tl-mixed-bare") == []
+    assert await _load_edition(reaped_id) is None
+    assert await _load_edition(kept_id) is not None
+    assert (await _load_project(tokened_id)).github_default_branch == "master"
+    assert (await _load_project(tokenless_id)).github_default_branch is None
+
+
+@pytest.mark.asyncio
+async def test_git_ref_audit_reads_a_project_once_it_gains_an_installation(
+    app: None,
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """The pass after a project records its installation id reads it.
+
+    The first pass skips the tokenless project. Once its installation id
+    is recorded — by its resolve, or an ``installation`` delivery — the
+    next pass reads it with the token and reaps its draft on a vanished
+    branch, with nothing else changed.
+    """
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session, slug="gra-tl-gains")
+        project_id = await _seed_github_project(
+            db_session,
+            org_id=org_id,
+            slug="tl-gains",
+            owner="acme",
+            repo="tl-gains",
+        )
+        draft_id = await _seed_draft_edition(
+            db_session,
+            project_id=project_id,
+            slug="gone-branch",
+            git_ref="tickets/DM-gone",
+        )
+    _seed_refs(mock_github.router, owner="acme", repo="tl-gains")
+
+    skipped = []
+    for tick in range(2):
+        if tick == 1:
+            async with db_session.begin():
+                await db_session.execute(
+                    update(SqlProject)
+                    .where(SqlProject.id == project_id)
+                    .values(
+                        github_installation_id=mock_github.seed_installation(
+                            "acme", "tl-gains", installation_id=90
+                        )
+                    )
+                )
+        async with db_session.begin():
+            run_id, queue_job_id = await _seed_run_and_queue_job(
+                db_session, org_id=org_id, org_slug=org_slug
+            )
+        with capture_logs() as captured:
+            await _run_audit(
+                mock_github=mock_github,
+                org_id=org_id,
+                org_slug=org_slug,
+                run_id=run_id,
+                queue_job_id=queue_job_id,
+            )
+        skipped.append(
+            (
+                _audit_summary(captured)["projects_skipped_no_installation"],
+                len(_repo_calls(mock_github, "tl-gains")),
+                await _load_edition(draft_id) is None,
+            )
+        )
+
+    assert skipped == [(1, 0, False), (0, 3, True)]

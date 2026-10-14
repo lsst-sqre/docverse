@@ -491,23 +491,33 @@ async def _fetch_live_refs(
 
     Authenticates the way the audit does, through
     :class:`~docverse_server.services.project_github_binding.ProjectGitHubBindingResolver`:
-    with the installation token for the id this resolve just committed,
-    or anonymously for a project without one. The resolver owns its own
-    short read transaction, so the caller must not hold one.
+    with the installation token for the id this resolve just committed.
+    A binding without one — a rebind landing since that commit clears
+    the id — is skipped without a GitHub request rather than read
+    anonymously (PRD #817). The resolver owns its own short read
+    transaction, so the caller must not hold one.
 
     Returns
     -------
     frozenset of str or None
         The live ref names, or ``None`` when the project is no longer
-        bound or GitHub could not list its refs — "not known", which
-        leaves ``__main`` alone rather than moving it off a ref that may
-        still exist.
+        bound, has no installation token, or GitHub could not list its
+        refs — "not known", which leaves ``__main`` alone rather than
+        moving it off a ref that may still exist.
     """
     resolver = factory.create_project_github_binding_resolver()
     fetcher = factory.create_github_ref_set_fetcher()
     try:
         binding = await resolver.resolve(project_id)
         if binding is None:
+            return None
+        if binding.auth is None:
+            logger.debug(
+                "Resolve: project has no GitHub App installation, skipping "
+                "live ref fetch",
+                owner=binding.owner,
+                repo=binding.repo,
+            )
             return None
         ref_set = await fetcher.fetch(
             owner=binding.owner,
