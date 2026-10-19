@@ -52,6 +52,7 @@ from docverse_server.storage._http_retry import (
     RETRYABLE_TRANSPORT_ERRORS,
 )
 from docverse_server.storage.github import (
+    EmptyRepositoryError,
     GitHubAppNotInstalledError,
     RepositoryNotAccessibleError,
     RepositoryRefFetchError,
@@ -108,9 +109,13 @@ _LIVE_REF_FETCH_ERRORS: tuple[type[Exception], ...] = (
 )
 """What a first-learn live ref fetch may raise and the resolve absorbs.
 
-The fetcher's two typed errors, plus what minting the installation
+The fetcher's two failure errors, plus what minting the installation
 token for it can raise. The ref set is only extra evidence for the
 default-branch rule, so none of these retries or fails the job.
+
+Deliberately not :class:`EmptyRepositoryError`: a repository without
+commits is not a failed fetch, so :func:`_fetch_live_refs` catches it
+ahead of this tuple, with an info line rather than this tuple's warning.
 """
 
 
@@ -497,13 +502,22 @@ async def _fetch_live_refs(
     anonymously (PRD #817). The resolver owns its own short read
     transaction, so the caller must not hold one.
 
+    A repository with no commits yet, whose ref endpoints GitHub answers
+    with 409 (:class:`EmptyRepositoryError`, PRD #821), has no ref set
+    to read. It is caught ahead of :data:`_LIVE_REF_FETCH_ERRORS` and
+    logged at info rather than as a failed fetch; either way the resolve
+    records the branch without live refs and leaves ``__main`` for the
+    audit, which reads the ref set once the repository gains its first
+    commit.
+
     Returns
     -------
     frozenset of str or None
         The live ref names, or ``None`` when the project is no longer
-        bound, has no installation token, or GitHub could not list its
-        refs — "not known", which leaves ``__main`` alone rather than
-        moving it off a ref that may still exist.
+        bound, has no installation token, has an empty repository, or
+        GitHub could not list its refs — "not known", which leaves
+        ``__main`` alone rather than moving it off a ref that may still
+        exist.
     """
     resolver = factory.create_project_github_binding_resolver()
     fetcher = factory.create_github_ref_set_fetcher()
@@ -525,6 +539,14 @@ async def _fetch_live_refs(
             auth=binding.auth,
             logger=logger,
         )
+    except EmptyRepositoryError as exc:
+        logger.info(
+            "Resolve: GitHub repository is empty, recording default branch "
+            "without live refs",
+            owner=exc.owner,
+            repo=exc.repo,
+        )
+        return None
     except _LIVE_REF_FETCH_ERRORS as exc:
         logger.warning(
             "Resolve: GitHub ref fetch failed, recording default branch "

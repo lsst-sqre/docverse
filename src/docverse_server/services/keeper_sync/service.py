@@ -100,6 +100,7 @@ from docverse_server.storage._http_retry import RETRYABLE_TRANSPORT_ERRORS
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.github import (
+    EmptyRepositoryError,
     GitHubRefSetFetcher,
     RepositoryNotAccessibleError,
     RepositoryRefFetchError,
@@ -1633,13 +1634,14 @@ class KeeperSyncService:
         outside any open write transaction, into the caller's
         *live_refs* cache) and is shared across every edition — and
         with ``__main``'s default-branch tracking, which reads the same
-        cache. A ``RepositoryNotAccessibleError`` or
-        ``RepositoryRefFetchError`` is caught, logged, and downgrades
-        the pass — ``ref_deleted`` cannot match without ``live_refs``,
-        so those projects fall through to KEEP and the regular
-        ``git_ref_audit`` cron catches up on its own schedule. A project
-        without an installation token is downgraded the same way, but
-        without a GitHub request (see :meth:`_fetch_live_refs`).
+        cache. A ``RepositoryNotAccessibleError``,
+        ``EmptyRepositoryError``, or ``RepositoryRefFetchError`` is
+        caught, logged, and downgrades the pass — ``ref_deleted`` cannot
+        match without ``live_refs``, so those projects fall through to
+        KEEP and the regular ``git_ref_audit`` cron catches up on its own
+        schedule. A project without an installation token is downgraded
+        the same way, but without a GitHub request (see
+        :meth:`_fetch_live_refs`).
         """
         if (
             self._tombstone_service is None
@@ -1784,7 +1786,17 @@ class KeeperSyncService:
         round-trip fails — both are accepted "rule disabled, KEEP wins"
         outcomes. ``draft_inactivity`` is unaffected because it does
         not read ``live_refs``, and ``__main`` keeps LTD's tracked ref
-        because a missing set is no evidence that ref is gone.
+        because a missing set is no evidence that ref is gone. How the
+        round-trip ended sets only the log line: a repository GitHub
+        will not show (404) is an info line, a failed read a warning.
+
+        A repository with no commits yet, whose ref endpoints GitHub
+        answers with 409 (:class:`EmptyRepositoryError`, PRD #821), also
+        returns ``None``, with only a debug line: it is a state of the
+        repository rather than a failed read, so it is caught ahead of
+        :class:`RepositoryRefFetchError` and writes no warning. Nothing
+        is recorded for it; the first sync after its first push reads
+        its ref set with no other change.
 
         A binding without an installation token (no
         ``github_installation_id`` recorded yet) also returns ``None``,
@@ -1833,6 +1845,17 @@ class KeeperSyncService:
             self._logger.info(
                 "Keeper sync: GitHub repository not accessible, live"
                 " refs unavailable for this pass",
+                owner=exc.owner,
+                repo=exc.repo,
+                installation_id=binding.installation_id,
+                project_id=project.id,
+                project=project.slug,
+            )
+            return None
+        except EmptyRepositoryError as exc:
+            self._logger.debug(
+                "Keeper sync: GitHub repository is empty, live refs"
+                " unavailable for this pass",
                 owner=exc.owner,
                 repo=exc.repo,
                 installation_id=binding.installation_id,
