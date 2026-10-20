@@ -208,7 +208,11 @@ it at startup next to the shared client and the LTD API client
 `ctx["ltd_http_client"]`), and `shutdown` closes all three. The shared
 client keeps httpx's defaults (5 s timeouts, 100 connections, 20 kept
 alive) and carries run discovery, GitHub, Cloudflare KV and CDN purges.
-LTD Keeper API calls have a client of their own (see
+Cloudflare KV calls use that pool but override its 5 s timeout on each
+request with `CLOUDFLARE_KV_HTTP_TIMEOUT` (30 s read), because KV's
+`bulk/get` stalls for ~5.4 s on a fraction of calls (see
+[Edition reconciliation](edition-reconcile.md)). LTD Keeper API calls
+have a client of their own (see
 [The LTD API client](#the-ltd-api-client)). LTD object downloads go
 through aiobotocore, so no HTTP client carries them (see
 [The LTD source client](#the-ltd-source-client)).
@@ -682,6 +686,9 @@ both passes sends the second pass's botocore exception from
   `ltd_http_limits`, the upload semaphore `_startup` builds, and the
   lifetimes of the copy client, the LTD API client and the shared LTD
   source.
+- `src/docverse_server/storage/editionpublisher/_cloudflare_kv.py`:
+  `CLOUDFLARE_KV_HTTP_TIMEOUT`, the per-request timeout Cloudflare KV
+  calls carry over the shared client.
 - `src/docverse_server/factory.py`:
   `create_build_content_copier_for_org`, which hands each copier the
   upload cap and the shared LTD source.

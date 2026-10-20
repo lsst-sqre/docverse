@@ -296,8 +296,11 @@ def create_copy_http_client(*, upload_concurrency: int) -> httpx.AsyncClient:
     Presigned PUTs of copied build content go over this client so that
     a copy burst neither queues behind nor starves the discovery,
     GitHub, Cloudflare KV and purge calls on the shared client, or the
-    LTD API calls on :func:`create_ltd_http_client`'s. The caller owns
-    its lifetime: :func:`shutdown` closes it.
+    LTD API calls on :func:`create_ltd_http_client`'s. The shared
+    client keeps httpx's defaults; Cloudflare KV calls set their own
+    per-request timeout on it (see
+    `~docverse_server.storage.editionpublisher.CLOUDFLARE_KV_HTTP_TIMEOUT`).
+    The caller owns its lifetime: :func:`shutdown` closes it.
 
     Parameters
     ----------
@@ -381,7 +384,10 @@ def create_ltd_http_client() -> httpx.AsyncClient:
     :data:`LTD_HTTP_MAX_CONNECTIONS` however many jobs list editions at
     once, and an LTD burst neither queues behind nor starves the
     discovery, GitHub, Cloudflare KV and purge calls on the shared
-    client. The caller owns its lifetime: :func:`shutdown` closes it.
+    client, which keeps httpx's defaults (Cloudflare KV calls set their
+    own per-request timeout on it; see
+    `~docverse_server.storage.editionpublisher.CLOUDFLARE_KV_HTTP_TIMEOUT`).
+    The caller owns its lifetime: :func:`shutdown` closes it.
     """
     return httpx.AsyncClient(
         timeout=LTD_HTTP_TIMEOUT, limits=ltd_http_limits()
@@ -393,8 +399,11 @@ def initialize_worker_http_clients(
 ) -> tuple[httpx.AsyncClient, httpx.AsyncClient, httpx.AsyncClient]:
     """Open this worker process's three HTTP clients and record them in ctx.
 
-    ``ctx["http_client"]`` is the shared client (httpx defaults),
-    ``ctx["copy_http_client"]`` the build-copy client from
+    ``ctx["http_client"]`` is the shared client, at httpx's defaults,
+    carrying run discovery, GitHub, Cloudflare KV and CDN purges (KV
+    calls override its 5 s timeout per request; see
+    `~docverse_server.storage.editionpublisher.CLOUDFLARE_KV_HTTP_TIMEOUT`).
+    ``ctx["copy_http_client"]`` is the build-copy client from
     :func:`create_copy_http_client`, sized from
     ``keeper_sync_upload_concurrency`` whichever pool is starting, and
     ``ctx["ltd_http_client"]`` the connection-capped LTD Keeper client

@@ -28,6 +28,7 @@ from .._http_retry import (
 )
 
 __all__ = [
+    "CLOUDFLARE_KV_HTTP_TIMEOUT",
     "CloudflareKvEditionPublisher",
     "CloudflareKvReadError",
     "MalformedKvReadField",
@@ -62,6 +63,60 @@ Cloudflare's own limit for the endpoint. An organization with more
 editions than this is ordinary, so the read-back chunks rather than
 failing — and chunking at exactly the limit keeps the number of
 round-trips (and of shared API rate-limit slots consumed) minimal.
+"""
+
+CLOUDFLARE_KV_HTTP_TIMEOUT = httpx.Timeout(
+    connect=10.0, read=30.0, write=30.0, pool=30.0
+)
+"""Timeouts of every request this publisher sends to Cloudflare KV.
+
+The publisher issues its pointer write, delete and ``bulk/get``
+read-back over whichever ``httpx.AsyncClient`` it is handed — the
+worker's shared client, or safir's in the API process — and that
+client's default is a flat 5 s. The default is right for the discovery,
+GitHub and CDN purge calls the client also carries, so rather than
+widen it for everyone each KV request carries this timeout itself
+(httpx folds a per-request ``timeout=`` into the request's extensions,
+overriding the client's), and the publisher behaves the same in both
+processes.
+
+On 2026-10-19 ``bulk/get`` against the production namespace began
+answering bimodally: about half of all calls took ~0.5 s and the rest
+~5.4 s, independent of how many keys were asked for, so shrinking
+:data:`_BULK_GET_CHUNK_SIZE` is not the lever. Every attempt of the
+read-back's four-attempt budget tripped at 5.00 s a few hundred
+milliseconds before the answer landed, and ``edition_reconcile``
+failed 4 of its 5 ticks for the ``rubin`` organization with
+``httpx.ReadTimeout`` (#825, Sentry DOCVERSE-3K), leaving any drifted
+pointer unrepaired. Each timeout is set for its own reason:
+
+- ``read`` (30 s) turns the stall into a ~5.4 s success with margin,
+  rather than sitting just above 5.4 s and tripping again the day the
+  stall grows by a second.
+- ``connect`` (10 s) matches the copy client's: room to reach
+  Cloudflare through a connect stall rather than failing the attempt
+  outright.
+- ``write`` and ``pool`` (30 s) are symmetric with ``read`` and never
+  bind: a pointer body is well under a KiB, and the KV call volume is
+  far below the shared pool's size.
+
+The same timeout covers the write and the delete, not just the read:
+a pointer write that stalls and succeeds at ~5.4 s is better for the
+publish transaction than a 5 s timeout, a backoff and a retry. The
+cost shows only in a full Cloudflare outage, where four attempts that
+each run ``read`` out plus the 0.5 + 1 + 2 s backoff pin a publish
+transaction for ~124 s instead of ~24 s — inside
+``publish_edition_job_timeout_seconds`` and the per-job connection
+budget. A reconcile of ~4,400 pointers in which every chunk stalls
+grows by about four minutes, inside
+``maintenance_job_timeout_seconds``.
+
+A constant rather than configuration, like the copy and LTD clients'
+timeouts: it bounds transport behaviour an operator has no reason to
+tune. The retry budget on top of it is unchanged, and every expiry
+raises a subclass of ``httpx.TimeoutException``, which
+:func:`~docverse_server.storage._http_retry.retry_request` treats as a
+retryable transport error.
 """
 
 
@@ -235,7 +290,11 @@ class CloudflareKvEditionPublisher:
     api_token
         Cloudflare API token authorized to write the namespace.
     http_client
-        Shared ``httpx.AsyncClient`` used to issue requests.
+        Shared ``httpx.AsyncClient`` used to issue requests. The
+        publisher overrides its timeout on every request it sends with
+        :data:`CLOUDFLARE_KV_HTTP_TIMEOUT`, so the client's own default
+        (5 s on the worker's shared client and on safir's) never binds a
+        KV call.
     logger
         Bound logger for contextual logging.
     max_attempts
@@ -315,7 +374,10 @@ class CloudflareKvEditionPublisher:
         pointer write shares Cloudflare's API rate limits with the zone
         purge and sits on the critical path of every publish, so a
         single 429 used to abandon an otherwise healthy publish and
-        leave the edition pointing at its previous build.
+        leave the edition pointing at its previous build. The request
+        carries :data:`CLOUDFLARE_KV_HTTP_TIMEOUT` rather than the
+        client's default, so a Cloudflare stall of a few seconds is a
+        slow success rather than a spent attempt.
 
         Raises
         ------
@@ -352,6 +414,7 @@ class CloudflareKvEditionPublisher:
                     "cache_profile": cache_profile,
                 },
                 headers={"Authorization": f"Bearer {self._api_token}"},
+                timeout=CLOUDFLARE_KV_HTTP_TIMEOUT,
             )
 
         outcome = await retry_request(
@@ -403,6 +466,7 @@ class CloudflareKvEditionPublisher:
         response = await self._http_client.delete(
             url,
             headers={"Authorization": f"Bearer {self._api_token}"},
+            timeout=CLOUDFLARE_KV_HTTP_TIMEOUT,
         )
         if response.status_code == _HTTP_NOT_FOUND:
             self._logger.info(
@@ -445,6 +509,9 @@ class CloudflareKvEditionPublisher:
         returning a half-read view — a missing pointer is exactly the
         signal that triggers a republish, and inventing one from a
         failed HTTP call would re-drive publishes the edge never lost.
+        Each chunk's request carries :data:`CLOUDFLARE_KV_HTTP_TIMEOUT`,
+        because ``bulk/get`` is the call that stalls past the shared
+        client's 5 s default (#825).
 
         Parameters
         ----------
@@ -498,6 +565,7 @@ class CloudflareKvEditionPublisher:
                 url,
                 json={"keys": list(chunk), "type": "json"},
                 headers={"Authorization": f"Bearer {self._api_token}"},
+                timeout=CLOUDFLARE_KV_HTTP_TIMEOUT,
             )
 
         outcome = await retry_request(

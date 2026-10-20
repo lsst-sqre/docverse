@@ -67,7 +67,10 @@ def create_edition_publisher(
     logger
         Bound logger for contextual logging.
     http_client
-        Shared ``httpx.AsyncClient`` used to issue requests.
+        Shared ``httpx.AsyncClient`` used to issue requests. The
+        Cloudflare KV publisher overrides its timeout per request with
+        `~docverse_server.storage.editionpublisher.CLOUDFLARE_KV_HTTP_TIMEOUT`,
+        so the client's own default never binds a KV call.
 
     Returns
     -------

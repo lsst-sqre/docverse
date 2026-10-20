@@ -1,11 +1,16 @@
 """Edition publisher abstractions and implementations."""
 
-from ._cloudflare_kv import CloudflareKvEditionPublisher, CloudflareKvReadError
+from ._cloudflare_kv import (
+    CLOUDFLARE_KV_HTTP_TIMEOUT,
+    CloudflareKvEditionPublisher,
+    CloudflareKvReadError,
+)
 from ._factory import create_edition_publisher
 from ._mock import MockEditionPublisher, PublishCall, UnpublishCall
 from ._protocol import EditionPublisher
 
 __all__ = [
+    "CLOUDFLARE_KV_HTTP_TIMEOUT",
     "CloudflareKvEditionPublisher",
     "CloudflareKvReadError",
     "EditionPublisher",

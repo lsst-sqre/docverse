@@ -10,9 +10,11 @@ import pytest
 import structlog
 from structlog.testing import capture_logs
 
+from docverse_server.config import Configuration
 from docverse_server.domain.edition_pointer import EditionPointer
 from docverse_server.storage._http_retry import MAX_BACKOFF_SECONDS
 from docverse_server.storage.editionpublisher import (
+    CLOUDFLARE_KV_HTTP_TIMEOUT,
     CloudflareKvEditionPublisher,
     CloudflareKvReadError,
 )
@@ -860,3 +862,169 @@ def test_kv_read_error_truncates_a_large_body() -> None:
 
     assert body is not None
     assert len(body) < 64 * 1024
+
+
+def _pointer_body(keys: list[str]) -> dict[str, object]:
+    """Build a valid ``bulk/get`` body with one pointer per key."""
+    return {
+        "success": True,
+        "result": {
+            "values": {
+                key: {
+                    "build_id": "ABC123",
+                    "r2_prefix": "myproject/__builds/ABC123/",
+                    "cache_profile": "long",
+                }
+                for key in keys
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_publish_sends_with_the_kv_timeout() -> None:
+    """The pointer write carries the KV timeout, not the client's.
+
+    The publisher sends over whichever client it is handed, and that
+    client's default (the worker's shared client, or safir's in the API
+    process) is a flat 5 s. The override has to ride on the request
+    itself for the publisher to behave the same in both processes.
+    """
+    seen: dict[str, dict[str, float | None]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["timeout"] = dict(request.extensions["timeout"])
+        return httpx.Response(200, json={"success": True})
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        await pub.publish(
+            project_slug="myproject",
+            edition_slug="main",
+            build_public_id="ABC123",
+            object_key_prefix="myproject/__builds/ABC123/",
+            cache_profile="long",
+        )
+
+    assert seen["timeout"] == CLOUDFLARE_KV_HTTP_TIMEOUT.as_dict()
+    assert seen["timeout"] != client.timeout.as_dict()
+
+
+@pytest.mark.asyncio
+async def test_unpublish_sends_with_the_kv_timeout() -> None:
+    """The pointer delete carries the KV timeout too.
+
+    Unpublish has no retry loop of its own, so in the API process's
+    edition and project DELETE paths a single stalled answer would
+    otherwise be the whole outcome.
+    """
+    seen: dict[str, dict[str, float | None]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["timeout"] = dict(request.extensions["timeout"])
+        return httpx.Response(200, json={"success": True})
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        await pub.unpublish(project_slug="myproject", edition_slug="main")
+
+    assert seen["timeout"] == CLOUDFLARE_KV_HTTP_TIMEOUT.as_dict()
+    assert seen["timeout"] != client.timeout.as_dict()
+
+
+@pytest.mark.asyncio
+async def test_get_pointers_sends_every_chunk_with_the_kv_timeout() -> None:
+    """Every ``bulk/get`` chunk carries the KV timeout.
+
+    ``bulk/get`` is the call that stalled on 2026-10-19 (#825), and it
+    stalls per request regardless of key count, so each chunk of a
+    multi-chunk read needs the override, not just the first.
+    """
+    timeouts: list[dict[str, float | None]] = []
+    keys = [f"myproject/e{index}" for index in range(150)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeouts.append(dict(request.extensions["timeout"]))
+        body = json.loads(request.content)
+        return httpx.Response(200, json=_pointer_body(body["keys"]))
+
+    publisher, client = _make_publisher(httpx.MockTransport(handler))
+    async with client, publisher as pub:
+        pointers = await pub.get_pointers(keys)
+
+    assert len(pointers) == 150
+    assert len(timeouts) == 2
+    for timeout in timeouts:
+        assert timeout == CLOUDFLARE_KV_HTTP_TIMEOUT.as_dict()
+        assert timeout != client.timeout.as_dict()
+
+
+@pytest.mark.asyncio
+async def test_get_pointers_retries_a_read_timeout_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``bulk/get`` that times out once is retried, then read.
+
+    This is the exact shape of the 2026-10-19 incident log: the retry
+    helper treats ``httpx.ReadTimeout`` as a transient transport error,
+    logs ``Retrying Cloudflare KV bulk read after transport error``,
+    backs off, and sends the chunk again.
+    """
+    delays = _record_sleeps(monkeypatch)
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json=_pointer_body(["myproject/main"]))
+
+    with capture_logs() as logs:
+        publisher, client = _make_publisher(httpx.MockTransport(handler))
+        async with client, publisher as pub:
+            pointers = await pub.get_pointers(["myproject/main"])
+
+    assert pointers == {
+        "myproject/main": EditionPointer(
+            build_public_id="ABC123",
+            r2_prefix="myproject/__builds/ABC123/",
+            cache_profile="long",
+        )
+    }
+    assert attempts == [1, 2]
+    assert len(delays) == 1
+    retries = [
+        entry
+        for entry in logs
+        if entry["event"]
+        == "Retrying Cloudflare KV bulk read after transport error"
+    ]
+    assert len(retries) == 1
+    assert retries[0]["error_type"] == "ReadTimeout"
+    assert retries[0]["attempt"] == 1
+
+
+def test_kv_timeout_outlasts_the_bulk_get_stall() -> None:
+    """The KV timeout clears the ~5.4 s ``bulk/get`` stall with margin.
+
+    On 2026-10-19 about half of all production ``bulk/get`` calls
+    answered in ~5.4 s, just past the shared client's flat 5 s, so
+    every attempt of the read-back's budget expired a few hundred
+    milliseconds before the answer landed (#825). A future tidy-up
+    that folds this back to the client default must fail here, and
+    the all-attempts-time-out worst case must still fit one
+    maintenance job.
+    """
+    timeout = CLOUDFLARE_KV_HTTP_TIMEOUT
+    assert timeout.read is not None
+    assert timeout.read >= 30.0
+    for field in ("connect", "write", "pool"):
+        assert getattr(timeout, field) is not None, field
+
+    # Four attempts that each run the read timeout out, plus the
+    # retry helper's 0.5 + 1 + 2 s backoff between them.
+    worst_case = 4 * timeout.read + 0.5 + 1 + 2
+    job_timeout = Configuration.model_fields[
+        "maintenance_job_timeout_seconds"
+    ].default
+    assert worst_case < job_timeout

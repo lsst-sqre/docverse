@@ -29,6 +29,18 @@ live under). The loop compares three things per edition:
 - **What the edge serves** — the KV value for that key, read back in
   bulk (`POST .../bulk/get`, 100 keys per request).
 
+Each `bulk/get` request carries its own 30 s read timeout
+(`CLOUDFLARE_KV_HTTP_TIMEOUT`) rather than the 5 s default of the
+worker's shared HTTP client. On 2026-10-19 the production namespace
+began answering about half of all `bulk/get` calls in ~5.4 s, just
+past that default, so every attempt of the read-back's four-attempt
+budget timed out a few hundred milliseconds before the answer landed
+and 4 of 5 ticks for the `rubin` organization failed with
+`httpx.ReadTimeout` (#825). The stall is per request and independent
+of how many keys are asked for, so the chunk size is not a lever. A
+tick in which every chunk of a ~4,400-edition organization stalls
+grows by about four minutes, inside `maintenance_job_timeout_seconds`.
+
 An organization with no `cdn_service_label` has no edge to read. Its
 tick runs the database leg only and reports `cdn_checked: false`; a
 `published` pair is then taken at its word. That is deliberately
@@ -421,6 +433,10 @@ repaired it as `pointer_stale`.
   service that applies a plan.
 - `src/docverse_server/worker/functions/edition_reconcile*.py` — the
   dispatcher, job, and reaper.
+- `src/docverse_server/storage/editionpublisher/_cloudflare_kv.py` —
+  the `bulk/get` read-back and `CLOUDFLARE_KV_HTTP_TIMEOUT`; see also
+  [Keeper-sync transport resilience](keeper-sync-transport.md) for the HTTP
+  clients a worker ships with.
 - `tests/docs_test.py` — fails when this page stops naming every case,
   counter, event field, or knob the code has.
 - SQR-112, "Reconciliation loop".
