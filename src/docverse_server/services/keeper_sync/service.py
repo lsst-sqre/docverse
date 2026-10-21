@@ -1717,6 +1717,7 @@ class KeeperSyncService:
                     ltd_id=ltd_edition.ltd_id,
                     ltd_slug=ltd_edition.slug,
                     reason=TombstoneReason.lifecycle_preemptive,
+                    note=matched_rule,
                 )
             self._logger.info(
                 "Proactive lifecycle delete: tombstoning LTD edition",

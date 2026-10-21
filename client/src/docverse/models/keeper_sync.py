@@ -1318,9 +1318,12 @@ class KeeperSyncTombstone(BaseModel):
     tombstone_note: str | None = Field(
         default=None,
         description=(
-            "Optional operator-facing note the writer attached to this"
-            " tombstone. ``null`` for automated writes (lifecycle and"
-            " preemptive paths attach no note today)."
+            "Optional note the writer attached to this tombstone. A"
+            " ``lifecycle_delete`` or ``lifecycle_preemptive`` tombstone"
+            " names the lifecycle rule that matched (``draft_inactivity``"
+            " or ``ref_deleted``). ``null`` for a ``manual_delete``"
+            " tombstone, and for lifecycle tombstones recorded before"
+            " Docverse began naming the rule."
         ),
     )
 

@@ -427,6 +427,8 @@ async def test_delete_edition_writes_manual_delete_tombstone(
     assert state is not None
     assert state.date_tombstoned is not None
     assert state.tombstone_reason == "manual_delete"
+    # Only lifecycle reaps name a rule; a DELETE leaves the note empty.
+    assert state.tombstone_note is None
 
 
 @pytest.mark.asyncio

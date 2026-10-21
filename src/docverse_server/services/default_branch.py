@@ -33,6 +33,7 @@ import structlog
 
 from docverse.models import TrackingMode
 from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
+from docverse_server.domain.lifecycle import REF_DELETED_RULE_TYPE
 from docverse_server.domain.project import Project
 from docverse_server.services.edition import EditionService
 from docverse_server.services.edition_publishing import (
@@ -168,12 +169,16 @@ class DuplicateDraftRetirer:
         for edition in candidates:
             if edition.tracking_mode is not TrackingMode.git_ref:
                 continue
+            # A retirement only follows a rewrite of ``__main``, which
+            # only follows evidence that ``__main``'s own ref is gone:
+            # the rule this stands in for is ``ref_deleted``.
             deleted = await self._edition_service.soft_delete(
                 org_id=project.org_id,
                 project_id=project.id,
                 edition_id=edition.id,
                 edition_slug=edition.slug,
                 reason=TombstoneReason.lifecycle_delete,
+                note=REF_DELETED_RULE_TYPE,
             )
             if not deleted:
                 continue

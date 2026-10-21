@@ -686,6 +686,7 @@ class EditionService:
         edition_id: int,
         edition_slug: str,
         reason: TombstoneReason,
+        note: str | None = None,
     ) -> bool:
         """Soft-delete one edition and stamp the keeper-sync tombstone.
 
@@ -697,6 +698,12 @@ class EditionService:
         on the matching ``keeper_sync_state`` row in the same flush as
         ``date_deleted`` (no-op when no state row exists).
 
+        ``note`` travels the same way into ``tombstone_note``. Every
+        lifecycle caller passes the matched rule's ``type``
+        (``draft_inactivity`` / ``ref_deleted``) so the tombstone says
+        which rule retired the edition (PRD #830); the DELETE handler
+        omits it, leaving a ``manual_delete`` tombstone's note empty.
+
         Returns ``False`` when the edition was not found / already
         soft-deleted so bulk callers iterating a candidate set can
         treat it as a no-op and continue; the handler raises
@@ -707,6 +714,7 @@ class EditionService:
             project_id=project_id,
             slug=edition_slug,
             reason=reason,
+            note=note,
         )
         if deleted:
             self._logger.info(
@@ -716,5 +724,6 @@ class EditionService:
                 edition_id=edition_id,
                 edition_slug=edition_slug,
                 reason=reason.value,
+                note=note,
             )
         return deleted

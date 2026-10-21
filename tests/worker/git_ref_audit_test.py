@@ -1031,7 +1031,11 @@ async def test_git_ref_audit_writes_lifecycle_delete_tombstone(
     db_session: AsyncSession,
     mock_github: GitHubMock,
 ) -> None:
-    """Soft-delete via the worker stamps a ``lifecycle_delete`` tombstone."""
+    """Soft-delete via the worker stamps a ``lifecycle_delete`` tombstone.
+
+    The note names the ``ref_deleted`` rule, the only one this worker
+    evaluates.
+    """
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session, slug="gra-tomb")
         installation_id = mock_github.seed_installation(
@@ -1101,6 +1105,7 @@ async def test_git_ref_audit_writes_lifecycle_delete_tombstone(
             assert state is not None
             assert state.date_tombstoned is not None
             assert state.tombstone_reason == "lifecycle_delete"
+            assert state.tombstone_note == "ref_deleted"
 
 
 async def _run_audit(

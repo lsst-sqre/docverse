@@ -1713,6 +1713,8 @@ async def test_soft_delete_edition_stamps_tombstone_when_state_row_exists(
     assert state is not None
     assert state.date_tombstoned is not None
     assert state.tombstone_reason == "lifecycle_delete"
+    # No ``note`` passed: the field stays empty, as it always was.
+    assert state.tombstone_note is None
 
 
 @pytest.mark.asyncio
@@ -1847,6 +1849,57 @@ async def test_soft_delete_edition_records_reason_as_passed(
         )
     assert state is not None
     assert state.tombstone_reason == "manual_delete"
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_edition_records_note(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """``note`` lands on the state row's ``tombstone_note``.
+
+    Lifecycle callers pass the matched rule's ``type`` here, which is
+    the only record of which rule retired the edition (PRD #830).
+    """
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="noted",
+                title="Noted",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=7878,
+            ltd_slug="noted",
+            docverse_id=edition.id,
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="noted",
+            reason=TombstoneReason.lifecycle_delete,
+            note="draft_inactivity",
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=7878,
+            include_tombstoned=True,
+        )
+    assert state is not None
+    assert state.tombstone_reason == "lifecycle_delete"
+    assert state.tombstone_note == "draft_inactivity"
 
 
 @pytest.mark.asyncio

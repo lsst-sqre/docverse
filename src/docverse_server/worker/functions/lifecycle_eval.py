@@ -451,7 +451,8 @@ async def _apply_decision(
     future rule that matches editions or builds attributes correctly
     without code changes here), and the rule's resolved parameter
     dict so an operator can audit *why* a row was deleted from logs
-    alone.
+    alone. A soft-deleted edition's keeper-sync tombstone (when it has
+    a state row) also records the matched rule's ``type`` as its note.
 
     Returns the number of editions that actually transitioned to
     soft-deleted in this call so the caller can decide whether a
@@ -475,6 +476,7 @@ async def _apply_decision(
             edition_id=edition.id,
             edition_slug=edition.slug,
             reason=TombstoneReason.lifecycle_delete,
+            note=rule_type,
         )
         if not deleted:
             continue

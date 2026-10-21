@@ -439,8 +439,8 @@ When a visit moves `__main` onto the default branch itself (case 2), it
 also retires the duplicate drafts, as step 3 of the rule does after a
 rewrite: every live, non-exempt `draft` in `git_ref` mode tracking that
 branch is soft-deleted and unpublished. A synced draft's
-`keeper_sync_state` row is tombstoned with reason `lifecycle_delete`, so
-later visits skip its LTD edition. Unlike the rule, a keeper-sync visit
+`keeper_sync_state` row is tombstoned with reason `lifecycle_delete` and
+note `ref_deleted`, so later visits skip its LTD edition. Unlike the rule, a keeper-sync visit
 does not repoint `__main` (which build it serves stays LTD's), publish
 an `edition_lifecycle` event, or enqueue a `dashboard_build`; the `/v/`
 dashboard drops the retired draft at the project's next publish.

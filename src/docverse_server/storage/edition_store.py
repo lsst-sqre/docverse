@@ -1356,6 +1356,7 @@ class EditionStore:
         project_id: int,
         slug: str,
         reason: TombstoneReason,
+        note: str | None = None,
     ) -> bool:
         """Soft-delete an edition and stamp the keeper-sync tombstone.
 
@@ -1372,6 +1373,12 @@ class EditionStore:
         ``reason`` (PRD #830), which is the only record of *why* a
         native edition — one with no state row — was deleted; see
         :func:`_edition_delete_reason` for the mapping.
+
+        ``note`` is written to the state row's ``tombstone_note``.
+        Lifecycle callers pass the ``type`` of the rule that matched
+        (``draft_inactivity`` / ``ref_deleted``), the only record of
+        which rule retired the edition; the API DELETE handler passes
+        nothing, so a ``manual_delete`` tombstone keeps an empty note.
 
         Returns
         -------
@@ -1400,7 +1407,7 @@ class EditionStore:
             .values(
                 date_tombstoned=func.now(),
                 tombstone_reason=reason.value,
-                tombstone_note=None,
+                tombstone_note=note,
             )
         )
         await self._session.flush()

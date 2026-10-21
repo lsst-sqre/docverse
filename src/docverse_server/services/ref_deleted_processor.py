@@ -9,6 +9,7 @@ from typing import Any
 import structlog
 
 from docverse.models.dashboard_template import normalize_github_ref
+from docverse_server.domain.lifecycle import REF_DELETED_RULE_TYPE
 from docverse_server.domain.project import Project
 from docverse_server.services.edition import EditionService
 from docverse_server.services.edition_publishing import (
@@ -243,6 +244,7 @@ class RefDeletedWebhookProcessor:
                 edition_id=edition.id,
                 edition_slug=edition.slug,
                 reason=TombstoneReason.lifecycle_delete,
+                note=REF_DELETED_RULE_TYPE,
             )
             if not was_deleted:
                 continue

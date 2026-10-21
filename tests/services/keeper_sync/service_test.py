@@ -7975,6 +7975,8 @@ async def test_proactive_ref_deleted_tombstones_and_skips_sync_edition(
         assert tombstone.tombstone_reason == (
             TombstoneReason.lifecycle_preemptive.value
         )
+        # The note names the rule that vetoed the import (PRD #830).
+        assert tombstone.tombstone_note == "ref_deleted"
         # No Docverse row was created — the tombstone is a pure veto.
         assert tombstone.docverse_id is None
 
@@ -8066,6 +8068,7 @@ async def test_proactive_draft_inactivity_tombstones_and_skips(
         assert tombstone.tombstone_reason == (
             TombstoneReason.lifecycle_preemptive.value
         )
+        assert tombstone.tombstone_note == "draft_inactivity"
 
 
 @pytest.mark.asyncio

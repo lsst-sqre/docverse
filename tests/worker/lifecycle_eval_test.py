@@ -1412,7 +1412,11 @@ async def test_lifecycle_eval_writes_lifecycle_delete_tombstone(
     app: None,
     db_session: AsyncSession,
 ) -> None:
-    """The worker's soft-delete stamps a ``lifecycle_delete`` tombstone."""
+    """The worker's soft-delete stamps a ``lifecycle_delete`` tombstone.
+
+    The tombstone's note names the rule that matched, so an operator
+    (and keeper-sync's re-evaluation) can tell which rule retired it.
+    """
     org_rules = LifecycleRuleSet(
         root=[DraftInactivityRule(max_days_inactive=30)]
     )
@@ -1472,3 +1476,4 @@ async def test_lifecycle_eval_writes_lifecycle_delete_tombstone(
             assert state is not None
             assert state.date_tombstoned is not None
             assert state.tombstone_reason == "lifecycle_delete"
+            assert state.tombstone_note == "draft_inactivity"
