@@ -101,6 +101,7 @@ from docverse_server.domain.edition import (
     Edition,
     EditionDeleteReason,
     EditionRepoint,
+    EnsuredEdition,
     RepointOutcome,
 )
 from docverse_server.domain.edition_reconcile import ReconcileEdition
@@ -230,10 +231,11 @@ class EditionStore:
         Used for system-created editions like ``__main`` where the slug
         does not conform to the user-facing pattern constraints in
         ``EditionCreate``. Every caller is a derivation — project
-        creation's default edition, the native tracking path's
-        auto-creation, the semver aggregates, keeper-sync's import — so
-        the row is stamped ``derived`` and stays the system's to
-        reconverge as rules change.
+        creation's default edition, keeper-sync's import — so the row is
+        stamped ``derived`` and stays the system's to reconverge as
+        rules change. The native tracking path's auto-creation and its
+        semver aggregates go through :meth:`revive_or_create` instead,
+        which also settles a slug a soft-deleted edition still holds.
 
         Race-tolerant: a concurrent transaction that already inserted
         the same ``(project_id, lower(slug))`` makes this insert a
@@ -274,6 +276,164 @@ class EditionStore:
             )
             raise RuntimeError(msg)
         return existing
+
+    async def revive_or_create(
+        self,
+        *,
+        project_id: int,
+        slug: str,
+        title: str,
+        kind: EditionKind,
+        tracking_mode: TrackingMode,
+        tracking_params: dict[str, Any] | None = None,
+        alternate_name: str | None = None,
+    ) -> EnsuredEdition | None:
+        """Ensure a derived edition holds *slug*, reviving a reaped one.
+
+        The primitive behind the derivation paths that auto-create
+        editions (PRD #830). ``uq_editions_project_lower_slug`` is not
+        partial, so a soft-deleted edition keeps its slug, and
+        :meth:`create_internal`'s ``ON CONFLICT DO NOTHING`` against it
+        inserts nothing and finds no live row. This settles that clash
+        by why the edition was deleted:
+
+        - Slug free: inserted exactly as :meth:`create_internal` would.
+        - Slug held by a live edition: that edition, untouched — the
+          same race-tolerant answer :meth:`create_internal` gives.
+        - Slug held by a soft-deleted edition whose ``delete_reason`` is
+          ``lifecycle_delete`` or ``NULL``: revived in place. The row
+          keeps its id, slug, title, ``lifecycle_exempt``,
+          ``alternate_name``, current build, and build history; loses
+          ``date_deleted`` and ``delete_reason``; and takes this
+          derivation's tracking — and its kind, unless an operator
+          declared one — so the build that triggered the revive
+          matches it. Any keeper-sync tombstone on the edition's state
+          row is cleared in the same transaction, since the edition it
+          vetoes is live again.
+        - Slug held by a ``manual_delete`` edition: ``None``. An
+          operator's delete is a permanent veto that only the admin
+          restore lifts, so the caller tracks no edition for the slug.
+
+        The soft-deleted row is read under ``FOR UPDATE``, so two
+        revives of one slug serialize: the second waits, finds the row
+        live, and returns it unrevived.
+
+        Raises
+        ------
+        RuntimeError
+            If the insert conflicted yet no row holds the slug — not a
+            race this method can lose, so an invariant violation.
+        """
+        stmt = (
+            pg_insert(SqlEdition)
+            .values(
+                slug=slug,
+                title=title,
+                project_id=project_id,
+                kind=kind,
+                kind_source=EditionKindSource.derived,
+                tracking_mode=tracking_mode,
+                tracking_params=tracking_params,
+                alternate_name=alternate_name,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    SqlEdition.project_id,
+                    func.lower(SqlEdition.slug),
+                ],
+            )
+        )
+        await self._session.execute(stmt)
+        live = await self.get_by_slug(project_id=project_id, slug=slug)
+        if live is not None:
+            return EnsuredEdition(edition=live, revived=False)
+
+        row = (
+            await self._session.execute(
+                select(SqlEdition)
+                .where(
+                    SqlEdition.project_id == project_id,
+                    func.lower(SqlEdition.slug) == slug.lower(),
+                    SqlEdition.date_deleted.is_not(None),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            # A concurrent revive committed while this one waited on
+            # the row lock, so the row no longer reads as deleted.
+            live = await self.get_by_slug(project_id=project_id, slug=slug)
+            if live is not None:
+                return EnsuredEdition(edition=live, revived=False)
+            msg = (
+                "revive_or_create lost ON CONFLICT race but no existing "
+                f"edition found for project_id={project_id} slug={slug!r}"
+            )
+            raise RuntimeError(msg)
+
+        previous_reason = row.delete_reason
+        if previous_reason == EditionDeleteReason.manual_delete.value:
+            return None
+
+        row.date_deleted = None
+        row.delete_reason = None
+        row.tracking_mode = tracking_mode
+        row.tracking_params = tracking_params
+        if row.kind_source == EditionKindSource.derived:
+            row.kind = kind
+        await self._session.flush()
+        tombstone_cleared = await self._clear_edition_tombstone(row)
+
+        revived = await self.get_by_slug(project_id=project_id, slug=slug)
+        if revived is None:
+            msg = (
+                f"Edition id={row.id} is not live after reviving it for "
+                f"project_id={project_id} slug={slug!r}"
+            )
+            raise RuntimeError(msg)
+        self._logger.info(
+            "Revived soft-deleted edition",
+            edition_id=revived.id,
+            edition_slug=revived.slug,
+            project_id=project_id,
+            previous_delete_reason=previous_reason,
+            tombstone_cleared=tombstone_cleared,
+        )
+        return EnsuredEdition(edition=revived, revived=True)
+
+    async def _clear_edition_tombstone(self, row: SqlEdition) -> bool:
+        """Clear the keeper-sync tombstone on *row*'s state row, if any.
+
+        The state row is keyed by ``(org_id, resource_type='edition',
+        docverse_id)``; the org comes from the edition's project. A
+        native edition has no state row and a live one no tombstone, so
+        matching nothing is the common case.
+
+        Returns
+        -------
+        bool
+            Whether a tombstone was cleared.
+        """
+        result = await self._session.execute(
+            update(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.org_id
+                == select(SqlProject.org_id)
+                .where(SqlProject.id == row.project_id)
+                .scalar_subquery(),
+                SqlKeeperSyncState.resource_type == ResourceType.edition.value,
+                SqlKeeperSyncState.docverse_id == row.id,
+                SqlKeeperSyncState.date_tombstoned.is_not(None),
+            )
+            .values(
+                date_tombstoned=None,
+                tombstone_reason=None,
+                tombstone_note=None,
+            )
+            .returning(SqlKeeperSyncState.id)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def get_by_slug(
         self, *, project_id: int, slug: str

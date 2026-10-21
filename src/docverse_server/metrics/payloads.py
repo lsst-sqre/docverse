@@ -279,15 +279,17 @@ class ProjectLifecycleEvent(DocverseEventBase):
 
 
 class EditionLifecycleEvent(DocverseEventBase):
-    """An edition was created, updated, deleted, or rolled back.
+    """An edition was created, updated, deleted, rolled back, or restored.
 
     Consolidates the edition management verbs into one event keyed by
     ``action`` (SQR-112 D4). Published from the FastAPI editions handler
-    after the operation's final commit.
+    after the operation's final commit, and with ``restore`` from the
+    ``build_processing`` worker for each edition a build revived from a
+    lifecycle soft-delete (PRD #830).
     """
 
     action: LifecycleAction
-    """Which management operation occurred (create/update/delete/rollback)."""
+    """Which operation occurred (create/update/delete/rollback/restore)."""
 
     edition_kind: MetricsEditionKind
     """Kind of the edition the operation acted on."""

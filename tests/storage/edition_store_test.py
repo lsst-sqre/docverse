@@ -35,6 +35,7 @@ from docverse_server.domain.edition import (
     DEFAULT_EDITION_SLUG,
     Edition,
     EditionDeleteReason,
+    EnsuredEdition,
     RepointOutcome,
 )
 from docverse_server.storage.build_store import BuildStore
@@ -3164,6 +3165,413 @@ async def test_create_internal_concurrent_mixed_case_slug(
         rows = result.scalars().all()
         await db_session.commit()
     assert len(rows) == 1
+
+
+# ── revive_or_create (PRD #830) ───────────────────────────────────────────
+
+
+async def _create_reaped_draft(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+    *,
+    org_id: int,
+    project_id: int,
+    slug: str,
+    reason: TombstoneReason,
+) -> Edition:
+    """Create a derived draft serving a build, then soft-delete it.
+
+    The edition is created as a ``release`` tracking a ref other than
+    the one the revive derives, with ``lifecycle_exempt`` and an
+    ``alternate_name`` set, so a test can tell what the revive kept
+    from what it re-derived.
+    """
+    edition = await edition_store.create_internal(
+        project_id=project_id,
+        slug=slug,
+        title=f"{slug} title",
+        kind=EditionKind.release,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": f"old/{slug}"},
+        alternate_name="old-alt",
+        lifecycle_exempt=True,
+    )
+    build = await BuildStore(
+        session=db_session, logger=structlog.get_logger("docverse")
+    ).create(
+        project_id=project_id,
+        data=BuildCreate(git_ref=f"old/{slug}", content_hash=_HASH),
+        uploader="testuser",
+        project_slug="ed-proj",
+    )
+    await edition_store.set_current_build(
+        edition_id=edition.id, build_id=build.id, skip_date_guard=True
+    )
+    assert await edition_store.soft_delete(
+        org_id=org_id, project_id=project_id, slug=slug, reason=reason
+    )
+    return edition
+
+
+async def _revive_or_create_draft(
+    edition_store: EditionStore, *, project_id: int, slug: str
+) -> EnsuredEdition | None:
+    """Call ``revive_or_create`` with a ``draft`` derivation for *slug*."""
+    return await edition_store.revive_or_create(
+        project_id=project_id,
+        slug=slug,
+        title=slug,
+        kind=EditionKind.draft,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": f"tickets/{slug}"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_revives_lifecycle_deleted_slug(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A lifecycle-deleted slug comes back in place, re-derived.
+
+    The row keeps its id, slug, title, ``lifecycle_exempt``,
+    ``alternate_name``, and current build; its deletion provenance is
+    cleared, and the derivation's kind and tracking are applied over
+    what the row carried before.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        reaped = await _create_reaped_draft(
+            db_session,
+            edition_store,
+            org_id=org_id,
+            project_id=project_id,
+            slug="DM-1",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        ensured = await _revive_or_create_draft(
+            edition_store, project_id=project_id, slug="dm-1"
+        )
+        await db_session.commit()
+
+    assert ensured is not None
+    assert ensured.revived is True
+    revived = ensured.edition
+    assert revived.id == reaped.id
+    assert revived.slug == "DM-1"
+    assert revived.title == "DM-1 title"
+    assert revived.date_deleted is None
+    assert revived.delete_reason is None
+    assert revived.kind is EditionKind.draft
+    assert revived.kind_source is EditionKindSource.derived
+    assert revived.tracking_mode is TrackingMode.git_ref
+    assert revived.tracking_params == {"git_ref": "tickets/dm-1"}
+    assert revived.lifecycle_exempt is True
+    assert revived.alternate_name == "old-alt"
+    assert revived.current_build_id is not None
+    assert revived.current_build_git_ref == "old/DM-1"
+
+    row = await _read_edition_row(db_session, reaped.id)
+    assert row.date_deleted is None
+    assert row.delete_reason is None
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_revives_slug_with_no_delete_reason(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A soft-deleted row with no recorded reason counts as revivable.
+
+    ``NULL`` is what a row deleted before ``delete_reason`` existed, with
+    no tombstone to backfill from, carries; PRD #830 errs toward revival
+    for those rather than leaving their slugs stuck.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        reaped = await _create_reaped_draft(
+            db_session,
+            edition_store,
+            org_id=org_id,
+            project_id=project_id,
+            slug="legacy",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.execute(
+            update(SqlEdition)
+            .where(SqlEdition.id == reaped.id)
+            .values(delete_reason=None)
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        ensured = await _revive_or_create_draft(
+            edition_store, project_id=project_id, slug="legacy"
+        )
+        await db_session.commit()
+
+    assert ensured is not None
+    assert ensured.revived is True
+    assert ensured.edition.id == reaped.id
+    row = await _read_edition_row(db_session, reaped.id)
+    assert row.date_deleted is None
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_refuses_manually_deleted_slug(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """An operator's delete reserves the slug: ``None``, nothing raised.
+
+    The row stays soft-deleted with its reason, and no second row is
+    inserted beside it.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        deleted = await _create_reaped_draft(
+            db_session,
+            edition_store,
+            org_id=org_id,
+            project_id=project_id,
+            slug="by-hand",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        ensured = await _revive_or_create_draft(
+            edition_store, project_id=project_id, slug="by-hand"
+        )
+        await db_session.commit()
+
+    assert ensured is None
+    row = await _read_edition_row(db_session, deleted.id)
+    assert row.date_deleted is not None
+    assert row.delete_reason == EditionDeleteReason.manual_delete.value
+    assert row.kind is EditionKind.release
+    async with db_session.begin():
+        count = (
+            await db_session.execute(
+                select(func.count())
+                .select_from(SqlEdition)
+                .where(SqlEdition.project_id == project_id)
+                .where(func.lower(SqlEdition.slug) == "by-hand")
+            )
+        ).scalar_one()
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_clears_keeper_sync_tombstone(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A once-synced edition's tombstone is cleared with the revive.
+
+    The soft-delete stamped the tombstone on the edition's state row;
+    left in place it would make keeper-sync skip an edition that is
+    live again. The clear lands in the revive's transaction.
+    """
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug="synced",
+            title="Synced",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "tickets/synced"},
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=5151,
+            ltd_slug="synced",
+            docverse_id=edition.id,
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="synced",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        ensured = await _revive_or_create_draft(
+            edition_store, project_id=project_id, slug="synced"
+        )
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=5151,
+            include_tombstoned=True,
+        )
+        await db_session.commit()
+
+    assert ensured is not None
+    assert ensured.revived is True
+    assert state is not None
+    assert state.date_tombstoned is None
+    assert state.tombstone_reason is None
+    assert state.tombstone_note is None
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_returns_live_edition_untouched(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A live slug resolves to its edition, unrevived and unchanged."""
+    async with db_session.begin():
+        _org_id, project_id = await _create_project_with_org(db_session)
+        live = await edition_store.create_internal(
+            project_id=project_id,
+            slug="alive",
+            title="Alive",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "old/alive"},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        ensured = await _revive_or_create_draft(
+            edition_store, project_id=project_id, slug="ALIVE"
+        )
+        await db_session.commit()
+
+    assert ensured is not None
+    assert ensured.revived is False
+    assert ensured.edition.id == live.id
+    assert ensured.edition.kind is EditionKind.release
+    assert ensured.edition.tracking_params == {"git_ref": "old/alive"}
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_inserts_free_slug(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A slug nobody holds is inserted as a ``derived`` edition."""
+    async with db_session.begin():
+        _org_id, project_id = await _create_project_with_org(db_session)
+        ensured = await _revive_or_create_draft(
+            edition_store, project_id=project_id, slug="fresh"
+        )
+        await db_session.commit()
+
+    assert ensured is not None
+    assert ensured.revived is False
+    assert ensured.edition.slug == "fresh"
+    assert ensured.edition.kind is EditionKind.draft
+    assert ensured.edition.kind_source is EditionKindSource.derived
+    assert ensured.edition.tracking_params == {"git_ref": "tickets/fresh"}
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_keeps_a_declared_kind(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A revived edition whose kind an operator declared keeps it.
+
+    The revive re-applies the derivation's tracking so the triggering
+    build matches, but a ``declared`` kind is the operator's, which no
+    derivation path rewrites.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        declared = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="pinned",
+                title="Pinned",
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "old/pinned"},
+            ),
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="pinned",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        ensured = await _revive_or_create_draft(
+            edition_store, project_id=project_id, slug="pinned"
+        )
+        await db_session.commit()
+
+    assert ensured is not None
+    assert ensured.revived is True
+    assert ensured.edition.id == declared.id
+    assert ensured.edition.kind is EditionKind.release
+    assert ensured.edition.kind_source is EditionKindSource.declared
+    assert ensured.edition.tracking_params == {"git_ref": "tickets/pinned"}
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_concurrent_revives_converge(
+    app: FastAPI,
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Two builds reviving one reaped slug bring back one edition, once.
+
+    Both inserts conflict and both find no live row, so both reach for
+    the soft-deleted one; its ``FOR UPDATE`` makes the second wait,
+    after which it finds the row live and returns it unrevived — so the
+    ``restore`` is announced exactly once.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        reaped = await _create_reaped_draft(
+            db_session,
+            edition_store,
+            org_id=org_id,
+            project_id=project_id,
+            slug="contended",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        await db_session.commit()
+
+    engine = create_database_engine(
+        config.database_url, config.database_password
+    )
+    try:
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def revive() -> EnsuredEdition | None:
+            async with maker() as session:
+                store = EditionStore(session=session, logger=logger)
+                async with session.begin():
+                    ensured = await _revive_or_create_draft(
+                        store, project_id=project_id, slug="contended"
+                    )
+                    await session.commit()
+                return ensured
+
+        results = await asyncio.gather(revive(), revive())
+    finally:
+        await engine.dispose()
+
+    assert all(result is not None for result in results)
+    assert {r.edition.id for r in results if r is not None} == {reaped.id}
+    assert sorted(r.revived for r in results if r is not None) == [
+        False,
+        True,
+    ]
 
 
 # ── list_draft_editions_by_git_ref ────────────────────────────────────────

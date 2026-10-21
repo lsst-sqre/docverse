@@ -396,15 +396,20 @@ Published by the handler after the operation's final commit.
 | --- | --- | --- | --- |
 | `organization` | string | tag | Organization slug. |
 | `project` | string or null | tag | Project slug; always set on this event. |
-| `action` | enum | tag | `create`, `update`, or `delete`. The enum's fourth value, `rollback`, applies only to editions and never appears here. |
+| `action` | enum | tag | `create`, `update`, or `delete`. The enum's other values, `rollback` and `restore`, apply only to editions and never appear here. |
 
 ### `edition_lifecycle`
 
 Measurement: `lsst.square.metrics.events.docverse.edition_lifecycle`
 
 An edition was created, updated, deleted, or rolled back through the
-editions API. Published by the handler after the operation's final
-commit.
+editions API, or restored after a soft-delete. Published by the handler
+after the operation's final commit.
+
+A `restore` is published when a client build for a lifecycle-deleted
+edition's git ref revives that edition in place: the `build_processing`
+worker publishes one per revived edition after edition tracking
+commits.
 
 An `update` of a `main` edition is also published when Docverse
 rewrites a project's `__main` edition to track the repository's
@@ -417,7 +422,7 @@ it after the convergence commits.
 | --- | --- | --- | --- |
 | `organization` | string | tag | Organization slug. |
 | `project` | string or null | tag | Project slug; always set on this event. |
-| `action` | enum | tag | `create`, `update`, `delete`, or `rollback`. |
+| `action` | enum | tag | `create`, `update`, `delete`, `rollback`, or `restore`. |
 | `edition_kind` | enum | tag | The edition's kind: `main`, `release`, `draft`, `major`, `minor`, or `alternate`. |
 
 ### `membership_changed`

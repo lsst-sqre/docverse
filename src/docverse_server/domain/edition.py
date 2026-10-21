@@ -244,3 +244,25 @@ class EditionWrite:
     edition: Edition
 
     changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EnsuredEdition:
+    """The result of ensuring a derived edition exists for a slug.
+
+    What
+    :meth:`~docverse_server.storage.edition_store.EditionStore.revive_or_create`
+    hands back when the slug is (now) held by a live edition: the
+    edition as it stands, and whether this call brought it back from a
+    soft-delete rather than inserting it or finding it already live.
+
+    ``revived`` is what the callers announce on. A revived edition is
+    new to every reader that skips soft-deleted rows — the dashboard,
+    the CDN, the API's listings — so it owes the world the same publish
+    and dashboard rebuild a newly created one does, plus an
+    ``edition_lifecycle`` ``restore`` event that says it came back.
+    """
+
+    edition: Edition
+
+    revived: bool

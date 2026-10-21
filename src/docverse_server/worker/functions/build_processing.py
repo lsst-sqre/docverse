@@ -41,7 +41,16 @@ from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
 from docverse_server.domain.queue import JobStatus
 from docverse_server.exceptions import InvalidBuildStateError, NotFoundError
 from docverse_server.factory import Factory
-from docverse_server.metrics import BuildProcessedEvent
+from docverse_server.metrics import (
+    BuildProcessedEvent,
+    DocverseEvents,
+    EditionLifecycleEvent,
+    LifecycleAction,
+    MetricsEditionKind,
+)
+from docverse_server.services.dashboard.enqueue import (
+    try_enqueue_dashboard_build_by_id,
+)
 from docverse_server.services.lock_service import LockKey
 from docverse_server.services.publish_enqueue import (
     enqueue_publish_for_edition,
@@ -684,6 +693,7 @@ async def _process_build_locked(
             editions_updated, editions_skipped = await _finalize_success(
                 session=session,
                 factory=factory,
+                events=ctx.get("events"),
                 build_store=build_store,
                 queue_job_store=queue_job_store,
                 org_id=org_id,
@@ -1289,6 +1299,7 @@ async def _finalize_success(
     *,
     session: AsyncSession,
     factory: Factory,
+    events: DocverseEvents | None,
     build_store: BuildStore,
     queue_job_store: QueueJobStore,
     org_id: int,
@@ -1305,6 +1316,10 @@ async def _finalize_success(
     """Run edition tracking and mark the queue job complete.
 
     Edition tracking failures are logged but do not fail the build.
+
+    *events* is the worker's metrics publishers, or ``None`` in a
+    worker running without them; it carries the ``restore`` events for
+    any edition tracking revived (see :func:`_announce_revivals`).
 
     Returns
     -------
@@ -1411,7 +1426,68 @@ async def _finalize_success(
 
     if tracking_result is None:
         return 0, 0
+    # Phase 5: Announce the editions tracking brought back.
+    await _announce_revivals(
+        session=session,
+        factory=factory,
+        events=events,
+        tracking_result=tracking_result,
+        org_id=org_id,
+        org_slug=org_slug,
+        project_id=project_id,
+        project_slug=project_slug,
+        logger=logger,
+    )
     return len(tracking_result.updated), len(tracking_result.skipped)
+
+
+async def _announce_revivals(
+    *,
+    session: AsyncSession,
+    factory: Factory,
+    events: DocverseEvents | None,
+    tracking_result: EditionTrackingResult,
+    org_id: int,
+    org_slug: str,
+    project_id: int,
+    project_slug: str,
+    logger: structlog.stdlib.BoundLogger,
+) -> None:
+    """Announce each edition tracking revived from a lifecycle delete.
+
+    Runs after the tracking transaction committed, so nothing announced
+    here can be rolled back. Each revived edition gets one
+    ``edition_lifecycle`` ``restore`` event (PRD #830), and the project
+    gets one ``dashboard_build``: the lifecycle reap that deleted the
+    edition rebuilt the dashboard without it, and a revive whose pointer
+    a guard refused publishes nothing, so the publish cascade alone
+    would not bring it back. When the pointer did move, the publish's
+    own cascade is deduplicated against this job.
+
+    Both are best-effort: a metrics outage or a failed enqueue is
+    logged by the publisher or
+    :func:`~docverse_server.services.dashboard.enqueue.try_enqueue_dashboard_build_by_id`
+    and never fails the build, whose tracking has already committed.
+    """
+    if not tracking_result.revived:
+        return
+    if events is not None:
+        for revived in tracking_result.revived:
+            await events.edition_lifecycle.publish(
+                EditionLifecycleEvent(
+                    organization=org_slug,
+                    project=project_slug,
+                    action=LifecycleAction.restore,
+                    edition_kind=MetricsEditionKind.from_api(revived.kind),
+                )
+            )
+    await try_enqueue_dashboard_build_by_id(
+        factory=factory,
+        session=session,
+        logger=logger,
+        org_id=org_id,
+        project_id=project_id,
+    )
 
 
 async def _enqueue_publish_jobs(

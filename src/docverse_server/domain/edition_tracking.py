@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from docverse.models import EditionKind
+
 
 @dataclass(slots=True)
 class EditionTrackingOutcome:
@@ -28,6 +30,25 @@ class EditionTrackingOutcome:
     """
 
 
+@dataclass(slots=True, frozen=True)
+class RevivedEdition:
+    """An edition tracking brought back from a lifecycle soft-delete.
+
+    Carries what the worker needs, after the tracking transaction
+    commits, to publish the edition's ``edition_lifecycle`` ``restore``
+    event without re-reading it.
+    """
+
+    edition_id: int
+    """Internal edition ID."""
+
+    slug: str
+    """Edition slug."""
+
+    kind: EditionKind
+    """The edition's kind once tracking re-derived it."""
+
+
 @dataclass(slots=True)
 class EditionTrackingResult:
     """Aggregate result from ``EditionTrackingService.track_build``."""
@@ -44,6 +65,15 @@ class EditionTrackingResult:
 
     outcomes: list[EditionTrackingOutcome] = field(default_factory=list)
     """Per-edition outcomes."""
+
+    revived: list[RevivedEdition] = field(default_factory=list)
+    """Editions this tracking revived from a lifecycle soft-delete.
+
+    Each also appears in :attr:`outcomes`, as ``created`` when its
+    pointer moved to the build: to everything downstream a revived
+    edition is a new one. Listed here too because a revive is announced
+    whether or not the pointer moved.
+    """
 
     @property
     def updated(self) -> list[EditionTrackingOutcome]:
