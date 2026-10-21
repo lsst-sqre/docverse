@@ -534,7 +534,10 @@ def should_refresh_other_edition(
     A lifecycle tombstone that keeper-sync judged again on an LTD
     rebuild and kept is stamped with ``date_last_synced``
     (:meth:`~docverse_server.services.keeper_sync_tombstone.KeeperSyncTombstoneService.keep`),
-    which ages it from that judgement like any synced row.
+    which ages it from that judgement like any synced row. So is one a
+    sync visited without a newer LTD rebuild to judge, which ages from
+    that visit, so a project whose only non-``main`` editions are such
+    tombstones is not re-synced on every poll.
 
     Callers pass ``now`` explicitly so tests can fix the wall clock.
     """

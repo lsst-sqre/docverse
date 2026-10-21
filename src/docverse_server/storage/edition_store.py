@@ -468,17 +468,21 @@ class EditionStore:
         return revived
 
     async def _clear_edition_tombstone(self, row: SqlEdition) -> bool:
-        """Clear the keeper-sync tombstone on *row*'s state row, if any.
+        """Clear the keeper-sync tombstones on *row*'s state rows, if any.
 
-        The state row is keyed by ``(org_id, resource_type='edition',
+        The state rows are found by ``(org_id, resource_type='edition',
         docverse_id)``; the org comes from the edition's project. A
         native edition has no state row and a live one no tombstone, so
-        matching nothing is the common case.
+        matching nothing is the common case. That triple is not a
+        unique key — edition state rows are unique on ``ltd_id`` — so an
+        LTD edition deleted and recreated under the same slug leaves
+        more than one row naming this edition, and every one of them is
+        cleared.
 
         Returns
         -------
         bool
-            Whether a tombstone was cleared.
+            Whether any tombstone was cleared.
         """
         result = await self._session.execute(
             update(SqlKeeperSyncState)
@@ -498,7 +502,7 @@ class EditionStore:
             )
             .returning(SqlKeeperSyncState.id)
         )
-        return result.scalar_one_or_none() is not None
+        return len(result.scalars().all()) > 0
 
     async def get_by_slug(
         self, *, project_id: int, slug: str

@@ -443,7 +443,8 @@ rewrite: every live, non-exempt `draft` in `git_ref` mode tracking that
 branch is soft-deleted and unpublished. A synced draft's
 `keeper_sync_state` row is tombstoned with reason `lifecycle_delete` and
 note `ref_deleted`, so later visits skip its LTD edition until LTD
-rebuilds it; a visit after a rebuild judges the tombstone again (see
+rebuilds it; a visit after a rebuild judges the tombstone again, and
+keeps it while the draft still duplicates `__main` (see
 [Lifecycle deletions come back with activity](#lifecycle-deletions-come-back-with-activity)).
 Unlike the rule, a keeper-sync visit does not repoint `__main` (which build it serves stays LTD's), publish
 an `edition_lifecycle` event, or enqueue a `dashboard_build`; the `/v/`
@@ -960,7 +961,9 @@ tombstone again once LTD has rebuilt the edition since the state row
 last saw it: LTD's `date_rebuilt` is later than the row's
 `date_rebuilt_seen` or, on a row that never saw one, its
 `date_tombstoned`. Until then the visit short-circuits on the tombstone
-as before, at no cost beyond the edition it already fetched.
+as before, at no cost beyond the edition it already fetched, and stamps
+only the row's `date_last_synced`, so `keeper_sync_tier_other` ages the
+tombstone from that visit as it does a synced edition.
 
 The judgement is the one the proactive pass makes at import: the
 rebuilt LTD edition, mapped as an import would map it, is evaluated
@@ -987,6 +990,14 @@ added. The verdict is one of:
   judged again until LTD rebuilds the edition once more. This is what
   keeps a trailing LTD build of a merged-and-deleted branch vetoed: its
   ref is still gone, so `ref_deleted` matches again.
+- **The edition duplicates `__main`: kept.** A `draft` tracking, in
+  `git_ref` mode, the ref `__main` tracks is the duplicate a
+  default-branch rewrite retires (see
+  [Keeper-synced projects](#keeper-synced-projects)). No rule matches
+  it — its branch is live, and LTD rebuilds it on every push — but
+  lifting its tombstone would only bring the duplicate back, so it is
+  kept as on a rule match, with note `ref_deleted` as the retirement
+  recorded it.
 - **The live ref set could not be read: kept, unjudged.** A failed
   GitHub read is no evidence that the ref is live, so the tombstone
   stands and nothing is stamped; the next visit judges it again. A

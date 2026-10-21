@@ -3477,6 +3477,71 @@ async def test_revive_or_create_clears_keeper_sync_tombstone(
 
 
 @pytest.mark.asyncio
+async def test_revive_or_create_clears_every_tombstone_naming_the_edition(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Every tombstoned state row naming the edition is cleared.
+
+    Edition state rows are unique on ``ltd_id``, not ``docverse_id``:
+    an LTD edition deleted and recreated under the same slug leaves two
+    state rows pointing at one Docverse edition, and the soft-delete
+    tombstones both. The revive clears both rather than tripping over
+    the second.
+    """
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug="recreated",
+            title="Recreated",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "tickets/recreated"},
+        )
+        for ltd_id in (5252, 5253):
+            await state_store.upsert(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug="recreated",
+                docverse_id=edition.id,
+            )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="recreated",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        ensured = await _revive_or_create_draft(
+            edition_store, project_id=project_id, slug="recreated"
+        )
+        states = [
+            await state_store.get(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                include_tombstoned=True,
+            )
+            for ltd_id in (5252, 5253)
+        ]
+        await db_session.commit()
+
+    assert ensured is not None
+    assert ensured.revived is True
+    for state in states:
+        assert state is not None
+        assert state.date_tombstoned is None
+        assert state.tombstone_reason is None
+        assert state.tombstone_note is None
+
+
+@pytest.mark.asyncio
 async def test_revive_or_create_returns_live_edition_untouched(
     db_session: AsyncSession,
     edition_store: EditionStore,

@@ -2579,10 +2579,12 @@ async def keeper_sync_tier_other(ctx: dict[str, Any]) -> str:
     A lifecycle-tombstoned edition is not exempt (PRD #830): it ages
     from its ``date_last_synced``, or its ``date_tombstoned`` when it was
     never synced, so the sync it triggers can judge the tombstone again
-    should LTD have rebuilt the edition. Only a ``manual_delete`` row is
-    left out of this tier's map, so it is never stale here, and
-    ``tier_discovery`` counts it as seen, so neither tier enqueues for
-    it.
+    should LTD have rebuilt the edition. That sync stamps the row's
+    ``date_last_synced`` when it keeps the tombstone on a rule match or
+    finds no rebuild to judge, so the tombstone then ages from it like a
+    synced edition. Only a ``manual_delete`` row is left out of this
+    tier's map, so it is never stale here, and ``tier_discovery`` counts
+    it as seen, so neither tier enqueues for it.
     """
     logger = structlog.get_logger(
         "docverse_server.worker.keeper_sync_tier_other"
@@ -3213,28 +3215,33 @@ class _PushedRefChecker:
         row records only LTD's slug for it. So the project's listed
         editions (:meth:`_listing`) are searched for a lifecycle
         tombstone on the slug LTD gives a ref's edition
-        (:func:`ltd_edition_slug_for_git_ref`), and that one edition is
+        (:func:`ltd_edition_slug_for_git_ref`), and the edition is
         fetched to confirm it tracks the ref, since an operator can name
-        an LTD edition anything. ``None`` when there is no such
-        tombstone, LTD no longer has its edition, or the edition tracks
-        some other ref.
+        an LTD edition anything. An edition LTD deleted and recreated
+        under the same slug leaves several such tombstones, so they are
+        tried newest (highest LTD id) first, as :meth:`_tracking_state`
+        picks, and the first that LTD still has and that tracks the ref
+        is the one. ``None`` when there is no such tombstone, or none
+        passes.
         """
         slug = ltd_edition_slug_for_git_ref(ref)
         listing = await self._listing()
-        state = next(
+        candidates = sorted(
             (
-                state
-                for state in listing.state_by_ltd_id.values()
+                (ltd_id, state)
+                for ltd_id, state in listing.state_by_ltd_id.items()
                 if state.is_lifecycle_tombstone and state.ltd_slug == slug
             ),
-            None,
+            key=lambda candidate: candidate[0],
+            reverse=True,
         )
-        if state is None or state.ltd_id is None:
-            return None
-        ltd_edition = await self._fetch(state.ltd_id)
-        if ltd_edition is None or ref not in (ltd_edition.tracked_refs or ()):
-            return None
-        return state, ltd_edition
+        for ltd_id, state in candidates:
+            ltd_edition = await self._fetch(ltd_id)
+            if ltd_edition is not None and ref in (
+                ltd_edition.tracked_refs or ()
+            ):
+                return state, ltd_edition
+        return None
 
     async def _fetch(self, ltd_id: int) -> LtdEdition | None:
         """Return LTD's edition ``ltd_id``, or ``None`` if LTD lost it."""

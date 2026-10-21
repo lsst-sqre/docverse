@@ -171,7 +171,10 @@ class DuplicateDraftRetirer:
                 continue
             # A retirement only follows a rewrite of ``__main``, which
             # only follows evidence that ``__main``'s own ref is gone:
-            # the rule this stands in for is ``ref_deleted``.
+            # the rule this stands in for is ``ref_deleted``. No rule
+            # matches the draft itself, so keeper-sync's re-evaluation
+            # of a rebuilt edition's lifecycle tombstone checks for the
+            # duplicate too, and keeps this veto while it still is one.
             deleted = await self._edition_service.soft_delete(
                 org_id=project.org_id,
                 project_id=project.id,

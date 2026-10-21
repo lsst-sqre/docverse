@@ -87,6 +87,9 @@ from docverse_server.services.keeper_sync.mappers import (
     derive_edition_dates,
     map_edition_tracking,
 )
+from docverse_server.services.keeper_sync.scheduler import (
+    should_refresh_other_edition,
+)
 from docverse_server.services.keeper_sync.service import (
     DEFAULT_COPY_RETRY_DELAY_SECONDS,
     MAX_CONSECUTIVE_EDITION_FAILURES,
@@ -11449,6 +11452,67 @@ async def test_rebuild_still_past_inactivity_keeps_tombstone(
 
 
 @pytest.mark.asyncio
+async def test_unjudged_lifecycle_tombstone_ages_from_the_visit(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A visit that finds no rebuild to judge stamps the tombstone's row.
+
+    LTD has not rebuilt the vetoed draft since its tombstoning, so the
+    visit short-circuits without judging it. It still stamps the row's
+    ``date_last_synced``, so ``tier_other`` ages the tombstone from the
+    visit that checked it, as it does a synced edition, rather than
+    finding it stale — and re-syncing its project — on every poll.
+    """
+    now = datetime.now(tz=UTC)
+    scenario = await _start_review_scenario(
+        db_session,
+        http_client,
+        mock_discovery,
+        mock_github,
+        org_slug="ks-review-unjudged-stamp",
+        first_draft=_review_draft_payload(
+            date_rebuilt=now - timedelta(days=200)
+        ),
+        live_branches=["main", "u/jsick/feature"],
+    )
+    vetoed = await _draft_state(db_session, org_id=scenario.org_id)
+    assert vetoed.tombstone_reason == (
+        TombstoneReason.lifecycle_preemptive.value
+    )
+    long_ago = now - timedelta(days=30)
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlKeeperSyncState)
+            .where(SqlKeeperSyncState.id == vetoed.id)
+            .values(date_tombstoned=long_ago, date_last_synced=long_ago)
+        )
+    assert should_refresh_other_edition(
+        state=await _draft_state(db_session, org_id=scenario.org_id), now=now
+    )
+
+    result = await scenario.service.sync_project(
+        org_id=scenario.org_id, ltd_slug="pipelines"
+    )
+
+    outcome = _draft_outcome(result)
+    assert outcome.tombstone_verdict is None
+    assert outcome.short_circuited is True
+    assert (result.tombstones_cleared, result.tombstones_kept) == (0, 0)
+    state = await _draft_state(db_session, org_id=scenario.org_id)
+    assert state.date_tombstoned == long_ago
+    assert state.tombstone_note == "draft_inactivity"
+    assert state.date_rebuilt_seen == vetoed.date_rebuilt_seen
+    assert state.date_last_synced is not None
+    assert state.date_last_synced >= now
+    assert not should_refresh_other_edition(
+        state=state, now=datetime.now(tz=UTC)
+    )
+
+
+@pytest.mark.asyncio
 async def test_live_refs_fetch_failure_keeps_lifecycle_tombstone(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
@@ -11521,6 +11585,92 @@ async def test_live_refs_fetch_failure_keeps_lifecycle_tombstone(
     assert recovered_outcome.build_outcome is not None
     state = await _draft_state(db_session, org_id=scenario.org_id)
     assert state.date_tombstoned is None
+
+
+@pytest.mark.asyncio
+async def test_rebuild_of_retired_main_duplicate_keeps_tombstone(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A draft retired as ``__main``'s duplicate stays retired on rebuild.
+
+    The ``DuplicateDraftRetirer`` tombstones a draft tracking the ref
+    ``__main`` tracks, and LTD rebuilds that draft on every push to the
+    branch. No lifecycle rule matches it — the branch is live and the
+    draft was just rebuilt — but the reason it was retired still holds,
+    so the tombstone is kept (with the rebuild stamped) rather than
+    lifted to re-import a duplicate the retirer would not retire again.
+    """
+    now = datetime.now(tz=UTC)
+    scenario = await _start_review_scenario(
+        db_session,
+        http_client,
+        mock_discovery,
+        mock_github,
+        org_slug="ks-review-main-duplicate",
+        first_draft=_review_draft_payload(
+            date_rebuilt=now - timedelta(days=5), tracked_ref="main"
+        ),
+        live_branches=["main"],
+    )
+    main = await _read_main_edition(db_session, project_id=scenario.project_id)
+    assert main.tracking_params == {"git_ref": "main"}
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_id(scenario.project_id)
+        assert project is not None
+        retired = await _build_draft_retirer(
+            db_session, _RecordingUnpublisher()
+        ).retire(
+            project=project, ref="main", logger=structlog.get_logger("test")
+        )
+        await db_session.commit()
+    assert len(retired) == 1
+    vetoed = await _draft_state(db_session, org_id=scenario.org_id)
+    assert vetoed.tombstone_reason == TombstoneReason.lifecycle_delete.value
+    await _backdate_tombstone(
+        db_session,
+        state_id=vetoed.id,
+        date_tombstoned=now - timedelta(days=3),
+    )
+    rebuilt_at = now - timedelta(days=1)
+    rebuilt_build = _rebuild_review_draft(
+        mock_discovery, date_rebuilt=rebuilt_at, tracked_ref="main"
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        result = await scenario.service.sync_project(
+            org_id=scenario.org_id, ltd_slug="pipelines"
+        )
+
+    outcome = _draft_outcome(result)
+    assert outcome.tombstone_verdict is TombstoneVerdict.kept
+    assert outcome.short_circuited is True
+    assert outcome.restored is False
+    assert rebuilt_build.call_count == 0
+    assert (result.tombstones_cleared, result.tombstones_kept) == (0, 1)
+    assert [
+        (log["ltd_edition_id"], log["rule_type"])
+        for log in _review_logs(logs, "Lifecycle tombstone kept")
+    ] == [(2, "ref_deleted")]
+    kept = await _draft_state(db_session, org_id=scenario.org_id)
+    assert kept.tombstone_reason == TombstoneReason.lifecycle_delete.value
+    assert kept.tombstone_note == "ref_deleted"
+    assert kept.date_rebuilt_seen == rebuilt_at
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        assert (
+            await edition_store.get_by_slug(
+                project_id=scenario.project_id, slug=_REVIEW_DRAFT_SLUG
+            )
+            is None
+        )
 
 
 @pytest.mark.asyncio

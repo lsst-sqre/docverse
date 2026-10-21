@@ -60,6 +60,7 @@ from docverse_server.domain.edition_autocreation import (
     resolve_edition_autocreation,
 )
 from docverse_server.domain.lifecycle import (
+    REF_DELETED_RULE_TYPE,
     DraftInactivityRule,
     RefDeletedRule,
 )
@@ -2121,8 +2122,12 @@ class KeeperSyncService:
         sync's cache of the project's live ref set that judgement reads
         (:meth:`sync_project` passes its own); a direct caller without
         one gets a cache seeded from ``live_refs`` when given, and
-        otherwise fetched on demand. A ``manual_delete`` tombstone is
-        never judged again: an operator's delete is a permanent veto.
+        otherwise fetched on demand. A lifecycle tombstone LTD has not
+        rebuilt since is not judged, but its row's ``date_last_synced``
+        is stamped so ``tier_other`` ages it from this visit (see
+        :meth:`_stamp_unjudged_tombstone`). A ``manual_delete``
+        tombstone is never judged again: an operator's delete is a
+        permanent veto.
 
         A soft-deleted row still holding the edition's slug — the
         canonical Docverse uniqueness index ignores ``date_deleted`` —
@@ -2432,7 +2437,10 @@ class KeeperSyncService:
         reads it) is later than the row's ``date_rebuilt_seen``, or its
         ``date_tombstoned`` when the row never saw one. Without a newer
         rebuild, or for a ``manual_delete`` veto, this returns ``None``
-        and the caller short-circuits as before. It also returns
+        and the caller short-circuits as before; a lifecycle tombstone
+        left unjudged for want of a rebuild still has its row's
+        ``date_last_synced`` stamped (:meth:`_stamp_unjudged_tombstone`).
+        It also returns
         ``None`` on a service built without a tombstone service, as the
         proactive pass does nothing there either.
 
@@ -2456,6 +2464,17 @@ class KeeperSyncService:
           its ``tombstone_note`` names the rule that matched this time.
           This is what keeps a trailing LTD build of a merged-and-deleted
           branch vetoed. Returns :attr:`TombstoneVerdict.kept`.
+        - **The edition duplicates ``__main``** — a ``draft`` tracking,
+          in plain ``git_ref`` mode, the ref ``__main`` tracks. No rule
+          matches it, since its branch is live and LTD rebuilds it on
+          every push, but this is the draft the
+          :class:`~docverse_server.services.default_branch.DuplicateDraftRetirer`
+          retires once ``__main`` moves onto that ref, and lifting its
+          tombstone would re-import a duplicate the retirer does not
+          visit again. The tombstone stands as it does on a rule match,
+          its note ``ref_deleted`` as the retirer records it (see
+          :meth:`_duplicates_main`). Returns
+          :attr:`TombstoneVerdict.kept`.
         - **The live ref set could not be read** (and ``ref_deleted`` is
           among the rules) — the tombstone stands unjudged: a failed read
           is no evidence the ref is live. Nothing is stamped, so the next
@@ -2474,6 +2493,9 @@ class KeeperSyncService:
         _, ltd_rebuilt = derive_edition_dates(ltd_edition)
         baseline = state.date_rebuilt_seen or state.date_tombstoned
         if baseline is not None and ltd_rebuilt <= baseline:
+            await self._stamp_unjudged_tombstone(
+                org_id=org_id, ltd_edition=ltd_edition, state=state
+            )
             return None
 
         log_fields: dict[str, Any] = {
@@ -2526,6 +2548,13 @@ class KeeperSyncService:
                 ),
             )
             matched_rule = decision.edition_matches.get(transient.id)
+            if matched_rule is None and await self._duplicates_main(
+                project=project, edition=transient
+            ):
+                # The ``DuplicateDraftRetirer``'s veto still holds: it
+                # records ``ref_deleted`` for a retirement, so a kept
+                # duplicate reads the same.
+                matched_rule = REF_DELETED_RULE_TYPE
 
         if matched_rule is not None:
             async with self._session.begin():
@@ -2552,6 +2581,70 @@ class KeeperSyncService:
             **log_fields,
         )
         return TombstoneVerdict.cleared
+
+    async def _stamp_unjudged_tombstone(
+        self,
+        *,
+        org_id: int,
+        ltd_edition: LtdEdition,
+        state: KeeperSyncState,
+    ) -> None:
+        """Stamp a lifecycle tombstone this visit checked but left unjudged.
+
+        :meth:`_review_lifecycle_tombstone` judges a lifecycle tombstone
+        only on an LTD rebuild newer than the one it last saw; without
+        one the visit short-circuits. It still checked the edition, so
+        the row's ``date_last_synced`` moves to now and ``tier_other``
+        ages the tombstone from this visit, as it does a synced edition
+        and a tombstone the review kept
+        (:func:`~docverse_server.services.keeper_sync.scheduler.should_refresh_other_edition`).
+        Left alone, the row would read stale on every poll, and a
+        project whose only non-``main`` editions are such tombstones
+        would be re-synced on every one. Only ``date_last_synced`` is
+        written: the tombstone, its note, and the rebuild baseline the
+        review compares against stay as recorded.
+        """
+        async with self._session.begin():
+            await self._state_store.upsert(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_edition.ltd_id,
+                ltd_slug=state.ltd_slug,
+                date_last_synced=_now(),
+            )
+
+    async def _duplicates_main(
+        self, *, project: Project, edition: Edition
+    ) -> bool:
+        """Whether *edition* is a ``draft`` duplicating ``__main``.
+
+        The candidate set of
+        :meth:`DuplicateDraftRetirer.retire
+        <docverse_server.services.default_branch.DuplicateDraftRetirer.retire>`:
+        a non-exempt ``draft`` tracking, in plain ``git_ref`` mode, the
+        ref ``__main`` tracks in that mode, so it would match every
+        push alongside ``__main``. A project whose ``__main`` tracks
+        anything else (or that has none) has no such duplicate.
+        """
+        if (
+            edition.slug == DEFAULT_EDITION_SLUG
+            or edition.kind is not EditionKind.draft
+            or edition.lifecycle_exempt
+            or edition.tracking_mode is not TrackingMode.git_ref
+        ):
+            return False
+        git_ref = (edition.tracking_params or {}).get("git_ref")
+        if git_ref is None:
+            return False
+        async with self._session.begin():
+            main = await self._edition_store.get_by_slug(
+                project_id=project.id, slug=DEFAULT_EDITION_SLUG
+            )
+        return (
+            main is not None
+            and main.tracking_mode is TrackingMode.git_ref
+            and (main.tracking_params or {}).get("git_ref") == git_ref
+        )
 
     async def _stamp_ltd_clock(
         self,

@@ -1112,6 +1112,51 @@ async def test_push_to_rebuilt_preemptive_tombstone_enqueues(
 
 
 @pytest.mark.asyncio
+async def test_push_check_prefers_the_newest_preemptive_tombstone_on_a_slug(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """Several tombstones on the ref's slug are tried newest first.
+
+    LTD recreated the ref's edition under the same slug, so two
+    ``lifecycle_preemptive`` rows name it. The older edition is gone
+    from LTD; the newer one was rebuilt. The check tries the highest LTD
+    id first and reads ``rebuilt`` from it, rather than settling on
+    whichever row it met first and reading ``not_found``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-tomb-pre-twice")
+        await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"tickets/DM-53614": _now() - timedelta(minutes=10)},
+        )
+        for ltd_id in (2, 3):
+            await _seed_preemptive_tombstone(
+                db_session, org_id=org_id, ltd_id=ltd_id, ltd_slug="DM-53614"
+            )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [2, 3, _MAIN_LTD_ID])
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(404)
+    )
+    _stub_edition(
+        mock_discovery,
+        ltd_id=3,
+        slug="DM-53614",
+        tracked_ref="tickets/DM-53614",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
+
+    assert await _push_outcomes() == {"tickets/DM-53614": "rebuilt"}
+    assert _ltd_paths(mock_discovery) == [
+        _MAIN_PATH,
+        f"/products/{_SLUG}/editions/",
+        "/editions/3",
+    ]
+    assert await _stamps(org_id) == {}
+
+
+@pytest.mark.asyncio
 async def test_push_to_unrebuilt_preemptive_tombstone_is_unchanged(
     app: None, db_session: AsyncSession, mock_discovery: respx.Router
 ) -> None:

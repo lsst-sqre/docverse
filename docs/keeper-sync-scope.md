@@ -531,7 +531,9 @@ a rebuild is one a rule still matches, most often a trailing LTD build
 of a branch that was merged and deleted. Clearing it by hand does not
 stick: the refresh's proactive pass vetoes the LTD edition again, or the
 next `lifecycle_eval` or `git_ref_audit` pass retires the revived
-edition again unless you set its `lifecycle_exempt` first.
+edition again unless you set its `lifecycle_exempt` first. The other
+survivor is a draft a default-branch rewrite retired for duplicating
+`__main`, which stays retired while it still tracks `__main`'s ref.
 
 **Clear, then refresh.** Two admin calls:
 
