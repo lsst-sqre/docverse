@@ -67,8 +67,11 @@ from docverse_server.factory import Factory
 from docverse_server.metrics import (
     BuildContentCopiedEvent,
     DocverseEvents,
+    EditionLifecycleEvent,
     KeeperSyncPushCheckEvent,
     KeeperSyncPushCheckOutcome,
+    LifecycleAction,
+    MetricsEditionKind,
 )
 from docverse_server.services.dashboard.enqueue import (
     try_enqueue_dashboard_build_by_id,
@@ -835,7 +838,9 @@ async def keeper_sync_project(
                     factory=factory,
                     session=session,
                     queue_job_store=queue_job_store,
+                    events=ctx.get("events"),
                     org_id=org_id,
+                    org_slug=org_slug,
                     run_id=run_id,
                     logger=logger,
                     restamp_only_project_ids=restamp_only_project_ids,
@@ -1161,6 +1166,8 @@ async def _continue_in_new_job(
         editions_remaining=sync_result.editions_remaining,
         continuation_job_id=continuation_job_id,
         restamped_edition_count=sync_result.restamped_edition_count,
+        tombstones_cleared=sync_result.tombstones_cleared,
+        tombstones_kept=sync_result.tombstones_kept,
         edition_failure_count=len(edition_failures),
     )
     return "completed_with_errors" if has_errors else "completed"
@@ -1175,19 +1182,28 @@ def _log_project_completion(
 
     Both lines carry ``restamped_edition_count``, the number of editions
     the sync moved onto LTD's clock (see
-    :attr:`ProjectSyncResult.restamped_edition_count`).
+    :attr:`ProjectSyncResult.restamped_edition_count`), and
+    ``tombstones_cleared`` / ``tombstones_kept``, how many rebuilt
+    editions' lifecycle tombstones the sync lifted and upheld (PRD #830;
+    see :attr:`ProjectSyncResult.tombstones_cleared`).
     """
     edition_failures = sync_result.edition_failures
     restamped_edition_count = sync_result.restamped_edition_count
+    tombstones_cleared = sync_result.tombstones_cleared
+    tombstones_kept = sync_result.tombstones_kept
     if not edition_failures:
         logger.info(
             "Keeper-sync project completed",
             restamped_edition_count=restamped_edition_count,
+            tombstones_cleared=tombstones_cleared,
+            tombstones_kept=tombstones_kept,
         )
         return
     logger.warning(
         "Keeper-sync project completed with edition failures",
         restamped_edition_count=restamped_edition_count,
+        tombstones_cleared=tombstones_cleared,
+        tombstones_kept=tombstones_kept,
         edition_failure_count=len(edition_failures),
         failed_ltd_edition_slugs=[
             failure.ltd_edition_slug
@@ -1266,7 +1282,9 @@ def _build_on_edition_synced(
     factory: Factory,
     session: AsyncSession,
     queue_job_store: QueueJobStore,
+    events: DocverseEvents | None,
     org_id: int,
+    org_slug: str,
     run_id: int | None,
     logger: structlog.stdlib.BoundLogger,
     restamp_only_project_ids: set[int],
@@ -1287,9 +1305,20 @@ def _build_on_edition_synced(
     edition loop is over. An outcome that did enqueue a publish is left
     out because every successful publish already cascades its own
     ``dashboard_build``.
+
+    An outcome that brought an edition back from a lifecycle delete
+    (:attr:`EditionSyncOutcome.restored`, PRD #830) is first announced
+    with one ``edition_lifecycle`` ``restore`` event (*events* is
+    ``None`` in a worker running without metrics), then published
+    whether or not its build was imported this visit — see
+    :func:`_enqueue_publish_for_restored_edition`.
     """
 
     async def callback(outcome: EditionSyncOutcome) -> None:
+        if outcome.restored:
+            await _announce_restored_edition(
+                events=events, org_slug=org_slug, outcome=outcome
+            )
         published_edition = await _enqueue_publish_for_synced_edition(
             factory=factory,
             session=session,
@@ -1299,6 +1328,16 @@ def _build_on_edition_synced(
             outcome=outcome,
             logger=logger,
         )
+        if outcome.restored and not published_edition:
+            published_edition = await _enqueue_publish_for_restored_edition(
+                factory=factory,
+                session=session,
+                queue_job_store=queue_job_store,
+                org_id=org_id,
+                run_id=run_id,
+                outcome=outcome,
+                logger=logger,
+            )
         published_aggregates = await _enqueue_publish_for_aggregates(
             factory=factory,
             session=session,
@@ -1497,6 +1536,96 @@ async def _enqueue_publish_for_synced_edition(
         edition_slug=outcome.docverse_slug,
         build_id=build_outcome.docverse_build_id,
         phase="synced",
+    )
+    return True
+
+
+async def _announce_restored_edition(
+    *,
+    events: DocverseEvents | None,
+    org_slug: str,
+    outcome: EditionSyncOutcome,
+) -> None:
+    """Publish the ``restore`` event for an edition a sync brought back.
+
+    One ``edition_lifecycle`` event with ``action=restore`` per restored
+    edition, the same event native edition tracking publishes when a
+    build revives an edition (PRD #830). Runs from the
+    ``on_edition_synced`` callback, after the visit's transactions have
+    committed. A metrics outage is logged by the publisher and never
+    fails the sync.
+    """
+    if events is None or outcome.edition_kind is None:
+        return
+    await events.edition_lifecycle.publish(
+        EditionLifecycleEvent(
+            organization=org_slug,
+            project=outcome.docverse_project_slug,
+            action=LifecycleAction.restore,
+            edition_kind=MetricsEditionKind.from_api(outcome.edition_kind),
+        )
+    )
+
+
+async def _enqueue_publish_for_restored_edition(
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    org_id: int,
+    run_id: int | None,
+    outcome: EditionSyncOutcome,
+    logger: structlog.stdlib.BoundLogger,
+) -> bool:
+    """Republish a restored edition whose build this visit did not import.
+
+    The lifecycle reap that retired the edition took it off the CDN, so
+    bringing it back must publish it again (PRD #830).
+    :func:`_enqueue_publish_for_synced_edition` already does for a
+    restored edition whose visit imported a fresh build — the usual
+    case, since a tombstone is only judged again once LTD has rebuilt
+    the edition. This covers the rest: ``sync_build`` short-circuited on
+    an LTD build Docverse already holds (an edition revived without a
+    tombstone, or a rebuild that converged onto an existing build), and
+    the tail-end self-heal would read the publish recorded before the
+    reap as settled and skip it.
+
+    Publishes the edition's current build as it stands after the visit.
+    Returns whether a publish was enqueued; an edition with no live
+    current build has nothing to publish.
+    """
+    edition_id = outcome.docverse_edition_id
+    if edition_id is None:
+        return False
+    edition_store = factory.create_edition_store()
+    async with session.begin():
+        edition = await edition_store.get_by_id(edition_id)
+    if (
+        edition is None
+        or edition.current_build_id is None
+        or edition.current_build_public_id is None
+    ):
+        return False
+    await enqueue_publish_for_edition(
+        session=session,
+        edition_store=edition_store,
+        history_store=factory.create_edition_build_history_store(),
+        queue_job_store=queue_job_store,
+        queue_backend=factory.create_queue_backend(),
+        org_id=org_id,
+        project_id=outcome.docverse_project_id,
+        project_slug=outcome.docverse_project_slug,
+        edition_id=edition.id,
+        edition_slug=edition.slug,
+        build_id=edition.current_build_id,
+        build_public_id=serialize_base32_id(edition.current_build_public_id),
+        keeper_sync_run_id=run_id,
+    )
+    logger.info(
+        "Enqueued publish_edition for synced build",
+        edition_slug=edition.slug,
+        build_id=edition.current_build_id,
+        phase="restored",
     )
     return True
 

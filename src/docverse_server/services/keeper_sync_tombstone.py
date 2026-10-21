@@ -9,7 +9,9 @@ This service is the single, well-tested entrypoint every deletion path
 goes through to write, check, list, or clear a tombstone. Manual
 deletes, lifecycle-driven deletes, and the lifecycle-preemptive
 short-circuit all write via :meth:`record`; the admin API reads via
-:meth:`list_for_org` and recovers via :meth:`clear`.
+:meth:`list_for_org` and recovers via :meth:`clear`. Keeper-sync's
+re-evaluation of a rebuilt edition's lifecycle tombstone (PRD #830)
+lifts it via :meth:`clear` or upholds it via :meth:`keep`.
 """
 
 from __future__ import annotations
@@ -178,6 +180,43 @@ class KeeperSyncTombstoneService:
             reason=reason.value,
         )
         return KeeperSyncState.model_validate(row)
+
+    async def keep(
+        self,
+        *,
+        state_id: int,
+        note: str,
+        date_rebuilt_seen: datetime,
+        date_last_synced: datetime,
+    ) -> None:
+        """Uphold a lifecycle tombstone that a re-evaluation judged again.
+
+        Backs keeper-sync's re-evaluation of a rebuilt edition's
+        lifecycle tombstone (PRD #830) when a rule still matches. The
+        veto stands, so ``date_tombstoned`` and ``tombstone_reason`` are
+        left as recorded: the tombstone is upheld, not re-issued.
+        ``tombstone_note`` is refreshed with the rule that matched this
+        time — a draft vetoed as idle may now be vetoed because its
+        branch is gone — and the row is stamped with the LTD rebuild it
+        was judged on (``date_rebuilt_seen``) and when
+        (``date_last_synced``), so the next visit leaves it alone until
+        LTD rebuilds the edition again.
+
+        Matches only a row that is still tombstoned, by its internal id;
+        a row cleared in the meantime is left as it is.
+        """
+        await self._session.execute(
+            update(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.id == state_id,
+                SqlKeeperSyncState.date_tombstoned.is_not(None),
+            )
+            .values(
+                tombstone_note=note,
+                date_rebuilt_seen=date_rebuilt_seen,
+                date_last_synced=date_last_synced,
+            )
+        )
 
     async def is_tombstoned(
         self,

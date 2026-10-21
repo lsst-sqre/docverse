@@ -567,10 +567,10 @@ and `ltd_slug`.
 | `Keeper-sync time ladder` | info | `slice_budget_seconds`, `job_timeout_seconds`, `reaper_threshold_seconds` |
 | `Keeper-sync reaper threshold capped at the job timeout plus margin` | warning | `requested_seconds`, `effective_seconds`, `job_timeout_seconds`, `margin_seconds` |
 | `Project sync stopped at its slice budget` | info | `editions_total`, `editions_visited`, `editions_remaining`, `last_visited_ltd_edition_id`, `project_id`, `project`, `ltd_slug` |
-| `Keeper-sync slice budget reached; continuing in a new job` | info | `editions_visited`, `editions_remaining`, `continuation_job_id`, `restamped_edition_count`, `edition_failure_count` |
+| `Keeper-sync slice budget reached; continuing in a new job` | info | `editions_visited`, `editions_remaining`, `continuation_job_id`, `restamped_edition_count`, `tombstones_cleared`, `tombstones_kept`, `edition_failure_count` |
 | `Keeper-sync slice made no progress within its budget; not continuing` | warning | `editions_total`, `editions_remaining`, `resume_after_ltd_edition_id`, `slice_budget_seconds` |
-| `Keeper-sync project completed` | info | `restamped_edition_count` |
-| `Keeper-sync project completed with edition failures` | warning | `restamped_edition_count`, `edition_failure_count`, `failed_ltd_edition_slugs` |
+| `Keeper-sync project completed` | info | `restamped_edition_count`, `tombstones_cleared`, `tombstones_kept` |
+| `Keeper-sync project completed with edition failures` | warning | `restamped_edition_count`, `tombstones_cleared`, `tombstones_kept`, `edition_failure_count`, `failed_ltd_edition_slugs` |
 | `Resume cursor is no longer in LTD's edition list; walking from the top` | info | `resume_after_ltd_edition_id`, `ltd_slug` |
 | `Skipping keeper_sync_project enqueue: an active job for this project already exists` | info | `org`, `ltd_slug`, `tier` |
 | `Skipping keeper_sync_project enqueue: an active job for this project already exists` | info | `org`, `ltd_slug`, `source` |
@@ -586,6 +586,9 @@ and `ltd_slug`.
   follows once the continuation is enqueued. Only the slice that walks
   to the end of LTD's list logs one of the two
   `Keeper-sync project completed` lines.
+- `tombstones_cleared` and `tombstones_kept` count the editions whose
+  lifecycle tombstone the slice judged again because LTD had rebuilt
+  them: lifted (and the edition imported) or upheld.
 - The two `Skipping keeper_sync_project enqueue` rows are a tier cron
   (with `tier`) and a run's discovery (with `source`) finding the
   project's slot taken, which is what they see for the whole of a

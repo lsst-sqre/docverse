@@ -24,6 +24,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from time import monotonic
 from typing import Any
 
@@ -49,7 +50,11 @@ from docverse_server.domain.content_hash import (
     EMPTY_MANIFEST_HASH,
     PLACEHOLDER_CONTENT_HASH,
 )
-from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
+from docverse_server.domain.edition import (
+    DEFAULT_EDITION_SLUG,
+    Edition,
+    EnsuredEdition,
+)
 from docverse_server.domain.edition_autocreation import (
     DEFAULT_EDITION_AUTOCREATION,
     resolve_edition_autocreation,
@@ -156,6 +161,7 @@ __all__ = [
     "ManifestCallable",
     "ProjectCreatedCallback",
     "ProjectSyncResult",
+    "TombstoneVerdict",
 ]
 
 #: Default age threshold for treating a ``pending`` keeper-sync
@@ -342,6 +348,20 @@ _AGGREGATES_BACKFILLED_BUILD_ID_KEY = "aggregates_backfilled_build_id"
 #: upsert that clears the column, and disappears on the next clean
 #: resolve because ``annotations`` replaces wholesale.
 _DATE_REBUILT_RETRACTED_KEY = "date_rebuilt_seen_retracted"
+
+#: Tombstone reasons a rebuild of the LTD edition reopens (PRD #830).
+#:
+#: A lifecycle rule retired these editions for inactivity or a deleted
+#: ref, and new activity on LTD is exactly what can undo either, so
+#: :meth:`KeeperSyncService._review_lifecycle_tombstone` judges them again
+#: once LTD rebuilds the edition. ``manual_delete`` is left out: an
+#: operator's delete is a permanent veto that only the operator lifts.
+_REVIEWABLE_TOMBSTONE_REASONS = frozenset(
+    {
+        TombstoneReason.lifecycle_preemptive.value,
+        TombstoneReason.lifecycle_delete.value,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -537,11 +557,13 @@ class _EditionStateKey:
 class _LiveRefsCache:
     """A project's live GitHub ref set, fetched at most once per sync.
 
-    Two consumers in one :meth:`KeeperSyncService.sync_project` read the
-    set: the proactive lifecycle pass (``ref_deleted``) and ``__main``'s
-    default-branch tracking (PRD #721). Whichever asks first pays the
-    GitHub round-trip; the other reuses the answer — including a
-    ``None`` from a failed or unconfigured fetch, which is not retried.
+    Three consumers in one :meth:`KeeperSyncService.sync_project` read
+    the set: the proactive lifecycle pass (``ref_deleted``), ``__main``'s
+    default-branch tracking (PRD #721), and the re-evaluation of a
+    rebuilt edition's lifecycle tombstone (PRD #830). Whichever asks
+    first pays the GitHub round-trip; the others reuse the answer —
+    including a ``None`` from a failed or unconfigured fetch, which is
+    not retried.
     """
 
     fetched: bool = False
@@ -549,6 +571,17 @@ class _LiveRefsCache:
 
     refs: frozenset[str] | None = None
     """The live ref names, or ``None`` when none are known."""
+
+    failed: bool = False
+    """Whether the fetch was attempted and GitHub's answer failed.
+
+    Tells a failed read apart from the other ways :attr:`refs` ends up
+    ``None`` — no binding, no installation, an inaccessible or empty
+    repository — which all mean "no evidence a ref is gone". A failure
+    is no evidence either way, so the tombstone re-evaluation keeps a
+    veto it cannot judge rather than lifting it (see
+    :meth:`KeeperSyncService._review_lifecycle_tombstone`).
+    """
 
 
 def _carries_tracking(
@@ -703,6 +736,29 @@ def _measures_sync_lag(
     return edition_state is not None and edition.current_build_id is not None
 
 
+class TombstoneVerdict(StrEnum):
+    """How a visit's re-evaluation settled an edition's lifecycle tombstone.
+
+    :meth:`KeeperSyncService.sync_edition` judges a ``lifecycle_preemptive``
+    or ``lifecycle_delete`` tombstone again once LTD has rebuilt the
+    edition since the row last saw it (PRD #830). A tombstone the visit
+    does not judge — a ``manual_delete`` veto, or no rebuild since —
+    has no verdict.
+    """
+
+    cleared = "cleared"
+    """No lifecycle rule matches the rebuilt edition any more.
+
+    The tombstone was cleared (a ``lifecycle_delete`` edition's
+    soft-deleted row revived with it) and the visit went on to import
+    the edition.
+    """
+
+    kept = "kept"
+    """The tombstone stands: a rule still matches the rebuilt edition,
+    or the live ref set it would be judged against could not be read."""
+
+
 @dataclass(frozen=True)
 class AggregateEditionOutcome:
     """One semver aggregate edition the backfill created or advanced.
@@ -733,7 +789,8 @@ class EditionSyncOutcome:
     ``docverse_edition_id`` is ``None`` when the call short-circuited
     on a tombstoned ``keeper_sync_state`` row whose ``docverse_id`` is
     also ``None`` (the ``lifecycle_preemptive`` case writes such rows
-    for LTD editions that were never imported).
+    for LTD editions that were never imported), and when the edition's
+    slug is reserved by an operator's delete (see :attr:`short_circuited`).
     """
 
     docverse_edition_id: int | None
@@ -742,14 +799,18 @@ class EditionSyncOutcome:
     docverse_project_slug: str
     build_outcome: BuildSyncOutcome | None
     short_circuited: bool
-    """``True`` when the call returned without contacting LTD at all.
+    """``True`` when the call returned without importing anything.
 
-    Set only by the tombstone short-circuit, which returns before
-    ``_ensure_edition`` on the strength of a single ``keeper_sync_state``
-    read. ``sync_project`` reads this to keep such a return out of its
-    consecutive-failure accounting: a database read succeeds *especially*
-    when LTD is down, so treating it as evidence of a healthy edition
-    reset the systemic-failure counter mid-outage.
+    Set by the tombstone short-circuit, which returns before
+    ``_ensure_edition`` on the strength of a ``keeper_sync_state`` read
+    (and, for a rebuilt lifecycle tombstone the re-evaluation keeps,
+    the live ref set the sync already holds), and when
+    ``_ensure_edition`` finds the edition's slug reserved by an
+    operator's ``manual_delete``. ``sync_project`` reads this to keep
+    such a return out of its consecutive-failure accounting: a database
+    read succeeds *especially* when LTD is down, so treating it as
+    evidence of a healthy edition reset the systemic-failure counter
+    mid-outage.
 
     Deliberately explicit rather than inferred from ``build_outcome is
     None``, which is also true of a legitimately build-less edition that
@@ -798,6 +859,34 @@ class EditionSyncOutcome:
     decision: consumers forward it without re-deriving freshness.
     """
 
+    tombstone_verdict: TombstoneVerdict | None = None
+    """How this visit settled the edition's lifecycle tombstone, if at all.
+
+    ``None`` unless the visit re-evaluated a ``lifecycle_*`` tombstone
+    on a rebuilt LTD edition (PRD #830).
+    :attr:`ProjectSyncResult.tombstones_cleared` and
+    :attr:`ProjectSyncResult.tombstones_kept` count it.
+    """
+
+    restored: bool = False
+    """``True`` when this visit brought back an edition a lifecycle rule
+    had retired (PRD #830).
+
+    Set when the visit cleared a lifecycle tombstone, and when
+    ``_ensure_edition`` revived a soft-deleted row holding the
+    edition's slug. Such an edition is new again to every reader that
+    skips deleted rows, and the reap that retired it unpublished it, so
+    the worker publishes one ``edition_lifecycle`` ``restore`` event for
+    it and republishes it even when its build short-circuited.
+    """
+
+    edition_kind: EditionKind | None = None
+    """The synced edition's kind; ``None`` when nothing was imported.
+
+    What the worker's ``restore`` event reports for a :attr:`restored`
+    edition.
+    """
+
     @property
     def contacted_ltd(self) -> bool:
         """``True`` when this edition's sync actually reached LTD.
@@ -810,8 +899,10 @@ class EditionSyncOutcome:
         object store both dark is not.
 
         Two returns are therefore *neutral* for the breaker rather than
-        successful. A tombstone short-circuit returns off a single
-        ``keeper_sync_state`` read (:attr:`short_circuited`). A build-less
+        successful. A tombstone short-circuit returns off a
+        ``keeper_sync_state`` read (:attr:`short_circuited`) — and, when
+        it judges a rebuilt lifecycle tombstone again, the LTD payload
+        already in hand and the sync's live ref set. A build-less
         LTD edition — one whose ``build_url`` is ``None`` — writes its
         edition and state rows and stops, so ``sync_build`` never runs
         and :attr:`build_outcome` stays ``None``. Both succeed
@@ -923,6 +1014,36 @@ class ProjectSyncResult:
         """
         return sum(
             1 for outcome in self.edition_outcomes if outcome.dates_restamped
+        )
+
+    @property
+    def tombstones_cleared(self) -> int:
+        """How many lifecycle tombstones this sync lifted (PRD #830).
+
+        Counts the outcomes whose :attr:`EditionSyncOutcome.tombstone_verdict`
+        is :attr:`TombstoneVerdict.cleared`: editions LTD rebuilt that no
+        lifecycle rule matches any more, imported again by this sync.
+        """
+        return sum(
+            1
+            for outcome in self.edition_outcomes
+            if outcome.tombstone_verdict is TombstoneVerdict.cleared
+        )
+
+    @property
+    def tombstones_kept(self) -> int:
+        """How many rebuilt editions' lifecycle tombstones this sync upheld.
+
+        Counts the outcomes whose :attr:`EditionSyncOutcome.tombstone_verdict`
+        is :attr:`TombstoneVerdict.kept`. A tombstone upheld on a rule
+        match is stamped with the rebuild it judged, so the same rebuild
+        is not counted again by the next sync; one upheld because the
+        live ref set could not be read is.
+        """
+        return sum(
+            1
+            for outcome in self.edition_outcomes
+            if outcome.tombstone_verdict is TombstoneVerdict.kept
         )
 
 
@@ -1152,8 +1273,8 @@ class KeeperSyncService:
         failures keep their per-edition boundary while editions the loop
         did no LTD work for stay invisible to the breaker: an edition in
         ``skip_ltd_ids`` never reaches :meth:`sync_edition`, one whose
-        ``keeper_sync_state`` row is tombstoned returns a
-        ``short_circuited`` outcome from a lone database read, and a
+        ``keeper_sync_state`` tombstone stands returns a
+        ``short_circuited`` outcome without an LTD request, and a
         build-less LTD edition writes its rows without ever resolving a
         build. None of them contacts LTD, so none is evidence that an
         outage has ended.
@@ -1299,6 +1420,7 @@ class KeeperSyncService:
                     rewrite_rules=rewrite_rules,
                     autocreation=autocreation,
                     live_refs=tracking_live_refs,
+                    live_refs_cache=live_refs,
                     tally=tally,
                     on_edition_synced=on_edition_synced,
                 )
@@ -1460,6 +1582,7 @@ class KeeperSyncService:
         rewrite_rules: Sequence[AnySlugRewriteRule],
         autocreation: EditionAutocreationConfig,
         live_refs: frozenset[str] | None,
+        live_refs_cache: _LiveRefsCache,
         tally: _EditionWalkTally,
         on_edition_synced: (
             Callable[[EditionSyncOutcome], Awaitable[None]] | None
@@ -1484,6 +1607,7 @@ class KeeperSyncService:
                 rewrite_rules=rewrite_rules,
                 autocreation=autocreation,
                 live_refs=live_refs,
+                live_refs_cache=live_refs_cache,
             )
         except Exception as exc:
             sentry_sdk.capture_exception(exc)
@@ -1623,7 +1747,10 @@ class KeeperSyncService:
         Returns the set of LTD edition ids the caller must skip — those
         are tombstoned ``lifecycle_preemptive`` and never reach
         ``sync_edition``. An empty set means "nothing tombstoned
-        proactively; iterate every LTD edition normally."
+        proactively; iterate every LTD edition normally." An edition
+        tombstoned on an earlier visit is not judged here: it reaches
+        ``sync_edition``, which judges a lifecycle tombstone again once
+        LTD has rebuilt the edition (PRD #830).
 
         The proactive pass is a no-op when any of ``tombstone_service``,
         ``binding_resolver``, or ``ref_set_fetcher`` is unconfigured —
@@ -1663,7 +1790,8 @@ class KeeperSyncService:
 
         # Pre-load state rows for this project's LTD editions in one
         # round-trip. We need both ``date_tombstoned`` (skip already-
-        # vetoed editions so we do not overwrite the recorded reason)
+        # vetoed editions so we do not overwrite the recorded reason;
+        # ``sync_edition`` re-judges them on a rebuild)
         # and ``docverse_id`` (skip already-imported editions — the
         # regular ``lifecycle_eval`` pass owns those, and the transient
         # built from LTD metadata could not see ``lifecycle_exempt`` or
@@ -1764,9 +1892,10 @@ class KeeperSyncService:
 
         ``None`` when the GitHub collaborators are unconfigured, and
         otherwise whatever :meth:`_fetch_live_refs` answers. The answer
-        is cached either way, so one sync costs at most one GitHub
-        round-trip. Like :meth:`_fetch_live_refs`, must not be called
-        inside ``session.begin()``.
+        is cached either way — a failed read flagged on
+        :attr:`_LiveRefsCache.failed` — so one sync costs at most one
+        GitHub round-trip. Like :meth:`_fetch_live_refs`, must not be
+        called inside ``session.begin()``.
         """
         if not cache.fetched:
             cache.fetched = True
@@ -1774,33 +1903,37 @@ class KeeperSyncService:
                 self._binding_resolver is not None
                 and self._ref_set_fetcher is not None
             ):
-                cache.refs = await self._fetch_live_refs(project=project)
+                await self._fetch_live_refs(project=project, cache=cache)
         return cache.refs
 
     async def _fetch_live_refs(
-        self, *, project: Project
-    ) -> frozenset[str] | None:
-        """Resolve binding + fetch the project's live ref set, once.
+        self, *, project: Project, cache: _LiveRefsCache
+    ) -> None:
+        """Resolve binding + fetch the project's live ref set into *cache*.
 
-        Returns ``None`` when the project has no GitHub binding (the
-        ``ref_deleted`` rule simply does not fire) or when the GitHub
-        round-trip fails — both are accepted "rule disabled, KEEP wins"
-        outcomes. ``draft_inactivity`` is unaffected because it does
-        not read ``live_refs``, and ``__main`` keeps LTD's tracked ref
-        because a missing set is no evidence that ref is gone. How the
+        Leaves ``cache.refs`` ``None`` when the project has no GitHub
+        binding (the ``ref_deleted`` rule simply does not fire) or when
+        the GitHub round-trip fails — both are accepted "rule disabled,
+        KEEP wins" outcomes for the lifecycle passes. Only the failed
+        round-trip (:class:`RepositoryRefFetchError`) also sets
+        ``cache.failed``: the lifecycle tombstone re-evaluation reads it
+        to keep a veto it cannot judge instead of lifting it.
+        ``draft_inactivity`` is unaffected because it does not read
+        ``live_refs``, and ``__main`` keeps LTD's tracked ref because a
+        missing set is no evidence that ref is gone. Otherwise, how the
         round-trip ended sets only the log line: a repository GitHub
         will not show (404) is an info line, a failed read a warning.
 
         A repository with no commits yet, whose ref endpoints GitHub
         answers with 409 (:class:`EmptyRepositoryError`, PRD #821), also
-        returns ``None``, with only a debug line: it is a state of the
+        leaves ``None``, with only a debug line: it is a state of the
         repository rather than a failed read, so it is caught ahead of
         :class:`RepositoryRefFetchError` and writes no warning. Nothing
         is recorded for it; the first sync after its first push reads
         its ref set with no other change.
 
         A binding without an installation token (no
-        ``github_installation_id`` recorded yet) also returns ``None``,
+        ``github_installation_id`` recorded yet) also leaves ``None``,
         before any GitHub request and with only a debug line (PRD #817).
         Reading it anonymously would draw on GitHub's unauthenticated
         budget of 60 requests an hour per source address, which every
@@ -1824,7 +1957,7 @@ class KeeperSyncService:
             raise KeeperSyncInvariantError(msg)
         binding = await self._binding_resolver.resolve(project.id)
         if binding is None:
-            return None
+            return
         if binding.auth is None:
             self._logger.debug(
                 "Keeper sync: project has no GitHub App installation, live"
@@ -1834,7 +1967,7 @@ class KeeperSyncService:
                 project_id=project.id,
                 project=project.slug,
             )
-            return None
+            return
         try:
             ref_set = await self._ref_set_fetcher.fetch(
                 owner=binding.owner,
@@ -1852,7 +1985,7 @@ class KeeperSyncService:
                 project_id=project.id,
                 project=project.slug,
             )
-            return None
+            return
         except EmptyRepositoryError as exc:
             self._logger.debug(
                 "Keeper sync: GitHub repository is empty, live refs"
@@ -1863,7 +1996,7 @@ class KeeperSyncService:
                 project_id=project.id,
                 project=project.slug,
             )
-            return None
+            return
         except RepositoryRefFetchError as exc:
             self._logger.warning(
                 "Keeper sync: GitHub ref fetch failed, live refs"
@@ -1875,8 +2008,9 @@ class KeeperSyncService:
                 project=project.slug,
                 error=str(exc),
             )
-            return None
-        return ref_set.all
+            cache.failed = True
+            return
+        cache.refs = ref_set.all
 
     async def _report_project_created(self, project: Project) -> None:
         """Hand ``on_project_created`` a project this sync created, if wired.
@@ -1964,6 +2098,7 @@ class KeeperSyncService:
         rewrite_rules: Sequence[AnySlugRewriteRule] = (),
         autocreation: EditionAutocreationConfig | None = None,
         live_refs: frozenset[str] | None = None,
+        live_refs_cache: _LiveRefsCache | None = None,
     ) -> EditionSyncOutcome:
         """Sync one LTD edition (and its current build) into Docverse.
 
@@ -1990,13 +2125,28 @@ class KeeperSyncService:
         defaults for the direct callers that do not resolve it.
 
         Short-circuits *before* ``_ensure_edition`` runs when the
-        edition's ``keeper_sync_state`` row is tombstoned. The check
-        sits ahead of ``_ensure_edition`` so a tombstoned-but-still-
-        soft-deleted edition row cannot trip the ``create_internal``
-        slug clash that previously raised "lost ON CONFLICT race"
-        (the canonical Docverse uniqueness index ignores
-        ``date_deleted``, so a soft-deleted row keeps its slug
-        reserved against re-import).
+        edition's ``keeper_sync_state`` row is tombstoned, unless the
+        tombstone is a lifecycle one that LTD's rebuild of the edition
+        has overtaken: :meth:`_review_lifecycle_tombstone` judges such a
+        tombstone again (PRD #830), and when no lifecycle rule matches
+        the rebuilt edition any more it clears the tombstone — reviving
+        a ``lifecycle_delete`` edition's soft-deleted row — and this
+        visit goes on to import the edition. ``live_refs_cache`` is the
+        sync's cache of the project's live ref set that judgement reads
+        (:meth:`sync_project` passes its own); a direct caller without
+        one gets a cache seeded from ``live_refs`` when given, and
+        otherwise fetched on demand. A ``manual_delete`` tombstone is
+        never judged again: an operator's delete is a permanent veto.
+
+        A soft-deleted row still holding the edition's slug — the
+        canonical Docverse uniqueness index ignores ``date_deleted`` —
+        is settled by :meth:`EditionStore.revive_or_create
+        <docverse_server.storage.edition_store.EditionStore.revive_or_create>`
+        inside ``_ensure_edition``: revived in place when a lifecycle
+        rule (or nothing on record) deleted it, and left deleted when an
+        operator did, in which case the visit imports nothing and logs a
+        warning. Either way the slug clash no longer raises "lost ON
+        CONFLICT race".
         """
         async with self._session.begin():
             edition_state = await self._state_store.get(
@@ -2005,21 +2155,38 @@ class KeeperSyncService:
                 ltd_id=ltd_edition.ltd_id,
                 include_tombstoned=True,
             )
+        tombstone_verdict: TombstoneVerdict | None = None
         if edition_state is not None and edition_state.date_tombstoned:
-            self._logger.info(
-                "Sync short-circuited: edition tombstoned",
-                ltd_edition_id=ltd_edition.ltd_id,
-                ltd_edition_slug=ltd_edition.slug,
-                tombstone_reason=edition_state.tombstone_reason,
+            tombstone_verdict = await self._review_lifecycle_tombstone(
+                org_id=org_id,
+                project=project,
+                ltd_edition=ltd_edition,
+                state=edition_state,
+                rewrite_rules=rewrite_rules,
+                live_refs_cache=(
+                    live_refs_cache
+                    if live_refs_cache is not None
+                    else _LiveRefsCache(
+                        fetched=live_refs is not None, refs=live_refs
+                    )
+                ),
             )
-            return EditionSyncOutcome(
-                docverse_edition_id=edition_state.docverse_id,
-                docverse_slug=derive_edition_slug(ltd_edition.slug),
-                docverse_project_id=project.id,
-                docverse_project_slug=project.slug,
-                build_outcome=None,
-                short_circuited=True,
-            )
+            if tombstone_verdict is not TombstoneVerdict.cleared:
+                self._logger.info(
+                    "Sync short-circuited: edition tombstoned",
+                    ltd_edition_id=ltd_edition.ltd_id,
+                    ltd_edition_slug=ltd_edition.slug,
+                    tombstone_reason=edition_state.tombstone_reason,
+                )
+                return EditionSyncOutcome(
+                    docverse_edition_id=edition_state.docverse_id,
+                    docverse_slug=derive_edition_slug(ltd_edition.slug),
+                    docverse_project_id=project.id,
+                    docverse_project_slug=project.slug,
+                    build_outcome=None,
+                    short_circuited=True,
+                    tombstone_verdict=tombstone_verdict,
+                )
 
         # ``manual`` editions need the published build's git_refs to
         # synthesize a Docverse ``git_ref`` tracking pair. Other modes
@@ -2090,25 +2257,41 @@ class KeeperSyncService:
                 backfilled_build_id
             )
 
-        async with self._session.begin():
-            edition = await self._ensure_edition(
-                project_id=project.id,
-                docverse_slug=docverse_slug,
-                kind_derivation=kind_derivation,
-                title=ltd_edition.title,
-                tracking_mode=tracking.tracking_mode,
-                tracking_params=tracking.tracking_params,
-            )
-            await self._state_store.upsert(
+        ensured = await self._record_edition(
+            state_key=_EditionStateKey(
                 org_id=org_id,
-                resource_type=ResourceType.edition,
                 ltd_id=ltd_edition.ltd_id,
                 ltd_slug=ltd_edition.slug,
-                docverse_id=edition.id,
-                date_last_synced=_now(),
-                date_rebuilt_seen=ltd_edition.date_rebuilt,
                 annotations=annotations,
+            ),
+            project_id=project.id,
+            ltd_edition=ltd_edition,
+            docverse_slug=docverse_slug,
+            kind_derivation=kind_derivation,
+            tracking=tracking,
+        )
+        if ensured is None:
+            # Not a failure: the operator's delete is the veto, and the
+            # native path skips a build for this slug the same way.
+            self._logger.warning(
+                "Edition slug reserved by manual delete; LTD edition not"
+                " imported",
+                ltd_edition_id=ltd_edition.ltd_id,
+                ltd_edition_slug=ltd_edition.slug,
+                docverse_slug=docverse_slug,
+                project_id=project.id,
+                project=project.slug,
             )
+            return EditionSyncOutcome(
+                docverse_edition_id=None,
+                docverse_slug=docverse_slug,
+                docverse_project_id=project.id,
+                docverse_project_slug=project.slug,
+                build_outcome=None,
+                short_circuited=True,
+                tombstone_verdict=tombstone_verdict,
+            )
+        edition = ensured.edition
         # Outside the transaction above: the kind convergence write takes
         # the edition's advisory lock, and this service acquires those
         # with no transaction open (see ``_edition_update_lock``).
@@ -2225,6 +2408,12 @@ class KeeperSyncService:
             short_circuited=False,
             aggregate_outcomes=aggregate_outcomes,
             dates_restamped=dates_restamped,
+            tombstone_verdict=tombstone_verdict,
+            restored=(
+                tombstone_verdict is TombstoneVerdict.cleared
+                or ensured.revived
+            ),
+            edition_kind=edition.kind,
             # A short-circuited build imported nothing this visit, so
             # there is no lag to report however known the edition is.
             ltd_date_rebuilt=(
@@ -2234,6 +2423,149 @@ class KeeperSyncService:
                 else None
             ),
         )
+
+    async def _review_lifecycle_tombstone(
+        self,
+        *,
+        org_id: int,
+        project: Project,
+        ltd_edition: LtdEdition,
+        state: KeeperSyncState,
+        rewrite_rules: Sequence[AnySlugRewriteRule],
+        live_refs_cache: _LiveRefsCache,
+    ) -> TombstoneVerdict | None:
+        """Judge a rebuilt edition's lifecycle tombstone again (PRD #830).
+
+        Lifecycle rules retire an edition for its age or its deleted
+        ref, and both can change: the author pushes again, LTD rebuilds
+        the edition. Tombstones once vetoed every later visit whatever
+        their reason, so a rebuilt draft never came back. Here a
+        ``lifecycle_preemptive`` or ``lifecycle_delete`` tombstone is
+        judged again — but only once LTD's rebuild (``date_rebuilt`` as
+        :func:`~docverse_server.services.keeper_sync.mappers.derive_edition_dates`
+        reads it) is later than the row's ``date_rebuilt_seen``, or its
+        ``date_tombstoned`` when the row never saw one. Without a newer
+        rebuild, or for a ``manual_delete`` veto, this returns ``None``
+        and the caller short-circuits as before. It also returns
+        ``None`` on a service built without a tombstone service, as the
+        proactive pass does nothing there either.
+
+        The judgement is the proactive pass's own: the transient
+        edition :func:`_transient_edition_from_ltd` builds from the LTD
+        payload already in hand, evaluated against the project's
+        resolved ``draft_inactivity`` / ``ref_deleted`` rules and the
+        sync's cached live ref set. No LTD request is made on any path.
+
+        - **No rule matches** — the tombstone is cleared through
+          :meth:`KeeperSyncTombstoneService.clear`, which revives a
+          ``lifecycle_delete`` edition's soft-deleted row in the same
+          transaction, and the caller imports the edition in this same
+          visit. Returns :attr:`TombstoneVerdict.cleared`. An LTD edition
+          the transient cannot be built for (``manual`` mode, which needs
+          its build to map) is cleared the same way, as the proactive
+          pass lets it import: the post-import passes judge it then.
+        - **A rule still matches** — the tombstone stands. The row is
+          stamped with the rebuild it was judged on and when, so it is
+          not judged again until LTD rebuilds the edition once more, and
+          its ``tombstone_note`` names the rule that matched this time.
+          This is what keeps a trailing LTD build of a merged-and-deleted
+          branch vetoed. Returns :attr:`TombstoneVerdict.kept`.
+        - **The live ref set could not be read** (and ``ref_deleted`` is
+          among the rules) — the tombstone stands unjudged: a failed read
+          is no evidence the ref is live. Nothing is stamped, so the next
+          visit judges it again. Returns :attr:`TombstoneVerdict.kept`.
+          A project with no GitHub binding (or no App installation) is
+          different: its ref set is ``None``, under which ``ref_deleted``
+          matches nothing, exactly as it does everywhere else.
+
+        Must not be called inside ``session.begin()``: the live ref set
+        may be fetched here (see :meth:`_live_refs`).
+        """
+        if self._tombstone_service is None:
+            return None
+        if state.tombstone_reason not in _REVIEWABLE_TOMBSTONE_REASONS:
+            return None
+        _, ltd_rebuilt = derive_edition_dates(ltd_edition)
+        baseline = state.date_rebuilt_seen or state.date_tombstoned
+        if baseline is not None and ltd_rebuilt <= baseline:
+            return None
+
+        log_fields: dict[str, Any] = {
+            "ltd_edition_id": ltd_edition.ltd_id,
+            "ltd_edition_slug": ltd_edition.slug,
+            "tombstone_reason": state.tombstone_reason,
+            "ltd_date_rebuilt": ltd_rebuilt,
+            "project_id": project.id,
+            "project": project.slug,
+        }
+        async with self._session.begin():
+            org = await self._org_store.get_by_id(org_id)
+        if org is None:
+            msg = f"Organization id={org_id} not found"
+            raise NotFoundError(msg)
+        rule_set = filter_rule_set(
+            resolve_rule_set(
+                org_rules=org.lifecycle_rules,
+                project_rules=project.lifecycle_rules,
+            ),
+            include=(DraftInactivityRule, RefDeletedRule),
+        )
+        live_refs: frozenset[str] | None = None
+        if any(isinstance(rule, RefDeletedRule) for rule in rule_set.root):
+            live_refs = await self._live_refs(
+                project=project, cache=live_refs_cache
+            )
+            if live_refs_cache.failed:
+                self._logger.info(
+                    "Lifecycle tombstone kept: live refs unavailable",
+                    **log_fields,
+                )
+                return TombstoneVerdict.kept
+
+        transient = _transient_edition_from_ltd(
+            ltd_edition=ltd_edition,
+            project_id=project.id,
+            rewrite_rules=rewrite_rules,
+        )
+        matched_rule: str | None = None
+        if transient is not None:
+            decision = evaluate_lifecycle(
+                rule_set=rule_set,
+                context=LifecycleEvaluationContext(
+                    editions=[transient],
+                    builds=[],
+                    edition_build_history=[],
+                    now=_now(),
+                    live_refs=live_refs,
+                ),
+            )
+            matched_rule = decision.edition_matches.get(transient.id)
+
+        if matched_rule is not None:
+            async with self._session.begin():
+                await self._tombstone_service.keep(
+                    state_id=state.id,
+                    note=matched_rule,
+                    date_rebuilt_seen=ltd_rebuilt,
+                    date_last_synced=_now(),
+                )
+            self._logger.info(
+                "Lifecycle tombstone kept",
+                rule_type=matched_rule,
+                **log_fields,
+            )
+            return TombstoneVerdict.kept
+
+        async with self._session.begin():
+            cleared = await self._tombstone_service.clear(
+                public_id=state.public_id, org_id=org_id
+            )
+        self._logger.info(
+            "Lifecycle tombstone cleared",
+            revived_docverse_row=cleared.revived_docverse_row,
+            **log_fields,
+        )
+        return TombstoneVerdict.cleared
 
     async def _stamp_ltd_clock(
         self,
@@ -2764,6 +3096,47 @@ class KeeperSyncService:
             docverse_build_public_id=serialize_base32_id(build.public_id),
         )
 
+    async def _record_edition(
+        self,
+        *,
+        state_key: _EditionStateKey,
+        project_id: int,
+        ltd_edition: LtdEdition,
+        docverse_slug: str,
+        kind_derivation: EditionKindDerivation,
+        tracking: TrackingDerivation,
+    ) -> EnsuredEdition | None:
+        """Ensure the edition's row and record it on its state row.
+
+        One transaction: :meth:`_ensure_edition`, then the edition's
+        ``keeper_sync_state`` upsert pointing at the row it settled on,
+        stamped with this visit's sync time and LTD's ``date_rebuilt``.
+        ``None`` — and no state write — when an operator's delete
+        reserves the slug.
+        """
+        async with self._session.begin():
+            ensured = await self._ensure_edition(
+                project_id=project_id,
+                docverse_slug=docverse_slug,
+                kind_derivation=kind_derivation,
+                title=ltd_edition.title,
+                tracking_mode=tracking.tracking_mode,
+                tracking_params=tracking.tracking_params,
+            )
+            if ensured is None:
+                return None
+            await self._state_store.upsert(
+                org_id=state_key.org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=state_key.ltd_id,
+                ltd_slug=state_key.ltd_slug,
+                docverse_id=ensured.edition.id,
+                date_last_synced=_now(),
+                date_rebuilt_seen=ltd_edition.date_rebuilt,
+                annotations=state_key.annotations,
+            )
+        return ensured
+
     async def _ensure_edition(
         self,
         *,
@@ -2773,7 +3146,7 @@ class KeeperSyncService:
         title: str,
         tracking_mode: TrackingMode,
         tracking_params: dict[str, Any],
-    ) -> Edition:
+    ) -> EnsuredEdition | None:
         """Look up or create an edition and realign its tracking columns.
 
         ``__main`` is looked up only: its tracking has already been
@@ -2781,12 +3154,22 @@ class KeeperSyncService:
 
         ``kind_derivation`` seeds a newly created edition's kind
         outright. Existing rows — matched by slug, adopted by
-        ``git_ref``, or handed back by a ``create_internal`` that lost
+        ``git_ref``, or handed back by a ``revive_or_create`` that lost
         its ``ON CONFLICT`` race — keep whatever kind they carry here;
         the caller converges them through :meth:`_refresh_kind` once
         this transaction has closed, because that write has to take the
         edition's advisory lock and acquiring one while holding row
         locks is the deadlock shape ``_edition_update_lock`` documents.
+
+        Creation goes through
+        :meth:`~docverse_server.storage.edition_store.EditionStore.revive_or_create`,
+        the primitive native edition tracking shares (PRD #830), so a
+        soft-deleted row still holding the slug is settled the same way
+        on both paths: revived in place when a lifecycle rule (or nothing
+        on record) deleted it, reported through
+        :attr:`EnsuredEdition.revived`; declined when an operator did,
+        in which case this returns ``None`` and the caller imports
+        nothing.
         """
         edition = await self._edition_store.get_by_slug(
             project_id=project_id, slug=docverse_slug
@@ -2799,7 +3182,8 @@ class KeeperSyncService:
                     " auto-created it"
                 )
                 raise RuntimeError(msg)
-            return edition
+            return EnsuredEdition(edition=edition, revived=False)
+        revived = False
         if edition is None:
             # PRD #409: native auto-creation and keeper-sync derive an
             # edition's slug from a branch differently, so the same
@@ -2831,8 +3215,8 @@ class KeeperSyncService:
                         keeper_slug=docverse_slug,
                         edition_id=adopted.id,
                     )
-                    return adopted
-            edition = await self._edition_store.create_internal(
+                    return EnsuredEdition(edition=adopted, revived=False)
+            ensured = await self._edition_store.revive_or_create(
                 project_id=project_id,
                 slug=docverse_slug,
                 title=title,
@@ -2840,24 +3224,28 @@ class KeeperSyncService:
                 tracking_mode=tracking_mode,
                 tracking_params=tracking_params,
             )
-        # Applied on both paths. ``create_internal`` is race-tolerant: a
+            if ensured is None:
+                return None
+            edition = ensured.edition
+            revived = ensured.revived
+        # Applied on every path. ``revive_or_create`` is race-tolerant: a
         # concurrent writer (e.g. the native ``track_build`` path handling
         # an upload for the same ref) that inserted this
         # ``(project, lower(slug))`` between our SELECT and INSERT wins the
         # ``ON CONFLICT DO NOTHING``, and we get *its* row back — an
         # existing edition exactly like a ``get_by_slug`` hit, whose
         # tracking columns still need realigning with LTD. The store
-        # returns the winner verbatim with no "did I insert?" signal, so
-        # the refresh runs unconditionally; on a genuinely fresh row it
-        # is a no-op, since that row already carries these params. The
-        # caller's ``_refresh_kind`` covers the winner's kind the same
-        # way, and is likewise a no-op on a fresh row.
+        # returns the winner with no "did I insert?" signal, so the
+        # refresh runs unconditionally; on a genuinely fresh or revived
+        # row it is a no-op, since that row already carries these
+        # params. The caller's ``_refresh_kind`` covers the winner's kind
+        # the same way, and is likewise a no-op on a fresh row.
         await self._refresh_tracking(
             edition=edition,
             tracking_mode=tracking_mode,
             tracking_params=tracking_params,
         )
-        return edition
+        return EnsuredEdition(edition=edition, revived=revived)
 
     async def _refresh_tracking(
         self,

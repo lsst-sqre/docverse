@@ -617,6 +617,96 @@ async def test_list_for_org_display_path_falls_back_for_preemptive(
 
 
 @pytest.mark.asyncio
+async def test_keep_refreshes_note_and_stamps_the_judged_rebuild(
+    db_session: AsyncSession,
+) -> None:
+    """``keep`` upholds a tombstone: note and stamps move, the veto stays.
+
+    The re-evaluation of a rebuilt edition's lifecycle tombstone (PRD
+    #830) calls it when a rule still matches. The note names the rule
+    that matched this time and the row records the rebuild it judged,
+    while ``date_tombstoned`` and ``tombstone_reason`` keep the original
+    veto's values.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    service = _build_service(db_session)
+    async with db_session.begin():
+        recorded = await service.record(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=42,
+            ltd_slug="tickets-DM-1",
+            reason=TombstoneReason.lifecycle_preemptive,
+            note="draft_inactivity",
+        )
+    rebuilt = datetime(2026, 10, 20, 17, 34, tzinfo=UTC)
+    synced = datetime(2026, 10, 21, 8, 0, tzinfo=UTC)
+
+    async with db_session.begin():
+        await service.keep(
+            state_id=recorded.id,
+            note="ref_deleted",
+            date_rebuilt_seen=rebuilt,
+            date_last_synced=synced,
+        )
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        kept = await state_store.get_by_id_for_org(
+            state_id=recorded.id, org_id=org_id
+        )
+    assert kept is not None
+    assert kept.tombstone_note == "ref_deleted"
+    assert kept.date_rebuilt_seen == rebuilt
+    assert kept.date_last_synced == synced
+    assert kept.date_tombstoned == recorded.date_tombstoned
+    assert kept.tombstone_reason == TombstoneReason.lifecycle_preemptive.value
+
+
+@pytest.mark.asyncio
+async def test_keep_leaves_a_cleared_row_alone(
+    db_session: AsyncSession,
+) -> None:
+    """A row cleared before ``keep`` lands is not stamped by it."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    service = _build_service(db_session)
+    async with db_session.begin():
+        recorded = await service.record(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=42,
+            ltd_slug="tickets-DM-1",
+            reason=TombstoneReason.lifecycle_preemptive,
+        )
+        await service.clear(public_id=recorded.public_id, org_id=org_id)
+
+    async with db_session.begin():
+        await service.keep(
+            state_id=recorded.id,
+            note="ref_deleted",
+            date_rebuilt_seen=datetime(2026, 10, 20, tzinfo=UTC),
+            date_last_synced=datetime(2026, 10, 21, tzinfo=UTC),
+        )
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        state = await state_store.get_by_id_for_org(
+            state_id=recorded.id, org_id=org_id
+        )
+    assert state is not None
+    assert state.date_tombstoned is None
+    assert state.tombstone_note is None
+    assert state.date_rebuilt_seen is None
+    assert state.date_last_synced is None
+
+
+@pytest.mark.asyncio
 async def test_clear_un_tombstones_state_row(
     db_session: AsyncSession,
 ) -> None:
