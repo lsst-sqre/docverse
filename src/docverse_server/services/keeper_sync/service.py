@@ -749,6 +749,35 @@ class TombstoneVerdict(StrEnum):
 
 
 @dataclass(frozen=True)
+class _TombstoneReview:
+    """What :meth:`KeeperSyncService._review_lifecycle_tombstone` decided."""
+
+    verdict: TombstoneVerdict | None = None
+    """How the tombstone was settled, as the outcome reports it.
+
+    ``None`` when the visit did not judge it: a ``manual_delete`` veto,
+    a lifecycle tombstone LTD has not rebuilt since, or a service built
+    without a tombstone service.
+    """
+
+    revived_docverse_row: bool = False
+    """Whether clearing the tombstone revived a soft-deleted edition row.
+
+    Only a :attr:`TombstoneVerdict.cleared` review can set it, and only
+    for a ``lifecycle_delete`` tombstone whose edition Docverse had
+    imported (:attr:`ClearedTombstone.revived_docverse_row
+    <docverse_server.services.keeper_sync_tombstone.ClearedTombstone.revived_docverse_row>`).
+    A cleared ``lifecycle_preemptive`` tombstone vetoed the LTD edition
+    before it was ever imported, so there is no row to revive and the
+    visit's import is a first one, not a restore.
+    """
+
+
+_UNJUDGED = _TombstoneReview()
+"""The review of a tombstone the visit did not judge, or of no tombstone."""
+
+
+@dataclass(frozen=True)
 class AggregateEditionOutcome:
     """One semver aggregate edition the backfill created or advanced.
 
@@ -861,12 +890,19 @@ class EditionSyncOutcome:
     """``True`` when this visit brought back an edition a lifecycle rule
     had retired (PRD #830).
 
-    Set when the visit cleared a lifecycle tombstone, and when
-    ``_ensure_edition`` revived a soft-deleted row holding the
-    edition's slug. Such an edition is new again to every reader that
-    skips deleted rows, and the reap that retired it unpublished it, so
-    the worker publishes one ``edition_lifecycle`` ``restore`` event for
-    it and republishes it even when its build short-circuited.
+    Set when clearing the visit's lifecycle tombstone revived the
+    edition's soft-deleted row, and when ``_ensure_edition`` revived a
+    soft-deleted row holding the edition's slug. Such an edition is new
+    again to every reader that skips deleted rows, and the reap that
+    retired it unpublished it, so the worker publishes one
+    ``edition_lifecycle`` ``restore`` event for it and republishes it
+    even when its build short-circuited.
+
+    A cleared tombstone alone does not set it. A ``lifecycle_preemptive``
+    tombstone vetoed the LTD edition before Docverse imported it, so
+    clearing one revives nothing: the visit creates the edition for the
+    first time, and :attr:`tombstone_verdict` still reads
+    :attr:`TombstoneVerdict.cleared` for the tombstone counts.
     """
 
     edition_kind: EditionKind | None = None
@@ -2151,9 +2187,9 @@ class KeeperSyncService:
                 ltd_id=ltd_edition.ltd_id,
                 include_tombstoned=True,
             )
-        tombstone_verdict: TombstoneVerdict | None = None
+        review = _UNJUDGED
         if edition_state is not None and edition_state.date_tombstoned:
-            tombstone_verdict = await self._review_lifecycle_tombstone(
+            review = await self._review_lifecycle_tombstone(
                 org_id=org_id,
                 project=project,
                 ltd_edition=ltd_edition,
@@ -2167,7 +2203,7 @@ class KeeperSyncService:
                     )
                 ),
             )
-            if tombstone_verdict is not TombstoneVerdict.cleared:
+            if review.verdict is not TombstoneVerdict.cleared:
                 self._logger.info(
                     "Sync short-circuited: edition tombstoned",
                     ltd_edition_id=ltd_edition.ltd_id,
@@ -2181,7 +2217,7 @@ class KeeperSyncService:
                     docverse_project_slug=project.slug,
                     build_outcome=None,
                     short_circuited=True,
-                    tombstone_verdict=tombstone_verdict,
+                    tombstone_verdict=review.verdict,
                 )
 
         # ``manual`` editions need the published build's git_refs to
@@ -2289,7 +2325,7 @@ class KeeperSyncService:
                 docverse_project_slug=project.slug,
                 build_outcome=None,
                 short_circuited=True,
-                tombstone_verdict=tombstone_verdict,
+                tombstone_verdict=review.verdict,
             )
         edition = ensured.edition
         # Outside the transaction above: the kind convergence write takes
@@ -2408,11 +2444,11 @@ class KeeperSyncService:
             short_circuited=False,
             aggregate_outcomes=aggregate_outcomes,
             dates_restamped=dates_restamped,
-            tombstone_verdict=tombstone_verdict,
-            restored=(
-                tombstone_verdict is TombstoneVerdict.cleared
-                or ensured.revived
-            ),
+            tombstone_verdict=review.verdict,
+            # Only a revived row is a restore: clearing a
+            # ``lifecycle_preemptive`` veto revives nothing, so the import
+            # is the edition's first.
+            restored=review.revived_docverse_row or ensured.revived,
             edition_kind=edition.kind,
             # A short-circuited build imported nothing this visit, so
             # there is no lag to report however known the edition is.
@@ -2433,7 +2469,7 @@ class KeeperSyncService:
         state: KeeperSyncState,
         rewrite_rules: Sequence[AnySlugRewriteRule],
         live_refs_cache: _LiveRefsCache,
-    ) -> TombstoneVerdict | None:
+    ) -> _TombstoneReview:
         """Judge a rebuilt edition's lifecycle tombstone again (PRD #830).
 
         Lifecycle rules retire an edition for its age or its deleted
@@ -2445,28 +2481,34 @@ class KeeperSyncService:
         :func:`~docverse_server.services.keeper_sync.mappers.derive_edition_dates`
         reads it) is later than the row's ``date_rebuilt_seen``, or its
         ``date_tombstoned`` when the row never saw one. Without a newer
-        rebuild, or for a ``manual_delete`` veto, this returns ``None``
-        and the caller short-circuits as before; a lifecycle tombstone
-        left unjudged for want of a rebuild still has its row's
-        ``date_last_synced`` stamped (:meth:`_stamp_unjudged_tombstone`).
-        It also returns
-        ``None`` on a service built without a tombstone service, as the
-        proactive pass does nothing there either.
+        rebuild, or for a ``manual_delete`` veto, this returns a review
+        with no verdict (:data:`_UNJUDGED`) and the caller
+        short-circuits as before; a lifecycle tombstone left unjudged
+        for want of a rebuild still has its row's ``date_last_synced``
+        stamped (:meth:`_stamp_unjudged_tombstone`). It returns the same
+        on a service built without a tombstone service, as the proactive
+        pass does nothing there either.
 
         The judgement is the proactive pass's own: the transient
         edition :func:`_transient_edition_from_ltd` builds from the LTD
         payload already in hand, evaluated against the project's
         resolved ``draft_inactivity`` / ``ref_deleted`` rules and the
         sync's cached live ref set. No LTD request is made on any path.
+        Each verdict below is returned as the review's
+        :attr:`_TombstoneReview.verdict`:
 
         - **No rule matches** — the tombstone is cleared through
           :meth:`KeeperSyncTombstoneService.clear`, which revives a
           ``lifecycle_delete`` edition's soft-deleted row in the same
           transaction, and the caller imports the edition in this same
-          visit. Returns :attr:`TombstoneVerdict.cleared`. An LTD edition
-          the transient cannot be built for (``manual`` mode, which needs
-          its build to map) is cleared the same way, as the proactive
-          pass lets it import: the post-import passes judge it then.
+          visit. Returns :attr:`TombstoneVerdict.cleared`, with
+          :attr:`_TombstoneReview.revived_docverse_row` saying whether
+          the clear revived a row — never for a ``lifecycle_preemptive``
+          tombstone, whose edition was vetoed before Docverse imported
+          it. An LTD edition the transient cannot be built for
+          (``manual`` mode, which needs its build to map) is cleared the
+          same way, as the proactive pass lets it import: the
+          post-import passes judge it then.
         - **A rule still matches** — the tombstone stands. The row is
           stamped with the rebuild it was judged on and when, so it is
           not judged again until LTD rebuilds the edition once more, and
@@ -2496,16 +2538,16 @@ class KeeperSyncService:
         may be fetched here (see :meth:`_live_refs`).
         """
         if self._tombstone_service is None:
-            return None
+            return _UNJUDGED
         if not state.is_lifecycle_tombstone:
-            return None
+            return _UNJUDGED
         _, ltd_rebuilt = derive_edition_dates(ltd_edition)
         baseline = state.date_rebuilt_seen or state.date_tombstoned
         if baseline is not None and ltd_rebuilt <= baseline:
             await self._stamp_unjudged_tombstone(
                 org_id=org_id, ltd_edition=ltd_edition, state=state
             )
-            return None
+            return _UNJUDGED
 
         log_fields: dict[str, Any] = {
             "ltd_edition_id": ltd_edition.ltd_id,
@@ -2537,7 +2579,7 @@ class KeeperSyncService:
                     "Lifecycle tombstone kept: live refs unavailable",
                     **log_fields,
                 )
-                return TombstoneVerdict.kept
+                return _TombstoneReview(verdict=TombstoneVerdict.kept)
 
         transient = _transient_edition_from_ltd(
             ltd_edition=ltd_edition,
@@ -2578,7 +2620,7 @@ class KeeperSyncService:
                 rule_type=matched_rule,
                 **log_fields,
             )
-            return TombstoneVerdict.kept
+            return _TombstoneReview(verdict=TombstoneVerdict.kept)
 
         async with self._session.begin():
             cleared = await self._tombstone_service.clear(
@@ -2589,7 +2631,10 @@ class KeeperSyncService:
             revived_docverse_row=cleared.revived_docverse_row,
             **log_fields,
         )
-        return TombstoneVerdict.cleared
+        return _TombstoneReview(
+            verdict=TombstoneVerdict.cleared,
+            revived_docverse_row=cleared.revived_docverse_row,
+        )
 
     async def _stamp_unjudged_tombstone(
         self,

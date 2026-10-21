@@ -417,11 +417,12 @@ soft delete (PRD #830), by whichever of three paths brought it back:
   client build for its git ref revived in place, after edition tracking
   commits;
 - the `keeper_sync_project` worker, for each edition a sync brought
-  back: one whose lifecycle tombstone the sync cleared after LTD rebuilt
-  it — including an LTD edition vetoed before it was ever imported,
-  which is imported for the first time — and a lifecycle-deleted
-  edition revived because it held the slug of the LTD edition being
-  imported.
+  back: one whose soft-deleted row was revived when the sync cleared
+  its `lifecycle_delete` tombstone after LTD rebuilt it, and a
+  lifecycle-deleted edition revived because it held the slug of the LTD
+  edition being imported. An LTD edition vetoed `lifecycle_preemptive`
+  before it was ever imported had no row to revive, so clearing its
+  tombstone makes its import a first one, with no `restore` event.
 
 What sets each path off is in
 [Lifecycle deletions come back with activity](github-integration.md#lifecycle-deletions-come-back-with-activity).

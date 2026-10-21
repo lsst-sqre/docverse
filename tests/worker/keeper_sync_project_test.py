@@ -1824,23 +1824,48 @@ async def _run_two_edition_sync(
     return result, logs
 
 
+def _spy_restored_republish(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the slug of each edition the restored republish is run for.
+
+    Wraps the worker's ``_enqueue_publish_for_restored_edition``, which
+    still runs, so a test can tell whether the callback took the
+    restored-edition path at all.
+    """
+    calls: list[str] = []
+    original = keeper_sync_worker_module._enqueue_publish_for_restored_edition
+
+    async def _spy(**kwargs: Any) -> bool:
+        calls.append(kwargs["outcome"].docverse_slug)
+        return await original(**kwargs)
+
+    monkeypatch.setattr(
+        keeper_sync_worker_module,
+        "_enqueue_publish_for_restored_edition",
+        _spy,
+    )
+    return calls
+
+
 @pytest.mark.asyncio
-async def test_keeper_sync_project_restores_a_cleared_lifecycle_tombstone(
+async def test_keeper_sync_project_first_import_after_preemptive_veto(
     app: None,
     db_session: AsyncSession,
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A lifecycle tombstone LTD's rebuild overtook is announced and counted.
+    """A cleared pre-import veto is counted, but is not a restore.
 
     The draft was vetoed ``lifecycle_preemptive`` before LTD last
     rebuilt it, and no lifecycle rule applies any more, so the sync
-    clears the tombstone and imports the draft (PRD #830). The job then
-    publishes it like any fresh import, publishes one
-    ``edition_lifecycle`` ``restore`` event for it, and its completion
-    log line counts the cleared tombstone.
+    clears the tombstone and imports the draft (PRD #830). Docverse
+    never held the draft, so nothing came back: the job publishes it
+    like any fresh import, through the synced build alone, announces no
+    ``edition_lifecycle`` ``restore``, and never takes the
+    restored-edition republish path. Its completion log line still
+    counts the cleared tombstone.
     """
     _manager, events = await build_event_manager(Configuration())
+    restored_republishes = _spy_restored_republish(monkeypatch)
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
         run_id = await _seed_run(db_session, org_id=org_id)
@@ -1893,6 +1918,116 @@ async def test_keeper_sync_project_restores_a_cleared_lifecycle_tombstone(
     assert result == "completed"
     publisher = events.edition_lifecycle
     assert isinstance(publisher, MockEventPublisher)
+    assert publisher.published == []
+    assert restored_republishes == []
+    publish_slugs = sorted(
+        job.kwargs["payload"]["edition_slug"]
+        for job in get_jobs_by_name(
+            mock_arq, "publish_edition", queue_name="docverse:queue"
+        )
+    )
+    assert publish_slugs == ["__main", "u-jsick-feature"]
+    assert [
+        (log["tombstones_cleared"], log["tombstones_kept"])
+        for log in logs
+        if log["event"] == "Keeper-sync project completed"
+    ] == [(1, 0)]
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_restores_a_cleared_lifecycle_delete(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tombstone clear that revives the edition's row is a restore.
+
+    A lifecycle reap retired the imported draft, soft-deleting its row
+    and tombstoning it ``lifecycle_delete``, before LTD last rebuilt it.
+    With no lifecycle rule matching any more, the sync clears the
+    tombstone, which revives the row in place (PRD #830). The job
+    announces one ``edition_lifecycle`` ``restore`` for it and, since
+    ``sync_build`` short-circuits on the LTD build Docverse already
+    holds, republishes it through the restored-edition path: the reap
+    took it off the CDN.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    restored_republishes = _spy_restored_republish(monkeypatch)
+    async with db_session.begin():
+        org_id, org_slug = await _seed_org(db_session)
+        run_id = await _seed_run(db_session, org_id=org_id)
+    _seed_two_edition_ltd(mock_discovery)
+    _patch_factory_io(
+        monkeypatch,
+        object_store=MockObjectStore(),
+        source_objects={
+            "pipelines/builds/42/index.html": b"<html>main</html>",
+            "pipelines/builds/43/index.html": b"<html>branch</html>",
+        },
+    )
+    mock_arq = MockArqQueue(default_queue_name="docverse:queue")
+    register_queue(mock_arq, KEEPER_SYNC_QUEUE_NAME)
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), arq_queue=mock_arq, events=events
+    )
+    first, _ = await _run_two_edition_sync(
+        ctx,
+        db_session,
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        backend_job_id="test-arq-reaped-1",
+    )
+    assert first == "completed"
+    project_id = await _project_id_for(org_id=org_id)
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.get_by_slug(
+            project_id=project_id, slug="u-jsick-feature"
+        )
+        assert edition is not None
+        # The first job's publish settled before the reap.
+        await db_session.execute(
+            update(SqlEditionBuildHistory)
+            .where(SqlEditionBuildHistory.edition_id == edition.id)
+            .values(publish_status=PublishStatus.published)
+        )
+        assert await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="u-jsick-feature",
+            reason=TombstoneReason.lifecycle_delete,
+            note="draft_inactivity",
+        )
+        # The reap predates LTD's last rebuild of the draft
+        # (2026-04-29), which converged on the build Docverse holds.
+        await db_session.execute(
+            update(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.org_id == org_id,
+                SqlKeeperSyncState.resource_type == ResourceType.edition.value,
+                SqlKeeperSyncState.docverse_id == edition.id,
+            )
+            .values(
+                date_tombstoned=datetime(2026, 4, 1, tzinfo=UTC),
+                date_rebuilt_seen=datetime(2026, 4, 1, tzinfo=UTC),
+            )
+        )
+
+    second, logs = await _run_two_edition_sync(
+        ctx,
+        db_session,
+        org_id=org_id,
+        org_slug=org_slug,
+        run_id=run_id,
+        backend_job_id="test-arq-reaped-2",
+    )
+    await ctx["http_client"].aclose()
+
+    assert second == "completed"
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
     assert [
         (event.organization, event.project, event.action, event.edition_kind)
         for event in publisher.published
@@ -1904,13 +2039,15 @@ async def test_keeper_sync_project_restores_a_cleared_lifecycle_tombstone(
             MetricsEditionKind.draft,
         )
     ]
+    assert restored_republishes == ["u-jsick-feature"]
     publish_slugs = sorted(
         job.kwargs["payload"]["edition_slug"]
         for job in get_jobs_by_name(
             mock_arq, "publish_edition", queue_name="docverse:queue"
         )
     )
-    assert publish_slugs == ["__main", "u-jsick-feature"]
+    # Both editions from the first job, and the restored draft again.
+    assert publish_slugs == ["__main", "u-jsick-feature", "u-jsick-feature"]
     assert [
         (log["tombstones_cleared"], log["tombstones_kept"])
         for log in logs
@@ -1936,6 +2073,7 @@ async def test_keeper_sync_project_republishes_a_revived_edition(
     restore.
     """
     _manager, events = await build_event_manager(Configuration())
+    restored_republishes = _spy_restored_republish(monkeypatch)
     async with db_session.begin():
         org_id, org_slug = await _seed_org(db_session)
         run_id = await _seed_run(db_session, org_id=org_id)
@@ -1961,6 +2099,8 @@ async def test_keeper_sync_project_republishes_a_revived_edition(
         run_id=run_id,
         backend_job_id="test-arq-revive-1",
     )
+    # A first import restores nothing.
+    assert restored_republishes == []
     assert first == "completed"
     project_id = await _project_id_for(org_id=org_id)
     async with db_session.begin():
@@ -2001,6 +2141,7 @@ async def test_keeper_sync_project_republishes_a_revived_edition(
     )
     # Both editions from the first job, and the revived draft again.
     assert publish_slugs == ["__main", "u-jsick-feature", "u-jsick-feature"]
+    assert restored_republishes == ["u-jsick-feature"]
     publisher = events.edition_lifecycle
     assert isinstance(publisher, MockEventPublisher)
     assert [

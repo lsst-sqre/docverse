@@ -981,8 +981,13 @@ added. The verdict is one of:
   `DELETE /orgs/{org}/keeper-sync/tombstones/{tombstone}` clears one —
   a `lifecycle_delete` edition's soft-deleted row is revived in place,
   keeping its id — and the visit goes on to import the edition: its
-  build is synced, the edition published, and the `keeper_sync_project`
-  worker publishes an `edition_lifecycle` `restore` event for it. A
+  build is synced and the edition published. When the clear revived an
+  edition row, the `keeper_sync_project` worker also publishes an
+  `edition_lifecycle` `restore` event for it. A `lifecycle_preemptive`
+  tombstone vetoed its LTD edition before Docverse ever imported it, so
+  clearing one revives nothing: the visit is the edition's first
+  import, published like any other and with no `restore` event, though
+  the cleared tombstone still counts in `tombstones_cleared`. A
   revived edition whose LTD build Docverse already holds is published
   at that build, unless the purgatory sweep reclaimed it while the
   edition was retired: then it stays unpublished, with the `Restored

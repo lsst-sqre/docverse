@@ -11461,6 +11461,12 @@ async def test_lifecycle_preemptive_tombstone_cleared_by_in_window_rebuild(
     it. The next visit judges the rebuilt draft again, finds no rule
     matching it (rebuilt yesterday, branch alive), clears the tombstone
     and imports the edition and its build in the same visit.
+
+    The veto fell before Docverse ever imported the draft, so clearing
+    it revives no row and the import is a first one. The outcome is not
+    ``restored``: nothing Docverse had deleted came back, so the worker
+    announces no ``restore`` and publishes the draft only as the synced
+    build it is.
     """
     now = datetime.now(tz=UTC)
     scenario = await _start_review_scenario(
@@ -11496,7 +11502,7 @@ async def test_lifecycle_preemptive_tombstone_cleared_by_in_window_rebuild(
 
     outcome = _draft_outcome(result)
     assert outcome.tombstone_verdict is TombstoneVerdict.cleared
-    assert outcome.restored is True
+    assert outcome.restored is False
     assert outcome.edition_kind is EditionKind.draft
     assert outcome.short_circuited is False
     assert outcome.build_outcome is not None
