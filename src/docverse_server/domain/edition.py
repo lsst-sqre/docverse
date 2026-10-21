@@ -26,6 +26,31 @@ as a change to the project itself.
 """
 
 
+class EditionDeleteReason(StrEnum):
+    """Why an edition was soft-deleted, as stamped on ``editions``.
+
+    Recorded on the edition row itself in the same flush as
+    ``date_deleted`` (PRD #830), because a native (direct-upload)
+    edition has no ``keeper_sync_state`` row whose tombstone could carry
+    it. Mirrors the SQL ``ck_editions_delete_reason`` constraint, and
+    the values match the corresponding
+    :class:`~docverse_server.storage.keeper_sync.TombstoneReason` wire
+    identifiers.
+
+    A soft-deleted row with no reason (``NULL``) predates the column and
+    had no tombstone to backfill from; every consumer treats it as
+    revivable, the same as ``lifecycle_delete``.
+    """
+
+    manual_delete = "manual_delete"
+    """An operator deleted the edition (or its project). A permanent
+    veto: only the admin restore brings it back."""
+
+    lifecycle_delete = "lifecycle_delete"
+    """A lifecycle rule retired the edition. Reversible by activity: a
+    new build for the edition's ref may revive it."""
+
+
 class Edition(BaseModel):
     """Domain representation of an edition."""
 
@@ -116,6 +141,17 @@ class Edition(BaseModel):
     date_deleted: datetime | None = Field(
         default=None,
         description="Timestamp when the edition was soft-deleted.",
+    )
+
+    delete_reason: EditionDeleteReason | None = Field(
+        default=None,
+        description=(
+            "Why the edition was soft-deleted, stamped with"
+            " ``date_deleted``. ``None`` on a live edition, and on a"
+            " soft-deleted one whose reason was never recorded, which"
+            " counts as revivable. Server-side provenance only: not part"
+            " of the API's create, update, or response models."
+        ),
     )
 
     @property

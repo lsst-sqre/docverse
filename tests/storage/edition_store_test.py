@@ -31,7 +31,12 @@ from docverse_server.config import config
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.project import SqlProject
-from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, RepointOutcome
+from docverse_server.domain.edition import (
+    DEFAULT_EDITION_SLUG,
+    Edition,
+    EditionDeleteReason,
+    RepointOutcome,
+)
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
@@ -1901,6 +1906,237 @@ async def test_soft_delete_edition_rollback_unwinds_both(
     assert state is not None
     assert state.date_tombstoned is None
     assert state.tombstone_reason is None
+
+
+async def _read_edition_row(
+    db_session: AsyncSession, edition_id: int
+) -> SqlEdition:
+    """Read an edition row fresh from the database, deleted or not.
+
+    ``populate_existing`` overwrites the identity map's copy so an
+    attribute the soft-delete expired or set in an earlier transaction
+    is re-read from the row.
+    """
+    async with db_session.begin():
+        return (
+            await db_session.execute(
+                select(SqlEdition)
+                .where(SqlEdition.id == edition_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_live_edition_has_no_delete_reason(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A freshly created edition carries no deletion provenance."""
+    async with db_session.begin():
+        _, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="alive",
+                title="Alive",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await db_session.commit()
+
+    assert edition.delete_reason is None
+    row = await _read_edition_row(db_session, edition.id)
+    assert row.delete_reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    [TombstoneReason.manual_delete, TombstoneReason.lifecycle_delete],
+)
+async def test_soft_delete_stamps_delete_reason(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+    reason: TombstoneReason,
+) -> None:
+    """``delete_reason`` lands with ``date_deleted``, from the reason passed.
+
+    The edition has no ``keeper_sync_state`` row — a native edition —
+    so the edition row itself is the only place the reason survives.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="why-gone",
+                title="Why Gone",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        assert await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="why-gone",
+            reason=reason,
+        )
+        await db_session.commit()
+
+    row = await _read_edition_row(db_session, edition.id)
+    assert row.date_deleted is not None
+    assert row.delete_reason == reason.value
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_records_preemptive_as_lifecycle_delete(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """``lifecycle_preemptive`` is a lifecycle deletion on the edition row.
+
+    The preemptive reason belongs to LTD editions that never reached
+    Docverse, so no caller soft-deletes a row with it today; mapping it
+    to ``lifecycle_delete`` keeps the CHECK constraint from turning a
+    future caller's mistake into a failed transaction, and keeps the
+    row revivable, which is what a lifecycle tombstone means.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="preempt",
+                title="Preempt",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="preempt",
+            reason=TombstoneReason.lifecycle_preemptive,
+        )
+        await db_session.commit()
+
+    row = await _read_edition_row(db_session, edition.id)
+    assert row.delete_reason == EditionDeleteReason.lifecycle_delete.value
+
+
+@pytest.mark.asyncio
+async def test_edition_domain_model_carries_delete_reason(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A soft-deleted row validates into an ``Edition`` with its reason."""
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="domain-reason",
+                title="Domain Reason",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="domain-reason",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    row = await _read_edition_row(db_session, edition.id)
+    domain = Edition.model_validate(row)
+    assert domain.delete_reason is EditionDeleteReason.manual_delete
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_all_by_project_stamps_delete_reason(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The project cascade stamps its reason on every edition it deletes.
+
+    An edition a lifecycle rule had already deleted is outside the
+    cascade's ``date_deleted IS NULL`` predicate, so it keeps its own
+    earlier reason rather than inheriting the project's.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        cascaded = [
+            await edition_store.create(
+                project_id=project_id,
+                data=EditionCreate(
+                    slug=slug,
+                    title=slug,
+                    kind=EditionKind.draft,
+                    tracking_mode=TrackingMode.git_ref,
+                ),
+            )
+            for slug in ("cascade-a", "cascade-b")
+        ]
+        reaped = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="reaped-earlier",
+                title="Reaped Earlier",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="reaped-earlier",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        await edition_store.soft_delete_all_by_project(
+            org_id=org_id,
+            project_id=project_id,
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    for edition in cascaded:
+        row = await _read_edition_row(db_session, edition.id)
+        assert row.date_deleted is not None
+        assert row.delete_reason == "manual_delete"
+    reaped_row = await _read_edition_row(db_session, reaped.id)
+    assert reaped_row.delete_reason == "lifecycle_delete"
+
+
+@pytest.mark.asyncio
+async def test_delete_reason_check_constraint_rejects_unknown_values(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Only the two edition deletion reasons are storable."""
+    async with db_session.begin():
+        _, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="bad-reason",
+                title="Bad Reason",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await db_session.commit()
+
+    with pytest.raises(IntegrityError, match="ck_editions_delete_reason"):
+        async with db_session.begin():
+            await db_session.execute(
+                update(SqlEdition)
+                .where(SqlEdition.id == edition.id)
+                .values(delete_reason="lifecycle_preemptive")
+            )
 
 
 @pytest.mark.asyncio

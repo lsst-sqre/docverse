@@ -99,6 +99,7 @@ from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.edition import (
     DEFAULT_EDITION_SLUG,
     Edition,
+    EditionDeleteReason,
     EditionRepoint,
     RepointOutcome,
 )
@@ -112,6 +113,21 @@ from docverse_server.domain.version import (
     SemverVersion,
 )
 from docverse_server.storage.keeper_sync import ResourceType, TombstoneReason
+
+
+def _edition_delete_reason(reason: TombstoneReason) -> EditionDeleteReason:
+    """Map a soft-delete's tombstone reason onto ``editions.delete_reason``.
+
+    ``manual_delete`` and ``lifecycle_delete`` carry over as-is.
+    ``lifecycle_preemptive`` names an LTD edition that never reached
+    Docverse, so no soft-delete passes it today; should one, it is still
+    a lifecycle deletion — revivable — and folding it into
+    ``lifecycle_delete`` keeps the ``ck_editions_delete_reason``
+    constraint from failing the caller's transaction over it.
+    """
+    if reason is TombstoneReason.manual_delete:
+        return EditionDeleteReason.manual_delete
+    return EditionDeleteReason.lifecycle_delete
 
 
 class EditionStore:
@@ -157,6 +173,7 @@ class EditionStore:
             SqlEdition.date_created,
             SqlEdition.date_updated,
             SqlEdition.date_deleted,
+            SqlEdition.delete_reason,
         ).outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
 
     def _validate(
@@ -1191,6 +1208,11 @@ class EditionStore:
         row exists for this edition (e.g. a manually-created edition
         never imported from LTD).
 
+        The same flush stamps ``editions.delete_reason`` from
+        ``reason`` (PRD #830), which is the only record of *why* a
+        native edition — one with no state row — was deleted; see
+        :func:`_edition_delete_reason` for the mapping.
+
         Returns
         -------
         bool
@@ -1207,6 +1229,7 @@ class EditionStore:
         if row is None:
             return False
         row.date_deleted = func.now()
+        row.delete_reason = _edition_delete_reason(reason).value
         await self._session.execute(
             update(SqlKeeperSyncState)
             .where(
@@ -1249,9 +1272,12 @@ class EditionStore:
         ``func.now()`` is the same instant on every row it touches and
         on the project row the caller is stamping.
 
-        An edition already soft-deleted by hand is excluded by the
-        ``date_deleted IS NULL`` predicate and keeps its earlier
-        timestamp and its own tombstone reason.
+        Each cascaded edition's ``delete_reason`` is stamped from the
+        same ``reason`` in the same statement as its ``date_deleted``.
+        An edition already soft-deleted by hand — or by a lifecycle
+        rule — is excluded by the ``date_deleted IS NULL`` predicate
+        and keeps its earlier timestamp, its own ``delete_reason``, and
+        its own tombstone reason.
 
         Returns
         -------
@@ -1266,7 +1292,10 @@ class EditionStore:
                 SqlEdition.project_id == project_id,
                 SqlEdition.date_deleted.is_(None),
             )
-            .values(date_deleted=func.now())
+            .values(
+                date_deleted=func.now(),
+                delete_reason=_edition_delete_reason(reason).value,
+            )
             .returning(SqlEdition.id)
         )
         edition_ids = [row[0] for row in result.all()]

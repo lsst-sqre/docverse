@@ -296,11 +296,13 @@ class KeeperSyncTombstoneService:
         that row's ``date_deleted`` is cleared in the *same*
         transaction — otherwise the next sync iteration would crash on
         the slug clash because the soft-deleted row still occupies the
-        ``uq_editions_project_lower_slug`` index slot. A project revive
-        reaches further, into the editions and builds its delete
-        cascaded to; see :meth:`_revive_project`. A ``build`` state row
-        has no revive branch: builds are addressed by the admin restore
-        endpoint, not by keeper-sync recovery.
+        ``uq_editions_project_lower_slug`` index slot. The revived
+        edition's ``delete_reason`` is cleared with ``date_deleted``, as
+        a live edition carries none. A project revive reaches further,
+        into the editions and builds its delete cascaded to; see
+        :meth:`_revive_project`. A ``build`` state row has no revive
+        branch: builds are addressed by the admin restore endpoint, not
+        by keeper-sync recovery.
 
         Raises
         ------
@@ -342,7 +344,7 @@ class KeeperSyncTombstoneService:
                         SqlEdition.id == state.docverse_id,
                         SqlEdition.date_deleted.is_not(None),
                     )
-                    .values(date_deleted=None)
+                    .values(date_deleted=None, delete_reason=None)
                     .returning(SqlEdition.id)
                 )
                 revived = edition_revive.scalar_one_or_none() is not None
@@ -459,7 +461,7 @@ class KeeperSyncTombstoneService:
                         SqlEdition.project_id == project_id,
                         SqlEdition.date_deleted == project_deleted,
                     )
-                    .values(date_deleted=None)
+                    .values(date_deleted=None, delete_reason=None)
                     .returning(SqlEdition.id)
                 )
             )
