@@ -1229,14 +1229,18 @@ class KeeperSyncTombstoneReason(StrEnum):
     """Why a ``keeper_sync_state`` row was tombstoned.
 
     - ``manual_delete`` — an operator soft-deleted the Docverse-side
-      resource; the tombstone stops sync from re-importing it.
-    - ``lifecycle_delete`` — an automated process (``lifecycle_eval``,
+      resource. A permanent veto: sync never re-imports it until an
+      operator clears the tombstone or restores the edition.
+    - ``lifecycle_delete`` — a lifecycle rule (``lifecycle_eval``,
       ``git_ref_audit``, or the ``ref_deleted`` webhook) soft-deleted
-      the Docverse-side resource.
+      the Docverse-side resource. Reversible: once LTD rebuilds the
+      edition, sync judges it again and, when no rule matches any
+      more, clears the tombstone and revives the edition.
     - ``lifecycle_preemptive`` — sync itself short-circuited an LTD
       edition that the lifecycle rules would immediately delete,
       before the build content was copied. No matching Docverse row
-      exists in this case.
+      exists in this case. Reversible as ``lifecycle_delete`` is: a
+      cleared tombstone lets sync import the edition.
     """
 
     manual_delete = "manual_delete"

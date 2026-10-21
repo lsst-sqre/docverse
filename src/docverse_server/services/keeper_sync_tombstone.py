@@ -1,9 +1,14 @@
 """Service for writing and reading keeper-sync tombstones.
 
-A *sync tombstone* is a permanent veto recorded on the existing
+A *sync tombstone* is a veto recorded on the existing
 ``keeper_sync_state`` table that tells the keeper-sync engine "this
 LTD resource has been deleted on the Docverse side; do not re-migrate
-it." See PRD #332 / DM-54914 for the full design.
+it." See PRD #332 / DM-54914 for the full design. How long the veto
+holds depends on its reason (PRD #830): a ``manual_delete`` is
+permanent until an operator clears it or restores the edition, while a
+``lifecycle_delete`` or ``lifecycle_preemptive`` tombstone is judged
+again whenever LTD rebuilds the edition, and lifted once no lifecycle
+rule matches it any more.
 
 This service is the single, well-tested entrypoint every deletion path
 goes through to write, check, list, or clear a tombstone. Manual
@@ -437,9 +442,12 @@ class KeeperSyncTombstoneService:
         them. The cascade goes through
         :meth:`~docverse_server.storage.edition_store.EditionStore.soft_delete_all_by_project`,
         which stamps every edition's state row exactly as a per-edition
-        delete would, and a tombstoned state row makes
+        delete would — with the project delete's ``manual_delete``, a
+        reason
         :meth:`~docverse_server.services.keeper_sync.service.KeeperSyncService.sync_edition`
-        short-circuit forever. Reviving the rows without clearing those
+        never judges again, so it short-circuits on the row forever
+        (only a lifecycle tombstone lifts on an LTD rebuild). Reviving
+        the rows without clearing those
         stamps would bring an LTD-imported project back live but
         permanently unsynced, and leave the operator looking at N
         edition tombstones they never created. The same shared instant

@@ -32,8 +32,11 @@ that back each of them up.
   one tick's outcome.
 - [Scoping the keeper sync](keeper-sync-scope.md) — which LTD products
   an organization syncs: the include/exclude rule, `fullmatch` pattern
-  semantics, what happens when a project falls out of scope, and the
-  preview → `PATCH` → backfill workflow a wave migration uses.
+  semantics, what happens when a project falls out of scope, the
+  preview → `PATCH` → backfill workflow a wave migration uses, and the
+  tombstones that keep LTD resources out — which ones lift by
+  themselves, and the clear-then-refresh and edition restore for the
+  ones an operator lifts.
 - [Keeper-sync timestamps](keeper-sync-scope.md#timestamps-mirror-ltd)
   — why a synced edition's and build's dates are LTD's rather than the
   import's: which columns follow LTD, how every sync visit re-asserts
@@ -65,7 +68,9 @@ that back each of them up.
   guarded rewrite and what it never touches; the audit as the
   post-upgrade backfill of default branches and GitHub ids; how
   keeper-sync keeps synced projects converged and resolves their GitHub
-  ids on creation; and the manual `PATCH` for a `__main` the rule
+  ids on creation; how an edition a lifecycle rule retired comes back
+  on a new build or an LTD rebuild while an operator's delete waits for
+  the admin restore; and the manual `PATCH` for a `__main` the rule
   leaves pinned.
 - [Memory diagnostics](memory-diagnostics.md) — the opt-in sampler
   every Docverse process carries: what each `Memory sample` field

@@ -2575,6 +2575,14 @@ async def keeper_sync_tier_other(ctx: dict[str, Any]) -> str:
     so multiple stale editions do not produce duplicate children.
     Editions with no state row are left to ``tier_discovery`` so the
     two cron functions do not race for the same enqueue.
+
+    A lifecycle-tombstoned edition is not exempt (PRD #830): it ages
+    from its ``date_last_synced``, or its ``date_tombstoned`` when it was
+    never synced, so the sync it triggers can judge the tombstone again
+    should LTD have rebuilt the edition. Only a ``manual_delete`` row is
+    left out of this tier's map, so it is never stale here, and
+    ``tier_discovery`` counts it as seen, so neither tier enqueues for
+    it.
     """
     logger = structlog.get_logger(
         "docverse_server.worker.keeper_sync_tier_other"
@@ -3881,7 +3889,11 @@ async def _tier_main_should_enqueue_edition(
 
     * Skip on tombstoned state row — ``sync_edition`` would only
       short-circuit on its own tombstone check (issue #396 / PRD #332
-      user story 17).
+      user story 17). That holds for every reason a ``main`` row can
+      carry: ``sync_edition`` judges a lifecycle tombstone again on an
+      LTD rebuild (PRD #830), but no lifecycle rule retires ``main``,
+      so its row is only ever tombstoned ``manual_delete``, by its
+      project's delete, which ``sync_edition`` never lifts.
     * Otherwise defer to :func:`should_refresh_main_edition` for the
       LTD ``date_rebuilt`` vs ``state.date_rebuilt_seen`` decision.
 

@@ -134,14 +134,23 @@ documents its values as a bulleted list in the class docstring:
 class KeeperSyncTombstoneReason(StrEnum):
     """Why a ``keeper_sync_state`` row was tombstoned.
 
-    - ``manual_delete`` — an operator soft-deleted ...
-    - ``lifecycle_delete`` — an automated process ...
+    - ``manual_delete`` — an operator soft-deleted the Docverse-side
+      resource. A permanent veto: sync never re-imports it until an
+      operator clears the tombstone or restores the edition.
+    - ``lifecycle_delete`` — a lifecycle rule ... soft-deleted the
+      Docverse-side resource. Reversible: once LTD rebuilds the
+      edition, sync judges it again ...
+    - ``lifecycle_preemptive`` — sync itself short-circuited an LTD
+      edition that the lifecycle rules would immediately delete ...
     """
 ```
 
 Do not put value semantics only in member docstrings — they are
 invisible to API consumers. The list format renders as Markdown in
-Swagger UI and Redoc.
+Swagger UI and Redoc. Say what each value *means for a consumer*, not
+only who writes it: here, which tombstones activity lifts by itself
+and which wait for an operator (see
+[Soft-deleted editions and builds](#soft-deleted-editions-and-builds)).
 
 ## OpenAPI tags
 
@@ -553,3 +562,48 @@ price is that a filtered pass **re-sends rows** the previous pass
 already delivered — the inclusive bound re-sends the boundary row
 besides — so treat the listing as a set of upserts keyed on each
 project's `id` rather than as a stream of distinct changes.
+
+## Soft-deleted editions and builds
+
+Deleting an edition or a build is a soft delete too: the row stays,
+stamped with a `date_deleted`, and ordinary reads hide it. Each has an
+admin `restore` action that undoes the delete, addressed at the deleted
+resource's own URL:
+
+- `POST /orgs/{org}/projects/{project}/editions/{edition}/restore`
+  revives an edition in place — same slug, kind, tracking, and build
+  history — clears its keeper-sync tombstone if it has one, and
+  republishes its current build unless that build was itself deleted
+  or purged. `DocverseClient.restore_edition` wraps it.
+- `POST /orgs/{org}/projects/{project}/builds/{build}/restore` clears a
+  build's `date_deleted` while its content is still on the store; a
+  build the purgatory sweep has already purged answers `409`.
+  `DocverseClient.restore_build` wraps it.
+
+Both answer `404` for a resource that is not deleted, since the URL
+addresses only the rows ordinary reads hide — as clearing an
+already-clear keeper-sync tombstone is a `404`. Neither is one of the
+async-action verbs above: a `restore`, like a `rollback`, answers `200`
+with the resource, which is live again by then. A restored edition
+whose publish was queued comes back with `publish_status` `pending`.
+
+An edition's slug outlives its delete. `uq_editions_project_lower_slug`
+ignores `date_deleted`, as `uq_projects_org_slug` does for projects, so
+the deleted edition holds its slug until it is restored, and a new
+edition never takes it over. Docverse records why each edition was
+deleted in its `delete_reason` column (`editions.delete_reason`),
+stamped with `date_deleted` and cleared when the edition comes back. It is server-side provenance, not
+a field of the edition resource:
+
+- `manual_delete` — an operator's `DELETE` of the edition or of its
+  project. Only the `restore` above brings the edition back.
+- `lifecycle_delete` — a lifecycle rule retired the edition. Activity
+  revives it without an operator: a new build for its git ref, or a
+  keeper-sync import of its LTD edition rebuilt, brings it back in
+  place.
+
+A deleted edition with no recorded reason (one deleted before the
+column existed, with nothing to backfill it from) counts as
+`lifecycle_delete`. The operations side — which rules, what a
+keeper-sync tombstone adds, and the log lines — is in
+[Lifecycle deletions come back with activity](github-integration.md#lifecycle-deletions-come-back-with-activity).

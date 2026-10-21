@@ -59,16 +59,25 @@ class TombstoneReason(StrEnum):
     """
 
     manual_delete = "manual_delete"
-    """Operator-driven soft-delete of the Docverse-side resource."""
+    """Operator-driven soft-delete of the Docverse-side resource.
+
+    A permanent veto: keeper-sync never judges it again, and only an
+    operator lifts it, by clearing the tombstone or restoring the
+    edition."""
 
     lifecycle_delete = "lifecycle_delete"
     """Automated soft-delete by ``lifecycle_eval`` / ``git_ref_audit`` /
-    the ``ref_deleted`` webhook."""
+    the ``ref_deleted`` webhook.
+
+    Reversible by activity (PRD #830): keeper-sync judges it again once
+    LTD rebuilds the edition, and clears it when no rule matches."""
 
     lifecycle_preemptive = "lifecycle_preemptive"
     """Sync itself short-circuited an LTD edition that the lifecycle
     rules would immediately delete, before the build content was
-    copied. No matching Docverse row exists in this case."""
+    copied. No matching Docverse row exists in this case.
+
+    Reversible by activity, as ``lifecycle_delete`` is."""
 
 
 #: Tombstone reasons that activity on LTD can lift (PRD #830).
