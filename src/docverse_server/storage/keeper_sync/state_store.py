@@ -11,7 +11,7 @@ slugs are only unique within a product.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -63,7 +63,9 @@ class TombstoneReason(StrEnum):
 
     A permanent veto: keeper-sync never judges it again, and only an
     operator lifts it, by clearing the tombstone or restoring the
-    edition."""
+    edition. Keeper-sync writes one itself on an LTD edition whose
+    Docverse slug an operator-deleted edition still holds, naming that
+    edition as ``docverse_id`` (issue #841)."""
 
     lifecycle_delete = "lifecycle_delete"
     """Automated soft-delete by ``lifecycle_eval`` / ``git_ref_audit`` /
@@ -644,5 +646,83 @@ class KeeperSyncStateStore:
             if clear_date_rebuilt_seen:
                 row.date_rebuilt_seen = None
         await self._session.flush()
+        await self._session.refresh(row)
+        return KeeperSyncState.model_validate(row)
+
+    async def tombstone(
+        self,
+        *,
+        org_id: int,
+        resource_type: ResourceType,
+        reason: TombstoneReason,
+        ltd_id: int | None = None,
+        ltd_slug: str | None = None,
+        note: str | None = None,
+        docverse_id: int | None = None,
+        date_last_synced: datetime | None = None,
+    ) -> KeeperSyncState:
+        """Tombstone the row keyed by the per-resource idempotency key.
+
+        Stamps ``date_tombstoned`` (now), ``tombstone_reason``, and
+        ``tombstone_note`` on the row keyed by ``(org_id,
+        resource_type, ltd_id|ltd_slug)``, inserting the row when there
+        is none: a ``lifecycle_preemptive`` veto, or keeper-sync's veto
+        on a slug an operator's delete reserves, can land on an LTD
+        edition no visit has recorded yet. An existing row is converted
+        in place, so a resource never gains a second row. ``note`` is
+        written as given, ``None`` included, since the tombstone is a
+        new record.
+
+        ``docverse_id`` and ``date_last_synced`` follow :meth:`upsert`'s
+        partial-update rule: written when given, left as stored when
+        ``None``. A new row without an ``ltd_slug`` records the LTD id
+        as its slug.
+
+        ``ltd_slug`` is required for ``project`` rows and ``ltd_id``
+        for ``edition`` / ``build`` rows; see :func:`_key_clauses`.
+        """
+        clauses = _key_clauses(
+            org_id=org_id,
+            resource_type=resource_type,
+            ltd_id=ltd_id,
+            ltd_slug=ltd_slug,
+        )
+        existing = await self._session.execute(
+            select(SqlKeeperSyncState).where(*clauses)
+        )
+        row = existing.scalar_one_or_none()
+        now = datetime.now(tz=UTC)
+        if row is None:
+            resolved_slug = ltd_slug if ltd_slug is not None else str(ltd_id)
+
+            def _make_row(public_id: int) -> SqlKeeperSyncState:
+                return SqlKeeperSyncState(
+                    public_id=public_id,
+                    org_id=org_id,
+                    resource_type=resource_type.value,
+                    ltd_id=ltd_id,
+                    ltd_slug=resolved_slug,
+                    docverse_id=docverse_id,
+                    date_last_synced=date_last_synced,
+                    date_tombstoned=now,
+                    tombstone_reason=reason.value,
+                    tombstone_note=note,
+                )
+
+            row = await insert_with_time_ordered_public_id(
+                self._session, _make_row
+            )
+        else:
+            row.date_tombstoned = now
+            row.tombstone_reason = reason.value
+            row.tombstone_note = note
+            _apply_present_columns(
+                row,
+                {
+                    "docverse_id": docverse_id,
+                    "date_last_synced": date_last_synced,
+                },
+            )
+            await self._session.flush()
         await self._session.refresh(row)
         return KeeperSyncState.model_validate(row)

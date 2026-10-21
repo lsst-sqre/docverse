@@ -12068,3 +12068,407 @@ async def test_sync_skips_slug_reserved_by_manual_delete(
             )
             is None
         )
+
+
+# ---------------------------------------------------------------------------
+# A slug an operator's delete reserves is recorded as a veto (issue #841):
+# the visit that meets it tombstones the LTD edition's state row
+# ``manual_delete``, so neither tier cron sends the project back for it.
+# ---------------------------------------------------------------------------
+
+
+async def _state_rows_for_draft_slug(
+    session: AsyncSession, *, org_id: int
+) -> list[KeeperSyncState]:
+    """Return every edition state row recorded for LTD's draft slug."""
+    async with session.begin():
+        result = await session.execute(
+            select(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.org_id == org_id,
+                SqlKeeperSyncState.resource_type == ResourceType.edition.value,
+                SqlKeeperSyncState.ltd_slug == _REVIEW_DRAFT_SLUG,
+            )
+            .order_by(SqlKeeperSyncState.ltd_id)
+        )
+        return [
+            KeeperSyncState.model_validate(row)
+            for row in result.scalars().all()
+        ]
+
+
+@dataclass(frozen=True)
+class _ReservedSlugScenario:
+    """A synced draft whose Docverse edition an operator then deleted."""
+
+    service: KeeperSyncService
+    org_id: int
+    project_id: int
+    edition_id: int
+    synced_state: KeeperSyncState
+    """The draft's state row as the first visit left it."""
+
+
+async def _start_reserved_slug_scenario(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    *,
+    org_slug: str,
+) -> _ReservedSlugScenario:
+    """Sync ``pipelines``, then delete its draft as ``manual_delete``.
+
+    The delete leaves the draft's state row untombstoned, the shape a
+    native edition an LTD edition later maps onto has (see
+    :func:`_soft_delete_synced_draft`), so the next visit reaches
+    ``_ensure_edition`` and meets the reserved slug.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug=org_slug)
+    _seed_two_editions_main_and_draft(mock_discovery)
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_REVIEW_SOURCE_OBJECTS),
+    )
+    first = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert first.docverse_project_id is not None
+    synced_state = await _draft_state(db_session, org_id=org_id)
+    edition_id = await _soft_delete_synced_draft(
+        db_session,
+        project_id=first.docverse_project_id,
+        delete_reason="manual_delete",
+    )
+    return _ReservedSlugScenario(
+        service=service,
+        org_id=org_id,
+        project_id=first.docverse_project_id,
+        edition_id=edition_id,
+        synced_state=synced_state,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_tombstones_state_row_of_slug_reserved_by_manual_delete(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A visit vetoed by a reserved slug records the veto on its state row.
+
+    The LTD draft's state row already exists, untombstoned. Without a
+    veto on record, ``tier_other`` would keep sending the project back
+    for a visit that imports nothing. The row is converted, in place,
+    into a ``manual_delete`` tombstone that names the deleted edition
+    and is stamped synced.
+    """
+    scenario = await _start_reserved_slug_scenario(
+        db_session,
+        http_client,
+        mock_discovery,
+        org_slug="ks-reserved-existing-row",
+    )
+    before = scenario.synced_state
+    assert before.date_tombstoned is None
+    assert before.date_last_synced is not None
+
+    await scenario.service.sync_project(
+        org_id=scenario.org_id, ltd_slug="pipelines"
+    )
+
+    [vetoed] = await _state_rows_for_draft_slug(
+        db_session, org_id=scenario.org_id
+    )
+    assert vetoed.id == before.id
+    assert vetoed.date_tombstoned is not None
+    assert vetoed.tombstone_reason == TombstoneReason.manual_delete.value
+    assert vetoed.tombstone_note is None
+    assert vetoed.docverse_id == scenario.edition_id
+    assert vetoed.date_last_synced is not None
+    assert vetoed.date_last_synced > before.date_last_synced
+
+
+@pytest.mark.asyncio
+async def test_sync_warns_about_reserved_slug_once(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """Only the visit that records the veto warns about the reserved slug.
+
+    Every later visit short-circuits on the ``manual_delete`` tombstone
+    that visit wrote, exactly as on one an operator's delete stamped
+    itself, at info level and before ``_ensure_edition`` runs.
+    """
+    scenario = await _start_reserved_slug_scenario(
+        db_session,
+        http_client,
+        mock_discovery,
+        org_slug="ks-reserved-warn-once",
+    )
+    reserved_event = (
+        "Edition slug reserved by manual delete; LTD edition not imported"
+    )
+
+    with structlog.testing.capture_logs() as vetoing_logs:
+        await scenario.service.sync_project(
+            org_id=scenario.org_id, ltd_slug="pipelines"
+        )
+    with structlog.testing.capture_logs() as later_logs:
+        later = await scenario.service.sync_project(
+            org_id=scenario.org_id, ltd_slug="pipelines"
+        )
+
+    assert [
+        (log["log_level"], log["ltd_edition_id"], log["edition_id"])
+        for log in _review_logs(vetoing_logs, reserved_event)
+    ] == [("warning", 2, scenario.edition_id)]
+    assert _review_logs(later_logs, reserved_event) == []
+    assert [
+        (log["ltd_edition_id"], log["tombstone_reason"])
+        for log in _review_logs(
+            later_logs, "Sync short-circuited: edition tombstoned"
+        )
+    ] == [(2, TombstoneReason.manual_delete.value)]
+    outcome = _draft_outcome(later)
+    assert outcome.short_circuited is True
+    assert outcome.tombstone_verdict is None
+    assert outcome.build_outcome is None
+
+
+def _recreate_ltd_draft(mock_discovery: respx.Router, *, ltd_id: int) -> None:
+    """List LTD's draft again under a new LTD id, as a recreated edition.
+
+    LTD deleted the ``u-jsick-feature`` edition and created it again, so
+    the product now lists ``main`` and the draft's new id, which no
+    ``keeper_sync_state`` row records.
+    """
+    payload = _load("edition_branch_git_refs.json")
+    payload["self_url"] = f"{LTD_BASE}/editions/{ltd_id}"
+    mock_discovery.get(f"{LTD_BASE}/products/pipelines/editions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "editions": [
+                    f"{LTD_BASE}/editions/1",
+                    f"{LTD_BASE}/editions/{ltd_id}",
+                ]
+            },
+        )
+    )
+    mock_discovery.get(f"{LTD_BASE}/editions/{ltd_id}").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+
+
+async def _sync_recreated_draft_after_manual_delete(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    *,
+    org_slug: str,
+) -> tuple[int, int]:
+    """Delete the synced draft by hand, recreate it on LTD, sync again.
+
+    The operator's delete tombstones the draft's own LTD edition (id 2)
+    as it always has; the recreated LTD edition (id 3) has no state row
+    until the second visit meets its reserved slug. Returns the org id
+    and the deleted edition's id.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug=org_slug)
+    _seed_two_editions_main_and_draft(mock_discovery)
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        dict(_REVIEW_SOURCE_OBJECTS),
+    )
+    first = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    assert first.docverse_project_id is not None
+    edition_id = (await _draft_state(db_session, org_id=org_id)).docverse_id
+    assert edition_id is not None
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        assert await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=first.docverse_project_id,
+            slug=_REVIEW_DRAFT_SLUG,
+            reason=TombstoneReason.manual_delete,
+        )
+    _recreate_ltd_draft(mock_discovery, ltd_id=3)
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    return org_id, edition_id
+
+
+@pytest.mark.asyncio
+async def test_sync_tombstones_unseen_ltd_edition_of_reserved_slug(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An LTD edition no visit has recorded gains a veto row of its own.
+
+    The recreated LTD edition had no state row, which is what
+    ``tier_discovery`` reads as an unseen edition worth a sync on every
+    tick. The visit inserts one: a ``manual_delete`` tombstone naming
+    the deleted edition, stamped synced. The original LTD edition's
+    tombstone is left as the operator's delete wrote it.
+    """
+    org_id, edition_id = await _sync_recreated_draft_after_manual_delete(
+        db_session,
+        http_client,
+        mock_discovery,
+        org_slug="ks-reserved-unseen-row",
+    )
+
+    rows = await _state_rows_for_draft_slug(db_session, org_id=org_id)
+    assert [
+        (row.ltd_id, row.tombstone_reason, row.docverse_id) for row in rows
+    ] == [
+        (2, TombstoneReason.manual_delete.value, edition_id),
+        (3, TombstoneReason.manual_delete.value, edition_id),
+    ]
+    assert rows[1].date_tombstoned is not None
+    assert rows[1].date_last_synced is not None
+
+
+@pytest.mark.asyncio
+async def test_reserved_slug_veto_lists_under_the_deleted_edition(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The admin tombstones listing names the edition that reserves the slug.
+
+    The veto row carries the deleted edition's id, so its
+    ``display_path`` is that edition's ``<project>/<edition>`` path, as
+    the operator's own delete reads, and its LTD slug is the recreated
+    LTD edition's.
+    """
+    org_id, _ = await _sync_recreated_draft_after_manual_delete(
+        db_session,
+        http_client,
+        mock_discovery,
+        org_slug="ks-reserved-listing",
+    )
+    logger = structlog.get_logger("test")
+    tombstone_service = KeeperSyncTombstoneService(
+        session=db_session,
+        state_store=KeeperSyncStateStore(session=db_session, logger=logger),
+        logger=logger,
+    )
+
+    async with db_session.begin():
+        listing = await tombstone_service.list_for_org(
+            org_id=org_id,
+            cursor=None,
+            limit=10,
+            resource_type=ResourceType.edition,
+        )
+
+    [veto] = [entry for entry in listing.page.entries if entry.ltd_id == 3]
+    assert veto.ltd_slug == _REVIEW_DRAFT_SLUG
+    assert veto.tombstone_reason == TombstoneReason.manual_delete.value
+    assert (
+        listing.display_path_by_state_id[veto.id]
+        == f"pipelines/{_REVIEW_DRAFT_SLUG}"
+    )
+
+
+async def _seed_manually_deleted_native_draft(
+    session: AsyncSession, *, org_id: int, project_id: int
+) -> int:
+    """Create a native draft on LTD's draft slug and delete it by hand.
+
+    A native edition has no ``keeper_sync_state`` row, so the delete
+    records its ``manual_delete`` only as the edition's
+    ``delete_reason``. Returns the edition's id.
+    """
+    edition_store = EditionStore(
+        session=session, logger=structlog.get_logger("test")
+    )
+    async with session.begin():
+        edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug=_REVIEW_DRAFT_SLUG,
+                title="u/jsick/feature",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "u/jsick/feature"},
+            ),
+        )
+        assert await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug=_REVIEW_DRAFT_SLUG,
+            reason=TombstoneReason.manual_delete,
+        )
+    return edition.id
+
+
+@pytest.mark.asyncio
+async def test_cleared_preemptive_tombstone_on_reserved_slug_turns_manual(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    mock_github: GitHubMock,
+) -> None:
+    """A lifted pre-import veto that meets a reserved slug turns manual.
+
+    LTD rebuilds the idle draft, so its ``lifecycle_preemptive``
+    tombstone is judged again and cleared — but an operator has deleted
+    the native edition holding its slug, so the visit imports nothing.
+    Left cleared and never synced, the row would read stale to
+    ``tier_other`` on every tick. The same row becomes the
+    ``manual_delete`` tombstone instead, naming the native edition and
+    stamped synced.
+    """
+    now = datetime.now(tz=UTC)
+    scenario = await _start_review_scenario(
+        db_session,
+        http_client,
+        mock_discovery,
+        mock_github,
+        org_slug="ks-reserved-preemptive",
+        first_draft=_review_draft_payload(
+            date_rebuilt=now - timedelta(days=200)
+        ),
+        live_branches=["main", "u/jsick/feature"],
+    )
+    vetoed = await _draft_state(db_session, org_id=scenario.org_id)
+    assert vetoed.tombstone_reason == (
+        TombstoneReason.lifecycle_preemptive.value
+    )
+    native_id = await _seed_manually_deleted_native_draft(
+        db_session, org_id=scenario.org_id, project_id=scenario.project_id
+    )
+    await _backdate_tombstone(
+        db_session,
+        state_id=vetoed.id,
+        date_tombstoned=now - timedelta(days=10),
+    )
+    _rebuild_review_draft(mock_discovery, date_rebuilt=now - timedelta(days=1))
+
+    result = await scenario.service.sync_project(
+        org_id=scenario.org_id, ltd_slug="pipelines"
+    )
+
+    outcome = _draft_outcome(result)
+    assert outcome.tombstone_verdict is TombstoneVerdict.cleared
+    assert outcome.short_circuited is True
+    assert outcome.restored is False
+    [state] = await _state_rows_for_draft_slug(
+        db_session, org_id=scenario.org_id
+    )
+    assert state.id == vetoed.id
+    assert state.tombstone_reason == TombstoneReason.manual_delete.value
+    assert state.tombstone_note is None
+    assert state.docverse_id == native_id
+    assert state.date_last_synced is not None
+    assert not should_refresh_other_edition(state=state, now=_now())

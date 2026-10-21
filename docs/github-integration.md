@@ -1031,6 +1031,19 @@ existed. It settles that clash as edition tracking does: a
 `lifecycle_delete` or `null` row is revived and the edition imported
 onto it, and a `manual_delete` row is left deleted, the visit importing
 nothing for it and logging a warning rather than failing the edition.
+That visit also records the operator's veto on the LTD edition's
+`keeper_sync_state` row: a `manual_delete` tombstone whose `docverse_id`
+is the deleted edition, stamped with the visit's `date_last_synced`. It
+is written onto the LTD edition's existing row when there is one —
+including one whose lifecycle tombstone the same visit just cleared —
+and onto a new row otherwise. Without it, an LTD edition with no row
+would read as unseen to `keeper_sync_tier_discovery`, and a cleared
+lifecycle row as stale to `keeper_sync_tier_other`, and both crons would
+send the project back for the same empty visit on every tick. With it,
+discovery counts the edition as seen, tier_other leaves the
+`manual_delete` row out, and every later visit short-circuits on the
+tombstone, so the warning is logged once. The edition's restore lifts
+the tombstone with the edition (see below).
 The semver aggregates a synced release backfills follow the aggregate
 rule above: a deleted `N` or `N.M` comes back only from a
 `lifecycle_delete` or `null` row on the aggregate's own tracking mode,
@@ -1054,7 +1067,9 @@ POST /orgs/{org}/projects/{project}/editions/{edition}/restore
 
 It revives the edition in place whatever its `delete_reason` — same id,
 slug, kind, tracking, and build history — and clears its keeper-sync
-tombstone if it has one, so keeper-sync syncs it again. It publishes
+tombstones if it has any, so keeper-sync syncs it again. That includes
+the one a visit wrote for an LTD edition that met the edition's slug,
+since that tombstone names the edition too. It publishes
 the edition's current build again unless that build was itself deleted
 or purged, rebuilds the project's dashboard, and answers `200` with the
 edition; the editions API handler publishes one `edition_lifecycle`
@@ -1073,7 +1088,7 @@ see [Tombstones](keeper-sync-scope.md#tombstones).
 | `Lifecycle tombstone cleared` | info | `revived_docverse_row` |
 | `Lifecycle tombstone kept` | info | `rule_type` |
 | `Lifecycle tombstone kept: live refs unavailable` | info | — |
-| `Edition slug reserved by manual delete; LTD edition not imported` | warning | `ltd_edition_id`, `ltd_edition_slug`, `docverse_slug`, `project_id`, `project` |
+| `Edition slug reserved by manual delete; LTD edition not imported` | warning | `ltd_edition_id`, `ltd_edition_slug`, `docverse_slug`, `edition_id`, `project_id`, `project` |
 | `Revived soft-deleted edition` | info | `edition_id`, `edition_slug`, `project_id`, `previous_delete_reason`, `tombstone_cleared` |
 | `Edition slug reserved by manual delete; build not tracked` | warning | `slug`, `project_id` |
 | `Semver aggregate slug held by a non-aggregate edition; leaving it untouched` | info | `project_id`, `edition_id`, `edition_slug`, `edition_kind`, `tracking_mode`, `edition_deleted` |
@@ -1090,6 +1105,11 @@ see [Tombstones](keeper-sync-scope.md#tombstones).
 - `Sync short-circuited: edition tombstoned` follows a kept verdict, and
   is the only line for a tombstone the visit did not judge: a
   `manual_delete`, or a lifecycle tombstone LTD has not rebuilt since.
+- `Edition slug reserved by manual delete; LTD edition not imported`
+  comes once per LTD edition, from the visit that records the
+  `manual_delete` tombstone; later visits log the short-circuit line
+  instead. `edition_id` is the deleted edition holding the slug, which
+  the tombstone's `docverse_id` names.
 - `Revived soft-deleted edition` comes from every revive of an edition
   row but a tombstone clear's: edition tracking's, keeper-sync's
   import, and the admin restore. `previous_delete_reason` is the

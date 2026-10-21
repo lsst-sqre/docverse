@@ -22,7 +22,7 @@ lifts it via :meth:`clear` or upholds it via :meth:`keep`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
 import structlog
 from safir.database import CountedPaginatedList
@@ -34,16 +34,12 @@ from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.base32id import serialize_base32_id
-from docverse_server.storage._public_id import (
-    insert_with_time_ordered_public_id,
-)
 from docverse_server.storage.keeper_sync import (
     KeeperSyncState,
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
 )
-from docverse_server.storage.keeper_sync.state_store import _key_clauses
 from docverse_server.storage.pagination import (
     KeeperSyncStateDateTombstonedCursor,
 )
@@ -135,47 +131,17 @@ class KeeperSyncTombstoneService:
         ``ltd_slug`` is required for ``project`` rows and ``ltd_id``
         for ``edition`` / ``build`` rows; see
         :func:`docverse_server.storage.keeper_sync.state_store._key_clauses`.
+        The write is :meth:`KeeperSyncStateStore.tombstone
+        <docverse_server.storage.keeper_sync.KeeperSyncStateStore.tombstone>`.
         """
-        clauses = _key_clauses(
+        state = await self._state_store.tombstone(
             org_id=org_id,
             resource_type=resource_type,
+            reason=reason,
             ltd_id=ltd_id,
             ltd_slug=ltd_slug,
+            note=note,
         )
-        existing = await self._session.execute(
-            select(SqlKeeperSyncState).where(*clauses)
-        )
-        row = existing.scalar_one_or_none()
-        now = datetime.now(tz=UTC)
-        if row is None:
-            # Lifecycle-preemptive path: no Docverse row exists yet, so
-            # synthesise a state row carrying only the tombstone fields.
-            # Every state row carries a time-ordered ``public_id``, minted
-            # here with the same collision-retry helper the state store's
-            # upsert uses.
-            resolved_slug = ltd_slug if ltd_slug is not None else str(ltd_id)
-
-            def _make_row(public_id: int) -> SqlKeeperSyncState:
-                return SqlKeeperSyncState(
-                    public_id=public_id,
-                    org_id=org_id,
-                    resource_type=resource_type.value,
-                    ltd_id=ltd_id,
-                    ltd_slug=resolved_slug,
-                    date_tombstoned=now,
-                    tombstone_reason=reason.value,
-                    tombstone_note=note,
-                )
-
-            row = await insert_with_time_ordered_public_id(
-                self._session, _make_row
-            )
-        else:
-            row.date_tombstoned = now
-            row.tombstone_reason = reason.value
-            row.tombstone_note = note
-            await self._session.flush()
-        await self._session.refresh(row)
         self._logger.info(
             "Sync tombstone recorded",
             org_id=org_id,
@@ -184,7 +150,7 @@ class KeeperSyncTombstoneService:
             ltd_slug=ltd_slug,
             reason=reason.value,
         )
-        return KeeperSyncState.model_validate(row)
+        return state
 
     async def keep(
         self,

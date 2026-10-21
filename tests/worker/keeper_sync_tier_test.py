@@ -41,6 +41,7 @@ from docverse_server.domain.queue import JobStatus
 from docverse_server.services.keeper_sync import mappers
 from docverse_server.services.keeper_sync.scheduler import (
     Tier,
+    should_refresh_other_edition,
     tier_cron_timeout,
 )
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
@@ -2584,6 +2585,77 @@ async def test_tier_discovery_does_not_treat_tombstoned_edition_as_unknown(
 
 
 @pytest.mark.asyncio
+async def test_tier_discovery_skips_edition_vetoed_for_reserved_slug(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An LTD edition vetoed for a reserved slug reads as seen.
+
+    The LTD edition had no state row — the unseen edition discovery
+    enqueues for — until a visit met its slug reserved by an operator's
+    delete and recorded the veto as a ``manual_delete`` tombstone on a
+    new row (issue #841), written here through the same store call. The
+    next tick finds the row and leaves the project alone.
+    """
+    async with db_session.begin():
+        org_id, _ = await _seed_org(
+            db_session,
+            slug="ks-tier-disc-reserved",
+            project_slugs=["pipelines"],
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_id=None,
+            ltd_slug="pipelines",
+        )
+        await _seed_state(
+            db_session,
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+            date_rebuilt_seen=_FIXTURE_MAIN_DATE_REBUILT,
+        )
+        await KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        ).tombstone(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            reason=TombstoneReason.manual_delete,
+            ltd_id=3,
+            ltd_slug="DM-53614",
+            docverse_id=7,
+            date_last_synced=datetime.now(tz=UTC),
+        )
+
+    _stub_products(mock_discovery, ["pipelines"])
+    _stub_editions_listing(
+        mock_discovery, product_slug="pipelines", edition_ids=[3, 1]
+    )
+
+    http_client = httpx.AsyncClient()
+    ctx = _make_ctx(http_client)
+    try:
+        result = await keeper_sync_tier_discovery(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+    assert result == "completed"
+    _assert_no_edition_fetches(mock_discovery)
+
+    assert (
+        get_jobs_by_name(
+            ctx["arq_queue"],
+            "keeper_sync_project",
+            queue_name=KEEPER_SYNC_QUEUE_NAME,
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
 async def test_tier_discovery_honours_scope_patterns_and_excludes(
     app: None,
     db_session: AsyncSession,
@@ -3411,6 +3483,57 @@ async def test_tier_other_ignores_manual_delete_tombstone(
             reason=TombstoneReason.manual_delete,
             date_tombstoned=now - timedelta(days=2),
             date_last_synced=now - timedelta(days=3),
+        )
+
+    assert await _tier_other_enqueued_slugs(mock_discovery) == []
+
+
+@pytest.mark.asyncio
+async def test_tier_other_skips_cleared_row_vetoed_for_reserved_slug(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A cleared lifecycle row that met a reserved slug stays quiet.
+
+    LTD rebuilt a ``lifecycle_preemptive`` draft, keeper-sync cleared its
+    tombstone, and the import then met a slug an operator's delete
+    reserves. Cleared and never synced, the row would read stale on
+    every tick and send the project back for a visit that imports
+    nothing. That visit converts it into a ``manual_delete`` tombstone
+    instead (issue #841), written here through the same store call, and
+    tier_other leaves it alone.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id = await _seed_tombstoned_branch_project(
+            db_session,
+            org_slug="ks-tier-other-reserved",
+            reason=TombstoneReason.lifecycle_preemptive,
+            date_tombstoned=now - timedelta(days=2),
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        tombstoned = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            include_tombstoned=True,
+        )
+        assert tombstoned is not None
+        cleared = await KeeperSyncTombstoneService(
+            session=db_session, state_store=state_store, logger=_logger()
+        ).clear(public_id=tombstoned.public_id, org_id=org_id)
+        assert should_refresh_other_edition(state=cleared.state, now=now)
+        await state_store.tombstone(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            reason=TombstoneReason.manual_delete,
+            ltd_id=2,
+            ltd_slug="DM-53614",
+            docverse_id=7,
+            date_last_synced=now,
         )
 
     assert await _tier_other_enqueued_slugs(mock_discovery) == []

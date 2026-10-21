@@ -2137,9 +2137,12 @@ class KeeperSyncService:
         <docverse_server.storage.edition_store.EditionStore.revive_or_create>`
         inside ``_ensure_edition``: revived in place when a lifecycle
         rule (or nothing on record) deleted it, and left deleted when an
-        operator did, in which case the visit imports nothing and logs a
-        warning. Either way the slug clash no longer raises "lost ON
-        CONFLICT race".
+        operator did, in which case the visit imports nothing, records
+        the operator's veto as a ``manual_delete`` tombstone on the LTD
+        edition's state row (see :meth:`_record_edition`), and logs a
+        warning that later visits, short-circuited on that tombstone,
+        do not repeat. Either way the slug clash no longer raises "lost
+        ON CONFLICT race".
         """
         async with self._session.begin():
             edition_state = await self._state_store.get(
@@ -2263,15 +2266,19 @@ class KeeperSyncService:
             kind_derivation=kind_derivation,
             tracking=tracking,
         )
-        if ensured is None:
+        if isinstance(ensured, ReservedSlug):
             # Not a failure: the operator's delete is the veto, and the
             # native path skips a build for this slug the same way.
+            # ``_record_edition`` recorded it as a ``manual_delete``
+            # tombstone, so this is the edition's one warning: every
+            # later visit short-circuits on that tombstone instead.
             self._logger.warning(
                 "Edition slug reserved by manual delete; LTD edition not"
                 " imported",
                 ltd_edition_id=ltd_edition.ltd_id,
                 ltd_edition_slug=ltd_edition.slug,
                 docverse_slug=docverse_slug,
+                edition_id=ensured.edition.id,
                 project_id=project.id,
                 project=project.slug,
             )
@@ -3262,14 +3269,26 @@ class KeeperSyncService:
         docverse_slug: str,
         kind_derivation: EditionKindDerivation,
         tracking: TrackingDerivation,
-    ) -> EnsuredEdition | None:
+    ) -> EnsuredEdition | ReservedSlug:
         """Ensure the edition's row and record it on its state row.
 
         One transaction: :meth:`_ensure_edition`, then the edition's
         ``keeper_sync_state`` upsert pointing at the row it settled on,
         stamped with this visit's sync time and LTD's ``date_rebuilt``.
-        ``None`` — and no state write — when an operator's delete
-        reserves the slug.
+
+        When an operator's delete reserves the slug, the
+        :class:`~docverse_server.domain.edition.ReservedSlug` comes back
+        and the state row records the veto instead: a ``manual_delete``
+        tombstone naming the deleted edition, stamped with this visit's
+        sync time, written onto the LTD edition's row whether or not one
+        exists yet (a row whose lifecycle tombstone this visit just
+        cleared is converted in place). Without it the LTD edition would
+        read as unseen to ``tier_discovery``, and a cleared lifecycle
+        row as stale to ``tier_other``, so both crons would send the
+        project back for a visit that imports nothing, on every tick.
+        With it, every later visit short-circuits on the tombstone, as
+        it does on one an operator's delete stamped itself, until the
+        edition's restore or a clear of the tombstone lifts it.
         """
         async with self._session.begin():
             ensured = await self._ensure_edition(
@@ -3280,8 +3299,17 @@ class KeeperSyncService:
                 tracking_mode=tracking.tracking_mode,
                 tracking_params=tracking.tracking_params,
             )
-            if ensured is None:
-                return None
+            if isinstance(ensured, ReservedSlug):
+                await self._state_store.tombstone(
+                    org_id=state_key.org_id,
+                    resource_type=ResourceType.edition,
+                    reason=TombstoneReason.manual_delete,
+                    ltd_id=state_key.ltd_id,
+                    ltd_slug=state_key.ltd_slug,
+                    docverse_id=ensured.edition.id,
+                    date_last_synced=_now(),
+                )
+                return ensured
             await self._state_store.upsert(
                 org_id=state_key.org_id,
                 resource_type=ResourceType.edition,
@@ -3303,7 +3331,7 @@ class KeeperSyncService:
         title: str,
         tracking_mode: TrackingMode,
         tracking_params: dict[str, Any],
-    ) -> EnsuredEdition | None:
+    ) -> EnsuredEdition | ReservedSlug:
         """Look up or create an edition and realign its tracking columns.
 
         ``__main`` is looked up only: its tracking has already been
@@ -3325,8 +3353,9 @@ class KeeperSyncService:
         on both paths: revived in place when a lifecycle rule (or nothing
         on record) deleted it, reported through
         :attr:`EnsuredEdition.revived`; declined when an operator did,
-        in which case this returns ``None`` and the caller imports
-        nothing.
+        in which case this returns the store's
+        :class:`~docverse_server.domain.edition.ReservedSlug` and the
+        caller imports nothing.
         """
         edition = await self._edition_store.get_by_slug(
             project_id=project_id, slug=docverse_slug
@@ -3382,7 +3411,7 @@ class KeeperSyncService:
                 tracking_params=tracking_params,
             )
             if isinstance(ensured, ReservedSlug):
-                return None
+                return ensured
             edition = ensured.edition
             revived = ensured.revived
         # Applied on every path. ``revive_or_create`` is race-tolerant: a

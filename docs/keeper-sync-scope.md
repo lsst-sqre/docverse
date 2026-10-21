@@ -508,7 +508,7 @@ project or edition.
 
 | `tombstone_reason` | Written when | Lifted by |
 | --- | --- | --- |
-| `manual_delete` | An operator deleted the Docverse project or edition; a project delete tombstones its editions too | An operator, only |
+| `manual_delete` | An operator deleted the Docverse project or edition; a project delete tombstones its editions too. Keeper-sync also writes one on an LTD edition whose Docverse slug a deleted edition still holds — a native edition on the same branch, say — naming that edition, so the tier crons stop re-syncing the project for it | An operator, only |
 | `lifecycle_delete` | A lifecycle rule soft-deleted the imported edition: `lifecycle_eval`, `git_ref_audit`, the GitHub `delete` webhook, or a default-branch rewrite retiring a duplicate draft | Keeper-sync itself, once LTD rebuilds the edition and no rule matches it any more; or an operator |
 | `lifecycle_preemptive` | Keeper-sync's proactive pass vetoed the LTD edition before importing it, because a rule would delete it at once; no Docverse edition exists | As `lifecycle_delete` |
 
@@ -566,9 +566,11 @@ never imported — comes back with one admin call:
 POST /orgs/{org}/projects/{project}/editions/{edition}/restore
 ```
 
-It revives the edition in place, clears its keeper-sync tombstone if it
-has one (so keeper-sync syncs it again), republishes its current build,
-and rebuilds the project's dashboard. Prefer it to a clear for an
+It revives the edition in place, clears every keeper-sync tombstone that
+names it (so keeper-sync syncs it again) — the one on its own LTD
+edition, and any keeper-sync wrote on another LTD edition that met its
+slug — republishes its current build, and rebuilds the project's
+dashboard. Prefer it to a clear for an
 edition: the clear revives the row but neither republishes it nor
 rebuilds the dashboard. The restore answers `404` for an edition that
 is not deleted.
