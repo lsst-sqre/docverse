@@ -342,7 +342,7 @@ async def _resolve_project_id(
 def _skip_reason(resources: _PublishResources) -> _PublishSkip | None:
     """Say why this job must publish nothing, or ``None`` to go ahead.
 
-    Three pickup guards, all read under ``EDITION_UPDATE`` so none can
+    Four pickup guards, all read under ``EDITION_UPDATE`` so none can
     straddle a concurrent write, and all ahead of ``_mark_publishing``
     so a refused job leaves no trace of itself on any row.
 
@@ -388,6 +388,16 @@ def _skip_reason(resources: _PublishResources) -> _PublishSkip | None:
     delivered the job leaves a build the ``purgatory_cleanup`` sweep may
     reclaim, and a KV pointer written now would outlive the objects it
     names (PRD #596).
+
+    *Purged build.* The sweep has already reclaimed the build's objects,
+    so there is nothing left to publish. A restored edition can still
+    point at such a build — keeper-sync revives a ``lifecycle_delete``
+    edition whose build was purged while it was retired (PRD #830) —
+    and its producers check before enqueueing, but a job is refused here
+    in any case rather than failing a copy into Sentry. ``date_purged``
+    is read in its own right, ahead of ``date_deleted``, so the skip
+    names the reclamation and does not rest on the sweep only ever
+    stamping deleted rows.
     """
     if resources.history_superseded:
         return _PublishSkip(
@@ -406,6 +416,12 @@ def _skip_reason(resources: _PublishResources) -> _PublishSkip | None:
             message="Edition no longer points at this build",
             progress_flag="superseded_skipped",
             log_event="Superseded publish skipped",
+        )
+    if resources.build.date_purged is not None:
+        return _PublishSkip(
+            message="Build was purged before publishing",
+            progress_flag="purged_skipped",
+            log_event="Purged build skipped before publishing",
         )
     if resources.build.date_deleted is not None:
         return _PublishSkip(
@@ -432,24 +448,24 @@ async def _retire_skipped_publish(
     The publish-side twin of ``build_processing``'s
     ``_mark_deleted_skipped``, and it records the same thing: a flag on
     the ``progress`` of a job that completes rather than fails. No
-    refusal is an error — an operator asked for the delete, a duplicate
-    delivery for a row another writer has already settled has nothing
-    left to do, and a job for a build the edition has moved off would
-    only overwrite the pointer a newer job owns — so the job must not
-    land in Sentry or wait for ``publish_edition_reaper``.
+    refusal is an error — an operator asked for the delete, the sweep
+    reclaimed a deleted build as it is meant to, a duplicate delivery
+    for a row another writer has already settled has nothing left to
+    do, and a job for a build the edition has moved off would only
+    overwrite the pointer a newer job owns — so the job must not land
+    in Sentry or wait for ``publish_edition_reaper``.
 
     Nothing else is touched: not the history row, not the edition's
     ``publish_status``, not the edge, and no ``EditionPublishedEvent``
-    is emitted for a publish that did not happen. A deleted build leaves
-    the row at the ``pending`` tracking set, because it records an
-    intent that was never carried out; a superseded row keeps whatever
-    the writer that overtook this job put there, which is by
-    construction newer than anything this job could say; a row whose
-    build the edition has left stays as its enqueue left it, for the
-    same reason. The keeper-sync
-    roll-up still runs: this job is terminal, so a run that was waiting
-    on it must be allowed to finalise exactly as the success and failure
-    paths allow it to.
+    is emitted for a publish that did not happen. A deleted or purged
+    build leaves the row at the ``pending`` tracking set, because it
+    records an intent that was never carried out; a superseded row
+    keeps whatever the writer that overtook this job put there, which
+    is by construction newer than anything this job could say; a row
+    whose build the edition has left stays as its enqueue left it, for
+    the same reason. The keeper-sync roll-up still runs: this job is
+    terminal, so a run that was waiting on it must be allowed to
+    finalise exactly as the success and failure paths allow it to.
     """
     logger.info(
         skip.log_event,

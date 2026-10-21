@@ -982,7 +982,11 @@ added. The verdict is one of:
   a `lifecycle_delete` edition's soft-deleted row is revived in place,
   keeping its id — and the visit goes on to import the edition: its
   build is synced, the edition published, and the `keeper_sync_project`
-  worker publishes an `edition_lifecycle` `restore` event for it. The
+  worker publishes an `edition_lifecycle` `restore` event for it. A
+  revived edition whose LTD build Docverse already holds is published
+  at that build, unless the purgatory sweep reclaimed it while the
+  edition was retired: then it stays unpublished, with the `Restored
+  edition without republishing` line below, until its next build. The
   tombstone leaves the listing. An LTD edition in `manual` mode, which
   cannot be judged before its build is mapped, is cleared the same way
   and left to the passes that judge imported editions.
@@ -1100,8 +1104,19 @@ see [Tombstones](keeper-sync-scope.md#tombstones).
   with `Edition slug reserved by manual delete; build not tracked`, the
   backfill with `Semver aggregate slug reserved by manual delete;
   aggregate not backfilled`.
-- The `Restored edition` lines are the admin restore's; `republished`
-  is whether it queued a publish of the edition's current build.
+- `Restored edition` is the admin restore's; `republished` is whether
+  it queued a publish of the edition's current build.
+- `Restored edition has no build to republish` and `Restored edition
+  without republishing; its current build is not live` come from the
+  one guard every republish of a restored edition runs: the admin
+  restore's, and keeper-sync's for an edition its visit brought back
+  without importing a fresh build. The edition stays restored but
+  unpublished. `build_deleted` and `build_purged` say why the build
+  is not live; a `lifecycle_delete` edition retired long enough for
+  the purgatory sweep to reclaim its build reads `build_purged=true`,
+  and comes back on the CDN once LTD or a native upload gives it a
+  new build. `publish_edition` refuses a purged build at pickup too,
+  completing its job with `purged_skipped` rather than failing it.
 
 ## Configuration
 

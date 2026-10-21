@@ -275,8 +275,8 @@ _REVIVAL_LOG_LINES: dict[str, tuple[str, ...]] = {
         "Edition slug reserved by manual delete; build not tracked",
         _AGGREGATE_SLUG_HELD,
     ),
-    "docverse_server.services.edition": (
-        "Restored edition",
+    "docverse_server.services.edition": ("Restored edition",),
+    "docverse_server.services.publish_enqueue": (
         "Restored edition has no build to republish",
         (
             "Restored edition without republishing; its current build is"

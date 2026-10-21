@@ -25,6 +25,7 @@ from docverse_server.domain.project import Project
 from docverse_server.domain.queue import QueueJob
 from docverse_server.exceptions import ConflictError, NotFoundError
 from docverse_server.metrics import EditionPublishTrigger
+from docverse_server.services.publish_enqueue import load_republishable_build
 from docverse_server.services.queue_dispatch import QueueDispatcher
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
@@ -758,36 +759,16 @@ class EditionService:
     ) -> bool:
         """Queue the publish of a restored edition's current build.
 
-        Returns whether a publish was queued. The build is read under
-        its row lock (editions, then builds, per the store's lock
-        order), so a build delete racing the restore is either seen
-        here or waits for it.
+        Returns whether a publish was queued. Whether the current build
+        can be published is :func:`load_republishable_build`'s call,
+        the guard keeper-sync's republish of a restored edition shares.
         """
-        if edition.current_build_id is None:
-            self._logger.info(
-                "Restored edition has no build to republish",
-                edition_id=edition.id,
-                edition_slug=edition.slug,
-            )
-            return False
-        build = await self._build_store.get_for_update(
-            build_id=edition.current_build_id
+        build = await load_republishable_build(
+            build_store=self._build_store,
+            edition=edition,
+            logger=self._logger,
         )
-        if (
-            build is None
-            or build.date_deleted is not None
-            or build.date_purged is not None
-        ):
-            self._logger.warning(
-                "Restored edition without republishing; its current build "
-                "is not live",
-                edition_id=edition.id,
-                edition_slug=edition.slug,
-                build_id=edition.current_build_id,
-                build_deleted=build is None or build.date_deleted is not None,
-                build_purged=build is not None
-                and build.date_purged is not None,
-            )
+        if build is None:
             return False
         await self._queue_publish(
             org_id=org_id,

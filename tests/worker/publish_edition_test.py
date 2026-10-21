@@ -34,6 +34,7 @@ from docverse.models import (
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
 from docverse_server.config import config as worker_config
+from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.keeper_sync_run import SqlKeeperSyncRun
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.queue_job import SqlQueueJob
@@ -1914,6 +1915,101 @@ async def test_publish_edition_deleted_build_skips(
             assert entries[0].id == history_entry.id
             # Untouched: ``_mark_publishing`` never ran, so the entry
             # still carries exactly what tracking recorded.
+            assert entries[0].publish_status == history_entry.publish_status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted", [True, False])
+async def test_publish_edition_purged_build_skips(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    deleted: bool,
+) -> None:
+    """A build whose content was reclaimed is never published.
+
+    A publish enqueued for a build the ``purgatory_cleanup`` sweep then
+    reclaimed — a restored edition still pointing at it, say (PRD #830)
+    — would copy objects that no longer exist. The pickup guard retires
+    the job instead: ``completed`` carrying ``purged_skipped``, nothing
+    published, no Sentry event. ``date_purged`` is checked in its own
+    right, so the job is refused even on a row whose ``date_deleted``
+    is somehow clear.
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug="pub-purged-build-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id="test-publish-arq-purged-build",
+        )
+        build_store = BuildStore(session=db_session, logger=logger)
+        if deleted:
+            assert await build_store.soft_delete(build_id=build.id) is True
+            assert await build_store.mark_purged(build_id=build.id) is not None
+        else:
+            await db_session.execute(
+                update(SqlBuild)
+                .where(SqlBuild.id == build.id)
+                .values(date_purged=func.now())
+            )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id="test-publish-arq-purged-build",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+
+    with sentry_init_fixture() as init:
+        init(environment="test")
+        sentry_events = capture_events_fixture(monkeypatch)()
+        result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert mock_publisher.calls == []
+    assert sentry_events.errors == []
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress["purged_skipped"] is True
+            assert (
+                job.progress["message"] == "Build was purged before publishing"
+            )
+
+            hist_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            entries = await hist_store.list_by_edition(edition.id)
+            assert [entry.id for entry in entries] == [history_entry.id]
             assert entries[0].publish_status == history_entry.publish_status
 
 

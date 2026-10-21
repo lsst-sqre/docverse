@@ -122,6 +122,7 @@ from docverse_server.services.keeper_sync_finalisation import (
 )
 from docverse_server.services.publish_enqueue import (
     enqueue_publish_for_edition,
+    load_republishable_build,
 )
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
@@ -1313,7 +1314,8 @@ def _build_on_edition_synced(
     (:attr:`EditionSyncOutcome.restored`, PRD #830) is first announced
     with one ``edition_lifecycle`` ``restore`` event (*events* is
     ``None`` in a worker running without metrics), then published
-    whether or not its build was imported this visit — see
+    whether or not its build was imported this visit, so long as that
+    build is still live — see
     :func:`_enqueue_publish_for_restored_edition`.
     """
 
@@ -1593,7 +1595,16 @@ async def _enqueue_publish_for_restored_edition(
     the tail-end self-heal would read the publish recorded before the
     reap as settled and skip it.
 
-    Publishes the edition's current build as it stands after the visit.
+    Publishes the edition's current build as it stands after the visit,
+    but only when :func:`load_republishable_build` — the guard the admin
+    restore shares — finds that build still live. The short-circuited
+    build is the one the edition held before its delete, and a
+    lifecycle-deleted edition can sit retired long enough for the
+    purgatory sweep to reclaim it; publishing it then would fail the
+    copy into Sentry and the reaper once per restore. The guard logs the
+    skip, and the edition stays restored, unpublished, until LTD
+    rebuilds it onto a fresh build.
+
     Returns whether a publish was enqueued; an edition with no live
     current build has nothing to publish.
     """
@@ -1603,11 +1614,14 @@ async def _enqueue_publish_for_restored_edition(
     edition_store = factory.create_edition_store()
     async with session.begin():
         edition = await edition_store.get_by_id(edition_id)
-    if (
-        edition is None
-        or edition.current_build_id is None
-        or edition.current_build_public_id is None
-    ):
+        if edition is None:
+            return False
+        build = await load_republishable_build(
+            build_store=factory.create_build_store(),
+            edition=edition,
+            logger=logger,
+        )
+    if build is None:
         return False
     await enqueue_publish_for_edition(
         session=session,
@@ -1620,14 +1634,14 @@ async def _enqueue_publish_for_restored_edition(
         project_slug=outcome.docverse_project_slug,
         edition_id=edition.id,
         edition_slug=edition.slug,
-        build_id=edition.current_build_id,
-        build_public_id=serialize_base32_id(edition.current_build_public_id),
+        build_id=build.id,
+        build_public_id=serialize_base32_id(build.public_id),
         keeper_sync_run_id=run_id,
     )
     logger.info(
         "Enqueued publish_edition for synced build",
         edition_slug=edition.slug,
-        build_id=edition.current_build_id,
+        build_id=build.id,
         phase="restored",
     )
     return True
