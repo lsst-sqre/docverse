@@ -37,6 +37,8 @@ from docverse_server.domain.edition import (
     EditionDeleteReason,
     EnsuredEdition,
     RepointOutcome,
+    ReservedSlug,
+    SlugReservation,
 )
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
@@ -3268,7 +3270,7 @@ async def _create_reaped_draft(
 
 async def _revive_or_create_draft(
     edition_store: EditionStore, *, project_id: int, slug: str
-) -> EnsuredEdition | None:
+) -> EnsuredEdition | ReservedSlug:
     """Call ``revive_or_create`` with a ``draft`` derivation for *slug*."""
     return await edition_store.revive_or_create(
         project_id=project_id,
@@ -3310,7 +3312,7 @@ async def test_revive_or_create_revives_lifecycle_deleted_slug(
         )
         await db_session.commit()
 
-    assert ensured is not None
+    assert isinstance(ensured, EnsuredEdition)
     assert ensured.revived is True
     revived = ensured.edition
     assert revived.id == reaped.id
@@ -3366,7 +3368,7 @@ async def test_revive_or_create_revives_slug_with_no_delete_reason(
         )
         await db_session.commit()
 
-    assert ensured is not None
+    assert isinstance(ensured, EnsuredEdition)
     assert ensured.revived is True
     assert ensured.edition.id == reaped.id
     row = await _read_edition_row(db_session, reaped.id)
@@ -3401,7 +3403,9 @@ async def test_revive_or_create_refuses_manually_deleted_slug(
         )
         await db_session.commit()
 
-    assert ensured is None
+    assert isinstance(ensured, ReservedSlug)
+    assert ensured.reason is SlugReservation.manual_delete
+    assert ensured.edition.id == deleted.id
     row = await _read_edition_row(db_session, deleted.id)
     assert row.date_deleted is not None
     assert row.delete_reason == EditionDeleteReason.manual_delete.value
@@ -3416,6 +3420,156 @@ async def test_revive_or_create_refuses_manually_deleted_slug(
             )
         ).scalar_one()
     assert count == 1
+
+
+async def _create_reaped_major_slug(
+    edition_store: EditionStore,
+    *,
+    org_id: int,
+    project_id: int,
+    tracking_mode: TrackingMode,
+    tracking_params: dict[str, Any],
+    reason: TombstoneReason = TombstoneReason.lifecycle_delete,
+) -> Edition:
+    """Create edition ``2`` on *tracking_mode*, then soft-delete it.
+
+    Stands in for whatever held the ``2`` aggregate slug before it was
+    deleted: the aggregate itself (``semver_major``) or an operator's
+    own edition tracking something else.
+    """
+    edition = await edition_store.create_internal(
+        project_id=project_id,
+        slug="2",
+        title="2 title",
+        kind=EditionKind.release,
+        tracking_mode=tracking_mode,
+        tracking_params=tracking_params,
+    )
+    assert await edition_store.soft_delete(
+        org_id=org_id, project_id=project_id, slug="2", reason=reason
+    )
+    return edition
+
+
+async def _revive_or_create_major_aggregate(
+    edition_store: EditionStore, *, project_id: int
+) -> EnsuredEdition | ReservedSlug:
+    """Ensure the ``2`` aggregate, reviving only a ``semver_major`` row."""
+    return await edition_store.revive_or_create(
+        project_id=project_id,
+        slug="2",
+        title="2",
+        kind=EditionKind.major,
+        tracking_mode=TrackingMode.semver_major,
+        tracking_params={"major_version": 2},
+        match_tracking_mode=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_leaves_a_differently_tracked_row_deleted(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A tracking-mode match can be required of the row to revive.
+
+    With ``match_tracking_mode`` a lifecycle-deleted edition that
+    tracked anything other than the derivation's mode keeps its
+    deletion, tracking, and kind, and the call reports the slug reserved
+    by it — so an operator's reaped ``2`` on git ref ``2`` is not turned
+    into the ``semver_major`` aggregate.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        reaped = await _create_reaped_major_slug(
+            edition_store,
+            org_id=org_id,
+            project_id=project_id,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "2"},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        ensured = await _revive_or_create_major_aggregate(
+            edition_store, project_id=project_id
+        )
+        await db_session.commit()
+
+    assert isinstance(ensured, ReservedSlug)
+    assert ensured.reason is SlugReservation.tracking_mismatch
+    assert ensured.edition.id == reaped.id
+    assert ensured.edition.tracking_mode is TrackingMode.git_ref
+    row = await _read_edition_row(db_session, reaped.id)
+    assert row.date_deleted is not None
+    assert row.delete_reason == EditionDeleteReason.lifecycle_delete.value
+    assert row.tracking_mode is TrackingMode.git_ref
+    assert row.tracking_params == {"git_ref": "2"}
+    assert row.kind is EditionKind.release
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_revives_a_matching_tracked_row(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A row already on the required tracking mode is revived as ever."""
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        reaped = await _create_reaped_major_slug(
+            edition_store,
+            org_id=org_id,
+            project_id=project_id,
+            tracking_mode=TrackingMode.semver_major,
+            tracking_params={"major_version": 2},
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        ensured = await _revive_or_create_major_aggregate(
+            edition_store, project_id=project_id
+        )
+        await db_session.commit()
+
+    assert isinstance(ensured, EnsuredEdition)
+    assert ensured.revived is True
+    assert ensured.edition.id == reaped.id
+    assert ensured.edition.kind is EditionKind.major
+    row = await _read_edition_row(db_session, reaped.id)
+    assert row.date_deleted is None
+
+
+@pytest.mark.asyncio
+async def test_revive_or_create_reports_a_manual_delete_over_a_mismatch(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """An operator's delete is the reservation reported, whatever it tracked.
+
+    The manual delete is the stronger veto — only the admin restore
+    lifts it — so a caller warns about it rather than about a mismatch.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        reaped = await _create_reaped_major_slug(
+            edition_store,
+            org_id=org_id,
+            project_id=project_id,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "2"},
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        ensured = await _revive_or_create_major_aggregate(
+            edition_store, project_id=project_id
+        )
+        await db_session.commit()
+
+    assert isinstance(ensured, ReservedSlug)
+    assert ensured.reason is SlugReservation.manual_delete
+    assert ensured.edition.id == reaped.id
 
 
 @pytest.mark.asyncio
@@ -3468,7 +3622,7 @@ async def test_revive_or_create_clears_keeper_sync_tombstone(
         )
         await db_session.commit()
 
-    assert ensured is not None
+    assert isinstance(ensured, EnsuredEdition)
     assert ensured.revived is True
     assert state is not None
     assert state.date_tombstoned is None
@@ -3532,7 +3686,7 @@ async def test_revive_or_create_clears_every_tombstone_naming_the_edition(
         ]
         await db_session.commit()
 
-    assert ensured is not None
+    assert isinstance(ensured, EnsuredEdition)
     assert ensured.revived is True
     for state in states:
         assert state is not None
@@ -3565,7 +3719,7 @@ async def test_revive_or_create_returns_live_edition_untouched(
         )
         await db_session.commit()
 
-    assert ensured is not None
+    assert isinstance(ensured, EnsuredEdition)
     assert ensured.revived is False
     assert ensured.edition.id == live.id
     assert ensured.edition.kind is EditionKind.release
@@ -3585,7 +3739,7 @@ async def test_revive_or_create_inserts_free_slug(
         )
         await db_session.commit()
 
-    assert ensured is not None
+    assert isinstance(ensured, EnsuredEdition)
     assert ensured.revived is False
     assert ensured.edition.slug == "fresh"
     assert ensured.edition.kind is EditionKind.draft
@@ -3630,7 +3784,7 @@ async def test_revive_or_create_keeps_a_declared_kind(
         )
         await db_session.commit()
 
-    assert ensured is not None
+    assert isinstance(ensured, EnsuredEdition)
     assert ensured.revived is True
     assert ensured.edition.id == declared.id
     assert ensured.edition.kind is EditionKind.release
@@ -3670,7 +3824,7 @@ async def test_revive_or_create_concurrent_revives_converge(
     try:
         maker = async_sessionmaker(engine, expire_on_commit=False)
 
-        async def revive() -> EnsuredEdition | None:
+        async def revive() -> EnsuredEdition | ReservedSlug:
             async with maker() as session:
                 store = EditionStore(session=session, logger=logger)
                 async with session.begin():
@@ -3684,12 +3838,10 @@ async def test_revive_or_create_concurrent_revives_converge(
     finally:
         await engine.dispose()
 
-    assert all(result is not None for result in results)
-    assert {r.edition.id for r in results if r is not None} == {reaped.id}
-    assert sorted(r.revived for r in results if r is not None) == [
-        False,
-        True,
-    ]
+    ensured = [r for r in results if isinstance(r, EnsuredEdition)]
+    assert len(ensured) == len(results)
+    assert {r.edition.id for r in ensured} == {reaped.id}
+    assert sorted(r.revived for r in ensured) == [False, True]
 
 
 # ── restore (PRD #830) ────────────────────────────────────────────────────

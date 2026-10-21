@@ -6869,6 +6869,208 @@ async def test_sync_leaves_non_aggregate_edition_on_aggregate_slug(
     assert occupant.current_build_id is None
 
 
+_AGGREGATE_SLUG_HELD = (
+    "Semver aggregate slug held by a non-aggregate edition; leaving it"
+    " untouched"
+)
+"""What the backfill logs when another edition holds an aggregate slug."""
+
+
+async def _seed_project_with_deleted_15(
+    session: AsyncSession,
+    *,
+    org_id: int,
+    tracking_mode: TrackingMode,
+    tracking_params: dict[str, Any],
+    reason: TombstoneReason,
+) -> int:
+    """Create ``pipelines`` with a soft-deleted edition ``15``.
+
+    ``15`` tracks *tracking_mode*: ``semver_major`` stands in for an
+    aggregate an earlier backfill created, anything else for an
+    operator's own edition on the slug. Returns the edition id.
+    """
+    logger = structlog.get_logger("test")
+    project_store = ProjectStore(session=session, logger=logger)
+    edition_store = EditionStore(session=session, logger=logger)
+    async with session.begin():
+        project = await project_store.create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="pipelines",
+                title="LSST Science Pipelines",
+                source_url="https://example.com/lsst/pipelines",
+            ),
+        )
+        edition = await edition_store.create_internal(
+            project_id=project.id,
+            slug="15",
+            title="15",
+            kind=EditionKind.release,
+            tracking_mode=tracking_mode,
+            tracking_params=tracking_params,
+        )
+        assert await edition_store.soft_delete(
+            org_id=org_id, project_id=project.id, slug="15", reason=reason
+        )
+    return edition.id
+
+
+async def _read_edition_15(session: AsyncSession, edition_id: int) -> Any:
+    """Read edition ``15``'s row fresh, deleted or not."""
+    async with session.begin():
+        return (
+            await session.execute(
+                select(SqlEdition)
+                .where(SqlEdition.id == edition_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+
+
+async def _sync_release_15_2_1(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    *,
+    org_id: int,
+) -> ProjectSyncResult:
+    """Sync ``pipelines`` with its one LTD release edition, ``15.2.1``."""
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/43/index.html": b"<html>release</html>"},
+    )
+    return await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+
+@pytest.mark.asyncio
+async def test_sync_leaves_differently_tracked_deleted_edition_on_aggregate(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reaped edition on another tracking mode is not made an aggregate.
+
+    The backfill settles the slug as native tracking does: the reaped
+    ``15`` on git ref ``v15`` stays deleted with its tracking, the
+    ``15`` aggregate is skipped and logged as for a live occupant, and
+    nothing reaches Sentry — the ``15.2`` aggregate is created as usual.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-deleted-held")
+    edition_id = await _seed_project_with_deleted_15(
+        db_session,
+        org_id=org_id,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": "v15"},
+        reason=TombstoneReason.lifecycle_delete,
+    )
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    with structlog.testing.capture_logs() as logs:
+        result = await _sync_release_15_2_1(
+            db_session, http_client, mock_discovery, org_id=org_id
+        )
+
+    assert captured == []
+    (outcome,) = result.edition_outcomes
+    assert [a.docverse_slug for a in outcome.aggregate_outcomes] == ["15.2"]
+    held = [entry for entry in logs if entry["event"] == _AGGREGATE_SLUG_HELD]
+    assert len(held) == 1
+    assert held[0]["edition_id"] == edition_id
+    assert held[0]["edition_deleted"] is True
+    row = await _read_edition_15(db_session, edition_id)
+    assert row.date_deleted is not None
+    assert row.delete_reason == TombstoneReason.lifecycle_delete.value
+    assert row.tracking_mode is TrackingMode.git_ref
+    assert row.tracking_params == {"git_ref": "v15"}
+    assert row.current_build_id is None
+
+
+@pytest.mark.asyncio
+async def test_sync_revives_deleted_aggregate_on_its_tracking_mode(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A reaped ``semver_major`` ``15`` comes back for a ``15.x`` release.
+
+    Revived in place, the same row the backfill once created is pointed
+    at the release build and reported for publishing.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-deleted-revive")
+    edition_id = await _seed_project_with_deleted_15(
+        db_session,
+        org_id=org_id,
+        tracking_mode=TrackingMode.semver_major,
+        tracking_params={"major_version": 15},
+        reason=TombstoneReason.lifecycle_delete,
+    )
+
+    result = await _sync_release_15_2_1(
+        db_session, http_client, mock_discovery, org_id=org_id
+    )
+
+    (outcome,) = result.edition_outcomes
+    aggregates = {a.docverse_slug: a for a in outcome.aggregate_outcomes}
+    assert set(aggregates) == {"15", "15.2"}
+    assert aggregates["15"].docverse_edition_id == edition_id
+    row = await _read_edition_15(db_session, edition_id)
+    assert row.date_deleted is None
+    assert row.delete_reason is None
+    assert row.tracking_mode is TrackingMode.semver_major
+    assert row.current_build_id == aggregates["15"].docverse_build_id
+
+
+@pytest.mark.asyncio
+async def test_sync_leaves_manually_deleted_aggregate_deleted(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator's delete of ``15`` reserves it from the backfill too.
+
+    Even on the aggregate's own tracking mode, the manual delete stands:
+    ``15`` stays deleted, the aggregate is skipped, and nothing reaches
+    Sentry.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-deleted-manual")
+    edition_id = await _seed_project_with_deleted_15(
+        db_session,
+        org_id=org_id,
+        tracking_mode=TrackingMode.semver_major,
+        tracking_params={"major_version": 15},
+        reason=TombstoneReason.manual_delete,
+    )
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+
+    result = await _sync_release_15_2_1(
+        db_session, http_client, mock_discovery, org_id=org_id
+    )
+
+    assert captured == []
+    (outcome,) = result.edition_outcomes
+    assert [a.docverse_slug for a in outcome.aggregate_outcomes] == ["15.2"]
+    row = await _read_edition_15(db_session, edition_id)
+    assert row.date_deleted is not None
+    assert row.delete_reason == TombstoneReason.manual_delete.value
+    assert row.current_build_id is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("edition_slug", "git_ref", "ltd_mode"),

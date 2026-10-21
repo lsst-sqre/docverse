@@ -947,7 +947,12 @@ edition tracking settles the clash by that row's `delete_reason`:
   advances to the build and publishes, and the project's dashboard is
   rebuilt. The `build_processing` worker publishes one
   `edition_lifecycle` event with `action` `restore` per revived
-  edition. The semver aggregates (`N` and `N.M`) revive the same way.
+  edition. The semver aggregates (`N` and `N.M`) revive the same way,
+  but only a row that already tracks the aggregate's mode
+  (`semver_major` or `semver_minor`): an edition on any other tracking
+  mode, such as one an operator made to follow git ref `2`, stays
+  deleted and the release skips that aggregate, logged just as when a
+  live edition of another tracking mode holds the slug.
 - **`manual_delete`: left deleted.** The build is stored and processed,
   but tracks no edition on that slug; edition tracking logs a warning,
   and the build carries on with its other editions. Nothing reaches
@@ -1022,6 +1027,10 @@ existed. It settles that clash as edition tracking does: a
 `lifecycle_delete` or `null` row is revived and the edition imported
 onto it, and a `manual_delete` row is left deleted, the visit importing
 nothing for it and logging a warning rather than failing the edition.
+The semver aggregates a synced release backfills follow the aggregate
+rule above: a deleted `N` or `N.M` comes back only from a
+`lifecycle_delete` or `null` row on the aggregate's own tracking mode,
+and the release skips the aggregate otherwise.
 
 ### An operator's delete is permanent
 
@@ -1063,6 +1072,8 @@ see [Tombstones](keeper-sync-scope.md#tombstones).
 | `Edition slug reserved by manual delete; LTD edition not imported` | warning | `ltd_edition_id`, `ltd_edition_slug`, `docverse_slug`, `project_id`, `project` |
 | `Revived soft-deleted edition` | info | `edition_id`, `edition_slug`, `project_id`, `previous_delete_reason`, `tombstone_cleared` |
 | `Edition slug reserved by manual delete; build not tracked` | warning | `slug`, `project_id` |
+| `Semver aggregate slug held by a non-aggregate edition; leaving it untouched` | info | `project_id`, `edition_id`, `edition_slug`, `edition_kind`, `tracking_mode`, `edition_deleted` |
+| `Semver aggregate slug reserved by manual delete; aggregate not backfilled` | warning | `project_id`, `edition_id`, `edition_slug` |
 | `Restored edition` | info | `org`, `project`, `edition_id`, `edition_slug`, `republished` |
 | `Restored edition has no build to republish` | info | `edition_id`, `edition_slug` |
 | `Restored edition without republishing; its current build is not live` | warning | `edition_id`, `edition_slug`, `build_id`, `build_deleted`, `build_purged` |
@@ -1080,6 +1091,15 @@ see [Tombstones](keeper-sync-scope.md#tombstones).
   import, and the admin restore. `previous_delete_reason` is the
   `delete_reason` it cleared, and `tombstone_cleared` whether a
   keeper-sync tombstone went with it.
+- `Semver aggregate slug held by a non-aggregate edition; leaving it
+  untouched` comes from edition tracking and from keeper-sync's
+  aggregate backfill alike, when an edition on another tracking mode
+  holds an `N` or `N.M` slug. `edition_deleted` is true when that
+  edition is soft-deleted and so stays deleted; `tracking_mode` is the
+  holder's. A native build reports an operator's delete of an aggregate
+  with `Edition slug reserved by manual delete; build not tracked`, the
+  backfill with `Semver aggregate slug reserved by manual delete;
+  aggregate not backfilled`.
 - The `Restored edition` lines are the admin restore's; `republished`
   is whether it queued a publish of the edition's current build.
 

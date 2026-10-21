@@ -103,6 +103,8 @@ from docverse_server.domain.edition import (
     EditionRepoint,
     EnsuredEdition,
     RepointOutcome,
+    ReservedSlug,
+    SlugReservation,
 )
 from docverse_server.domain.edition_reconcile import ReconcileEdition
 from docverse_server.domain.project import FALLBACK_DEFAULT_BRANCH
@@ -287,7 +289,8 @@ class EditionStore:
         tracking_mode: TrackingMode,
         tracking_params: dict[str, Any] | None = None,
         alternate_name: str | None = None,
-    ) -> EnsuredEdition | None:
+        match_tracking_mode: bool = False,
+    ) -> EnsuredEdition | ReservedSlug:
         """Ensure a derived edition holds *slug*, reviving a reaped one.
 
         The primitive behind the derivation paths that auto-create
@@ -310,9 +313,24 @@ class EditionStore:
           matches it. Any keeper-sync tombstone on the edition's state
           row is cleared in the same transaction, since the edition it
           vetoes is live again.
-        - Slug held by a ``manual_delete`` edition: ``None``. An
-          operator's delete is a permanent veto that only the admin
-          restore lifts, so the caller tracks no edition for the slug.
+        - Slug held by a ``manual_delete`` edition: a
+          :class:`~docverse_server.domain.edition.ReservedSlug` with
+          reason ``manual_delete``. An operator's delete is a permanent
+          veto that only the admin restore lifts, so the caller tracks
+          no edition for the slug.
+
+        With *match_tracking_mode*, a lifecycle-deleted (or ``NULL``)
+        edition is revived only when it already tracks *tracking_mode*;
+        one tracking anything else stays deleted, untouched, and the
+        slug comes back reserved with reason ``tracking_mismatch``. The
+        semver aggregate derivations set it, so they treat a deleted
+        edition on another tracking mode the way they treat a live one:
+        an operator's reaped ``2`` on git ref ``2`` is not theirs to turn
+        into the ``semver_major`` aggregate. A ``manual_delete`` is
+        reported as such whatever the edition tracked. The derivations
+        that settle a slug by the ref it names — native auto-creation,
+        keeper-sync's import — leave it off: the slug is the ref's,
+        whatever the reaped edition tracked.
 
         The soft-deleted row is read under ``FOR UPDATE``, so two
         revives of one slug serialize: the second waits, finds the row
@@ -362,7 +380,15 @@ class EditionStore:
             raise RuntimeError(msg)
 
         if row.delete_reason == EditionDeleteReason.manual_delete.value:
-            return None
+            return ReservedSlug(
+                edition=self._validate(row, None),
+                reason=SlugReservation.manual_delete,
+            )
+        if match_tracking_mode and row.tracking_mode != tracking_mode:
+            return ReservedSlug(
+                edition=self._validate(row, None),
+                reason=SlugReservation.tracking_mismatch,
+            )
 
         row.tracking_mode = tracking_mode
         row.tracking_params = tracking_params

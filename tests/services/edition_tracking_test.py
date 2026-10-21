@@ -2582,6 +2582,182 @@ async def test_track_build_revives_lifecycle_deleted_semver_aggregate(
     assert major.current_build_id == build.id
 
 
+_AGGREGATE_SLUG_HELD = (
+    "Semver aggregate slug held by a non-aggregate edition; leaving it"
+    " untouched"
+)
+"""What edition tracking logs when another edition holds an aggregate slug."""
+
+
+async def _seed_git_ref_edition_on_slug_2(
+    db_session: AsyncSession,
+    *,
+    org: Organization,
+    project: Project,
+    reason: TombstoneReason | None,
+) -> int:
+    """Hold slug ``2`` with an edition tracking git ref ``2``.
+
+    The operator-made edition the issue's example names. Soft-deleted
+    with *reason*, or left live when it is ``None``. Returns its id.
+    """
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        edition = await edition_store.create_internal(
+            project_id=project.id,
+            slug="2",
+            title="Two",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "2"},
+        )
+        if reason is not None:
+            assert await edition_store.soft_delete(
+                org_id=org.id, project_id=project.id, slug="2", reason=reason
+            )
+        await db_session.commit()
+    return edition.id
+
+
+async def _read_slug_2_row(db_session: AsyncSession, edition_id: int) -> Any:
+    """Read edition ``2``'s row fresh, deleted or not."""
+    async with db_session.begin():
+        row = (
+            await db_session.execute(
+                select(SqlEdition)
+                .where(SqlEdition.id == edition_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        await db_session.commit()
+    return row
+
+
+@pytest.mark.asyncio
+async def test_track_build_leaves_differently_tracked_deleted_aggregate(
+    db_session: AsyncSession,
+) -> None:
+    """A reaped edition on another tracking mode is not made an aggregate.
+
+    An operator's ``2`` on git ref ``2``, reaped by a lifecycle rule,
+    stays deleted with its tracking when a ``2.1.0`` release arrives:
+    the ``2`` aggregate is skipped for the build, and logged, exactly as
+    it would be were the edition live. The ``2.1`` aggregate, whose slug
+    nobody holds, is created as usual.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        org, project = await _setup(db_session, org_slug="agg-mismatch-org")
+        await db_session.commit()
+    edition_id = await _seed_git_ref_edition_on_slug_2(
+        db_session,
+        org=org,
+        project=project,
+        reason=TombstoneReason.lifecycle_delete,
+    )
+
+    with capture_logs() as logs:
+        async with db_session.begin():
+            build = await _create_build(
+                db_session, project.id, git_ref="2.1.0"
+            )
+            result = await service.track_build(build)
+            await db_session.commit()
+
+    assert result.revived == []
+    actions = {o.slug: o.action for o in result.outcomes}
+    assert "2" not in actions
+    assert actions["2.1"] == "created"
+    held = [entry for entry in logs if entry["event"] == _AGGREGATE_SLUG_HELD]
+    assert len(held) == 1
+    assert held[0]["log_level"] == "info"
+    assert held[0]["edition_id"] == edition_id
+    assert held[0]["edition_slug"] == "2"
+    assert held[0]["tracking_mode"] == TrackingMode.git_ref
+    assert held[0]["edition_deleted"] is True
+    row = await _read_slug_2_row(db_session, edition_id)
+    assert row.date_deleted is not None
+    assert row.delete_reason == TombstoneReason.lifecycle_delete.value
+    assert row.tracking_mode is TrackingMode.git_ref
+    assert row.tracking_params == {"git_ref": "2"}
+    assert row.current_build_id is None
+
+
+@pytest.mark.asyncio
+async def test_track_build_logs_live_non_aggregate_on_aggregate_slug(
+    db_session: AsyncSession,
+) -> None:
+    """A live edition on another tracking mode is skipped the same way."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        org, project = await _setup(db_session, org_slug="agg-live-held-org")
+        await db_session.commit()
+    edition_id = await _seed_git_ref_edition_on_slug_2(
+        db_session, org=org, project=project, reason=None
+    )
+
+    with capture_logs() as logs:
+        async with db_session.begin():
+            build = await _create_build(
+                db_session, project.id, git_ref="2.1.0"
+            )
+            result = await service.track_build(build)
+            await db_session.commit()
+
+    assert "2" not in {o.slug for o in result.outcomes}
+    held = [entry for entry in logs if entry["event"] == _AGGREGATE_SLUG_HELD]
+    assert len(held) == 1
+    assert held[0]["edition_id"] == edition_id
+    assert held[0]["edition_deleted"] is False
+    row = await _read_slug_2_row(db_session, edition_id)
+    assert row.date_deleted is None
+    assert row.tracking_mode is TrackingMode.git_ref
+    assert row.current_build_id is None
+
+
+@pytest.mark.asyncio
+async def test_track_build_skips_manually_deleted_aggregate_slug(
+    db_session: AsyncSession,
+) -> None:
+    """An operator-deleted edition reserves its aggregate slug, as ever.
+
+    The manual delete is what the build is told about — the same
+    warning a reserved git-ref slug gets — whatever the edition tracked.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        org, project = await _setup(db_session, org_slug="agg-manual-org")
+        await db_session.commit()
+    edition_id = await _seed_git_ref_edition_on_slug_2(
+        db_session,
+        org=org,
+        project=project,
+        reason=TombstoneReason.manual_delete,
+    )
+
+    with capture_logs() as logs:
+        async with db_session.begin():
+            build = await _create_build(
+                db_session, project.id, git_ref="2.1.0"
+            )
+            result = await service.track_build(build)
+            await db_session.commit()
+
+    assert result.revived == []
+    assert "2" not in {o.slug for o in result.outcomes}
+    reserved = [
+        entry
+        for entry in logs
+        if entry["event"]
+        == "Edition slug reserved by manual delete; build not tracked"
+    ]
+    assert [entry["slug"] for entry in reserved] == ["2"]
+    assert not [e for e in logs if e["event"] == _AGGREGATE_SLUG_HELD]
+    row = await _read_slug_2_row(db_session, edition_id)
+    assert row.date_deleted is not None
+    assert row.tracking_mode is TrackingMode.git_ref
+
+
 @pytest.mark.asyncio
 async def test_track_build_locks_project_before_reviving(
     db_session: AsyncSession,

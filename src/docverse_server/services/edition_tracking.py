@@ -16,7 +16,12 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.domain.build import Build
-from docverse_server.domain.edition import Edition, EnsuredEdition
+from docverse_server.domain.edition import (
+    Edition,
+    EnsuredEdition,
+    ReservedSlug,
+    SlugReservation,
+)
 from docverse_server.domain.edition_autocreation import (
     resolve_edition_autocreation,
 )
@@ -698,7 +703,7 @@ class EditionTrackingService:
             tracking_params=derivation.tracking_params,
             alternate_name=derivation.tracking_params.get("alternate_name"),
         )
-        if ensured is None:
+        if isinstance(ensured, ReservedSlug):
             self._log_slug_reserved(
                 slug=derivation.slug, project_id=project_id
             )
@@ -719,6 +724,26 @@ class EditionTrackingService:
             "Edition slug reserved by manual delete; build not tracked",
             slug=slug,
             project_id=project_id,
+        )
+
+    def _log_aggregate_slug_held(
+        self, *, edition: Edition, project_id: int, deleted: bool
+    ) -> None:
+        """Say that *edition*, not an aggregate, holds an aggregate slug.
+
+        *deleted* tells a soft-deleted holder, which stays deleted, from
+        a live one, which stays as it is; either way the build leaves
+        the aggregate alone.
+        """
+        self._deps.logger.info(
+            "Semver aggregate slug held by a non-aggregate edition; leaving"
+            " it untouched",
+            project_id=project_id,
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            edition_kind=edition.kind,
+            tracking_mode=edition.tracking_mode,
+            edition_deleted=deleted,
         )
 
     async def _auto_create_version_editions(
@@ -762,7 +787,14 @@ class EditionTrackingService:
         An aggregate slug held by a lifecycle-deleted edition revives
         it, and one an operator deleted stays deleted, through the same
         :meth:`~docverse_server.storage.edition_store.EditionStore.revive_or_create`
-        primitive :meth:`_auto_create_edition` uses.
+        primitive :meth:`_auto_create_edition` uses — but only a deleted
+        edition already on the aggregate's tracking mode is revived. One
+        tracking anything else (an operator's ``2`` on git ref ``2``,
+        reaped by ``draft_inactivity``) stays deleted and the aggregate
+        is skipped for this build, exactly as a live edition of another
+        tracking mode holding the slug is: neither is this build's to
+        turn into an aggregate. Keeper-sync's
+        ``_backfill_semver_aggregates`` settles the slug the same way.
         """
         version_editions = _VersionEditions()
         if not autocreation.semver_aggregates:
@@ -779,6 +811,10 @@ class EditionTrackingService:
             if edition is not None:
                 if edition.tracking_mode == spec.tracking_mode:
                     version_editions.matched.append(edition)
+                else:
+                    self._log_aggregate_slug_held(
+                        edition=edition, project_id=project_id, deleted=False
+                    )
                 continue
             ensured = await self._deps.edition_store.revive_or_create(
                 project_id=project_id,
@@ -787,9 +823,19 @@ class EditionTrackingService:
                 kind=spec.kind,
                 tracking_mode=spec.tracking_mode,
                 tracking_params=spec.tracking_params,
+                match_tracking_mode=True,
             )
-            if ensured is None:
-                self._log_slug_reserved(slug=spec.slug, project_id=project_id)
+            if isinstance(ensured, ReservedSlug):
+                if ensured.reason is SlugReservation.manual_delete:
+                    self._log_slug_reserved(
+                        slug=spec.slug, project_id=project_id
+                    )
+                else:
+                    self._log_aggregate_slug_held(
+                        edition=ensured.edition,
+                        project_id=project_id,
+                        deleted=True,
+                    )
                 continue
             if not ensured.revived:
                 self._deps.logger.info(

@@ -247,6 +247,16 @@ _KEEPER_SYNC_TRACKING_MESSAGE = "Derived keeper-sync edition tracking and kind"
 _REVIVAL_SECTION = "Lifecycle deletions come back with activity"
 """GitHub-page section on reviving lifecycle-deleted editions (PRD #830)."""
 
+_AGGREGATE_SLUG_HELD = (
+    "Semver aggregate slug held by a non-aggregate edition; leaving it"
+    " untouched"
+)
+"""The line both aggregate paths write for an aggregate slug they skip.
+
+Listed under each module that writes it. The revival table gives it one
+row, so the two paths must write it with the same level and fields.
+"""
+
 _REVIVAL_LOG_LINES: dict[str, tuple[str, ...]] = {
     _KEEPER_SYNC_SERVICE_MODULE: (
         "Sync short-circuited: edition tombstoned",
@@ -254,10 +264,16 @@ _REVIVAL_LOG_LINES: dict[str, tuple[str, ...]] = {
         "Lifecycle tombstone kept",
         "Lifecycle tombstone kept: live refs unavailable",
         "Edition slug reserved by manual delete; LTD edition not imported",
+        _AGGREGATE_SLUG_HELD,
+        (
+            "Semver aggregate slug reserved by manual delete; aggregate not"
+            " backfilled"
+        ),
     ),
     "docverse_server.storage.edition_store": ("Revived soft-deleted edition",),
     "docverse_server.services.edition_tracking": (
         "Edition slug reserved by manual delete; build not tracked",
+        _AGGREGATE_SLUG_HELD,
     ),
     "docverse_server.services.edition": (
         "Restored edition",
@@ -2124,7 +2140,9 @@ def test_github_revival_log_lines_match_the_code() -> None:
             assert message in calls, (
                 f"{module_name} no longer logs {message!r}"
             )
-            emitted[message] = {_as_logged(call) for call in calls[message]}
+            emitted.setdefault(message, set()).update(
+                _as_logged(call) for call in calls[message]
+            )
     assert documented == emitted
 
 

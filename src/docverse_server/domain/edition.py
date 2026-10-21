@@ -255,6 +255,8 @@ class EnsuredEdition:
     hands back when the slug is (now) held by a live edition: the
     edition as it stands, and whether this call brought it back from a
     soft-delete rather than inserting it or finding it already live.
+    When it declines to revive the soft-deleted edition holding the
+    slug instead, it hands back a :class:`ReservedSlug`.
 
     ``revived`` is what the callers announce on. A revived edition is
     new to every reader that skips soft-deleted rows — the dashboard,
@@ -266,3 +268,51 @@ class EnsuredEdition:
     edition: Edition
 
     revived: bool
+
+
+class SlugReservation(StrEnum):
+    """Why a soft-deleted edition keeps its slug from a derivation.
+
+    The reason a :class:`ReservedSlug` carries: why
+    :meth:`~docverse_server.storage.edition_store.EditionStore.revive_or_create`
+    left the soft-deleted edition holding a slug deleted instead of
+    reviving it.
+    """
+
+    manual_delete = "manual_delete"
+    """An operator deleted the edition. A permanent veto that only the
+    admin restore lifts, whatever the edition tracked."""
+
+    tracking_mismatch = "tracking_mismatch"
+    """The edition tracked something other than the derivation's
+    tracking mode, and the caller asked for a match before reviving.
+
+    The semver aggregate paths ask: a reaped edition an operator made to
+    follow git ref ``2`` is not the ``semver_major`` aggregate ``2``, so
+    a ``2.1.0`` release leaves it deleted rather than turning it into
+    one — exactly as a live edition of another tracking mode on the
+    slug is left alone.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class ReservedSlug:
+    """A slug a soft-deleted edition still holds against a derivation.
+
+    What
+    :meth:`~docverse_server.storage.edition_store.EditionStore.revive_or_create`
+    hands back when it declines to revive the soft-deleted edition
+    holding the slug: no live edition holds it, and none was inserted,
+    so the caller tracks no edition there and says why.
+    """
+
+    edition: Edition
+    """The soft-deleted edition holding the slug, as it was deleted.
+
+    Its ``current_build_public_id`` and ``current_build_git_ref`` are
+    left unresolved (``None``); what callers read is its id, slug, kind,
+    and tracking, to say what holds the slug.
+    """
+
+    reason: SlugReservation
+    """Why the edition was left deleted."""

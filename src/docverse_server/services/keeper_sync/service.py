@@ -54,6 +54,8 @@ from docverse_server.domain.edition import (
     DEFAULT_EDITION_SLUG,
     Edition,
     EnsuredEdition,
+    ReservedSlug,
+    SlugReservation,
 )
 from docverse_server.domain.edition_autocreation import (
     DEFAULT_EDITION_AUTOCREATION,
@@ -3087,38 +3089,20 @@ class KeeperSyncService:
         Returns ``None`` — leaving the row untouched — when the slug is
         occupied by an edition that is not this aggregate (an operator's
         own ``15``, or a natively created one on a different tracking
-        mode), when the version guard rejects an older release, or when
-        the pointer is already where it should be.
+        mode, live or soft-deleted — see
+        :meth:`_locate_aggregate_edition`), when the version guard
+        rejects an older release, or when the pointer is already where
+        it should be.
         """
         async with self._session.begin():
-            edition = await self._edition_store.get_by_slug(
-                project_id=project_id, slug=spec.slug
+            edition = await self._locate_aggregate_edition(
+                project_id=project_id,
+                spec=spec,
+                build_id=build.id,
+                allow_create=allow_create,
             )
-            if edition is None:
-                if not allow_create:
-                    self._logger.debug(
-                        "Semver aggregate not created: autocreation disabled",
-                        project_id=project_id,
-                        edition_slug=spec.slug,
-                        build_id=build.id,
-                    )
-                    return None
-                edition = await self._edition_store.create_internal(
-                    project_id=project_id,
-                    slug=spec.slug,
-                    title=spec.title,
-                    kind=spec.kind,
-                    tracking_mode=spec.tracking_mode,
-                    tracking_params=spec.tracking_params,
-                )
-                self._logger.info(
-                    "Auto-created semver aggregate edition for synced release",
-                    project_id=project_id,
-                    edition_id=edition.id,
-                    edition_slug=edition.slug,
-                    edition_kind=spec.kind.value,
-                    tracking_mode=spec.tracking_mode.value,
-                )
+        if edition is None:
+            return None
         # Steady state on an unchanged project: the pointer is already
         # where this build wants it, so decline before paying for a lock.
         # Only ever declines, so a stale read here costs a poll at worst
@@ -3133,18 +3117,12 @@ class KeeperSyncService:
                 if current is None:
                     # Soft-deleted between the locate and the lock.
                     return None
-                # Also catches ``create_internal`` losing its ON CONFLICT
-                # race to a concurrent writer that inserted a
-                # differently-tracked row.
+                # Also catches ``revive_or_create`` losing its ON
+                # CONFLICT race to a concurrent writer that inserted (or
+                # revived) a differently-tracked row.
                 if current.tracking_mode != spec.tracking_mode:
-                    self._logger.info(
-                        "Semver aggregate slug held by a non-aggregate"
-                        " edition; leaving it untouched",
-                        project_id=project_id,
-                        edition_id=current.id,
-                        edition_slug=current.slug,
-                        edition_kind=current.kind.value,
-                        tracking_mode=current.tracking_mode.value,
+                    self._log_aggregate_slug_held(
+                        edition=current, project_id=project_id, deleted=False
                     )
                     return None
                 if not _aggregate_accepts(current, version):
@@ -3173,6 +3151,106 @@ class KeeperSyncService:
             docverse_slug=updated.slug,
             docverse_build_id=build.id,
             docverse_build_public_id=serialize_base32_id(build.public_id),
+        )
+
+    async def _locate_aggregate_edition(
+        self,
+        *,
+        project_id: int,
+        spec: SemverAggregateSpec,
+        build_id: int,
+        allow_create: bool,
+    ) -> Edition | None:
+        """Find the live edition holding *spec*'s slug, or make one.
+
+        The locate-or-create step of :meth:`_ensure_aggregate_edition`,
+        run inside the caller's transaction. A live row on the slug is
+        returned whatever it tracks; the caller's locked re-read judges
+        it. A missing row is created only when *allow_create*, through
+        :meth:`~docverse_server.storage.edition_store.EditionStore.revive_or_create`
+        with ``match_tracking_mode``, as native tracking's
+        ``_auto_create_version_editions`` does, so a soft-deleted
+        edition still holding the slug is settled the same way on both
+        paths: revived in place when a lifecycle rule (or nothing on
+        record) deleted it *and* it already tracks this aggregate's
+        mode; otherwise left deleted, and ``None`` returned so the
+        aggregate is skipped — an edition on another tracking mode
+        exactly as a live one is, an operator's delete because only the
+        admin restore lifts it.
+        """
+        edition = await self._edition_store.get_by_slug(
+            project_id=project_id, slug=spec.slug
+        )
+        if edition is not None:
+            return edition
+        if not allow_create:
+            self._logger.debug(
+                "Semver aggregate not created: autocreation disabled",
+                project_id=project_id,
+                edition_slug=spec.slug,
+                build_id=build_id,
+            )
+            return None
+        ensured = await self._edition_store.revive_or_create(
+            project_id=project_id,
+            slug=spec.slug,
+            title=spec.title,
+            kind=spec.kind,
+            tracking_mode=spec.tracking_mode,
+            tracking_params=spec.tracking_params,
+            match_tracking_mode=True,
+        )
+        if isinstance(ensured, ReservedSlug):
+            self._log_aggregate_slug_reserved(
+                reserved=ensured, project_id=project_id
+            )
+            return None
+        if not ensured.revived:
+            self._logger.info(
+                "Auto-created semver aggregate edition for synced release",
+                project_id=project_id,
+                edition_id=ensured.edition.id,
+                edition_slug=ensured.edition.slug,
+                edition_kind=spec.kind.value,
+                tracking_mode=spec.tracking_mode.value,
+            )
+        return ensured.edition
+
+    def _log_aggregate_slug_held(
+        self, *, edition: Edition, project_id: int, deleted: bool
+    ) -> None:
+        """Say that *edition*, not an aggregate, holds an aggregate slug.
+
+        *deleted* tells a soft-deleted holder, which stays deleted, from
+        a live one, which stays as it is; either way the backfill leaves
+        the aggregate alone. Native tracking logs the same line.
+        """
+        self._logger.info(
+            "Semver aggregate slug held by a non-aggregate edition; leaving"
+            " it untouched",
+            project_id=project_id,
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            edition_kind=edition.kind.value,
+            tracking_mode=edition.tracking_mode.value,
+            edition_deleted=deleted,
+        )
+
+    def _log_aggregate_slug_reserved(
+        self, *, reserved: ReservedSlug, project_id: int
+    ) -> None:
+        """Say why a soft-deleted edition keeps an aggregate's slug."""
+        if reserved.reason is SlugReservation.tracking_mismatch:
+            self._log_aggregate_slug_held(
+                edition=reserved.edition, project_id=project_id, deleted=True
+            )
+            return
+        self._logger.warning(
+            "Semver aggregate slug reserved by manual delete; aggregate"
+            " not backfilled",
+            project_id=project_id,
+            edition_id=reserved.edition.id,
+            edition_slug=reserved.edition.slug,
         )
 
     async def _record_edition(
@@ -3303,7 +3381,7 @@ class KeeperSyncService:
                 tracking_mode=tracking_mode,
                 tracking_params=tracking_params,
             )
-            if ensured is None:
+            if isinstance(ensured, ReservedSlug):
                 return None
             edition = ensured.edition
             revived = ensured.revived
