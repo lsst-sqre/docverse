@@ -61,6 +61,7 @@ from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
 from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
+from docverse_server.domain.edition_tracking import RevivedEdition
 from docverse_server.domain.lifecycle import (
     BuildHistoryOrphanRule,
     DraftInactivityRule,
@@ -91,6 +92,7 @@ from docverse_server.services.keeper_sync.scheduler import (
     should_refresh_other_edition,
 )
 from docverse_server.services.keeper_sync.service import (
+    _AGGREGATES_BACKFILLED_BUILD_ID_KEY,
     DEFAULT_COPY_RETRY_DELAY_SECONDS,
     MAX_CONSECUTIVE_EDITION_FAILURES,
     BuildCopiedCallback,
@@ -103,6 +105,7 @@ from docverse_server.services.keeper_sync.service import (
     ProjectCreatedCallback,
     ProjectSyncResult,
     TombstoneVerdict,
+    _AggregateBackfill,
     _measure_ltd_lag_seconds,
     _now,
     _retryable_transport_error,
@@ -7006,7 +7009,9 @@ async def test_sync_revives_deleted_aggregate_on_its_tracking_mode(
     """A reaped ``semver_major`` ``15`` comes back for a ``15.x`` release.
 
     Revived in place, the same row the backfill once created is pointed
-    at the release build and reported for publishing.
+    at the release build and reported for publishing, and reported as
+    revived for its ``restore`` event. The ``15.2`` aggregate the visit
+    creates fresh is not a revive.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, slug="ks-agg-deleted-revive")
@@ -7031,6 +7036,160 @@ async def test_sync_revives_deleted_aggregate_on_its_tracking_mode(
     assert row.delete_reason is None
     assert row.tracking_mode is TrackingMode.semver_major
     assert row.current_build_id == aggregates["15"].docverse_build_id
+    assert outcome.revived_aggregates == (
+        RevivedEdition(edition_id=edition_id, slug="15", kind=row.kind),
+    )
+
+
+async def _retire_aggregate(
+    session: AsyncSession,
+    *,
+    org_id: int,
+    aggregate_slug: str,
+    release_ltd_slug: str,
+) -> Edition:
+    """Soft-delete a backfilled aggregate and rewind its release's marker.
+
+    The delete is a ``lifecycle_delete``, which the backfill revives.
+    Dropping the release edition's ``aggregates_backfilled_build_id``
+    marker makes its next visit run the backfill again on the
+    short-circuited build it already holds. Returns the aggregate as it
+    stood before the delete.
+    """
+    logger = structlog.get_logger("test")
+    edition_store = EditionStore(session=session, logger=logger)
+    project_store = ProjectStore(session=session, logger=logger)
+    async with session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        aggregate = await edition_store.get_by_slug(
+            project_id=project.id, slug=aggregate_slug
+        )
+        assert aggregate is not None
+        assert await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project.id,
+            slug=aggregate_slug,
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        state = (
+            await session.execute(
+                select(SqlKeeperSyncState).where(
+                    SqlKeeperSyncState.org_id == org_id,
+                    SqlKeeperSyncState.resource_type
+                    == ResourceType.edition.value,
+                    SqlKeeperSyncState.ltd_slug == release_ltd_slug,
+                )
+            )
+        ).scalar_one()
+        annotations = dict(state.annotations or {})
+        del annotations[_AGGREGATES_BACKFILLED_BUILD_ID_KEY]
+        state.annotations = annotations
+    return aggregate
+
+
+@pytest.mark.asyncio
+async def test_sync_reports_revived_aggregate_already_on_the_build(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A revived aggregate whose pointer stays put is still reported.
+
+    ``15`` was retired while pointing at the release build, so the
+    revive leaves its pointer where it is and nothing moves. The delete
+    took it off the CDN all the same, so the visit reports it as
+    revived for the worker to announce and republish.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-revive-steady")
+    await _seed_project(db_session, org_id=org_id)
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_version_edition_payload(
+            slug="15.2.1", git_ref="15.2.1"
+        ),
+    )
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>release</html>",
+    }
+    first = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    (first_outcome,) = first.edition_outcomes
+    assert first_outcome.revived_aggregates == ()
+    retired = await _retire_aggregate(
+        db_session,
+        org_id=org_id,
+        aggregate_slug="15",
+        release_ltd_slug="15.2.1",
+    )
+
+    second = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    (outcome,) = second.edition_outcomes
+    assert outcome.aggregate_outcomes == ()
+    assert outcome.revived_aggregates == (
+        RevivedEdition(
+            edition_id=retired.id, slug="15", kind=EditionKind.major
+        ),
+    )
+    row = await _read_edition_15(db_session, retired.id)
+    assert row.date_deleted is None
+    assert row.current_build_id == retired.current_build_id
+
+
+@pytest.mark.asyncio
+async def test_sync_reports_revived_aggregate_held_by_the_version_guard(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A revived aggregate on a newer release is reported, not moved.
+
+    ``15`` was retired pointing at ``15.2.1``. The ``15.0.0`` visit
+    revives it, the version guard keeps it on ``15.2.1``, and the visit
+    reports it as revived though nothing moved.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-agg-revive-guard")
+    await _seed_project(db_session, org_id=org_id)
+    _seed_ltd_two_releases(
+        mock_discovery, first_ref="15.2.1", second_ref="15.0.0"
+    )
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>15.2.1</html>",
+        "pipelines/builds/44/index.html": b"<html>15.0.0</html>",
+    }
+    await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+    retired = await _retire_aggregate(
+        db_session,
+        org_id=org_id,
+        aggregate_slug="15",
+        release_ltd_slug="15.0.0",
+    )
+
+    result = await _build_service(
+        db_session, http_client, MockObjectStore(), source_objects
+    ).sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    outcomes = {o.docverse_slug: o for o in result.edition_outcomes}
+    assert outcomes["15.2.1"].revived_aggregates == ()
+    assert outcomes["15.0.0"].aggregate_outcomes == ()
+    assert outcomes["15.0.0"].revived_aggregates == (
+        RevivedEdition(
+            edition_id=retired.id, slug="15", kind=EditionKind.major
+        ),
+    )
+    row = await _read_edition_15(db_session, retired.id)
+    assert row.date_deleted is None
+    assert row.current_build_id == retired.current_build_id
 
 
 @pytest.mark.asyncio
@@ -7187,9 +7346,9 @@ def _record_backfill_calls(
     """
     calls: list[int] = []
 
-    async def _recording_backfill(**kwargs: object) -> tuple[object, ...]:
+    async def _recording_backfill(**kwargs: object) -> _AggregateBackfill:
         calls.append(int(kwargs["build_id"]))  # type: ignore[call-overload]
-        return ()
+        return _AggregateBackfill()
 
     monkeypatch.setattr(
         service, "_backfill_semver_aggregates", _recording_backfill

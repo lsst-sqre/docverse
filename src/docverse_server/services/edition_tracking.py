@@ -741,8 +741,8 @@ class EditionTrackingService:
             project_id=project_id,
             edition_id=edition.id,
             edition_slug=edition.slug,
-            edition_kind=edition.kind,
-            tracking_mode=edition.tracking_mode,
+            edition_kind=edition.kind.value,
+            tracking_mode=edition.tracking_mode.value,
             edition_deleted=deleted,
         )
 

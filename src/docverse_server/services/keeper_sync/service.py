@@ -61,6 +61,7 @@ from docverse_server.domain.edition_autocreation import (
     DEFAULT_EDITION_AUTOCREATION,
     resolve_edition_autocreation,
 )
+from docverse_server.domain.edition_tracking import RevivedEdition
 from docverse_server.domain.lifecycle import (
     REF_DELETED_RULE_TYPE,
     DraftInactivityRule,
@@ -785,13 +786,43 @@ class AggregateEditionOutcome:
     ``N`` / ``N.M`` edition, or an existing aggregate whose pointer
     advanced onto this build. The steady state (aggregate already on the
     build, or held back by the version guard) emits nothing, so the
-    worker's publish fan-out stays a no-op on repeat polls.
+    worker's publish fan-out stays a no-op on repeat polls. An aggregate
+    the pass revived from a soft-delete is reported in
+    :attr:`EditionSyncOutcome.revived_aggregates` whether or not it also
+    moved.
     """
 
     docverse_edition_id: int
     docverse_slug: str
     docverse_build_id: int
     docverse_build_public_id: str
+
+
+@dataclass(frozen=True)
+class _AggregateReconciled:
+    """What one :meth:`KeeperSyncService._ensure_aggregate_edition` did."""
+
+    moved: AggregateEditionOutcome | None = None
+    """The aggregate's pointer move onto the build, when there was one."""
+
+    revived: RevivedEdition | None = None
+    """The aggregate, when the locate step revived it from a soft-delete."""
+
+
+_AGGREGATE_UNTOUCHED = _AggregateReconciled()
+"""An aggregate the backfill neither moved nor revived."""
+
+
+@dataclass(frozen=True)
+class _AggregateBackfill:
+    """What :meth:`KeeperSyncService._backfill_semver_aggregates` did.
+
+    The edition's :attr:`EditionSyncOutcome.aggregate_outcomes` and
+    :attr:`EditionSyncOutcome.revived_aggregates`.
+    """
+
+    moved: tuple[AggregateEditionOutcome, ...] = ()
+    revived: tuple[RevivedEdition, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -842,6 +873,21 @@ class EditionSyncOutcome:
     tombstone short-circuit, a non-semver ref, aggregates switched off)
     and in the steady state where the aggregates already point at the
     build.
+    """
+
+    revived_aggregates: tuple[RevivedEdition, ...] = ()
+    """Semver aggregates the backfill brought back from a soft-delete.
+
+    A soft-deleted ``N`` / ``N.M`` on the aggregate's own tracking mode,
+    deleted by a lifecycle rule or with no recorded reason, is revived
+    in place when this edition's release build needs it, as native
+    edition tracking revives one (PRD #830). The delete took it off the
+    CDN, so the worker announces one ``edition_lifecycle`` ``restore``
+    event for each and republishes the ones whose pointer did not move
+    onto the build — already there, or held back by the version guard —
+    at their current build, when it is still live. A revived aggregate
+    whose pointer did move is in :attr:`aggregate_outcomes` too, and
+    publishes from there.
     """
 
     dates_restamped: bool = False
@@ -2346,7 +2392,7 @@ class KeeperSyncService:
             else None
         )
         build_outcome: BuildSyncOutcome | None = None
-        aggregate_outcomes: tuple[AggregateEditionOutcome, ...] = ()
+        backfill = _AggregateBackfill()
         if ltd_edition.build_url is not None:
             build_outcome = await self.sync_build(
                 org_id=org_id,
@@ -2386,21 +2432,19 @@ class KeeperSyncService:
                 # the aggregates are a derived nicety, and the next poll
                 # re-runs the backfill for this build anyway.
                 try:
-                    aggregate_outcomes = (
-                        await self._backfill_semver_aggregates(
-                            project_id=project.id,
-                            git_ref=tracking.tracking_params.get("git_ref"),
-                            build_id=build_outcome.docverse_build_id,
-                            autocreation=(
-                                autocreation or DEFAULT_EDITION_AUTOCREATION
-                            ),
-                            state_key=_EditionStateKey(
-                                org_id=org_id,
-                                ltd_id=ltd_edition.ltd_id,
-                                ltd_slug=ltd_edition.slug,
-                                annotations=annotations,
-                            ),
-                        )
+                    backfill = await self._backfill_semver_aggregates(
+                        project_id=project.id,
+                        git_ref=tracking.tracking_params.get("git_ref"),
+                        build_id=build_outcome.docverse_build_id,
+                        autocreation=(
+                            autocreation or DEFAULT_EDITION_AUTOCREATION
+                        ),
+                        state_key=_EditionStateKey(
+                            org_id=org_id,
+                            ltd_id=ltd_edition.ltd_id,
+                            ltd_slug=ltd_edition.slug,
+                            annotations=annotations,
+                        ),
                     )
                 except Exception as exc:
                     sentry_sdk.capture_exception(exc)
@@ -2442,7 +2486,8 @@ class KeeperSyncService:
             docverse_project_slug=project.slug,
             build_outcome=build_outcome,
             short_circuited=False,
-            aggregate_outcomes=aggregate_outcomes,
+            aggregate_outcomes=backfill.moved,
+            revived_aggregates=backfill.revived,
             dates_restamped=dates_restamped,
             tombstone_verdict=review.verdict,
             # Only a revived row is a restore: clearing a
@@ -3005,7 +3050,7 @@ class KeeperSyncService:
         build_id: int,
         autocreation: EditionAutocreationConfig,
         state_key: _EditionStateKey,
-    ) -> tuple[AggregateEditionOutcome, ...]:
+    ) -> _AggregateBackfill:
         """Create/point the ``N`` / ``N.M`` aggregates for a release.
 
         The migration counterpart of
@@ -3069,21 +3114,25 @@ class KeeperSyncService:
         poll.
 
         Returns one outcome per aggregate this call actually moved, for
-        the worker to publish; see :class:`AggregateEditionOutcome`.
+        the worker to publish (see :class:`AggregateEditionOutcome`),
+        and each aggregate it revived from a soft-delete, for the worker
+        to announce and republish (see
+        :attr:`EditionSyncOutcome.revived_aggregates`).
         """
         version = parse_stable_semver(git_ref)
         if version is None:
-            return ()
+            return _AggregateBackfill()
         specs = semver_aggregate_specs(version)
         if not specs:
-            return ()
+            return _AggregateBackfill()
         async with self._session.begin():
             build = await self._build_store.get_by_id(build_id)
         if build is None:
-            return ()
+            return _AggregateBackfill()
         outcomes: list[AggregateEditionOutcome] = []
+        revived: list[RevivedEdition] = []
         for spec in specs:
-            outcome = await self._ensure_aggregate_edition(
+            reconciled = await self._ensure_aggregate_edition(
                 org_id=state_key.org_id,
                 project_id=project_id,
                 spec=spec,
@@ -3091,8 +3140,10 @@ class KeeperSyncService:
                 version=version,
                 allow_create=autocreation.semver_aggregates,
             )
-            if outcome is not None:
-                outcomes.append(outcome)
+            if reconciled.moved is not None:
+                outcomes.append(reconciled.moved)
+            if reconciled.revived is not None:
+                revived.append(reconciled.revived)
         if autocreation.semver_aggregates or outcomes:
             async with self._session.begin():
                 await self._state_store.upsert(
@@ -3105,7 +3156,9 @@ class KeeperSyncService:
                         _AGGREGATES_BACKFILLED_BUILD_ID_KEY: build_id,
                     },
                 )
-        return tuple(outcomes)
+        return _AggregateBackfill(
+            moved=tuple(outcomes), revived=tuple(revived)
+        )
 
     async def _ensure_aggregate_edition(
         self,
@@ -3116,7 +3169,7 @@ class KeeperSyncService:
         build: Build,
         version: SemverVersion,
         allow_create: bool,
-    ) -> AggregateEditionOutcome | None:
+    ) -> _AggregateReconciled:
         """Ensure one aggregate exists and points at *build*.
 
         ``allow_create`` carries
@@ -3138,34 +3191,76 @@ class KeeperSyncService:
         from before the wait, and acting on it would be the same
         unguarded read-check-write the lock is here to close.
 
-        Returns ``None`` — leaving the row untouched — when the slug is
-        occupied by an edition that is not this aggregate (an operator's
-        own ``15``, or a natively created one on a different tracking
-        mode, live or soft-deleted — see
-        :meth:`_locate_aggregate_edition`), when the version guard
-        rejects an older release, or when the pointer is already where
-        it should be.
+        Returns :data:`_AGGREGATE_UNTOUCHED` — leaving the row untouched
+        — when the slug is occupied by an edition that is not this
+        aggregate (an operator's own ``15``, or a natively created one
+        on a different tracking mode, live or soft-deleted — see
+        :meth:`_locate_aggregate_edition`). Otherwise
+        :attr:`_AggregateReconciled.moved` reports a pointer move onto
+        *build*, absent when the version guard rejects an older release
+        or the pointer is already where it should be, and
+        :attr:`_AggregateReconciled.revived` the aggregate when the
+        locate step revived it from a soft-delete, moved or not: the
+        delete took it off the CDN, so it is owed a republish and a
+        ``restore`` event even when its pointer stays put.
         """
         async with self._session.begin():
-            edition = await self._locate_aggregate_edition(
+            located = await self._locate_aggregate_edition(
                 project_id=project_id,
                 spec=spec,
                 build_id=build.id,
                 allow_create=allow_create,
             )
-        if edition is None:
-            return None
+        if located is None:
+            return _AGGREGATE_UNTOUCHED
+        edition = located.edition
+        revived = (
+            RevivedEdition(
+                edition_id=edition.id, slug=edition.slug, kind=edition.kind
+            )
+            if located.revived
+            else None
+        )
         # Steady state on an unchanged project: the pointer is already
         # where this build wants it, so decline before paying for a lock.
         # Only ever declines, so a stale read here costs a poll at worst
         # — the authoritative check runs under the lock below.
         if edition.current_build_id == build.id:
-            return None
+            return _AggregateReconciled(revived=revived)
+        moved = await self._repoint_aggregate(
+            org_id=org_id,
+            project_id=project_id,
+            spec=spec,
+            edition_id=edition.id,
+            build=build,
+            version=version,
+        )
+        return _AggregateReconciled(moved=moved, revived=revived)
+
+    async def _repoint_aggregate(
+        self,
+        *,
+        org_id: int,
+        project_id: int,
+        spec: SemverAggregateSpec,
+        edition_id: int,
+        build: Build,
+        version: SemverVersion,
+    ) -> AggregateEditionOutcome | None:
+        """Point the located aggregate at *build*, under its lock.
+
+        The decide-and-write step of :meth:`_ensure_aggregate_edition`,
+        which explains why it re-reads the row inside the
+        ``EDITION_UPDATE`` lock. Returns ``None`` when the row was
+        soft-deleted or retracked since the locate step, when the
+        version guard rejects an older release, or when the pointer is
+        already where it should be.
+        """
         async with self._edition_update_lock(
-            org_id=org_id, project_id=project_id, edition_id=edition.id
+            org_id=org_id, project_id=project_id, edition_id=edition_id
         ):
             async with self._session.begin():
-                current = await self._edition_store.get_by_id(edition.id)
+                current = await self._edition_store.get_by_id(edition_id)
                 if current is None:
                     # Soft-deleted between the locate and the lock.
                     return None
@@ -3212,7 +3307,7 @@ class KeeperSyncService:
         spec: SemverAggregateSpec,
         build_id: int,
         allow_create: bool,
-    ) -> Edition | None:
+    ) -> EnsuredEdition | None:
         """Find the live edition holding *spec*'s slug, or make one.
 
         The locate-or-create step of :meth:`_ensure_aggregate_edition`,
@@ -3228,13 +3323,15 @@ class KeeperSyncService:
         mode; otherwise left deleted, and ``None`` returned so the
         aggregate is skipped — an edition on another tracking mode
         exactly as a live one is, an operator's delete because only the
-        admin restore lifts it.
+        admin restore lifts it. The returned
+        :attr:`~docverse_server.domain.edition.EnsuredEdition.revived`
+        says whether this call brought the row back.
         """
         edition = await self._edition_store.get_by_slug(
             project_id=project_id, slug=spec.slug
         )
         if edition is not None:
-            return edition
+            return EnsuredEdition(edition=edition, revived=False)
         if not allow_create:
             self._logger.debug(
                 "Semver aggregate not created: autocreation disabled",
@@ -3266,7 +3363,7 @@ class KeeperSyncService:
                 edition_kind=spec.kind.value,
                 tracking_mode=spec.tracking_mode.value,
             )
-        return ensured.edition
+        return ensured
 
     def _log_aggregate_slug_held(
         self, *, edition: Edition, project_id: int, deleted: bool

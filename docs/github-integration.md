@@ -1052,7 +1052,14 @@ the tombstone with the edition (see below).
 The semver aggregates a synced release backfills follow the aggregate
 rule above: a deleted `N` or `N.M` comes back only from a
 `lifecycle_delete` or `null` row on the aggregate's own tracking mode,
-and the release skips the aggregate otherwise.
+and the release skips the aggregate otherwise. An aggregate the backfill
+revives is restored as a revived edition is: the `keeper_sync_project`
+worker publishes one `edition_lifecycle` `restore` event for it and
+publishes it, at the release build when the revive moved its pointer
+there and otherwise at the build it already points at — the release's
+own, or a newer release the version guard keeps it on — unless that
+build is no longer live, which logs the `Restored edition without
+republishing` line below.
 
 ### An operator's delete is permanent
 
@@ -1135,7 +1142,8 @@ see [Tombstones](keeper-sync-scope.md#tombstones).
   without republishing; its current build is not live` come from the
   one guard every republish of a restored edition runs: the admin
   restore's, and keeper-sync's for an edition its visit brought back
-  without importing a fresh build. The edition stays restored but
+  without importing a fresh build or a semver aggregate its backfill
+  revived without moving its pointer. The edition stays restored but
   unpublished. `build_deleted` and `build_purged` say why the build
   is not live; a `lifecycle_delete` edition retired long enough for
   the purgatory sweep to reclaim its build reads `build_purged=true`,

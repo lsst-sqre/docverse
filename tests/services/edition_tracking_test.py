@@ -2673,7 +2673,10 @@ async def test_track_build_leaves_differently_tracked_deleted_aggregate(
     assert held[0]["log_level"] == "info"
     assert held[0]["edition_id"] == edition_id
     assert held[0]["edition_slug"] == "2"
-    assert held[0]["tracking_mode"] == TrackingMode.git_ref
+    # Plain strings, as keeper-sync's backfill logs the same line.
+    assert type(held[0]["tracking_mode"]) is str
+    assert held[0]["tracking_mode"] == TrackingMode.git_ref.value
+    assert type(held[0]["edition_kind"]) is str
     assert held[0]["edition_deleted"] is True
     row = await _read_slug_2_row(db_session, edition_id)
     assert row.date_deleted is not None

@@ -51,6 +51,7 @@ from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from docverse.models import (
+    EditionKind,
     JobKind,
     KeeperSyncConfig,
     KeeperSyncRunStatus,
@@ -1316,13 +1317,24 @@ def _build_on_edition_synced(
     ``None`` in a worker running without metrics), then published
     whether or not its build was imported this visit, so long as that
     build is still live — see
-    :func:`_enqueue_publish_for_restored_edition`.
+    :func:`_enqueue_publish_for_restored_edition`. Each semver aggregate
+    the visit's backfill revived
+    (:attr:`EditionSyncOutcome.revived_aggregates`) gets the same: one
+    ``restore`` event, and a publish whether or not its pointer moved —
+    see :func:`_enqueue_publish_for_revived_aggregates`.
     """
 
     async def callback(outcome: EditionSyncOutcome) -> None:
         if outcome.restored:
             await _announce_restored_edition(
                 events=events, org_slug=org_slug, outcome=outcome
+            )
+        for revived in outcome.revived_aggregates:
+            await _announce_restore(
+                events=events,
+                org_slug=org_slug,
+                project_slug=outcome.docverse_project_slug,
+                edition_kind=revived.kind,
             )
         published_edition = await _enqueue_publish_for_synced_edition(
             factory=factory,
@@ -1352,10 +1364,20 @@ def _build_on_edition_synced(
             outcome=outcome,
             logger=logger,
         )
+        republished_aggregates = await _enqueue_publish_for_revived_aggregates(
+            factory=factory,
+            session=session,
+            queue_job_store=queue_job_store,
+            org_id=org_id,
+            run_id=run_id,
+            outcome=outcome,
+            logger=logger,
+        )
         if (
             outcome.dates_restamped
             and not published_edition
             and not published_aggregates
+            and not republished_aggregates
         ):
             restamp_only_project_ids.add(outcome.docverse_project_id)
 
@@ -1560,14 +1582,37 @@ async def _announce_restored_edition(
     committed. A metrics outage is logged by the publisher and never
     fails the sync.
     """
-    if events is None or outcome.edition_kind is None:
+    if outcome.edition_kind is None:
+        return
+    await _announce_restore(
+        events=events,
+        org_slug=org_slug,
+        project_slug=outcome.docverse_project_slug,
+        edition_kind=outcome.edition_kind,
+    )
+
+
+async def _announce_restore(
+    *,
+    events: DocverseEvents | None,
+    org_slug: str,
+    project_slug: str,
+    edition_kind: EditionKind,
+) -> None:
+    """Publish one ``edition_lifecycle`` ``restore`` event.
+
+    Shared by a restored LTD edition (:func:`_announce_restored_edition`)
+    and each semver aggregate a visit's backfill revived. A no-op in a
+    worker running without metrics.
+    """
+    if events is None:
         return
     await events.edition_lifecycle.publish(
         EditionLifecycleEvent(
             organization=org_slug,
-            project=outcome.docverse_project_slug,
+            project=project_slug,
             action=LifecycleAction.restore,
-            edition_kind=MetricsEditionKind.from_api(outcome.edition_kind),
+            edition_kind=MetricsEditionKind.from_api(edition_kind),
         )
     )
 
@@ -1611,6 +1656,91 @@ async def _enqueue_publish_for_restored_edition(
     edition_id = outcome.docverse_edition_id
     if edition_id is None:
         return False
+    return await _republish_restored_edition(
+        factory=factory,
+        session=session,
+        queue_job_store=queue_job_store,
+        org_id=org_id,
+        run_id=run_id,
+        project_id=outcome.docverse_project_id,
+        project_slug=outcome.docverse_project_slug,
+        edition_id=edition_id,
+        phase="restored",
+        logger=logger,
+    )
+
+
+async def _enqueue_publish_for_revived_aggregates(
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    org_id: int,
+    run_id: int | None,
+    outcome: EditionSyncOutcome,
+    logger: structlog.stdlib.BoundLogger,
+) -> bool:
+    """Republish the revived semver aggregates whose pointer stayed put.
+
+    The delete that retired an aggregate took it off the CDN, so the
+    backfill reviving it must publish it again, as native edition
+    tracking does (PRD #830). A revived aggregate whose pointer moved
+    onto the release is already in
+    :attr:`EditionSyncOutcome.aggregate_outcomes` and published by
+    :func:`_enqueue_publish_for_aggregates`. This covers the rest: an
+    aggregate already on the release's build, or held on a newer
+    release by the version guard. Neither is caught by
+    :func:`_self_heal_unpublished_aggregates`, which reads the publish
+    recorded before the delete as settled.
+
+    Each publishes its current build through the same guard a restored
+    LTD edition's republish runs, so a build reclaimed while the
+    aggregate was deleted is skipped and logged, not published.
+
+    Returns whether any publish was enqueued.
+    """
+    moved = {a.docverse_edition_id for a in outcome.aggregate_outcomes}
+    published = False
+    for revived in outcome.revived_aggregates:
+        if revived.edition_id in moved:
+            continue
+        if await _republish_restored_edition(
+            factory=factory,
+            session=session,
+            queue_job_store=queue_job_store,
+            org_id=org_id,
+            run_id=run_id,
+            project_id=outcome.docverse_project_id,
+            project_slug=outcome.docverse_project_slug,
+            edition_id=revived.edition_id,
+            phase="restored_aggregate",
+            logger=logger,
+        ):
+            published = True
+    return published
+
+
+async def _republish_restored_edition(
+    *,
+    factory: Factory,
+    session: AsyncSession,
+    queue_job_store: QueueJobStore,
+    org_id: int,
+    run_id: int | None,
+    project_id: int,
+    project_slug: str,
+    edition_id: int,
+    phase: str,
+    logger: structlog.stdlib.BoundLogger,
+) -> bool:
+    """Publish a restored edition's current build, if it is still live.
+
+    The guarded republish behind
+    :func:`_enqueue_publish_for_restored_edition` and
+    :func:`_enqueue_publish_for_revived_aggregates`;
+    :func:`load_republishable_build` decides and logs a skip. *phase*
+    tags the enqueue's log line. Returns whether a publish was enqueued.
+    """
     edition_store = factory.create_edition_store()
     async with session.begin():
         edition = await edition_store.get_by_id(edition_id)
@@ -1630,8 +1760,8 @@ async def _enqueue_publish_for_restored_edition(
         queue_job_store=queue_job_store,
         queue_backend=factory.create_queue_backend(),
         org_id=org_id,
-        project_id=outcome.docverse_project_id,
-        project_slug=outcome.docverse_project_slug,
+        project_id=project_id,
+        project_slug=project_slug,
         edition_id=edition.id,
         edition_slug=edition.slug,
         build_id=build.id,
@@ -1642,7 +1772,7 @@ async def _enqueue_publish_for_restored_edition(
         "Enqueued publish_edition for synced build",
         edition_slug=edition.slug,
         build_id=build.id,
-        phase="restored",
+        phase=phase,
     )
     return True
 
@@ -1670,15 +1800,16 @@ async def _enqueue_publish_for_aggregates(
     an outcome when it actually created or advanced the row, so the
     steady state enqueues nothing.
 
-    This is a one-shot enqueue and the only outcome-driven one an
-    aggregate ever gets: the next sync skips the backfill outright
-    (its ``aggregates_backfilled_build_id`` state marker already names
-    this build) and would emit no outcome even if it ran, because the
-    pointer is where it should be — nothing here fires again. Whatever
-    this
-    call loses — ``sync_project`` swallows this callback's exceptions,
-    and a worker can die between the backfill's commit and this enqueue
-    — is recovered from persistent state by
+    This is a one-shot enqueue for the move: the next sync skips the
+    backfill outright (its ``aggregates_backfilled_build_id`` state
+    marker already names this build) and would emit no outcome even if
+    it ran, because the pointer is where it should be — nothing here
+    fires again. The only other outcome-driven publish an aggregate gets
+    is :func:`_enqueue_publish_for_revived_aggregates`, for one the
+    backfill revived without moving. Whatever this call loses —
+    ``sync_project`` swallows this callback's exceptions, and a worker
+    can die between the backfill's commit and this enqueue — is
+    recovered from persistent state by
     :func:`_self_heal_unpublished_aggregates`.
 
     Each payload carries the release edition's ``ltd_date_rebuilt`` as

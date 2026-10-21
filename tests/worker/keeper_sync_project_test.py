@@ -4413,6 +4413,123 @@ async def test_keeper_sync_project_aggregate_publish_skips_dashboard(
     assert dashboard_calls == []
 
 
+async def _retire_aggregate(
+    *, org_id: int, aggregate_slug: str, release_ltd_slug: str
+) -> None:
+    """Soft-delete a published aggregate so the next visit revives it.
+
+    The aggregate's publish settles first, as it would have before the
+    delete took it off the CDN. The release edition's
+    ``aggregates_backfilled_build_id`` marker is dropped, if a rewind
+    has not already, so the next visit re-runs the backfill on the
+    short-circuited build it holds.
+    """
+    project_id = await _project_id_for(org_id=org_id)
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            aggregate = await edition_store.get_by_slug(
+                project_id=project_id, slug=aggregate_slug
+            )
+            assert aggregate is not None
+            await session.execute(
+                update(SqlEditionBuildHistory)
+                .where(SqlEditionBuildHistory.edition_id == aggregate.id)
+                .values(publish_status=PublishStatus.published)
+            )
+            assert await edition_store.soft_delete(
+                org_id=org_id,
+                project_id=project_id,
+                slug=aggregate_slug,
+                reason=TombstoneReason.lifecycle_delete,
+            )
+            state = (
+                await session.execute(
+                    select(SqlKeeperSyncState).where(
+                        SqlKeeperSyncState.org_id == org_id,
+                        SqlKeeperSyncState.resource_type
+                        == ResourceType.edition.value,
+                        SqlKeeperSyncState.ltd_slug == release_ltd_slug,
+                    )
+                )
+            ).scalar_one()
+            annotations = dict(state.annotations or {})
+            annotations.pop("aggregates_backfilled_build_id", None)
+            state.annotations = annotations
+        return
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pointer_moves", [False, True])
+async def test_keeper_sync_project_restores_a_revived_aggregate(
+    *,
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+    pointer_moves: bool,
+) -> None:
+    """A semver aggregate the backfill revives is announced and published.
+
+    ``15`` was deleted after its publish settled, and the release's next
+    visit revives it. The job announces one ``edition_lifecycle``
+    ``restore`` for it and publishes it exactly once: through the
+    aggregate publish when the revive moved its pointer back onto the
+    release, and through the restored-edition guard when the pointer
+    was already there, where the aggregate self-heal would read the
+    publish from before the delete as settled.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    harness = await _prepare_restamp_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        seed_ltd=_seed_release_edition_ltd,
+        events=events,
+    )
+    await harness.run_pass(db_session, backend_job_id="test-arq-project-1")
+    if pointer_moves:
+        await _rewind_aggregate_backfill(
+            org_id=harness.org_id,
+            aggregate_slug="15",
+            release_ltd_slug="15.2.1",
+        )
+    await _retire_aggregate(
+        org_id=harness.org_id,
+        aggregate_slug="15",
+        release_ltd_slug="15.2.1",
+    )
+    publishes_before = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    publisher.published.clear()
+
+    logs = await harness.run_pass(
+        db_session, backend_job_id="test-arq-project-2"
+    )
+    await harness.ctx["http_client"].aclose()
+
+    publishes_after = get_jobs_by_name(
+        harness.mock_arq, "publish_edition", queue_name="docverse:queue"
+    )
+    republished = [
+        job.kwargs["payload"]["edition_slug"]
+        for job in publishes_after[len(publishes_before) :]
+    ]
+    assert republished == ["15"]
+    assert [
+        (event.project, event.action, event.edition_kind)
+        for event in publisher.published
+    ] == [("pipelines", LifecycleAction.restore, MetricsEditionKind.major)]
+    assert [
+        log["phase"]
+        for log in logs
+        if log["event"] == "Enqueued publish_edition for synced build"
+    ] == ["semver_aggregate" if pointer_moves else "restored_aggregate"]
+
+
 @pytest.mark.asyncio
 async def test_keeper_sync_project_short_circuited_aggregate_reports_no_lag(
     app: None,
