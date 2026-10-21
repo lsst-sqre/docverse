@@ -348,18 +348,7 @@ class EditionStore:
         if live is not None:
             return EnsuredEdition(edition=live, revived=False)
 
-        row = (
-            await self._session.execute(
-                select(SqlEdition)
-                .where(
-                    SqlEdition.project_id == project_id,
-                    func.lower(SqlEdition.slug) == slug.lower(),
-                    SqlEdition.date_deleted.is_not(None),
-                )
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
+        row = await self._lock_deleted_row(project_id=project_id, slug=slug)
         if row is None:
             # A concurrent revive committed while this one waited on
             # the row lock, so the row no longer reads as deleted.
@@ -372,35 +361,111 @@ class EditionStore:
             )
             raise RuntimeError(msg)
 
-        previous_reason = row.delete_reason
-        if previous_reason == EditionDeleteReason.manual_delete.value:
+        if row.delete_reason == EditionDeleteReason.manual_delete.value:
             return None
 
-        row.date_deleted = None
-        row.delete_reason = None
         row.tracking_mode = tracking_mode
         row.tracking_params = tracking_params
         if row.kind_source == EditionKindSource.derived:
             row.kind = kind
+        revived = await self._revive_row(row)
+        return EnsuredEdition(edition=revived, revived=True)
+
+    async def restore(self, *, project_id: int, slug: str) -> Edition | None:
+        """Bring a soft-deleted edition back in place, whatever its reason.
+
+        Backs the admin ``POST .../editions/{edition}/restore`` endpoint
+        (PRD #830), the one way back for an edition an operator deleted:
+        :meth:`revive_or_create` honours a ``manual_delete`` as a veto,
+        and this is the operator lifting it. Unlike that derivation
+        path nothing is re-derived — the edition comes back exactly as
+        it was deleted (id, slug, title, kind, tracking,
+        ``lifecycle_exempt``, ``alternate_name``, current build, build
+        history), less ``date_deleted`` and ``delete_reason``. Any
+        keeper-sync tombstone on the edition's state row is cleared in
+        the same transaction, so keeper-sync stops skipping an edition
+        that is live again.
+
+        The deleted row is read under ``FOR UPDATE``, so a restore and a
+        native revive of the same slug serialize; whichever waits finds
+        the row live.
+
+        Returns
+        -------
+        Edition or None
+            The revived edition, or ``None`` when no soft-deleted
+            edition holds *slug* — including when a live one does: this
+            addresses only the rows ordinary reads hide.
+        """
+        row = await self._lock_deleted_row(project_id=project_id, slug=slug)
+        if row is None:
+            return None
+        return await self._revive_row(row)
+
+    async def _lock_deleted_row(
+        self, *, project_id: int, slug: str
+    ) -> SqlEdition | None:
+        """Read the soft-deleted edition holding *slug*, locked for update.
+
+        ``populate_existing`` asks for the locked row's values rather
+        than whatever an earlier read left in the identity map, so a
+        caller that waited behind a concurrent revive sees what that
+        revive wrote: a row it made live no longer matches, and this
+        returns ``None``.
+        """
+        return (
+            await self._session.execute(
+                select(SqlEdition)
+                .where(
+                    SqlEdition.project_id == project_id,
+                    func.lower(SqlEdition.slug) == slug.lower(),
+                    SqlEdition.date_deleted.is_not(None),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+
+    async def _revive_row(self, row: SqlEdition) -> Edition:
+        """Clear a locked, soft-deleted row's deletion and its tombstone.
+
+        The shared tail of :meth:`revive_or_create` and :meth:`restore`.
+        Whatever the caller already set on *row* is flushed together
+        with the cleared ``date_deleted`` / ``delete_reason``, the
+        keeper-sync tombstone on the edition's state row (if any) is
+        cleared, and the edition is read back as the live row it now
+        is.
+
+        Raises
+        ------
+        RuntimeError
+            If the edition does not read as live after the flush — an
+            invariant violation, since the caller holds the row lock.
+        """
+        previous_reason = row.delete_reason
+        row.date_deleted = None
+        row.delete_reason = None
         await self._session.flush()
         tombstone_cleared = await self._clear_edition_tombstone(row)
 
-        revived = await self.get_by_slug(project_id=project_id, slug=slug)
+        revived = await self.get_by_slug(
+            project_id=row.project_id, slug=row.slug
+        )
         if revived is None:
             msg = (
                 f"Edition id={row.id} is not live after reviving it for "
-                f"project_id={project_id} slug={slug!r}"
+                f"project_id={row.project_id} slug={row.slug!r}"
             )
             raise RuntimeError(msg)
         self._logger.info(
             "Revived soft-deleted edition",
             edition_id=revived.id,
             edition_slug=revived.slug,
-            project_id=project_id,
+            project_id=row.project_id,
             previous_delete_reason=previous_reason,
             tombstone_cleared=tombstone_cleared,
         )
-        return EnsuredEdition(edition=revived, revived=True)
+        return revived
 
     async def _clear_edition_tombstone(self, row: SqlEdition) -> bool:
         """Clear the keeper-sync tombstone on *row*'s state row, if any.

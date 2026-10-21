@@ -12,6 +12,7 @@ from docverse.models.queue_enums import JobKind, PublishStatus
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import (
+    DEFAULT_EDITION_SLUG,
     Edition,
     EditionWrite,
     RepointOutcome,
@@ -430,6 +431,7 @@ class EditionService:
         edition: Edition,
         build: Build,
         trigger: EditionPublishTrigger | None = None,
+        record_history: bool = True,
     ) -> QueueJob:
         """Record the publish an edition owes after a repoint, and queue it.
 
@@ -437,16 +439,29 @@ class EditionService:
         for the pair, the edition and that row marked ``pending``, and a
         ``publish_edition`` job deferred to the dispatcher so it is
         handed to arq only once the caller commits.
+
+        A caller republishing the build the edition already serves,
+        rather than repointing it, passes ``record_history=False``: the
+        pair's newest history row is marked ``pending`` and named
+        instead, and one is recorded only if the pair has none. That
+        row is the one ``publish_edition`` reads as current, so the job
+        is not skipped as superseded.
         """
-        new_history_entry = await self._history_store.record(
-            edition_id=edition.id, build_id=build.id
-        )
+        history_entry = None
+        if not record_history:
+            history_entry = await self._history_store.get_by_edition_and_build(
+                edition_id=edition.id, build_id=build.id
+            )
+        if history_entry is None:
+            history_entry = await self._history_store.record(
+                edition_id=edition.id, build_id=build.id
+            )
 
         await self._store.set_publish_status(
             edition_id=edition.id, status=PublishStatus.pending
         )
         await self._history_store.set_publish_status(
-            history_id=new_history_entry.id, status=PublishStatus.pending
+            history_id=history_entry.id, status=PublishStatus.pending
         )
 
         child_job = await self._queue_job_store.create(
@@ -463,11 +478,11 @@ class EditionService:
             "edition_slug": edition.slug,
             "build_id": build.id,
             "build_public_id": serialize_base32_id(build.public_id),
-            # Name the row just recorded. Rollback is what puts two
-            # rows on one ``(edition, build)`` pair, so a worker that
-            # resolved the pair instead could pick up — and overwrite —
-            # whichever row a *later* repoint added.
-            "history_id": new_history_entry.id,
+            # Name the row just marked pending. Rollback is what puts
+            # two rows on one ``(edition, build)`` pair, so a worker
+            # that resolved the pair instead could pick up — and
+            # overwrite — whichever row a *later* repoint added.
+            "history_id": history_entry.id,
         }
         if trigger is not None:
             # Tag the publish so its edition_published metric reports
@@ -677,6 +692,112 @@ class EditionService:
             edition=updated_edition,
             changed=child_job is not None,
         )
+
+    async def restore(
+        self,
+        *,
+        org_slug: str,
+        project_slug: str,
+        edition_slug: str,
+    ) -> tuple[Organization, Project, Edition]:
+        """Bring a soft-deleted edition back and republish it.
+
+        Backs ``POST .../editions/{edition}/restore`` (PRD #830). The
+        edition is revived in place whatever its ``delete_reason`` —
+        this is how an operator lifts a ``manual_delete``, which no
+        build or sync will — and its keeper-sync tombstone, if it has
+        one, is cleared with it; see
+        :meth:`~docverse_server.storage.edition_store.EditionStore.restore`.
+
+        The deletion took the edition off the CDN, so its current build
+        is published again: the pair's existing history row is marked
+        ``pending`` and a ``publish_edition`` job is deferred to the
+        dispatcher, as for a repoint, but no history entry is added — a
+        restore moves no pointer. A current build that is itself
+        soft-deleted or purged is not published (its content is not
+        served, or is gone), and neither is anything for an edition
+        that never had a build; the edition still comes back, and the
+        skip is logged.
+
+        ``__main`` cannot be deleted, so it cannot be restored either.
+
+        Raises
+        ------
+        NotFoundError
+            If the org or project is not found, or no soft-deleted
+            edition holds the slug — a live edition included, since
+            this URL addresses only deleted ones.
+        """
+        org, project = await self._resolve_org_project(org_slug, project_slug)
+        not_found = f"No deleted edition {edition_slug!r} found"
+        if edition_slug.lower() == DEFAULT_EDITION_SLUG:
+            raise NotFoundError(not_found)
+        edition = await self._store.restore(
+            project_id=project.id, slug=edition_slug
+        )
+        if edition is None:
+            raise NotFoundError(not_found)
+
+        republished = await self._republish_restored(
+            org_id=org.id, project_slug=project_slug, edition=edition
+        )
+        if republished:
+            edition.publish_status = PublishStatus.pending
+        self._logger.info(
+            "Restored edition",
+            org=org_slug,
+            project=project_slug,
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            republished=republished,
+        )
+        return org, project, edition
+
+    async def _republish_restored(
+        self, *, org_id: int, project_slug: str, edition: Edition
+    ) -> bool:
+        """Queue the publish of a restored edition's current build.
+
+        Returns whether a publish was queued. The build is read under
+        its row lock (editions, then builds, per the store's lock
+        order), so a build delete racing the restore is either seen
+        here or waits for it.
+        """
+        if edition.current_build_id is None:
+            self._logger.info(
+                "Restored edition has no build to republish",
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+            )
+            return False
+        build = await self._build_store.get_for_update(
+            build_id=edition.current_build_id
+        )
+        if (
+            build is None
+            or build.date_deleted is not None
+            or build.date_purged is not None
+        ):
+            self._logger.warning(
+                "Restored edition without republishing; its current build "
+                "is not live",
+                edition_id=edition.id,
+                edition_slug=edition.slug,
+                build_id=edition.current_build_id,
+                build_deleted=build is None or build.date_deleted is not None,
+                build_purged=build is not None
+                and build.date_purged is not None,
+            )
+            return False
+        await self._queue_publish(
+            org_id=org_id,
+            project_id=edition.project_id,
+            project_slug=project_slug,
+            edition=edition,
+            build=build,
+            record_history=False,
+        )
+        return True
 
     async def soft_delete(
         self,

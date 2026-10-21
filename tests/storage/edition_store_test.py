@@ -3627,6 +3627,130 @@ async def test_revive_or_create_concurrent_revives_converge(
     ]
 
 
+# ── restore (PRD #830) ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_restore_revives_a_manually_deleted_edition_as_it_was(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The admin restore lifts an operator's delete, re-deriving nothing.
+
+    ``revive_or_create`` refuses a ``manual_delete``; the restore is the
+    operator lifting that veto, so the row comes back exactly as it was
+    deleted: same id, kind, tracking, and current build.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        deleted = await _create_reaped_draft(
+            db_session,
+            edition_store,
+            org_id=org_id,
+            project_id=project_id,
+            slug="by-hand",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        restored = await edition_store.restore(
+            project_id=project_id, slug="BY-HAND"
+        )
+        await db_session.commit()
+
+    assert restored is not None
+    assert restored.id == deleted.id
+    assert restored.slug == "by-hand"
+    assert restored.kind is EditionKind.release
+    assert restored.tracking_params == {"git_ref": "old/by-hand"}
+    assert restored.lifecycle_exempt is True
+    assert restored.alternate_name == "old-alt"
+    assert restored.current_build_git_ref == "old/by-hand"
+    row = await _read_edition_row(db_session, deleted.id)
+    assert row.date_deleted is None
+    assert row.delete_reason is None
+
+
+@pytest.mark.asyncio
+async def test_restore_clears_keeper_sync_tombstone(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A once-synced edition's tombstone goes with the restore."""
+    logger = structlog.get_logger("docverse")
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await edition_store.create_internal(
+            project_id=project_id,
+            slug="synced",
+            title="Synced",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "tickets/synced"},
+        )
+        await state_store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=6161,
+            ltd_slug="synced",
+            docverse_id=edition.id,
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="synced",
+            reason=TombstoneReason.manual_delete,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        restored = await edition_store.restore(
+            project_id=project_id, slug="synced"
+        )
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=6161,
+            include_tombstoned=True,
+        )
+        await db_session.commit()
+
+    assert restored is not None
+    assert state is not None
+    assert state.date_tombstoned is None
+    assert state.tombstone_reason is None
+
+
+@pytest.mark.asyncio
+async def test_restore_does_not_address_a_live_or_unknown_slug(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """Only a soft-deleted edition is restorable; anything else is None."""
+    async with db_session.begin():
+        _org_id, project_id = await _create_project_with_org(db_session)
+        await edition_store.create_internal(
+            project_id=project_id,
+            slug="alive",
+            title="Alive",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        live = await edition_store.restore(project_id=project_id, slug="alive")
+        unknown = await edition_store.restore(
+            project_id=project_id, slug="nobody"
+        )
+        await db_session.commit()
+
+    assert live is None
+    assert unknown is None
+
+
 # ── list_draft_editions_by_git_ref ────────────────────────────────────────
 
 

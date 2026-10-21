@@ -21,7 +21,7 @@ from docverse.models import (
     OrgRole,
 )
 from docverse.models.builds import BuildAnnotations, BuildStatus
-from docverse.models.queue_enums import JobKind, JobStatus
+from docverse.models.queue_enums import JobKind, JobStatus, PublishStatus
 
 BASE_URL = "https://docverse.example.com"
 TOKEN = "test-token"
@@ -477,6 +477,69 @@ async def test_restore_build_raises_on_purged_build() -> None:
                 await client.restore_build("myorg", "myproj", BUILD_ID)
 
     assert excinfo.value.status_code == 409
+
+
+def _edition_response(slug: str, **overrides: Any) -> dict[str, Any]:
+    """Return a dict matching the Edition model shape."""
+    edition_url = f"/orgs/myorg/projects/myproj/editions/{slug}"
+    data: dict[str, Any] = {
+        "self_url": edition_url,
+        "project_url": "/orgs/myorg/projects/myproj",
+        "build_url": f"/orgs/myorg/projects/myproj/builds/{BUILD_ID}",
+        "published_url": f"https://myproj.example.com/v/{slug}/",
+        "history_url": f"{edition_url}/history",
+        "rollback_url": f"{edition_url}/rollback",
+        "slug": slug,
+        "title": slug,
+        "kind": "draft",
+        "kind_source": "derived",
+        "tracking_mode": "git_ref",
+        "tracking_params": {"git_ref": f"tickets/{slug}"},
+        "lifecycle_exempt": False,
+        "publish_status": "pending",
+        "date_created": datetime(2026, 1, 1, tzinfo=UTC).isoformat(),
+        "date_updated": datetime(2026, 1, 2, tzinfo=UTC).isoformat(),
+    }
+    data.update(overrides)
+    return data
+
+
+@pytest.mark.asyncio
+async def test_restore_edition() -> None:
+    """POST to the edition's restore sub-resource returns it, live again.
+
+    The server republishes the restored edition's build, so the round
+    trip has to carry the ``pending`` publish status through.
+    """
+    async with respx.mock(base_url=BASE_URL) as router:
+        route = router.post(
+            "/orgs/myorg/projects/myproj/editions/DM-1/restore"
+        ).mock(
+            return_value=httpx.Response(200, json=_edition_response("DM-1"))
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            edition = await client.restore_edition("myorg", "myproj", "DM-1")
+
+        assert route.called
+        assert route.calls[0].request.headers["Authorization"] == (
+            f"Bearer {TOKEN}"
+        )
+        assert edition.slug == "DM-1"
+        assert edition.publish_status == PublishStatus.pending
+
+
+@pytest.mark.asyncio
+async def test_restore_edition_raises_when_not_deleted() -> None:
+    """A 404 (no deleted edition with that slug) is a client error."""
+    async with respx.mock(base_url=BASE_URL) as router:
+        router.post("/orgs/myorg/projects/myproj/editions/live/restore").mock(
+            return_value=httpx.Response(404, text="not found")
+        )
+        async with DocverseClient(BASE_URL, TOKEN) as client:
+            with pytest.raises(DocverseClientError) as excinfo:
+                await client.restore_edition("myorg", "myproj", "live")
+
+    assert excinfo.value.status_code == 404
 
 
 @pytest.mark.asyncio

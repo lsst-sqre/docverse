@@ -85,7 +85,9 @@ class LifecycleAction(StrEnum):
 
     restore = "restore"
     """A soft-deleted edition came back in place (PRD #830): a native
-    build for a lifecycle-deleted edition's ref revived it."""
+    build for a lifecycle-deleted edition's ref revived it, keeper-sync
+    cleared its lifecycle tombstone, or an admin restored it through
+    ``POST .../editions/{edition}/restore``."""
 
 
 class MembershipChangeAction(StrEnum):

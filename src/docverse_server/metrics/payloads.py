@@ -283,9 +283,11 @@ class EditionLifecycleEvent(DocverseEventBase):
 
     Consolidates the edition management verbs into one event keyed by
     ``action`` (SQR-112 D4). Published from the FastAPI editions handler
-    after the operation's final commit, and with ``restore`` from the
-    ``build_processing`` worker for each edition a build revived from a
-    lifecycle soft-delete (PRD #830).
+    after the operation's final commit — ``restore`` included, for the
+    admin ``POST .../editions/{edition}/restore`` — and with ``restore``
+    from the ``build_processing`` worker for each edition a build revived
+    from a lifecycle soft-delete and from the ``keeper_sync_project``
+    worker for each edition a sync brought back (PRD #830).
     """
 
     action: LifecycleAction
