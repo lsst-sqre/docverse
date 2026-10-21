@@ -29,12 +29,13 @@ import structlog
 from arq.cron import CronJob
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 from structlog.typing import EventDict, WrappedLogger
 
 from docverse.models import JobKind, KeeperSyncConfig, OrganizationCreate
+from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.queue import JobStatus
 from docverse_server.services.keeper_sync import mappers
@@ -334,25 +335,34 @@ async def _seed_tombstone(
     ltd_id: int | None = None,
     ltd_slug: str | None = None,
     reason: TombstoneReason = TombstoneReason.manual_delete,
+    date_tombstoned: datetime | None = None,
 ) -> None:
     """Stamp a tombstone on the matching ``keeper_sync_state`` row.
 
     Uses the same service entrypoint the production deletion paths
     will use (PRD #332 §"Centralized edition soft-delete"), so the
     tier-cron filter behavior is exercised against rows produced the
-    same way operators and lifecycle workers produce them.
+    same way operators and lifecycle workers produce them. The service
+    stamps ``date_tombstoned`` with the current time; pass
+    ``date_tombstoned`` to backdate it.
     """
     state_store = KeeperSyncStateStore(session=db_session, logger=_logger())
     service = KeeperSyncTombstoneService(
         session=db_session, state_store=state_store, logger=_logger()
     )
-    await service.record(
+    state = await service.record(
         org_id=org_id,
         resource_type=resource_type,
         ltd_id=ltd_id,
         ltd_slug=ltd_slug,
         reason=reason,
     )
+    if date_tombstoned is not None:
+        await db_session.execute(
+            update(SqlKeeperSyncState)
+            .where(SqlKeeperSyncState.id == state.id)
+            .values(date_tombstoned=date_tombstoned)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3220,62 +3230,74 @@ async def test_tier_other_batches_edition_state_lookups_across_slugs(
     assert recorder.list_for_org_edition_calls == 1
 
 
-@pytest.mark.asyncio
-async def test_tier_other_ignores_tombstoned_stale_edition(
-    app: None,
+async def _seed_tombstoned_branch_project(
     db_session: AsyncSession,
-    mock_discovery: respx.Router,
-) -> None:
-    """A tombstoned non-main edition is never treated as stale.
+    *,
+    org_slug: str,
+    reason: TombstoneReason,
+    date_tombstoned: datetime,
+    date_last_synced: datetime | None = None,
+) -> int:
+    """Seed ``pipelines`` with a fresh ``main`` and one tombstoned branch.
 
-    LTD still lists the edition, and its state row is past the refresh
-    threshold, but Docverse tombstoned it (issue #396 / PRD #332 user
-    story 17): re-syncing it would only reach ``sync_edition``'s
-    tombstone short-circuit, so tier_other must not enqueue for it.
+    The branch edition (LTD id 2, ``DM-53614``) is the project's only
+    non-``main`` edition. A ``lifecycle_preemptive`` one is vetoed
+    before any import, so its state row is created by the tombstone
+    itself, with no Docverse id and no sync; any other reason tombstones
+    an imported edition's row, last synced ``date_last_synced``.
+    Returns the org id.
     """
-    stale = datetime.now(tz=UTC) - timedelta(hours=2)
-    async with db_session.begin():
-        org_id, _ = await _seed_org(
-            db_session,
-            slug="ks-tier-other-tomb-ed",
-            project_slugs=["pipelines"],
-        )
-        await _seed_state(
-            db_session,
-            org_id=org_id,
-            resource_type=ResourceType.project,
-            ltd_id=None,
-            ltd_slug="pipelines",
-        )
-        await _seed_state(
-            db_session,
-            org_id=org_id,
-            resource_type=ResourceType.edition,
-            ltd_id=1,
-            ltd_slug="main",
-            date_last_synced=datetime.now(tz=UTC),
-        )
+    org_id, _ = await _seed_org(
+        db_session, slug=org_slug, project_slugs=["pipelines"]
+    )
+    await _seed_state(
+        db_session,
+        org_id=org_id,
+        resource_type=ResourceType.project,
+        ltd_id=None,
+        ltd_slug="pipelines",
+    )
+    await _seed_state(
+        db_session,
+        org_id=org_id,
+        resource_type=ResourceType.edition,
+        ltd_id=1,
+        ltd_slug="main",
+        date_last_synced=datetime.now(tz=UTC),
+    )
+    if reason is not TombstoneReason.lifecycle_preemptive:
         await _seed_state(
             db_session,
             org_id=org_id,
             resource_type=ResourceType.edition,
             ltd_id=2,
-            ltd_slug="u-jsick-feature",
-            date_last_synced=stale,
+            ltd_slug="DM-53614",
+            date_last_synced=date_last_synced,
         )
-        await _seed_tombstone(
-            db_session,
-            org_id=org_id,
-            resource_type=ResourceType.edition,
-            ltd_id=2,
-            reason=TombstoneReason.lifecycle_delete,
-        )
+    await _seed_tombstone(
+        db_session,
+        org_id=org_id,
+        resource_type=ResourceType.edition,
+        ltd_id=2,
+        ltd_slug="DM-53614",
+        reason=reason,
+        date_tombstoned=date_tombstoned,
+    )
+    return org_id
 
+
+async def _tier_other_enqueued_slugs(
+    mock_discovery: respx.Router,
+) -> list[str]:
+    """Run one ``tier_other`` tick on ``pipelines``; return enqueued slugs.
+
+    LTD lists the seeded branch edition (2) and ``main`` (1); the tick
+    must decide from the listing alone, without fetching either.
+    """
     _stub_products(mock_discovery, ["pipelines"])
     _stub_editions_listing(
         mock_discovery, product_slug="pipelines", edition_ids=[2, 1]
     )
-
     http_client = httpx.AsyncClient()
     ctx = _make_ctx(http_client)
     try:
@@ -3284,14 +3306,114 @@ async def test_tier_other_ignores_tombstoned_stale_edition(
         await ctx["http_client"].aclose()
     assert result == "completed"
     _assert_no_edition_fetches(mock_discovery)
-    assert (
-        get_jobs_by_name(
+    return [
+        job.kwargs["payload"]["ltd_slug"]
+        for job in get_jobs_by_name(
             ctx["arq_queue"],
             "keeper_sync_project",
             queue_name=KEEPER_SYNC_QUEUE_NAME,
         )
-        == []
-    )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tier_other_enqueues_for_old_lifecycle_preemptive_tombstone(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """An old lifecycle tombstone makes its project stale (PRD #830).
+
+    tier_other cannot see LTD's rebuild of the edition without fetching
+    it, so a lifecycle-tombstoned edition ages like any other, from its
+    ``date_tombstoned`` when it was never synced, and a sync of the
+    project lets keeper-sync judge the tombstone again should LTD have
+    rebuilt the edition since. Here it is the project's only non-``main``
+    edition, so the enqueue comes from the tombstone alone.
+    """
+    async with db_session.begin():
+        await _seed_tombstoned_branch_project(
+            db_session,
+            org_slug="ks-tier-other-tomb-pre",
+            reason=TombstoneReason.lifecycle_preemptive,
+            date_tombstoned=datetime.now(tz=UTC) - timedelta(days=2),
+        )
+
+    assert await _tier_other_enqueued_slugs(mock_discovery) == ["pipelines"]
+
+
+@pytest.mark.asyncio
+async def test_tier_other_leaves_a_kept_lifecycle_tombstone_dormant(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A tombstone keeper-sync just judged and kept is not stale again.
+
+    Upholding a lifecycle tombstone on an LTD rebuild stamps the row's
+    ``date_last_synced``
+    (:meth:`KeeperSyncTombstoneService.keep`), which tier_other then
+    ages it from, as it ages a synced edition: no re-enqueue until the
+    refresh threshold has passed again, however old the tombstone.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        org_id = await _seed_tombstoned_branch_project(
+            db_session,
+            org_slug="ks-tier-other-tomb-kept",
+            reason=TombstoneReason.lifecycle_preemptive,
+            date_tombstoned=now - timedelta(days=2),
+        )
+        state = await KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        ).get(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            include_tombstoned=True,
+        )
+        assert state is not None
+        await KeeperSyncTombstoneService(
+            session=db_session,
+            state_store=KeeperSyncStateStore(
+                session=db_session, logger=_logger()
+            ),
+            logger=_logger(),
+        ).keep(
+            state_id=state.id,
+            note="ref_deleted",
+            date_rebuilt_seen=now - timedelta(minutes=20),
+            date_last_synced=now - timedelta(minutes=10),
+        )
+
+    assert await _tier_other_enqueued_slugs(mock_discovery) == []
+
+
+@pytest.mark.asyncio
+async def test_tier_other_ignores_manual_delete_tombstone(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+) -> None:
+    """A ``manual_delete`` edition is never treated as stale.
+
+    LTD still lists the edition, and its state row is past the refresh
+    threshold, but an operator deleted it (issue #396 / PRD #332 user
+    story 17): that veto is permanent, so re-syncing it would only reach
+    ``sync_edition``'s tombstone short-circuit, and tier_other must not
+    enqueue for it.
+    """
+    now = datetime.now(tz=UTC)
+    async with db_session.begin():
+        await _seed_tombstoned_branch_project(
+            db_session,
+            org_slug="ks-tier-other-tomb-manual",
+            reason=TombstoneReason.manual_delete,
+            date_tombstoned=now - timedelta(days=2),
+            date_last_synced=now - timedelta(days=3),
+        )
+
+    assert await _tier_other_enqueued_slugs(mock_discovery) == []
 
 
 @pytest.mark.asyncio

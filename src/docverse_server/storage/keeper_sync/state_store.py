@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from pydantic import BaseModel, ConfigDict
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnElement
 
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "LIFECYCLE_TOMBSTONE_REASONS",
     "KeeperSyncState",
     "KeeperSyncStateStore",
     "ResourceType",
@@ -68,6 +69,23 @@ class TombstoneReason(StrEnum):
     """Sync itself short-circuited an LTD edition that the lifecycle
     rules would immediately delete, before the build content was
     copied. No matching Docverse row exists in this case."""
+
+
+#: Tombstone reasons that activity on LTD can lift (PRD #830).
+#:
+#: A lifecycle rule retired these editions for inactivity or a deleted
+#: ref, and an LTD rebuild of the edition is what can undo either: the
+#: keeper-sync service judges such a tombstone again on a rebuild, and
+#: the tier crons and the push hot path keep these rows in view so a
+#: rebuild alone brings the project in for that judgement.
+#: ``manual_delete`` is left out: an operator's delete is a permanent
+#: veto that only the operator lifts.
+LIFECYCLE_TOMBSTONE_REASONS = frozenset(
+    {
+        TombstoneReason.lifecycle_preemptive.value,
+        TombstoneReason.lifecycle_delete.value,
+    }
+)
 
 
 class KeeperSyncState(BaseModel):
@@ -147,6 +165,18 @@ class KeeperSyncState(BaseModel):
     date_tombstoned: datetime | None = None
     tombstone_reason: str | None = None
     tombstone_note: str | None = None
+
+    @property
+    def is_lifecycle_tombstone(self) -> bool:
+        """Whether a lifecycle rule tombstoned the row.
+
+        True for the reasons in :data:`LIFECYCLE_TOMBSTONE_REASONS`,
+        which an LTD rebuild of the edition can lift (PRD #830).
+        """
+        return (
+            self.date_tombstoned is not None
+            and self.tombstone_reason in LIFECYCLE_TOMBSTONE_REASONS
+        )
 
 
 def _key_clauses(
@@ -296,6 +326,7 @@ class KeeperSyncStateStore:
         ltd_ids: Iterable[int] | None = None,
         docverse_ids: Iterable[int] | None = None,
         include_tombstoned: bool = False,
+        include_lifecycle_tombstoned: bool = False,
     ) -> list[KeeperSyncState]:
         """Return every state row for ``(org_id, resource_type)``.
 
@@ -316,7 +347,11 @@ class KeeperSyncStateStore:
         convergence and short-circuit callers see a tombstoned LTD
         resource as "not present"; admin endpoints and the
         tombstone-service write path opt in with
-        ``include_tombstoned=True``.
+        ``include_tombstoned=True``. ``include_lifecycle_tombstoned=True``
+        opts in only the rows a lifecycle rule tombstoned
+        (:data:`LIFECYCLE_TOMBSTONE_REASONS`), which an LTD rebuild can
+        lift, and still leaves ``manual_delete`` rows out: the tier
+        crons' and the push hot path's view (PRD #830).
         """
         if ltd_ids is not None:
             ltd_id_list = list(ltd_ids)
@@ -340,7 +375,16 @@ class KeeperSyncStateStore:
             clauses.append(
                 SqlKeeperSyncState.docverse_id.in_(docverse_id_list)
             )
-        if not include_tombstoned:
+        if include_lifecycle_tombstoned and not include_tombstoned:
+            clauses.append(
+                or_(
+                    SqlKeeperSyncState.date_tombstoned.is_(None),
+                    SqlKeeperSyncState.tombstone_reason.in_(
+                        LIFECYCLE_TOMBSTONE_REASONS
+                    ),
+                )
+            )
+        elif not include_tombstoned:
             clauses.append(SqlKeeperSyncState.date_tombstoned.is_(None))
         stmt = select(SqlKeeperSyncState).where(*clauses)
         result = await self._session.execute(stmt)

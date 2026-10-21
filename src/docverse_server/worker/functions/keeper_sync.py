@@ -80,7 +80,10 @@ from docverse_server.services.keeper_sync.budget import (
     SliceBudget,
     SliceProgress,
 )
-from docverse_server.services.keeper_sync.mappers import is_ltd_main
+from docverse_server.services.keeper_sync.mappers import (
+    is_ltd_main,
+    ltd_edition_slug_for_git_ref,
+)
 from docverse_server.services.keeper_sync.push_hints import (
     PushCheckOutcome,
     ltd_rebuilt_since_sync,
@@ -3062,18 +3065,34 @@ class _PushedRefCheck:
     """What the visit found."""
 
 
+@dataclass(frozen=True, slots=True)
+class _ProjectEditionListing:
+    """A project's LTD edition listing, with its editions' state rows.
+
+    Read once per project per ``tier_main`` tick by
+    :meth:`_PushedRefChecker._listing`, and shared by the checks that
+    need the project's editions rather than the ref's Docverse edition.
+    """
+
+    ltd_edition_ids: list[int]
+    """The LTD ids of the editions LTD lists for the project."""
+
+    state_by_ltd_id: dict[int, KeeperSyncState]
+    """The listed editions' state rows by LTD id, tombstoned ones too."""
+
+
 @dataclass(slots=True)
 class _PushedRefChecker:
     """Checks a project's pushed refs against LTD for one ``tier_main`` tick.
 
     Each ref costs at most two LTD calls of its own: the edition the
     ref's Docverse edition maps to, and, when the ref has no such edition
-    or LTD no longer has it, the project's edition listing, with the
-    newest editions on it that keeper-sync has not seen (at most
-    :data:`_MAX_UNSEEN_EDITIONS_FETCHED`). The listing and those editions
-    are fetched once per project per tick and shared by every ref, and
-    an edition the ``main`` check already fetched this tick is not
-    fetched again.
+    or LTD no longer has it, the edition of a lifecycle tombstone the
+    ref's name points to. Past those, the project's edition listing and
+    the newest editions on it that keeper-sync has not seen (at most
+    :data:`_MAX_UNSEEN_EDITIONS_FETCHED`) are fetched once per project
+    per tick and shared by every ref, and an edition the ``main`` check
+    already fetched this tick is not fetched again.
     """
 
     session: AsyncSession
@@ -3090,28 +3109,31 @@ class _PushedRefChecker:
 
     logger: structlog.stdlib.BoundLogger
     _editions: dict[int, LtdEdition] = field(default_factory=dict, init=False)
+    _project_listing: _ProjectEditionListing | None = field(
+        default=None, init=False
+    )
     _unseen: list[LtdEdition] | None = field(default=None, init=False)
 
     async def check(self, ref: str) -> PushCheckOutcome:
         """Return what LTD says about the edition a pushed ref feeds.
 
-        ``rebuilt`` or ``unchanged`` when a synced edition tracks the
-        ref and LTD still has it (:func:`ltd_rebuilt_since_sync`);
-        otherwise ``new_edition`` when LTD lists an edition keeper-sync
-        has not seen that tracks the ref, and ``not_found`` when it lists
-        none. An LTD failure is logged, sent to Sentry, and reported as
-        ``error``.
+        ``rebuilt`` or ``unchanged`` when an edition keeper-sync has seen
+        tracks the ref and LTD still has it (:func:`ltd_rebuilt_since_sync`)
+        — a synced edition, or one a lifecycle rule tombstoned, which a
+        rebuild can bring back (PRD #830); otherwise ``new_edition`` when
+        LTD lists an edition keeper-sync has not seen that tracks the
+        ref, and ``not_found`` when it lists none. An LTD failure is
+        logged, sent to Sentry, and reported as ``error``.
         """
-        state = await self._tracking_state(ref)
         try:
-            if state is not None and state.ltd_id is not None:
-                ltd_edition = await self._fetch(state.ltd_id)
-                if ltd_edition is not None:
-                    if ltd_rebuilt_since_sync(
-                        state, ltd_date_rebuilt=ltd_edition.date_rebuilt
-                    ):
-                        return PushCheckOutcome.rebuilt
-                    return PushCheckOutcome.unchanged
+            tracked = await self._tracked_edition(ref)
+            if tracked is not None:
+                state, ltd_edition = tracked
+                if ltd_rebuilt_since_sync(
+                    state, ltd_date_rebuilt=ltd_edition.date_rebuilt
+                ):
+                    return PushCheckOutcome.rebuilt
+                return PushCheckOutcome.unchanged
             if await self._lists_unseen_edition_of(ref):
                 return PushCheckOutcome.new_edition
         except LtdClientError as exc:
@@ -3125,27 +3147,86 @@ class _PushedRefChecker:
             return PushCheckOutcome.error
         return PushCheckOutcome.not_found
 
+    async def _tracked_edition(
+        self, ref: str
+    ) -> tuple[KeeperSyncState, LtdEdition] | None:
+        """Return the state row and LTD edition of the edition ``ref`` feeds.
+
+        The ref's Docverse edition (:meth:`_tracking_state`) when LTD
+        still has it, and otherwise a lifecycle tombstone on an edition
+        keeper-sync never imported, or one whose Docverse edition is
+        gone, found by the ref's name
+        (:meth:`_lifecycle_tombstoned_edition_of`). ``None`` when neither
+        is there.
+        """
+        state = await self._tracking_state(ref)
+        if state is not None and state.ltd_id is not None:
+            ltd_edition = await self._fetch(state.ltd_id)
+            if ltd_edition is not None:
+                return state, ltd_edition
+        return await self._lifecycle_tombstoned_edition_of(ref)
+
     async def _tracking_state(self, ref: str) -> KeeperSyncState | None:
         """Return the state row of the synced edition tracking ``ref``.
 
-        Every live ``git_ref``-mode Docverse edition of the project
-        tracking the ref is mapped to its untombstoned edition state
-        rows; when several LTD editions feed the ref, the newest (the
-        highest LTD id) is the one checked.
+        Every ``git_ref``-mode Docverse edition of the project tracking
+        the ref is mapped to its edition state rows; when several LTD
+        editions feed the ref, the newest (the highest LTD id) is the one
+        checked. A lifecycle rule's work counts as tracking too (PRD
+        #830): an edition it reaped (soft-deleted, ``delete_reason``
+        ``lifecycle_delete`` or ``NULL``) and a ``lifecycle_*`` tombstone
+        on a state row are both in view, since a rebuild of the edition
+        is what brings it back. An operator's ``manual_delete`` is not.
         """
         if self.project_id is None:
             return None
         async with self.session.begin():
             editions = await self.edition_store.list_git_ref_tracking_editions(
-                project_id=self.project_id, git_ref=ref
+                project_id=self.project_id,
+                git_ref=ref,
+                include_revivable=True,
             )
             states = await self.state_store.list_for_org(
                 org_id=self.org.id,
                 resource_type=ResourceType.edition,
                 docverse_ids=[edition.id for edition in editions],
+                include_lifecycle_tombstoned=True,
             )
         synced = [state for state in states if state.ltd_id is not None]
         return max(synced, key=lambda state: state.ltd_id or 0, default=None)
+
+    async def _lifecycle_tombstoned_edition_of(
+        self, ref: str
+    ) -> tuple[KeeperSyncState, LtdEdition] | None:
+        """Return a lifecycle-tombstoned LTD edition that tracks ``ref``.
+
+        The edition a ``lifecycle_preemptive`` tombstone vetoed has no
+        Docverse edition whose tracking could name the ref, and its state
+        row records only LTD's slug for it. So the project's listed
+        editions (:meth:`_listing`) are searched for a lifecycle
+        tombstone on the slug LTD gives a ref's edition
+        (:func:`ltd_edition_slug_for_git_ref`), and that one edition is
+        fetched to confirm it tracks the ref, since an operator can name
+        an LTD edition anything. ``None`` when there is no such
+        tombstone, LTD no longer has its edition, or the edition tracks
+        some other ref.
+        """
+        slug = ltd_edition_slug_for_git_ref(ref)
+        listing = await self._listing()
+        state = next(
+            (
+                state
+                for state in listing.state_by_ltd_id.values()
+                if state.is_lifecycle_tombstone and state.ltd_slug == slug
+            ),
+            None,
+        )
+        if state is None or state.ltd_id is None:
+            return None
+        ltd_edition = await self._fetch(state.ltd_id)
+        if ltd_edition is None or ref not in (ltd_edition.tracked_refs or ()):
+            return None
+        return state, ltd_edition
 
     async def _fetch(self, ltd_id: int) -> LtdEdition | None:
         """Return LTD's edition ``ltd_id``, or ``None`` if LTD lost it."""
@@ -3157,6 +3238,39 @@ class _PushedRefChecker:
                 return None
             self._editions[ltd_id] = edition
         return edition
+
+    async def _listing(self) -> _ProjectEditionListing:
+        """Return the project's edition listing and its state rows.
+
+        One ``GET /products/<slug>/editions/`` and one read of the state
+        rows of the listed ids, tombstoned ones included, as ``tier_main``
+        does not load the org's whole edition-state map. Answered once
+        per project per tick.
+        """
+        if self._project_listing is None:
+            ltd_edition_ids = await _list_edition_ltd_ids(
+                ltd_client=self.ltd_client,
+                org_slug=self.org.slug,
+                ltd_slug=self.ltd_slug,
+                tier=Tier.main,
+                logger=self.logger,
+            )
+            async with self.session.begin():
+                states = await self.state_store.list_for_org(
+                    org_id=self.org.id,
+                    resource_type=ResourceType.edition,
+                    ltd_ids=ltd_edition_ids,
+                    include_tombstoned=True,
+                )
+            self._project_listing = _ProjectEditionListing(
+                ltd_edition_ids=ltd_edition_ids,
+                state_by_ltd_id={
+                    state.ltd_id: state
+                    for state in states
+                    if state.ltd_id is not None
+                },
+            )
+        return self._project_listing
 
     async def _lists_unseen_edition_of(self, ref: str) -> bool:
         """Return whether LTD lists an unseen edition that tracks ``ref``.
@@ -3177,37 +3291,19 @@ class _PushedRefChecker:
         """Return the newest LTD editions keeper-sync has not seen.
 
         The discovery tier's listing check (:func:`_project_needs_discovery`)
-        on one project — its edition listing's LTD ids against the org's
-        edition state rows, tombstoned ones counting as seen — followed
-        by a fetch of each unseen edition, so the caller can read the
-        ref it tracks. The state rows are read for the listed ids only,
-        as ``tier_main`` does not load the org's whole edition-state
-        map. At most :data:`_MAX_UNSEEN_EDITIONS_FETCHED` editions are
-        fetched, highest LTD id first, and one LTD no longer has is left
-        out. Answered once per project per tick.
+        on one project — its edition listing's LTD ids against its
+        editions' state rows (:meth:`_listing`), tombstoned ones counting
+        as seen — followed by a fetch of each unseen edition, so the
+        caller can read the ref it tracks. At most
+        :data:`_MAX_UNSEEN_EDITIONS_FETCHED` editions are fetched,
+        highest LTD id first, and one LTD no longer has is left out.
+        Answered once per project per tick.
         """
         if self._unseen is None:
-            ltd_edition_ids = await _list_edition_ltd_ids(
-                ltd_client=self.ltd_client,
-                org_slug=self.org.slug,
-                ltd_slug=self.ltd_slug,
-                tier=Tier.main,
-                logger=self.logger,
-            )
-            async with self.session.begin():
-                states = await self.state_store.list_for_org(
-                    org_id=self.org.id,
-                    resource_type=ResourceType.edition,
-                    ltd_ids=ltd_edition_ids,
-                    include_tombstoned=True,
-                )
+            listing = await self._listing()
             unseen_ids = _unseen_edition_ltd_ids(
-                ltd_edition_ids=ltd_edition_ids,
-                edition_state_by_ltd_id={
-                    state.ltd_id: state
-                    for state in states
-                    if state.ltd_id is not None
-                },
+                ltd_edition_ids=listing.ltd_edition_ids,
+                edition_state_by_ltd_id=listing.state_by_ltd_id,
             )
             unseen: list[LtdEdition] = []
             for ltd_id in sorted(set(unseen_ids), reverse=True)[
@@ -3576,15 +3672,19 @@ async def _tier_other_for_org(
     now = datetime.now(tz=UTC)
     # Hoist the org-wide edition-state read out of the per-slug loop,
     # as ``_tier_discovery_for_org`` does. ``_list_in_scope_slugs``
-    # drops tombstoned *project* slugs; for the editions themselves the
-    # default ``include_tombstoned=False`` leaves tombstoned rows out
-    # of the map, so a tombstoned edition LTD still lists reads like
-    # one with no state row and is never treated as stale (issue #396
-    # / PRD #332 user story 17).
+    # drops tombstoned *project* slugs. For the editions themselves,
+    # a lifecycle tombstone stays in the map (PRD #830): an LTD rebuild
+    # can lift it, which only a sync of the project judges, and this
+    # tier cannot see the rebuild without fetching the edition, so the
+    # row ages like any other. A ``manual_delete`` row is left out, so
+    # an edition an operator deleted reads like one with no state row
+    # and is never treated as stale (issue #396 / PRD #332 user story
+    # 17).
     async with session.begin():
         edition_states = await state_store.list_for_org(
             org_id=org.id,
             resource_type=ResourceType.edition,
+            include_lifecycle_tombstoned=True,
         )
     edition_state_by_ltd_id = {
         s.ltd_id: s for s in edition_states if s.ltd_id is not None
@@ -4123,12 +4223,15 @@ def _has_stale_non_main_edition(
     (:func:`~docverse_server.services.keeper_sync.mappers.is_ltd_main`),
     and left out of the staleness check: ``tier_main`` owns that row.
 
-    ``edition_state_by_ltd_id`` is the org's untombstoned edition
-    state rows keyed by LTD id, read once per tick by
-    :func:`_tier_other_for_org`, so this check makes no database call:
-    a product that lists only ``main`` costs nothing beyond its LTD
-    listing. A tombstoned edition has no entry, so it reads like one
-    without state.
+    ``edition_state_by_ltd_id`` is the org's edition state rows keyed by
+    LTD id, untombstoned and lifecycle-tombstoned alike, read once per
+    tick by :func:`_tier_other_for_org`, so this check makes no database
+    call: a product that lists only ``main`` costs nothing beyond its
+    LTD listing. A lifecycle-tombstoned row ages from its last sync or,
+    failing one, its tombstoning (:func:`should_refresh_other_edition`),
+    so the project's sync can judge the tombstone again on an LTD
+    rebuild (PRD #830). A ``manual_delete`` edition has no entry, so it
+    reads like one without state.
 
     Editions without a state row are deliberately ignored — they are
     ``tier_discovery``'s job. This decoupling keeps the two cron

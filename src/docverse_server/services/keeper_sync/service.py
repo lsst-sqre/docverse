@@ -349,20 +349,6 @@ _AGGREGATES_BACKFILLED_BUILD_ID_KEY = "aggregates_backfilled_build_id"
 #: resolve because ``annotations`` replaces wholesale.
 _DATE_REBUILT_RETRACTED_KEY = "date_rebuilt_seen_retracted"
 
-#: Tombstone reasons a rebuild of the LTD edition reopens (PRD #830).
-#:
-#: A lifecycle rule retired these editions for inactivity or a deleted
-#: ref, and new activity on LTD is exactly what can undo either, so
-#: :meth:`KeeperSyncService._review_lifecycle_tombstone` judges them again
-#: once LTD rebuilds the edition. ``manual_delete`` is left out: an
-#: operator's delete is a permanent veto that only the operator lifts.
-_REVIEWABLE_TOMBSTONE_REASONS = frozenset(
-    {
-        TombstoneReason.lifecycle_preemptive.value,
-        TombstoneReason.lifecycle_delete.value,
-    }
-)
-
 
 @dataclass(frozen=True)
 class BuildCopyReport:
@@ -2483,7 +2469,7 @@ class KeeperSyncService:
         """
         if self._tombstone_service is None:
             return None
-        if state.tombstone_reason not in _REVIEWABLE_TOMBSTONE_REASONS:
+        if not state.is_lifecycle_tombstone:
             return None
         _, ltd_rebuilt = derive_edition_dates(ltd_edition)
         baseline = state.date_rebuilt_seen or state.date_tombstoned

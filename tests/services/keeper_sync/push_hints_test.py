@@ -52,6 +52,8 @@ def _edition_state(
     *,
     date_rebuilt_seen: datetime | None = None,
     date_last_synced: datetime | None = None,
+    date_tombstoned: datetime | None = None,
+    tombstone_reason: str | None = None,
 ) -> KeeperSyncState:
     """Build an edition-resource ``KeeperSyncState`` row."""
     return KeeperSyncState(
@@ -64,6 +66,8 @@ def _edition_state(
         docverse_id=8,
         date_rebuilt_seen=date_rebuilt_seen,
         date_last_synced=date_last_synced,
+        date_tombstoned=date_tombstoned,
+        tombstone_reason=tombstone_reason,
     )
 
 
@@ -349,6 +353,26 @@ def test_ltd_rebuilt_since_sync_falls_back_to_the_last_sync() -> None:
     assert ltd_rebuilt_since_sync(state, ltd_date_rebuilt=_NOW)
     assert not ltd_rebuilt_since_sync(
         state, ltd_date_rebuilt=synced - timedelta(minutes=1)
+    )
+
+
+def test_ltd_rebuilt_since_sync_falls_back_to_the_tombstone_date() -> None:
+    """A tombstoned row with no rebuild recorded compares with its veto.
+
+    A ``lifecycle_preemptive`` tombstone was written before keeper-sync
+    imported the edition, so it records no rebuild and no sync; only a
+    rebuild after the tombstone is new to it (PRD #830). Without the
+    fallback every such row would read as never synced, and so rebuilt,
+    on every push to its ref.
+    """
+    tombstoned = _NOW - timedelta(days=2)
+    state = _edition_state(
+        date_tombstoned=tombstoned, tombstone_reason="lifecycle_preemptive"
+    )
+
+    assert ltd_rebuilt_since_sync(state, ltd_date_rebuilt=_NOW)
+    assert not ltd_rebuilt_since_sync(
+        state, ltd_date_rebuilt=tombstoned - timedelta(days=30)
     )
 
 

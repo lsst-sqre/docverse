@@ -4195,6 +4195,57 @@ async def test_list_git_ref_tracking_editions_excludes_non_matches(
     assert found == []
 
 
+@pytest.mark.asyncio
+async def test_list_git_ref_tracking_editions_can_include_revivable(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """``include_revivable`` adds soft-deleted editions a rebuild revives.
+
+    The keeper-sync push check (PRD #830): a push to a reaped draft's
+    branch should find it, since LTD rebuilding the edition brings it
+    back. A ``lifecycle_delete`` edition and one with no reason on
+    record are revivable; an operator's ``manual_delete`` is not.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        for slug in ("live", "reaped", "unrecorded", "deleted"):
+            await edition_store.create(
+                project_id=project_id,
+                data=EditionCreate(
+                    slug=slug,
+                    title=slug,
+                    kind=EditionKind.draft,
+                    tracking_mode=TrackingMode.git_ref,
+                    tracking_params={"git_ref": "tickets/DM-1"},
+                ),
+            )
+        for slug, reason in (
+            ("reaped", TombstoneReason.lifecycle_delete),
+            ("unrecorded", TombstoneReason.lifecycle_delete),
+            ("deleted", TombstoneReason.manual_delete),
+        ):
+            await edition_store.soft_delete(
+                org_id=org_id, project_id=project_id, slug=slug, reason=reason
+            )
+        await db_session.execute(
+            update(SqlEdition)
+            .where(
+                SqlEdition.project_id == project_id,
+                SqlEdition.slug == "unrecorded",
+            )
+            .values(delete_reason=None)
+        )
+        found = await edition_store.list_git_ref_tracking_editions(
+            project_id=project_id,
+            git_ref="tickets/DM-1",
+            include_revivable=True,
+        )
+        await db_session.commit()
+    assert [e.slug for e in found] == ["live", "reaped", "unrecorded"]
+    assert [e.date_deleted is not None for e in found] == [False, True, True]
+
+
 async def _wait_until_a_backend_blocks(
     maker: async_sessionmaker[AsyncSession], *, timeout: float = 10.0
 ) -> None:

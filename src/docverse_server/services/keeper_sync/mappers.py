@@ -12,6 +12,7 @@ mode (PRD #275 "Out of scope") and is collapsed onto a pinned
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,6 +41,7 @@ __all__ = [
     "derive_synced_build_git_ref",
     "derive_tracking_source",
     "is_ltd_main",
+    "ltd_edition_slug_for_git_ref",
     "map_edition_tracking",
     "tracking_reads_live_refs",
 ]
@@ -64,6 +66,10 @@ _LTD_BUILDS_SEGMENT = "builds"
 #: Path segment LTD publishes edition copies under:
 #: ``<product>/v/<edition-slug>/``.
 _LTD_EDITIONS_SEGMENT = "v"
+
+#: A ticket branch, whose LTD edition LTD Keeper names after the ticket
+#: key alone; ``keeper.utils.TICKET_BRANCH_PATTERN``.
+_LTD_TICKET_BRANCH_PATTERN = re.compile(r"^tickets/([A-Z]+-[0-9]+)$")
 
 
 class KindDerivationSource(StrEnum):
@@ -297,6 +303,25 @@ def is_ltd_main(ltd_edition_slug: str) -> bool:
     callers cannot disagree about which edition is ``main``.
     """
     return derive_edition_slug(ltd_edition_slug) == DOCVERSE_MAIN_SLUG
+
+
+def ltd_edition_slug_for_git_ref(git_ref: str) -> str:
+    """Return the slug LTD Keeper gives the edition it creates for a ref.
+
+    Mirrors ``keeper.utils.auto_slugify_edition`` for a single ref: a
+    ``tickets/DM-1234`` branch's edition is ``DM-1234``, and any other
+    ref's slashes become hyphens (``u/jsick/feature`` →
+    ``u-jsick-feature``). LTD creates an edition so named when a build
+    for a ref no edition tracks is uploaded, which is how nearly every
+    branch edition, and so nearly every lifecycle-retired draft, came
+    to be. An operator can create an edition with any slug, so a caller
+    that finds an edition by this slug confirms it against the
+    edition's ``tracked_refs``.
+    """
+    match = _LTD_TICKET_BRANCH_PATTERN.match(git_ref)
+    if match is not None:
+        return match.group(1)
+    return git_ref.replace("/", "-")
 
 
 def derive_edition_dates(ltd_edition: LtdEdition) -> tuple[datetime, datetime]:

@@ -644,7 +644,11 @@ a project dormant for months:
 - `keeper_sync_tier_discovery` lists its LTD editions every 30 minutes,
   and enqueues its sync for any it has not seen.
 - `keeper_sync_tier_other` lists them every hour, and enqueues its sync
-  for any non-`main` edition last synced an hour or more ago.
+  for any non-`main` edition last synced an hour or more ago. An edition
+  a lifecycle rule tombstoned counts too, aging from its tombstoning
+  when keeper-sync never synced it, so the sync can judge the tombstone
+  again should LTD have rebuilt the edition; an edition an operator
+  deleted does not.
 
 When the window closes, the project drops back to its cohort and nothing
 else has to change: the stamp left on the row counts for nothing once
@@ -677,18 +681,38 @@ call, and is pruned. Then each live ref, oldest push first:
    `__main` edition for a push to the default branch, a draft for a
    branch, a release for a tag) are mapped to their `keeper_sync_state`
    edition rows and the LTD editions those record. When several LTD
-   editions feed the ref, the newest is checked.
+   editions feed the ref, the newest is checked. A draft a lifecycle
+   rule retired still counts, since its author pushing again is what
+   brings it back: an edition the rule soft-deleted (`delete_reason`
+   `lifecycle_delete`, or none on record) and a state row tombstoned
+   `lifecycle_delete` or `lifecycle_preemptive` are both looked at. An
+   edition an operator deleted (`manual_delete`) is not.
 2. **Ask LTD.** One `GET /editions/<id>`, skipped when the `main` check
    already fetched that edition this tick. The edition is `rebuilt` when
    its `date_rebuilt` is newer than the `date_rebuilt_seen` its state
    row recorded at the last sync (or, if the row recorded none, its
-   `date_last_synced`), and `unchanged` otherwise: the push's CI has not
-   uploaded yet.
-3. **Fall back to the listing.** When no synced edition tracks the ref,
-   or LTD answers `404` for the one that did, the project's edition
-   listing (`GET /products/<slug>/editions/`, read once per project per
-   tick) is checked the way `keeper_sync_tier_discovery` checks it, for
-   editions keeper-sync has no state row for. Each of those, newest
+   `date_last_synced`, or for a tombstoned row its `date_tombstoned`),
+   and `unchanged` otherwise: the push's CI has not uploaded yet. A
+   `rebuilt` tombstoned edition enqueues the project's sync, which
+   judges the tombstone again against the lifecycle rules: it clears
+   the tombstone and imports the edition when no rule matches the
+   rebuilt edition any more, and keeps it, stamped with the rebuild it
+   judged, when one still does.
+3. **Find a tombstone by name.** An edition a lifecycle rule vetoed at
+   import (`lifecycle_preemptive`) has no Docverse edition to track the
+   ref, and its state row records only LTD's slug for it. So when step
+   1 finds nothing, or LTD answers `404` for what it found, the
+   project's edition listing (`GET /products/<slug>/editions/`, read
+   once per project per tick, with the state rows of the editions it
+   lists) is searched for a lifecycle tombstone on the slug LTD gives
+   the ref's edition: the ticket key for a `tickets/DM-1234` branch
+   (`DM-1234`), and otherwise the ref with its slashes made hyphens
+   (`u/jsick/feature` → `u-jsick-feature`). That edition is fetched,
+   and when it tracks the pushed ref it is checked as in step 2.
+4. **Fall back to the listing.** When no edition keeper-sync has seen
+   tracks the ref, the listing is checked the way
+   `keeper_sync_tier_discovery` checks it, for editions keeper-sync has
+   no state row for. Each of those, newest
    first and at most three, is fetched (`GET /editions/<id>`, also once
    per project per tick) to read the ref it tracks. One that tracks the
    pushed ref is a `new_edition`: LTD created it for the push's CI
@@ -701,10 +725,10 @@ call, and is pruned. Then each live ref, oldest push first:
 
 | Outcome | What the visit found | The stamp |
 | --- | --- | --- |
-| `rebuilt` | LTD rebuilt the ref's edition since its last sync | Cleared once the sync is enqueued |
-| `new_edition` | No synced edition tracks the ref, and LTD lists one keeper-sync has not seen that tracks it | Cleared once the sync is enqueued |
-| `unchanged` | The ref's edition is as keeper-sync last synced it | Kept |
-| `not_found` | No synced edition tracks the ref, and LTD lists nothing new that tracks it | Kept |
+| `rebuilt` | LTD rebuilt the ref's edition since its last sync, or since a lifecycle rule tombstoned it | Cleared once the sync is enqueued |
+| `new_edition` | No edition keeper-sync has seen tracks the ref, and LTD lists one keeper-sync has not seen that tracks it | Cleared once the sync is enqueued |
+| `unchanged` | The ref's edition is as keeper-sync last synced or tombstoned it | Kept |
+| `not_found` | No edition keeper-sync has seen tracks the ref, and LTD lists nothing new that tracks it | Kept |
 | `error` | LTD failed to answer | Kept |
 | `expired` | The ref's window passed | Pruned |
 
@@ -733,9 +757,10 @@ record when they polled the project, read it `FOR UPDATE` for the same
 reason, so none of them can write back a map that predates a stamp.
 
 The check's cost is bounded: at most two LTD calls per stamped ref per
-tick (its edition, then the listing), plus at most three fetches of the
-unseen editions the listing shows, the listing and those fetches shared
-by the project's refs, and at most 20 refs per project. A dormant project the
+tick (its edition, then the edition of the lifecycle tombstone its name
+points to), plus the listing and at most three fetches of the unseen
+editions it shows, the listing and those fetches shared by the
+project's refs, and at most 20 refs per project. A dormant project the
 push woke adds its `main` check, usually one more call per tick for the
 window, which a push to `main` itself shares. Editions that follow a
 ref by a version rule rather than by name (`lsst_doc` and the `eups`

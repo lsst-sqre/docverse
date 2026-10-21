@@ -289,10 +289,14 @@ def ltd_rebuilt_since_sync(
     The rebuild check ``tier_main`` runs on the edition tracking a
     pushed ref. LTD's ``date_rebuilt`` is compared with the
     ``date_rebuilt_seen`` the edition's state row recorded at its last
-    sync or, when the row recorded none, with its ``date_last_synced``.
-    An LTD edition that has never been rebuilt has nothing new to sync,
-    and a row that records neither time has never been synced, so any
-    rebuild is new to it.
+    sync or, when the row recorded none, with its ``date_last_synced``
+    — or, on a tombstoned row, its ``date_tombstoned``: a
+    ``lifecycle_preemptive`` tombstone vetoed the edition before any
+    sync, so only a rebuild after the veto is new to it, the same
+    baseline keeper-sync's re-evaluation of the tombstone reads (PRD
+    #830). An LTD edition that has never been rebuilt has nothing new
+    to sync, and a row that records none of these times has never been
+    synced, so any rebuild is new to it.
 
     Parameters
     ----------
@@ -303,7 +307,11 @@ def ltd_rebuilt_since_sync(
     """
     if ltd_date_rebuilt is None:
         return False
-    reference = state.date_rebuilt_seen or state.date_last_synced
+    reference = state.date_rebuilt_seen or (
+        state.date_tombstoned
+        if state.date_tombstoned is not None
+        else state.date_last_synced
+    )
     if reference is None:
         return True
     return ltd_date_rebuilt > reference

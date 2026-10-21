@@ -1581,7 +1581,7 @@ class EditionStore:
         return self._validate(edition_row, build_public_id, build_git_ref)
 
     async def list_git_ref_tracking_editions(
-        self, *, project_id: int, git_ref: str
+        self, *, project_id: int, git_ref: str, include_revivable: bool = False
     ) -> list[Edition]:
         """List every live ``git_ref``-mode edition tracking ``git_ref``.
 
@@ -1597,15 +1597,30 @@ class EditionStore:
         ignored. The ``tracking_params->>'git_ref'`` equality is applied
         in the database.
 
+        ``include_revivable=True`` also returns the soft-deleted editions
+        that activity brings back (PRD #830): those whose
+        ``delete_reason`` is ``lifecycle_delete`` or ``NULL``, as
+        :meth:`revive_or_create` revives. A ``manual_delete`` edition
+        stays out.
+
         Returns the matches in creation order (``date_created``, then
         ``id``); usually one.
         """
+        if include_revivable:
+            deleted_clause = or_(
+                SqlEdition.date_deleted.is_(None),
+                SqlEdition.delete_reason.is_distinct_from(
+                    EditionDeleteReason.manual_delete.value
+                ),
+            )
+        else:
+            deleted_clause = SqlEdition.date_deleted.is_(None)
         stmt = (
             self._base_query()
             .where(
                 SqlEdition.project_id == project_id,
                 SqlEdition.tracking_mode == TrackingMode.git_ref,
-                SqlEdition.date_deleted.is_(None),
+                deleted_clause,
                 SqlEdition.tracking_params["git_ref"].astext == git_ref,
             )
             .order_by(SqlEdition.date_created, SqlEdition.id)

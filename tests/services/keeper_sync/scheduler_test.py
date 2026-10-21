@@ -63,6 +63,8 @@ def _state(
     resource_type: str = "edition",
     ltd_id: int | None = 42,
     ltd_slug: str = "main",
+    date_tombstoned: datetime | None = None,
+    tombstone_reason: str | None = None,
 ) -> KeeperSyncState:
     """Build a ``KeeperSyncState`` with sane defaults for assertions."""
     return KeeperSyncState(
@@ -76,6 +78,8 @@ def _state(
         date_last_synced=date_last_synced,
         date_rebuilt_seen=date_rebuilt_seen,
         annotations=annotations,
+        date_tombstoned=date_tombstoned,
+        tombstone_reason=tombstone_reason,
     )
 
 
@@ -202,6 +206,29 @@ def test_should_refresh_other_at_threshold_exactly() -> None:
     now = datetime(2026, 5, 7, 12, tzinfo=UTC)
     state = _state(date_last_synced=now - TIER_OTHER_REFRESH_THRESHOLD)
     assert should_refresh_other_edition(state=state, now=now)
+
+
+def test_should_refresh_other_falls_back_to_the_tombstone_date() -> None:
+    """A tombstoned row never synced ages from when it was tombstoned.
+
+    A ``lifecycle_preemptive`` tombstone has no ``date_last_synced``:
+    the edition was vetoed before keeper-sync ever imported it. Its
+    ``date_tombstoned`` is the baseline instead (PRD #830), so a fresh
+    tombstone is not stale on the tick that wrote it, and an old one is.
+    """
+    now = datetime(2026, 5, 7, 12, tzinfo=UTC)
+    fresh = _state(
+        docverse_id=None,
+        date_tombstoned=now - timedelta(minutes=10),
+        tombstone_reason="lifecycle_preemptive",
+    )
+    old = _state(
+        docverse_id=None,
+        date_tombstoned=now - timedelta(days=2),
+        tombstone_reason="lifecycle_preemptive",
+    )
+    assert not should_refresh_other_edition(state=fresh, now=now)
+    assert should_refresh_other_edition(state=old, now=now)
 
 
 def test_tier_other_refresh_threshold_matches_user_story() -> None:

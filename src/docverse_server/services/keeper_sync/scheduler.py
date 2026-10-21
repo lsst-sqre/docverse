@@ -521,18 +521,27 @@ def should_refresh_other_edition(
 ) -> bool:
     """Decide whether tier_other should re-enqueue a non-main edition.
 
-    A row whose ``date_last_synced`` is ``None`` is treated as stale
-    (the next sync should record it). Otherwise the row is stale once
-    its age (``now - date_last_synced``) reaches the configured
-    ``threshold``; the comparison is ``>=`` so an edition synced exactly
-    one threshold-period ago re-enters the refresh set on this tick
-    instead of slipping to the next one.
+    The row ages from its ``date_last_synced`` or, when it has none, its
+    ``date_tombstoned``: a ``lifecycle_preemptive`` tombstone was vetoed
+    before keeper-sync ever imported the edition, so its tombstoning is
+    the only visit on record (PRD #830). A row with neither is treated
+    as stale (the next sync should record it). Otherwise the row is
+    stale once its age reaches the configured ``threshold``; the
+    comparison is ``>=`` so an edition synced exactly one
+    threshold-period ago re-enters the refresh set on this tick instead
+    of slipping to the next one.
+
+    A lifecycle tombstone that keeper-sync judged again on an LTD
+    rebuild and kept is stamped with ``date_last_synced``
+    (:meth:`~docverse_server.services.keeper_sync_tombstone.KeeperSyncTombstoneService.keep`),
+    which ages it from that judgement like any synced row.
 
     Callers pass ``now`` explicitly so tests can fix the wall clock.
     """
-    if state.date_last_synced is None:
+    baseline = state.date_last_synced or state.date_tombstoned
+    if baseline is None:
         return True
-    return (now - state.date_last_synced) >= threshold
+    return (now - baseline) >= threshold
 
 
 @dataclass(frozen=True)

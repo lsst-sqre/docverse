@@ -617,7 +617,8 @@ A visit is any `keeper_sync_project` job for the project:
 - a per-project refresh,
   `POST /orgs/{org}/keeper-sync/projects/{ltd_slug}/refresh`;
 - a tier-cron tick. `tier_other` revisits a project with any
-  non-`main` edition hourly while the project is hot (its LTD `main`
+  non-`main` edition, a lifecycle-tombstoned one included (not one an
+  operator deleted), hourly while the project is hot (its LTD `main`
   rebuilt within 14 days, or a
   [push](github-integration.md#a-push-counts-as-hot) is inside the
   push window) and every day or two once it is dormant.
