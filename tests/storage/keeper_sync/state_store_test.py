@@ -14,6 +14,7 @@ from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
+    TombstoneReason,
 )
 from docverse_server.storage.organization_store import OrganizationStore
 
@@ -700,6 +701,49 @@ async def test_list_for_org_hides_tombstoned_rows_by_default(
 
 
 @pytest.mark.asyncio
+async def test_list_for_org_can_include_lifecycle_tombstones_only(
+    db_session: AsyncSession,
+) -> None:
+    """``include_lifecycle_tombstoned`` adds lifecycle vetoes, not manual.
+
+    The tier crons' view (PRD #830): a rebuild can lift a lifecycle
+    tombstone, so those rows must be seen, while an operator's
+    ``manual_delete`` stays out as if the row were gone.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-tomb-lifecycle")
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=1,
+            ltd_slug="main",
+        )
+        for ltd_id, reason in (
+            (2, "lifecycle_delete"),
+            (3, "lifecycle_preemptive"),
+            (4, "manual_delete"),
+        ):
+            row = await store.upsert(
+                org_id=org_id,
+                resource_type=ResourceType.edition,
+                ltd_id=ltd_id,
+                ltd_slug=f"DM-{ltd_id}",
+            )
+            await _set_tombstone(db_session, row_id=row.id, reason=reason)
+
+    async with db_session.begin():
+        rows = await store.list_for_org(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            include_lifecycle_tombstoned=True,
+        )
+    assert sorted(r.ltd_id for r in rows if r.ltd_id is not None) == [1, 2, 3]
+
+
+@pytest.mark.asyncio
 async def test_list_project_resources_hides_tombstoned_by_default(
     db_session: AsyncSession,
 ) -> None:
@@ -788,3 +832,98 @@ async def test_get_for_update_reads_the_committed_row(
     assert got is not None
     assert got.annotations == {"first": 1, "second": 2}
     assert held.annotations == {"first": 1, "second": 2}
+
+
+@pytest.mark.asyncio
+async def test_tombstone_inserts_row_naming_the_docverse_resource(
+    db_session: AsyncSession,
+) -> None:
+    """With no row for the LTD edition, ``tombstone`` inserts one.
+
+    The row carries the tombstone fields together with the Docverse id
+    and sync time the caller passes, and a public id like any other.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    synced = datetime(2026, 10, 21, tzinfo=UTC)
+
+    async with db_session.begin():
+        state = await store.tombstone(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            reason=TombstoneReason.manual_delete,
+            ltd_id=3,
+            ltd_slug="u-jsick-feature",
+            docverse_id=17,
+            date_last_synced=synced,
+        )
+
+    assert state.public_id > 0
+    assert state.ltd_slug == "u-jsick-feature"
+    assert state.docverse_id == 17
+    assert state.date_last_synced == synced
+    assert state.date_tombstoned is not None
+    assert state.tombstone_reason == TombstoneReason.manual_delete.value
+    assert state.tombstone_note is None
+
+
+@pytest.mark.asyncio
+async def test_tombstone_converts_existing_row_in_place(
+    db_session: AsyncSession,
+) -> None:
+    """An existing row is tombstoned in place, not duplicated.
+
+    Its id and public id stay, the Docverse id and sync time move to the
+    caller's, the note is written as given, and the columns the
+    tombstone does not speak to keep their values.
+    """
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    store = KeeperSyncStateStore(session=db_session, logger=logger)
+    rebuilt = datetime(2026, 4, 17, tzinfo=UTC)
+    async with db_session.begin():
+        before = await store.upsert(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=2,
+            ltd_slug="DM-53614",
+            docverse_id=5,
+            date_last_synced=datetime(2026, 9, 29, tzinfo=UTC),
+            date_rebuilt_seen=rebuilt,
+            annotations={"ltd_mode": "git_refs"},
+        )
+    synced = datetime(2026, 10, 21, tzinfo=UTC)
+
+    async with db_session.begin():
+        state = await store.tombstone(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            reason=TombstoneReason.manual_delete,
+            ltd_id=2,
+            ltd_slug="DM-53614",
+            docverse_id=9,
+            date_last_synced=synced,
+        )
+        rows = (
+            (
+                await db_session.execute(
+                    select(SqlKeeperSyncState).where(
+                        SqlKeeperSyncState.org_id == org_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert len(rows) == 1
+    assert (state.id, state.public_id) == (before.id, before.public_id)
+    assert state.docverse_id == 9
+    assert state.date_last_synced == synced
+    assert state.date_rebuilt_seen == rebuilt
+    assert state.annotations == {"ltd_mode": "git_refs"}
+    assert state.tombstone_reason == TombstoneReason.manual_delete.value
+    assert state.date_tombstoned is not None

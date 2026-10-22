@@ -36,7 +36,7 @@ import structlog
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
-from sqlalchemy import text
+from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
@@ -49,6 +49,7 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.config import config
+from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.metrics import (
     DocverseEvents,
     KeeperSyncPushCheckEvent,
@@ -63,10 +64,14 @@ from docverse_server.services.keeper_sync.scheduler import (
     ANNOTATION_DATE_OTHER_LAST_POLLED,
 )
 from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME
+from docverse_server.services.keeper_sync_tombstone import (
+    KeeperSyncTombstoneService,
+)
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
     KeeperSyncStateStore,
     ResourceType,
+    TombstoneReason,
 )
 from docverse_server.storage.ltd import LtdClientError
 from docverse_server.storage.organization_store import OrganizationStore
@@ -1018,6 +1023,265 @@ async def test_edition_gone_from_ltd_falls_back_to_the_listing(
         "/editions/6",
     ]
     assert await _stamps(org_id) == {}
+
+
+_TOMBSTONED_AT = _now() - timedelta(days=2)
+"""When the lifecycle tombstone tests' editions were tombstoned."""
+
+
+async def _seed_preemptive_tombstone(
+    session: AsyncSession, *, org_id: int, ltd_id: int, ltd_slug: str
+) -> None:
+    """Tombstone an LTD edition keeper-sync never imported.
+
+    The proactive lifecycle pass's veto (``lifecycle_preemptive``): a
+    state row with no Docverse edition and no sync, tombstoned
+    ``_TOMBSTONED_AT``.
+    """
+    state = await KeeperSyncTombstoneService(
+        session=session,
+        state_store=KeeperSyncStateStore(session=session, logger=_logger()),
+        logger=_logger(),
+    ).record(
+        org_id=org_id,
+        resource_type=ResourceType.edition,
+        ltd_id=ltd_id,
+        ltd_slug=ltd_slug,
+        reason=TombstoneReason.lifecycle_preemptive,
+        note="draft_inactivity",
+    )
+    await session.execute(
+        update(SqlKeeperSyncState)
+        .where(SqlKeeperSyncState.id == state.id)
+        .values(date_tombstoned=_TOMBSTONED_AT)
+    )
+
+
+async def _push_outcomes() -> dict[str, str]:
+    """Run one ``tier_main`` tick; return each visited ref's outcome."""
+    with capture_logs() as captured:
+        await _run_tier_main()
+    return {
+        entry["github_ref"]: entry["outcome"]
+        for entry in captured
+        if entry["event"] == "Tier-main: checked pushed ref"
+    }
+
+
+@pytest.mark.asyncio
+async def test_push_to_rebuilt_preemptive_tombstone_enqueues(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """A rebuilt edition vetoed before import reads ``rebuilt`` (PRD #830).
+
+    rdo-151's case: the draft ``DM-53614`` was tombstoned
+    ``lifecycle_preemptive`` at import, then its author pushed again and
+    LTD rebuilt it. No Docverse edition tracks the ref, so the check
+    finds the tombstone among the project's listed editions by the slug
+    LTD gives the ref's edition, confirms the ref against the fetched
+    edition, and compares its rebuild with the veto. The sync it
+    enqueues is what judges the tombstone again.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-tomb-pre")
+        await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"tickets/DM-53614": _now() - timedelta(minutes=10)},
+        )
+        await _seed_preemptive_tombstone(
+            db_session, org_id=org_id, ltd_id=2, ltd_slug="DM-53614"
+        )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [2, _MAIN_LTD_ID])
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="DM-53614",
+        tracked_ref="tickets/DM-53614",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
+
+    assert await _push_outcomes() == {"tickets/DM-53614": "rebuilt"}
+    assert _ltd_paths(mock_discovery) == [
+        _MAIN_PATH,
+        f"/products/{_SLUG}/editions/",
+        "/editions/2",
+    ]
+    assert await _stamps(org_id) == {}
+
+
+@pytest.mark.asyncio
+async def test_push_check_prefers_the_newest_preemptive_tombstone_on_a_slug(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """Several tombstones on the ref's slug are tried newest first.
+
+    LTD recreated the ref's edition under the same slug, so two
+    ``lifecycle_preemptive`` rows name it. The older edition is gone
+    from LTD; the newer one was rebuilt. The check tries the highest LTD
+    id first and reads ``rebuilt`` from it, rather than settling on
+    whichever row it met first and reading ``not_found``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-tomb-pre-twice")
+        await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"tickets/DM-53614": _now() - timedelta(minutes=10)},
+        )
+        for ltd_id in (2, 3):
+            await _seed_preemptive_tombstone(
+                db_session, org_id=org_id, ltd_id=ltd_id, ltd_slug="DM-53614"
+            )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [2, 3, _MAIN_LTD_ID])
+    mock_discovery.get(f"{LTD_BASE}/editions/2").mock(
+        return_value=httpx.Response(404)
+    )
+    _stub_edition(
+        mock_discovery,
+        ltd_id=3,
+        slug="DM-53614",
+        tracked_ref="tickets/DM-53614",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
+
+    assert await _push_outcomes() == {"tickets/DM-53614": "rebuilt"}
+    assert _ltd_paths(mock_discovery) == [
+        _MAIN_PATH,
+        f"/products/{_SLUG}/editions/",
+        "/editions/3",
+    ]
+    assert await _stamps(org_id) == {}
+
+
+@pytest.mark.asyncio
+async def test_push_to_unrebuilt_preemptive_tombstone_is_unchanged(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """A tombstoned edition LTD has not rebuilt since its veto waits.
+
+    The push's CI has not uploaded yet: LTD's last rebuild predates the
+    tombstone, so the ref reads ``unchanged`` and keeps its stamp, as a
+    synced edition's would.
+    """
+    pushed_at = _now() - timedelta(minutes=10)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-tomb-pre-same")
+        await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"tickets/DM-53614": pushed_at},
+        )
+        await _seed_preemptive_tombstone(
+            db_session, org_id=org_id, ltd_id=2, ltd_slug="DM-53614"
+        )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [2, _MAIN_LTD_ID])
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="DM-53614",
+        tracked_ref="tickets/DM-53614",
+        date_rebuilt=_TOMBSTONED_AT - timedelta(days=165),
+    )
+
+    assert await _push_outcomes() == {"tickets/DM-53614": "unchanged"}
+    assert await _stamps(org_id) == {"tickets/DM-53614": pushed_at.isoformat()}
+
+
+@pytest.mark.asyncio
+async def test_push_to_rebuilt_lifecycle_deleted_edition_enqueues(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """A rebuilt edition a lifecycle rule reaped reads ``rebuilt``.
+
+    The reaped edition is soft-deleted, not gone: the check still finds
+    it as the ref's Docverse edition, through its tombstoned state row,
+    with no listing, and compares LTD's rebuild with the one the row
+    last saw.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-tomb-reaped")
+        project_id = await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"tickets/DM-1": _now() - timedelta(minutes=10)},
+        )
+        await _seed_synced_edition(
+            db_session,
+            org_id=org_id,
+            project_id=project_id,
+            slug="DM-1",
+            git_ref="tickets/DM-1",
+            ltd_id=2,
+        )
+        await EditionStore(session=db_session, logger=_logger()).soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="DM-1",
+            reason=TombstoneReason.lifecycle_delete,
+            note="draft_inactivity",
+        )
+    _stub_ltd(mock_discovery)
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="DM-1",
+        tracked_ref="tickets/DM-1",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
+
+    assert await _push_outcomes() == {"tickets/DM-1": "rebuilt"}
+    assert _ltd_paths(mock_discovery) == [_MAIN_PATH, "/editions/2"]
+    assert await _stamps(org_id) == {}
+
+
+@pytest.mark.asyncio
+async def test_push_to_manually_deleted_edition_is_not_found(
+    app: None, db_session: AsyncSession, mock_discovery: respx.Router
+) -> None:
+    """An operator's delete stays out of the check, rebuilt or not.
+
+    A ``manual_delete`` is a permanent veto no rebuild lifts, so the
+    edition is not the ref's: the listing check finds its tombstoned row
+    seen, and the ref reads ``not_found`` and keeps its stamp.
+    """
+    pushed_at = _now() - timedelta(minutes=10)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-tomb-manual")
+        project_id = await _seed_pushed_project(
+            db_session,
+            org_id=org_id,
+            pushed_refs={"tickets/DM-1": pushed_at},
+        )
+        await _seed_synced_edition(
+            db_session,
+            org_id=org_id,
+            project_id=project_id,
+            slug="DM-1",
+            git_ref="tickets/DM-1",
+            ltd_id=2,
+        )
+        await EditionStore(session=db_session, logger=_logger()).soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="DM-1",
+            reason=TombstoneReason.manual_delete,
+        )
+    _stub_ltd(mock_discovery)
+    _stub_listing(mock_discovery, [2, _MAIN_LTD_ID])
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="DM-1",
+        tracked_ref="tickets/DM-1",
+        date_rebuilt=_now() - timedelta(minutes=1),
+    )
+
+    assert await _push_outcomes() == {"tickets/DM-1": "not_found"}
+    assert await _stamps(org_id) == {"tickets/DM-1": pushed_at.isoformat()}
 
 
 @pytest.mark.asyncio

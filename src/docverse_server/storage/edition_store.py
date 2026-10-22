@@ -99,8 +99,12 @@ from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.edition import (
     DEFAULT_EDITION_SLUG,
     Edition,
+    EditionDeleteReason,
     EditionRepoint,
+    EnsuredEdition,
     RepointOutcome,
+    ReservedSlug,
+    SlugReservation,
 )
 from docverse_server.domain.edition_reconcile import ReconcileEdition
 from docverse_server.domain.project import FALLBACK_DEFAULT_BRANCH
@@ -112,6 +116,21 @@ from docverse_server.domain.version import (
     SemverVersion,
 )
 from docverse_server.storage.keeper_sync import ResourceType, TombstoneReason
+
+
+def _edition_delete_reason(reason: TombstoneReason) -> EditionDeleteReason:
+    """Map a soft-delete's tombstone reason onto ``editions.delete_reason``.
+
+    ``manual_delete`` and ``lifecycle_delete`` carry over as-is.
+    ``lifecycle_preemptive`` names an LTD edition that never reached
+    Docverse, so no soft-delete passes it today; should one, it is still
+    a lifecycle deletion — revivable — and folding it into
+    ``lifecycle_delete`` keeps the ``ck_editions_delete_reason``
+    constraint from failing the caller's transaction over it.
+    """
+    if reason is TombstoneReason.manual_delete:
+        return EditionDeleteReason.manual_delete
+    return EditionDeleteReason.lifecycle_delete
 
 
 class EditionStore:
@@ -157,6 +176,7 @@ class EditionStore:
             SqlEdition.date_created,
             SqlEdition.date_updated,
             SqlEdition.date_deleted,
+            SqlEdition.delete_reason,
         ).outerjoin(SqlBuild, SqlEdition.current_build_id == SqlBuild.id)
 
     def _validate(
@@ -213,10 +233,11 @@ class EditionStore:
         Used for system-created editions like ``__main`` where the slug
         does not conform to the user-facing pattern constraints in
         ``EditionCreate``. Every caller is a derivation — project
-        creation's default edition, the native tracking path's
-        auto-creation, the semver aggregates, keeper-sync's import — so
-        the row is stamped ``derived`` and stays the system's to
-        reconverge as rules change.
+        creation's default edition, keeper-sync's import — so the row is
+        stamped ``derived`` and stays the system's to reconverge as
+        rules change. The native tracking path's auto-creation and its
+        semver aggregates go through :meth:`revive_or_create` instead,
+        which also settles a slug a soft-deleted edition still holds.
 
         Race-tolerant: a concurrent transaction that already inserted
         the same ``(project_id, lower(slug))`` makes this insert a
@@ -257,6 +278,257 @@ class EditionStore:
             )
             raise RuntimeError(msg)
         return existing
+
+    async def revive_or_create(
+        self,
+        *,
+        project_id: int,
+        slug: str,
+        title: str,
+        kind: EditionKind,
+        tracking_mode: TrackingMode,
+        tracking_params: dict[str, Any] | None = None,
+        alternate_name: str | None = None,
+        match_tracking_mode: bool = False,
+    ) -> EnsuredEdition | ReservedSlug:
+        """Ensure a derived edition holds *slug*, reviving a reaped one.
+
+        The primitive behind the derivation paths that auto-create
+        editions (PRD #830). ``uq_editions_project_lower_slug`` is not
+        partial, so a soft-deleted edition keeps its slug, and
+        :meth:`create_internal`'s ``ON CONFLICT DO NOTHING`` against it
+        inserts nothing and finds no live row. This settles that clash
+        by why the edition was deleted:
+
+        - Slug free: inserted exactly as :meth:`create_internal` would.
+        - Slug held by a live edition: that edition, untouched — the
+          same race-tolerant answer :meth:`create_internal` gives.
+        - Slug held by a soft-deleted edition whose ``delete_reason`` is
+          ``lifecycle_delete`` or ``NULL``: revived in place. The row
+          keeps its id, slug, title, ``lifecycle_exempt``,
+          ``alternate_name``, current build, and build history; loses
+          ``date_deleted`` and ``delete_reason``; and takes this
+          derivation's tracking — and its kind, unless an operator
+          declared one — so the build that triggered the revive
+          matches it. Any keeper-sync tombstone on the edition's state
+          row is cleared in the same transaction, since the edition it
+          vetoes is live again.
+        - Slug held by a ``manual_delete`` edition: a
+          :class:`~docverse_server.domain.edition.ReservedSlug` with
+          reason ``manual_delete``. An operator's delete is a permanent
+          veto that only the admin restore lifts, so the caller tracks
+          no edition for the slug.
+
+        With *match_tracking_mode*, a lifecycle-deleted (or ``NULL``)
+        edition is revived only when it already tracks *tracking_mode*;
+        one tracking anything else stays deleted, untouched, and the
+        slug comes back reserved with reason ``tracking_mismatch``. The
+        semver aggregate derivations set it, so they treat a deleted
+        edition on another tracking mode the way they treat a live one:
+        an operator's reaped ``2`` on git ref ``2`` is not theirs to turn
+        into the ``semver_major`` aggregate. A ``manual_delete`` is
+        reported as such whatever the edition tracked. The derivations
+        that settle a slug by the ref it names — native auto-creation,
+        keeper-sync's import — leave it off: the slug is the ref's,
+        whatever the reaped edition tracked.
+
+        The soft-deleted row is read under ``FOR UPDATE``, so two
+        revives of one slug serialize: the second waits, finds the row
+        live, and returns it unrevived.
+
+        Raises
+        ------
+        RuntimeError
+            If the insert conflicted yet no row holds the slug — not a
+            race this method can lose, so an invariant violation.
+        """
+        stmt = (
+            pg_insert(SqlEdition)
+            .values(
+                slug=slug,
+                title=title,
+                project_id=project_id,
+                kind=kind,
+                kind_source=EditionKindSource.derived,
+                tracking_mode=tracking_mode,
+                tracking_params=tracking_params,
+                alternate_name=alternate_name,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    SqlEdition.project_id,
+                    func.lower(SqlEdition.slug),
+                ],
+            )
+        )
+        await self._session.execute(stmt)
+        live = await self.get_by_slug(project_id=project_id, slug=slug)
+        if live is not None:
+            return EnsuredEdition(edition=live, revived=False)
+
+        row = await self._lock_deleted_row(project_id=project_id, slug=slug)
+        if row is None:
+            # A concurrent revive committed while this one waited on
+            # the row lock, so the row no longer reads as deleted.
+            live = await self.get_by_slug(project_id=project_id, slug=slug)
+            if live is not None:
+                return EnsuredEdition(edition=live, revived=False)
+            msg = (
+                "revive_or_create lost ON CONFLICT race but no existing "
+                f"edition found for project_id={project_id} slug={slug!r}"
+            )
+            raise RuntimeError(msg)
+
+        if row.delete_reason == EditionDeleteReason.manual_delete.value:
+            return ReservedSlug(
+                edition=self._validate(row, None),
+                reason=SlugReservation.manual_delete,
+            )
+        if match_tracking_mode and row.tracking_mode != tracking_mode:
+            return ReservedSlug(
+                edition=self._validate(row, None),
+                reason=SlugReservation.tracking_mismatch,
+            )
+
+        row.tracking_mode = tracking_mode
+        row.tracking_params = tracking_params
+        if row.kind_source == EditionKindSource.derived:
+            row.kind = kind
+        revived = await self._revive_row(row)
+        return EnsuredEdition(edition=revived, revived=True)
+
+    async def restore(self, *, project_id: int, slug: str) -> Edition | None:
+        """Bring a soft-deleted edition back in place, whatever its reason.
+
+        Backs the admin ``POST .../editions/{edition}/restore`` endpoint
+        (PRD #830), the one way back for an edition an operator deleted:
+        :meth:`revive_or_create` honours a ``manual_delete`` as a veto,
+        and this is the operator lifting it. Unlike that derivation
+        path nothing is re-derived — the edition comes back exactly as
+        it was deleted (id, slug, title, kind, tracking,
+        ``lifecycle_exempt``, ``alternate_name``, current build, build
+        history), less ``date_deleted`` and ``delete_reason``. Any
+        keeper-sync tombstone on the edition's state row is cleared in
+        the same transaction, so keeper-sync stops skipping an edition
+        that is live again.
+
+        The deleted row is read under ``FOR UPDATE``, so a restore and a
+        native revive of the same slug serialize; whichever waits finds
+        the row live.
+
+        Returns
+        -------
+        Edition or None
+            The revived edition, or ``None`` when no soft-deleted
+            edition holds *slug* — including when a live one does: this
+            addresses only the rows ordinary reads hide.
+        """
+        row = await self._lock_deleted_row(project_id=project_id, slug=slug)
+        if row is None:
+            return None
+        return await self._revive_row(row)
+
+    async def _lock_deleted_row(
+        self, *, project_id: int, slug: str
+    ) -> SqlEdition | None:
+        """Read the soft-deleted edition holding *slug*, locked for update.
+
+        ``populate_existing`` asks for the locked row's values rather
+        than whatever an earlier read left in the identity map, so a
+        caller that waited behind a concurrent revive sees what that
+        revive wrote: a row it made live no longer matches, and this
+        returns ``None``.
+        """
+        return (
+            await self._session.execute(
+                select(SqlEdition)
+                .where(
+                    SqlEdition.project_id == project_id,
+                    func.lower(SqlEdition.slug) == slug.lower(),
+                    SqlEdition.date_deleted.is_not(None),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+
+    async def _revive_row(self, row: SqlEdition) -> Edition:
+        """Clear a locked, soft-deleted row's deletion and its tombstone.
+
+        The shared tail of :meth:`revive_or_create` and :meth:`restore`.
+        Whatever the caller already set on *row* is flushed together
+        with the cleared ``date_deleted`` / ``delete_reason``, the
+        keeper-sync tombstone on the edition's state row (if any) is
+        cleared, and the edition is read back as the live row it now
+        is.
+
+        Raises
+        ------
+        RuntimeError
+            If the edition does not read as live after the flush — an
+            invariant violation, since the caller holds the row lock.
+        """
+        previous_reason = row.delete_reason
+        row.date_deleted = None
+        row.delete_reason = None
+        await self._session.flush()
+        tombstone_cleared = await self._clear_edition_tombstone(row)
+
+        revived = await self.get_by_slug(
+            project_id=row.project_id, slug=row.slug
+        )
+        if revived is None:
+            msg = (
+                f"Edition id={row.id} is not live after reviving it for "
+                f"project_id={row.project_id} slug={row.slug!r}"
+            )
+            raise RuntimeError(msg)
+        self._logger.info(
+            "Revived soft-deleted edition",
+            edition_id=revived.id,
+            edition_slug=revived.slug,
+            project_id=row.project_id,
+            previous_delete_reason=previous_reason,
+            tombstone_cleared=tombstone_cleared,
+        )
+        return revived
+
+    async def _clear_edition_tombstone(self, row: SqlEdition) -> bool:
+        """Clear the keeper-sync tombstones on *row*'s state rows, if any.
+
+        The state rows are found by ``(org_id, resource_type='edition',
+        docverse_id)``; the org comes from the edition's project. A
+        native edition has no state row and a live one no tombstone, so
+        matching nothing is the common case. That triple is not a
+        unique key — edition state rows are unique on ``ltd_id`` — so an
+        LTD edition deleted and recreated under the same slug leaves
+        more than one row naming this edition, and every one of them is
+        cleared.
+
+        Returns
+        -------
+        bool
+            Whether any tombstone was cleared.
+        """
+        result = await self._session.execute(
+            update(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.org_id
+                == select(SqlProject.org_id)
+                .where(SqlProject.id == row.project_id)
+                .scalar_subquery(),
+                SqlKeeperSyncState.resource_type == ResourceType.edition.value,
+                SqlKeeperSyncState.docverse_id == row.id,
+                SqlKeeperSyncState.date_tombstoned.is_not(None),
+            )
+            .values(
+                date_tombstoned=None,
+                tombstone_reason=None,
+                tombstone_note=None,
+            )
+            .returning(SqlKeeperSyncState.id)
+        )
+        return len(result.scalars().all()) > 0
 
     async def get_by_slug(
         self, *, project_id: int, slug: str
@@ -1179,6 +1451,7 @@ class EditionStore:
         project_id: int,
         slug: str,
         reason: TombstoneReason,
+        note: str | None = None,
     ) -> bool:
         """Soft-delete an edition and stamp the keeper-sync tombstone.
 
@@ -1190,6 +1463,17 @@ class EditionStore:
         <edition.id>)``). The tombstone write is a no-op when no state
         row exists for this edition (e.g. a manually-created edition
         never imported from LTD).
+
+        The same flush stamps ``editions.delete_reason`` from
+        ``reason`` (PRD #830), which is the only record of *why* a
+        native edition — one with no state row — was deleted; see
+        :func:`_edition_delete_reason` for the mapping.
+
+        ``note`` is written to the state row's ``tombstone_note``.
+        Lifecycle callers pass the ``type`` of the rule that matched
+        (``draft_inactivity`` / ``ref_deleted``), the only record of
+        which rule retired the edition; the API DELETE handler passes
+        nothing, so a ``manual_delete`` tombstone keeps an empty note.
 
         Returns
         -------
@@ -1207,6 +1491,7 @@ class EditionStore:
         if row is None:
             return False
         row.date_deleted = func.now()
+        row.delete_reason = _edition_delete_reason(reason).value
         await self._session.execute(
             update(SqlKeeperSyncState)
             .where(
@@ -1217,7 +1502,7 @@ class EditionStore:
             .values(
                 date_tombstoned=func.now(),
                 tombstone_reason=reason.value,
-                tombstone_note=None,
+                tombstone_note=note,
             )
         )
         await self._session.flush()
@@ -1249,9 +1534,12 @@ class EditionStore:
         ``func.now()`` is the same instant on every row it touches and
         on the project row the caller is stamping.
 
-        An edition already soft-deleted by hand is excluded by the
-        ``date_deleted IS NULL`` predicate and keeps its earlier
-        timestamp and its own tombstone reason.
+        Each cascaded edition's ``delete_reason`` is stamped from the
+        same ``reason`` in the same statement as its ``date_deleted``.
+        An edition already soft-deleted by hand — or by a lifecycle
+        rule — is excluded by the ``date_deleted IS NULL`` predicate
+        and keeps its earlier timestamp, its own ``delete_reason``, and
+        its own tombstone reason.
 
         Returns
         -------
@@ -1266,7 +1554,10 @@ class EditionStore:
                 SqlEdition.project_id == project_id,
                 SqlEdition.date_deleted.is_(None),
             )
-            .values(date_deleted=func.now())
+            .values(
+                date_deleted=func.now(),
+                delete_reason=_edition_delete_reason(reason).value,
+            )
             .returning(SqlEdition.id)
         )
         edition_ids = [row[0] for row in result.all()]
@@ -1385,7 +1676,7 @@ class EditionStore:
         return self._validate(edition_row, build_public_id, build_git_ref)
 
     async def list_git_ref_tracking_editions(
-        self, *, project_id: int, git_ref: str
+        self, *, project_id: int, git_ref: str, include_revivable: bool = False
     ) -> list[Edition]:
         """List every live ``git_ref``-mode edition tracking ``git_ref``.
 
@@ -1401,15 +1692,30 @@ class EditionStore:
         ignored. The ``tracking_params->>'git_ref'`` equality is applied
         in the database.
 
+        ``include_revivable=True`` also returns the soft-deleted editions
+        that activity brings back (PRD #830): those whose
+        ``delete_reason`` is ``lifecycle_delete`` or ``NULL``, as
+        :meth:`revive_or_create` revives. A ``manual_delete`` edition
+        stays out.
+
         Returns the matches in creation order (``date_created``, then
         ``id``); usually one.
         """
+        if include_revivable:
+            deleted_clause = or_(
+                SqlEdition.date_deleted.is_(None),
+                SqlEdition.delete_reason.is_distinct_from(
+                    EditionDeleteReason.manual_delete.value
+                ),
+            )
+        else:
+            deleted_clause = SqlEdition.date_deleted.is_(None)
         stmt = (
             self._base_query()
             .where(
                 SqlEdition.project_id == project_id,
                 SqlEdition.tracking_mode == TrackingMode.git_ref,
-                SqlEdition.date_deleted.is_(None),
+                deleted_clause,
                 SqlEdition.tracking_params["git_ref"].astext == git_ref,
             )
             .order_by(SqlEdition.date_created, SqlEdition.id)

@@ -45,7 +45,11 @@ from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
 from docverse_server.storage.edition_store import EditionStore
-from docverse_server.storage.keeper_sync import TombstoneReason
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+    TombstoneReason,
+)
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from tests.support.rowlocks import (
@@ -612,3 +616,56 @@ async def test_advance_to_build_refuses_an_older_build(
             session=db_session, logger=_logger()
         ).list_by_edition(seeded.edition_id)
     assert history == []
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_threads_note_to_the_tombstone(
+    db_session: AsyncSession,
+) -> None:
+    """``soft_delete(note=...)`` lands on the state row's note.
+
+    Every lifecycle caller goes through the service, so the note has to
+    reach the store's tombstone write rather than stop here.
+    """
+    logger = _logger()
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        seeded = await _seed(db_session, n_builds=0)
+        draft = await EditionStore(session=db_session, logger=logger).create(
+            project_id=seeded.project_id,
+            data=EditionCreate(
+                slug="dm-1",
+                title="DM-1",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": "tickets/DM-1"},
+            ),
+        )
+        await state_store.upsert(
+            org_id=seeded.org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=6161,
+            ltd_slug="dm-1",
+            docverse_id=draft.id,
+        )
+        deleted = await _edition_service(db_session).soft_delete(
+            org_id=seeded.org_id,
+            project_id=seeded.project_id,
+            edition_id=draft.id,
+            edition_slug=draft.slug,
+            reason=TombstoneReason.lifecycle_delete,
+            note="ref_deleted",
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=seeded.org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=6161,
+            include_tombstoned=True,
+        )
+    assert deleted is True
+    assert state is not None
+    assert state.tombstone_reason == "lifecycle_delete"
+    assert state.tombstone_note == "ref_deleted"

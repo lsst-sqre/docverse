@@ -17,6 +17,7 @@ from .models import (
     Build,
     BuildStatus,
     BuildUpdate,
+    Edition,
     KeeperSyncConfig,
     KeeperSyncConfigUpdate,
     OrganizationSummary,
@@ -451,6 +452,45 @@ class DocverseClient:
         response = await self._client.post(url)
         _raise_for_status(response)
         return Build.model_validate(response.json())
+
+    async def restore_edition(
+        self, org: str, project: str, edition: str
+    ) -> Edition:
+        """Restore a soft-deleted edition.
+
+        Brings the edition back in place — same slug, tracking, and
+        build history — whether an admin deleted it or a lifecycle rule
+        retired it, and clears its keeper-sync tombstone if it was
+        imported from LTD Keeper. The server republishes the edition's
+        current build, unless that build was itself deleted or purged,
+        and rebuilds the project's dashboard. Requires the admin role.
+
+        Parameters
+        ----------
+        org
+            Organization slug.
+        project
+            Project slug.
+        edition
+            Edition slug.
+
+        Returns
+        -------
+        Edition
+            The restored edition. Its ``publish_status`` is ``pending``
+            when a republish was queued.
+
+        Raises
+        ------
+        DocverseClientError
+            With ``status_code`` 404 if there is no soft-deleted edition
+            with that slug — a live edition included, and ``__main``,
+            which cannot be deleted.
+        """
+        url = f"/orgs/{org}/projects/{project}/editions/{edition}/restore"
+        response = await self._client.post(url)
+        _raise_for_status(response)
+        return Edition.model_validate(response.json())
 
     async def upload_tarball(
         self, upload_url: str, tarball_path: Path

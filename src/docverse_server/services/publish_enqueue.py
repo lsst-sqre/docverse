@@ -23,10 +23,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from structlog.stdlib import BoundLogger
 
 from docverse.models.queue_enums import JobKind, PublishStatus
 from docverse_server.domain.base32id import serialize_base32_id
+from docverse_server.domain.build import Build
+from docverse_server.domain.edition import Edition
 from docverse_server.metrics import EditionPublishTrigger
+from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
@@ -34,7 +38,11 @@ from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.queue_backend import QueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
 
-__all__ = ["PublishEnqueueResult", "enqueue_publish_for_edition"]
+__all__ = [
+    "PublishEnqueueResult",
+    "enqueue_publish_for_edition",
+    "load_republishable_build",
+]
 
 
 class PublishEnqueueResult:
@@ -217,3 +225,65 @@ async def enqueue_publish_for_edition(
         queue_job_public_id=child_public_id,
         backend_job_id=enqueued.id,
     )
+
+
+async def load_republishable_build(
+    *,
+    build_store: BuildStore,
+    edition: Edition,
+    logger: BoundLogger,
+) -> Build | None:
+    """Return a restored edition's current build if it can be published.
+
+    The one guard every path that brings an edition back from a delete
+    runs before it republishes the edition (PRD #830): the admin restore
+    (:meth:`EditionService.restore
+    <docverse_server.services.edition.EditionService.restore>`) and
+    keeper-sync's republish of an edition its visit restored. The delete
+    took the edition off the CDN, so coming back means publishing its
+    current build again — but only a build whose content is still
+    served. A soft-deleted build is on its way to the purgatory sweep,
+    and a purged one has no objects left, so a publish of either would
+    point the CDN at nothing, or fail its copy into Sentry and the
+    reaper. A lifecycle-deleted edition can sit retired long enough for
+    the sweep to reclaim its build, which is the case this exists for.
+
+    The build is read under its row lock (editions, then builds, per the
+    stores' lock order), so a build delete racing the caller's
+    transaction is either seen here or waits for it. The lock ends with
+    that transaction, and ``publish_edition`` re-checks both stamps at
+    pickup for any delete that lands later.
+
+    Returns
+    -------
+    Build or None
+        The live current build, or ``None`` when there is nothing to
+        republish — the edition never had a build (logged at info), or
+        its build is missing, soft-deleted, or purged (logged as a
+        warning naming which). Neither is an error: the edition stays
+        restored, just unpublished.
+    """
+    if edition.current_build_id is None:
+        logger.info(
+            "Restored edition has no build to republish",
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+        )
+        return None
+    build = await build_store.get_for_update(build_id=edition.current_build_id)
+    if (
+        build is None
+        or build.date_deleted is not None
+        or build.date_purged is not None
+    ):
+        logger.warning(
+            "Restored edition without republishing; its current build "
+            "is not live",
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            build_id=edition.current_build_id,
+            build_deleted=build is None or build.date_deleted is not None,
+            build_purged=build is not None and build.date_purged is not None,
+        )
+        return None
+    return build

@@ -738,7 +738,10 @@ async def test_process_unpublish_failure_propagates(
 async def test_process_writes_lifecycle_delete_tombstone(
     db_session: AsyncSession,
 ) -> None:
-    """A webhook-driven soft-delete stamps a ``lifecycle_delete`` tombstone."""
+    """A webhook-driven soft-delete stamps a ``lifecycle_delete`` tombstone.
+
+    The note names the ``ref_deleted`` rule the delivery applied.
+    """
     async with db_session.begin():
         org_id = await _seed_org(db_session, "ref-del-tomb")
         project_id = await _seed_project(
@@ -780,3 +783,4 @@ async def test_process_writes_lifecycle_delete_tombstone(
     assert state is not None
     assert state.date_tombstoned is not None
     assert state.tombstone_reason == "lifecycle_delete"
+    assert state.tombstone_note == "ref_deleted"

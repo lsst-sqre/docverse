@@ -74,14 +74,20 @@ class LifecycleAction(StrEnum):
     than a distinct event type per CRUD verb, one ``project_lifecycle`` /
     ``edition_lifecycle`` event carries the verb in this field. The
     emission site selects the action statically (each handler knows its
-    own operation). ``rollback`` applies only to editions; projects emit
-    just ``create``/``update``/``delete``.
+    own operation). ``rollback`` and ``restore`` apply only to editions;
+    projects emit just ``create``/``update``/``delete``.
     """
 
     create = "create"
     update = "update"
     delete = "delete"
     rollback = "rollback"
+
+    restore = "restore"
+    """A soft-deleted edition came back in place (PRD #830): a native
+    build for a lifecycle-deleted edition's ref revived it, keeper-sync
+    cleared its lifecycle tombstone, or an admin restored it through
+    ``POST .../editions/{edition}/restore``."""
 
 
 class MembershipChangeAction(StrEnum):

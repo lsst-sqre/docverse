@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 import structlog
 from httpx import AsyncClient
+from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 
 from docverse.models import (
@@ -17,10 +18,12 @@ from docverse.models import (
     ProjectCreate,
     TrackingMode,
 )
+from docverse_server.config import Configuration
 from docverse_server.domain.base32id import (
     serialize_base32_id,
     validate_base32_id,
 )
+from docverse_server.factory import Factory
 from docverse_server.services.keeper_sync_tombstone import (
     KeeperSyncTombstoneService,
 )
@@ -270,6 +273,54 @@ async def test_list_tombstones_returns_recorded_rows(
     assert entry["self_url"].endswith(
         f"/orgs/{_ORG}/keeper-sync/tombstones/{tombstone_id}"
     )
+
+
+@pytest.mark.asyncio
+async def test_list_tombstones_shows_lifecycle_rule_in_note(
+    client: AsyncClient,
+) -> None:
+    """A lifecycle reap's tombstone lists the matched rule as its note.
+
+    Every lifecycle write site soft-deletes through
+    ``EditionService.soft_delete`` with the matched rule's ``type`` as
+    the note (PRD #830), so the listing tells an operator which rule
+    retired an edition without reading worker logs.
+    """
+    await _setup(client)
+    org_id = await _get_org_id()
+    project_id, edition_id = await _seed_imported_edition(
+        org_id=org_id,
+        project_slug="rule-proj",
+        edition_slug="aged-draft",
+        ltd_id=3030,
+    )
+    async for session in db_session_dependency():
+        async with session.begin():
+            factory = Factory(
+                session=session,
+                logger=_logger(),
+                arq_queue=MockArqQueue(),
+                default_queue_name=Configuration().arq_queue_name,
+            )
+            await factory.create_edition_service().soft_delete(
+                org_id=org_id,
+                project_id=project_id,
+                edition_id=edition_id,
+                edition_slug="aged-draft",
+                reason=TombstoneReason.lifecycle_delete,
+                note="draft_inactivity",
+            )
+            await session.commit()
+
+    response = await client.get(
+        f"/docverse/orgs/{_ORG}/keeper-sync/tombstones",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert [entry["ltd_id"] for entry in body] == [3030]
+    assert body[0]["tombstone_reason"] == "lifecycle_delete"
+    assert body[0]["tombstone_note"] == "draft_inactivity"
 
 
 @pytest.mark.asyncio

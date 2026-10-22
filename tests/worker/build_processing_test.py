@@ -51,7 +51,11 @@ from docverse_server.domain.content_hash import (
 from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
 from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.factory import Factory
-from docverse_server.metrics import build_event_manager
+from docverse_server.metrics import (
+    LifecycleAction,
+    MetricsEditionKind,
+    build_event_manager,
+)
 from docverse_server.services.build import BuildService
 from docverse_server.services.edition_tracking import EditionTrackingService
 from docverse_server.services.lock_service import (
@@ -64,6 +68,7 @@ from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
 from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import TombstoneReason
 from docverse_server.storage.objectstore import MockObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
@@ -4531,3 +4536,219 @@ async def test_build_processing_cancel_fails_the_job_and_the_build(
             assert refreshed is not None
             assert refreshed.status == BuildStatus.failed
         break
+
+
+# ── Reviving lifecycle-deleted editions (PRD #830) ─────────────────────────
+
+
+async def _stage_build_for_deleted_edition(
+    db_session: AsyncSession,
+    mock_store: MockObjectStore,
+    *,
+    reason: TombstoneReason,
+    backend_job_id: str,
+) -> tuple[Any, Any, Build, int]:
+    """Soft-delete a ``feature-x`` draft and stage a new build for its ref.
+
+    Returns the org, the project, the staged ``processing`` build, and
+    the deleted edition's id.
+    """
+    logger = _logger()
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        edition_store = EditionStore(session=db_session, logger=logger)
+        edition = await edition_store.create_internal(
+            project_id=project.id,
+            slug="feature-x",
+            title="feature-x",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "feature/x"},
+        )
+        assert await edition_store.soft_delete(
+            org_id=org.id,
+            project_id=project.id,
+            slug="feature-x",
+            reason=reason,
+        )
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="feature/x"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id=backend_job_id,
+        )
+
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=_make_tarball({"index.html": b"<html>back</html>"}),
+        content_type="application/gzip",
+    )
+    return org, project, build, edition.id
+
+
+@pytest.mark.asyncio
+async def test_build_processing_revives_lifecycle_deleted_edition(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build for a reaped draft's ref revives and republishes it.
+
+    The edition comes back with its id and is treated like a newly
+    created one: a ``publish_edition`` job for the new build, a
+    ``dashboard_build`` for the project, and one ``edition_lifecycle``
+    ``restore`` event. Nothing reaches Sentry.
+    """
+    mock_store = MockObjectStore()
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    _manager, events = await build_event_manager(Configuration())
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+    org, project, build, edition_id = await _stage_build_for_deleted_edition(
+        db_session,
+        mock_store,
+        reason=TombstoneReason.lifecycle_delete,
+        backend_job_id="test-arq-revive",
+    )
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        arq_queue=mock_arq,
+        job_id="test-arq-revive",
+        events=events,
+    )
+    result = await build_processing(
+        ctx,
+        {
+            "org_id": org.id,
+            "org_slug": org.slug,
+            "project_slug": project.slug,
+            "build_id": build.id,
+            "build_public_id": serialize_base32_id(build.public_id),
+        },
+    )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert captured == []
+    publish_jobs = get_jobs_by_name(
+        mock_arq, "publish_edition", queue_name=_config.arq_queue_name
+    )
+    assert [job.kwargs["payload"]["edition_id"] for job in publish_jobs] == [
+        edition_id
+    ]
+    assert publish_jobs[0].kwargs["payload"]["build_id"] == build.id
+    assert (
+        count_jobs_by_name(
+            mock_arq, "dashboard_build", queue_name=_config.arq_queue_name
+        )
+        == 1
+    )
+
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == org.slug
+    assert event.project == project.slug
+    assert event.action is LifecycleAction.restore
+    assert event.edition_kind is MetricsEditionKind.draft
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            edition_store = EditionStore(session=session, logger=_logger())
+            edition = await edition_store.get_by_id(edition_id)
+            assert edition is not None
+            assert edition.current_build_id == build.id
+            assert edition.publish_status == PublishStatus.pending
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id("test-arq-revive")
+            assert job is not None
+            assert job.status == JobStatus.completed
+
+
+@pytest.mark.asyncio
+async def test_build_processing_skips_manually_deleted_edition_quietly(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build for an operator-deleted slug completes, tracking nothing.
+
+    The build is stored and the job completes without errors; the
+    edition stays deleted, nothing is published or announced, and —
+    unlike the ``lost ON CONFLICT race`` this replaces — nothing is
+    captured to Sentry.
+    """
+    mock_store = MockObjectStore()
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    _manager, events = await build_event_manager(Configuration())
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+    org, project, build, edition_id = await _stage_build_for_deleted_edition(
+        db_session,
+        mock_store,
+        reason=TombstoneReason.manual_delete,
+        backend_job_id="test-arq-manual",
+    )
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        arq_queue=mock_arq,
+        job_id="test-arq-manual",
+        events=events,
+    )
+    with capture_logs() as logs:
+        result = await build_processing(
+            ctx,
+            {
+                "org_id": org.id,
+                "org_slug": org.slug,
+                "project_slug": project.slug,
+                "build_id": build.id,
+                "build_public_id": serialize_base32_id(build.public_id),
+            },
+        )
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert captured == []
+    assert any(
+        entry["event"]
+        == "Edition slug reserved by manual delete; build not tracked"
+        and entry["log_level"] == "warning"
+        for entry in logs
+    )
+    assert count_jobs_by_name(mock_arq, "publish_edition") == 0
+    assert count_jobs_by_name(mock_arq, "dashboard_build") == 0
+    publisher = events.edition_lifecycle
+    assert isinstance(publisher, MockEventPublisher)
+    assert publisher.published == []
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            build_store = BuildStore(session=session, logger=_logger())
+            stored = await build_store.get_by_id(build.id)
+            assert stored is not None
+            assert stored.status == BuildStatus.completed
+            edition_store = EditionStore(session=session, logger=_logger())
+            assert await edition_store.get_by_id(edition_id) is None
+            qjs = QueueJobStore(session=session, logger=_logger())
+            job = await qjs.get_by_backend_job_id("test-arq-manual")
+            assert job is not None
+            assert job.status == JobStatus.completed

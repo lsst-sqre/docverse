@@ -19,6 +19,7 @@ from docverse_server.metrics import (
     HttpMethod,
     HttpStatusClass,
     KeeperSyncPushCheckOutcome,
+    LifecycleAction,
     LifecycleActionTrigger,
     LifecycleReapAction,
     WebhookOutcome,
@@ -34,6 +35,16 @@ def test_purgatory_cleanup_is_a_lifecycle_action_trigger() -> None:
     borrowing ``lifecycle_eval``'s.
     """
     assert LifecycleActionTrigger.purgatory_cleanup == "purgatory_cleanup"
+
+
+def test_restore_is_a_lifecycle_action() -> None:
+    """A revived edition is announced as ``restore`` (PRD #830).
+
+    Distinct from ``create`` so a dashboard can tell an edition that
+    came back — same id, same history — from one seen for the first
+    time.
+    """
+    assert LifecycleAction.restore == "restore"
 
 
 def test_retention_expired_is_a_lifecycle_reap_action() -> None:

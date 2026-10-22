@@ -100,6 +100,15 @@ class SqlEdition(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Why ``date_deleted`` was stamped (PRD #830): one of
+    # ``EditionDeleteReason``'s values, written in the same flush by the
+    # ``EditionStore`` soft-delete chokepoints. ``NULL`` on live rows and
+    # on soft-deleted rows that predate the column without a keeper-sync
+    # tombstone to backfill from; consumers read ``NULL`` as revivable.
+    delete_reason: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+
     __table_args__ = (
         Index(
             "uq_editions_project_lower_slug",
@@ -110,6 +119,11 @@ class SqlEdition(Base):
         CheckConstraint(
             "(kind = 'main') = (slug = '__main')",
             name="ck_editions_main_slug_kind",
+        ),
+        CheckConstraint(
+            "delete_reason IS NULL OR delete_reason IN "
+            "('manual_delete', 'lifecycle_delete')",
+            name="ck_editions_delete_reason",
         ),
         Index("idx_editions_project_id", "project_id"),
     )

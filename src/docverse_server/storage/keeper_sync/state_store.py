@@ -11,14 +11,14 @@ slugs are only unique within a product.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from pydantic import BaseModel, ConfigDict
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnElement
 
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "LIFECYCLE_TOMBSTONE_REASONS",
     "KeeperSyncState",
     "KeeperSyncStateStore",
     "ResourceType",
@@ -58,16 +59,44 @@ class TombstoneReason(StrEnum):
     """
 
     manual_delete = "manual_delete"
-    """Operator-driven soft-delete of the Docverse-side resource."""
+    """Operator-driven soft-delete of the Docverse-side resource.
+
+    A permanent veto: keeper-sync never judges it again, and only an
+    operator lifts it, by clearing the tombstone or restoring the
+    edition. Keeper-sync writes one itself on an LTD edition whose
+    Docverse slug an operator-deleted edition still holds, naming that
+    edition as ``docverse_id`` (issue #841)."""
 
     lifecycle_delete = "lifecycle_delete"
     """Automated soft-delete by ``lifecycle_eval`` / ``git_ref_audit`` /
-    the ``ref_deleted`` webhook."""
+    the ``ref_deleted`` webhook.
+
+    Reversible by activity (PRD #830): keeper-sync judges it again once
+    LTD rebuilds the edition, and clears it when no rule matches."""
 
     lifecycle_preemptive = "lifecycle_preemptive"
     """Sync itself short-circuited an LTD edition that the lifecycle
     rules would immediately delete, before the build content was
-    copied. No matching Docverse row exists in this case."""
+    copied. No matching Docverse row exists in this case.
+
+    Reversible by activity, as ``lifecycle_delete`` is."""
+
+
+#: Tombstone reasons that activity on LTD can lift (PRD #830).
+#:
+#: A lifecycle rule retired these editions for inactivity or a deleted
+#: ref, and an LTD rebuild of the edition is what can undo either: the
+#: keeper-sync service judges such a tombstone again on a rebuild, and
+#: the tier crons and the push hot path keep these rows in view so a
+#: rebuild alone brings the project in for that judgement.
+#: ``manual_delete`` is left out: an operator's delete is a permanent
+#: veto that only the operator lifts.
+LIFECYCLE_TOMBSTONE_REASONS = frozenset(
+    {
+        TombstoneReason.lifecycle_preemptive.value,
+        TombstoneReason.lifecycle_delete.value,
+    }
+)
 
 
 class KeeperSyncState(BaseModel):
@@ -147,6 +176,18 @@ class KeeperSyncState(BaseModel):
     date_tombstoned: datetime | None = None
     tombstone_reason: str | None = None
     tombstone_note: str | None = None
+
+    @property
+    def is_lifecycle_tombstone(self) -> bool:
+        """Whether a lifecycle rule tombstoned the row.
+
+        True for the reasons in :data:`LIFECYCLE_TOMBSTONE_REASONS`,
+        which an LTD rebuild of the edition can lift (PRD #830).
+        """
+        return (
+            self.date_tombstoned is not None
+            and self.tombstone_reason in LIFECYCLE_TOMBSTONE_REASONS
+        )
 
 
 def _key_clauses(
@@ -296,6 +337,7 @@ class KeeperSyncStateStore:
         ltd_ids: Iterable[int] | None = None,
         docverse_ids: Iterable[int] | None = None,
         include_tombstoned: bool = False,
+        include_lifecycle_tombstoned: bool = False,
     ) -> list[KeeperSyncState]:
         """Return every state row for ``(org_id, resource_type)``.
 
@@ -316,7 +358,11 @@ class KeeperSyncStateStore:
         convergence and short-circuit callers see a tombstoned LTD
         resource as "not present"; admin endpoints and the
         tombstone-service write path opt in with
-        ``include_tombstoned=True``.
+        ``include_tombstoned=True``. ``include_lifecycle_tombstoned=True``
+        opts in only the rows a lifecycle rule tombstoned
+        (:data:`LIFECYCLE_TOMBSTONE_REASONS`), which an LTD rebuild can
+        lift, and still leaves ``manual_delete`` rows out: the tier
+        crons' and the push hot path's view (PRD #830).
         """
         if ltd_ids is not None:
             ltd_id_list = list(ltd_ids)
@@ -340,7 +386,16 @@ class KeeperSyncStateStore:
             clauses.append(
                 SqlKeeperSyncState.docverse_id.in_(docverse_id_list)
             )
-        if not include_tombstoned:
+        if include_lifecycle_tombstoned and not include_tombstoned:
+            clauses.append(
+                or_(
+                    SqlKeeperSyncState.date_tombstoned.is_(None),
+                    SqlKeeperSyncState.tombstone_reason.in_(
+                        LIFECYCLE_TOMBSTONE_REASONS
+                    ),
+                )
+            )
+        elif not include_tombstoned:
             clauses.append(SqlKeeperSyncState.date_tombstoned.is_(None))
         stmt = select(SqlKeeperSyncState).where(*clauses)
         result = await self._session.execute(stmt)
@@ -591,5 +646,83 @@ class KeeperSyncStateStore:
             if clear_date_rebuilt_seen:
                 row.date_rebuilt_seen = None
         await self._session.flush()
+        await self._session.refresh(row)
+        return KeeperSyncState.model_validate(row)
+
+    async def tombstone(
+        self,
+        *,
+        org_id: int,
+        resource_type: ResourceType,
+        reason: TombstoneReason,
+        ltd_id: int | None = None,
+        ltd_slug: str | None = None,
+        note: str | None = None,
+        docverse_id: int | None = None,
+        date_last_synced: datetime | None = None,
+    ) -> KeeperSyncState:
+        """Tombstone the row keyed by the per-resource idempotency key.
+
+        Stamps ``date_tombstoned`` (now), ``tombstone_reason``, and
+        ``tombstone_note`` on the row keyed by ``(org_id,
+        resource_type, ltd_id|ltd_slug)``, inserting the row when there
+        is none: a ``lifecycle_preemptive`` veto, or keeper-sync's veto
+        on a slug an operator's delete reserves, can land on an LTD
+        edition no visit has recorded yet. An existing row is converted
+        in place, so a resource never gains a second row. ``note`` is
+        written as given, ``None`` included, since the tombstone is a
+        new record.
+
+        ``docverse_id`` and ``date_last_synced`` follow :meth:`upsert`'s
+        partial-update rule: written when given, left as stored when
+        ``None``. A new row without an ``ltd_slug`` records the LTD id
+        as its slug.
+
+        ``ltd_slug`` is required for ``project`` rows and ``ltd_id``
+        for ``edition`` / ``build`` rows; see :func:`_key_clauses`.
+        """
+        clauses = _key_clauses(
+            org_id=org_id,
+            resource_type=resource_type,
+            ltd_id=ltd_id,
+            ltd_slug=ltd_slug,
+        )
+        existing = await self._session.execute(
+            select(SqlKeeperSyncState).where(*clauses)
+        )
+        row = existing.scalar_one_or_none()
+        now = datetime.now(tz=UTC)
+        if row is None:
+            resolved_slug = ltd_slug if ltd_slug is not None else str(ltd_id)
+
+            def _make_row(public_id: int) -> SqlKeeperSyncState:
+                return SqlKeeperSyncState(
+                    public_id=public_id,
+                    org_id=org_id,
+                    resource_type=resource_type.value,
+                    ltd_id=ltd_id,
+                    ltd_slug=resolved_slug,
+                    docverse_id=docverse_id,
+                    date_last_synced=date_last_synced,
+                    date_tombstoned=now,
+                    tombstone_reason=reason.value,
+                    tombstone_note=note,
+                )
+
+            row = await insert_with_time_ordered_public_id(
+                self._session, _make_row
+            )
+        else:
+            row.date_tombstoned = now
+            row.tombstone_reason = reason.value
+            row.tombstone_note = note
+            _apply_present_columns(
+                row,
+                {
+                    "docverse_id": docverse_id,
+                    "date_last_synced": date_last_synced,
+                },
+            )
+            await self._session.flush()
         await self._session.refresh(row)
         return KeeperSyncState.model_validate(row)

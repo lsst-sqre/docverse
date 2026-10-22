@@ -1,21 +1,28 @@
 """Service for writing and reading keeper-sync tombstones.
 
-A *sync tombstone* is a permanent veto recorded on the existing
+A *sync tombstone* is a veto recorded on the existing
 ``keeper_sync_state`` table that tells the keeper-sync engine "this
 LTD resource has been deleted on the Docverse side; do not re-migrate
-it." See PRD #332 / DM-54914 for the full design.
+it." See PRD #332 / DM-54914 for the full design. How long the veto
+holds depends on its reason (PRD #830): a ``manual_delete`` is
+permanent until an operator clears it or restores the edition, while a
+``lifecycle_delete`` or ``lifecycle_preemptive`` tombstone is judged
+again whenever LTD rebuilds the edition, and lifted once no lifecycle
+rule matches it any more.
 
 This service is the single, well-tested entrypoint every deletion path
 goes through to write, check, list, or clear a tombstone. Manual
 deletes, lifecycle-driven deletes, and the lifecycle-preemptive
 short-circuit all write via :meth:`record`; the admin API reads via
-:meth:`list_for_org` and recovers via :meth:`clear`.
+:meth:`list_for_org` and recovers via :meth:`clear`. Keeper-sync's
+re-evaluation of a rebuilt edition's lifecycle tombstone (PRD #830)
+lifts it via :meth:`clear` or upholds it via :meth:`keep`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
 import structlog
 from safir.database import CountedPaginatedList
@@ -27,16 +34,12 @@ from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.base32id import serialize_base32_id
-from docverse_server.storage._public_id import (
-    insert_with_time_ordered_public_id,
-)
 from docverse_server.storage.keeper_sync import (
     KeeperSyncState,
     KeeperSyncStateStore,
     ResourceType,
     TombstoneReason,
 )
-from docverse_server.storage.keeper_sync.state_store import _key_clauses
 from docverse_server.storage.pagination import (
     KeeperSyncStateDateTombstonedCursor,
 )
@@ -128,47 +131,17 @@ class KeeperSyncTombstoneService:
         ``ltd_slug`` is required for ``project`` rows and ``ltd_id``
         for ``edition`` / ``build`` rows; see
         :func:`docverse_server.storage.keeper_sync.state_store._key_clauses`.
+        The write is :meth:`KeeperSyncStateStore.tombstone
+        <docverse_server.storage.keeper_sync.KeeperSyncStateStore.tombstone>`.
         """
-        clauses = _key_clauses(
+        state = await self._state_store.tombstone(
             org_id=org_id,
             resource_type=resource_type,
+            reason=reason,
             ltd_id=ltd_id,
             ltd_slug=ltd_slug,
+            note=note,
         )
-        existing = await self._session.execute(
-            select(SqlKeeperSyncState).where(*clauses)
-        )
-        row = existing.scalar_one_or_none()
-        now = datetime.now(tz=UTC)
-        if row is None:
-            # Lifecycle-preemptive path: no Docverse row exists yet, so
-            # synthesise a state row carrying only the tombstone fields.
-            # Every state row carries a time-ordered ``public_id``, minted
-            # here with the same collision-retry helper the state store's
-            # upsert uses.
-            resolved_slug = ltd_slug if ltd_slug is not None else str(ltd_id)
-
-            def _make_row(public_id: int) -> SqlKeeperSyncState:
-                return SqlKeeperSyncState(
-                    public_id=public_id,
-                    org_id=org_id,
-                    resource_type=resource_type.value,
-                    ltd_id=ltd_id,
-                    ltd_slug=resolved_slug,
-                    date_tombstoned=now,
-                    tombstone_reason=reason.value,
-                    tombstone_note=note,
-                )
-
-            row = await insert_with_time_ordered_public_id(
-                self._session, _make_row
-            )
-        else:
-            row.date_tombstoned = now
-            row.tombstone_reason = reason.value
-            row.tombstone_note = note
-            await self._session.flush()
-        await self._session.refresh(row)
         self._logger.info(
             "Sync tombstone recorded",
             org_id=org_id,
@@ -177,7 +150,44 @@ class KeeperSyncTombstoneService:
             ltd_slug=ltd_slug,
             reason=reason.value,
         )
-        return KeeperSyncState.model_validate(row)
+        return state
+
+    async def keep(
+        self,
+        *,
+        state_id: int,
+        note: str,
+        date_rebuilt_seen: datetime,
+        date_last_synced: datetime,
+    ) -> None:
+        """Uphold a lifecycle tombstone that a re-evaluation judged again.
+
+        Backs keeper-sync's re-evaluation of a rebuilt edition's
+        lifecycle tombstone (PRD #830) when a rule still matches. The
+        veto stands, so ``date_tombstoned`` and ``tombstone_reason`` are
+        left as recorded: the tombstone is upheld, not re-issued.
+        ``tombstone_note`` is refreshed with the rule that matched this
+        time — a draft vetoed as idle may now be vetoed because its
+        branch is gone — and the row is stamped with the LTD rebuild it
+        was judged on (``date_rebuilt_seen``) and when
+        (``date_last_synced``), so the next visit leaves it alone until
+        LTD rebuilds the edition again.
+
+        Matches only a row that is still tombstoned, by its internal id;
+        a row cleared in the meantime is left as it is.
+        """
+        await self._session.execute(
+            update(SqlKeeperSyncState)
+            .where(
+                SqlKeeperSyncState.id == state_id,
+                SqlKeeperSyncState.date_tombstoned.is_not(None),
+            )
+            .values(
+                tombstone_note=note,
+                date_rebuilt_seen=date_rebuilt_seen,
+                date_last_synced=date_last_synced,
+            )
+        )
 
     async def is_tombstoned(
         self,
@@ -296,11 +306,13 @@ class KeeperSyncTombstoneService:
         that row's ``date_deleted`` is cleared in the *same*
         transaction — otherwise the next sync iteration would crash on
         the slug clash because the soft-deleted row still occupies the
-        ``uq_editions_project_lower_slug`` index slot. A project revive
-        reaches further, into the editions and builds its delete
-        cascaded to; see :meth:`_revive_project`. A ``build`` state row
-        has no revive branch: builds are addressed by the admin restore
-        endpoint, not by keeper-sync recovery.
+        ``uq_editions_project_lower_slug`` index slot. The revived
+        edition's ``delete_reason`` is cleared with ``date_deleted``, as
+        a live edition carries none. A project revive reaches further,
+        into the editions and builds its delete cascaded to; see
+        :meth:`_revive_project`. A ``build`` state row has no revive
+        branch: builds are addressed by the admin restore endpoint, not
+        by keeper-sync recovery.
 
         Raises
         ------
@@ -342,7 +354,7 @@ class KeeperSyncTombstoneService:
                         SqlEdition.id == state.docverse_id,
                         SqlEdition.date_deleted.is_not(None),
                     )
-                    .values(date_deleted=None)
+                    .values(date_deleted=None, delete_reason=None)
                     .returning(SqlEdition.id)
                 )
                 revived = edition_revive.scalar_one_or_none() is not None
@@ -396,9 +408,12 @@ class KeeperSyncTombstoneService:
         them. The cascade goes through
         :meth:`~docverse_server.storage.edition_store.EditionStore.soft_delete_all_by_project`,
         which stamps every edition's state row exactly as a per-edition
-        delete would, and a tombstoned state row makes
+        delete would — with the project delete's ``manual_delete``, a
+        reason
         :meth:`~docverse_server.services.keeper_sync.service.KeeperSyncService.sync_edition`
-        short-circuit forever. Reviving the rows without clearing those
+        never judges again, so it short-circuits on the row forever
+        (only a lifecycle tombstone lifts on an LTD rebuild). Reviving
+        the rows without clearing those
         stamps would bring an LTD-imported project back live but
         permanently unsynced, and leave the operator looking at N
         edition tombstones they never created. The same shared instant
@@ -459,7 +474,7 @@ class KeeperSyncTombstoneService:
                         SqlEdition.project_id == project_id,
                         SqlEdition.date_deleted == project_deleted,
                     )
-                    .values(date_deleted=None)
+                    .values(date_deleted=None, delete_reason=None)
                     .returning(SqlEdition.id)
                 )
             )

@@ -71,7 +71,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from docverse_server.config import config
 from docverse_server.domain.edition import Edition
 from docverse_server.domain.keeper_sync_run import KeeperSyncRunWithActivity
-from docverse_server.domain.lifecycle import LifecycleRuleSet, RefDeletedRule
+from docverse_server.domain.lifecycle import (
+    REF_DELETED_RULE_TYPE,
+    LifecycleRuleSet,
+    RefDeletedRule,
+)
 from docverse_server.domain.project import Project
 from docverse_server.factory import Factory
 from docverse_server.metrics import (
@@ -845,6 +849,7 @@ async def _apply_deletions(
                     edition_id=edition.id,
                     edition_slug=edition.slug,
                     reason=TombstoneReason.lifecycle_delete,
+                    note=REF_DELETED_RULE_TYPE,
                 )
                 if not deleted:
                     continue
@@ -873,7 +878,7 @@ async def _apply_deletions(
                     project=project.slug,
                     # _evaluate_matches filters to RefDeletedRule, so
                     # every match reaching here is a ref-deleted match.
-                    rule_type="ref_deleted",
+                    rule_type=REF_DELETED_RULE_TYPE,
                 )
             if deleted_count:
                 projects_with_deletes.append(project.slug)

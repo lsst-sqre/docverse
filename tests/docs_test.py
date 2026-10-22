@@ -46,6 +46,7 @@ from docverse.models import (
     KeeperSyncRun,
     KeeperSyncScopePreview,
     KeeperSyncTierStatus,
+    KeeperSyncTombstoneReason,
     ProjectGitHubBinding,
     ProjectGitHubBindingCreate,
 )
@@ -62,7 +63,10 @@ from docverse_server.config import (
     config,
 )
 from docverse_server.diagnostics.memory import MemorySample
+from docverse_server.domain.edition import EditionDeleteReason
 from docverse_server.domain.edition_reconcile import ReconcileReason, _Skip
+from docverse_server.domain.lifecycle import REF_DELETED_RULE_TYPE
+from docverse_server.handlers.orgs.builds import router as builds_router
 from docverse_server.handlers.orgs.editions import router as editions_router
 from docverse_server.handlers.orgs.jobs import router as jobs_router
 from docverse_server.handlers.orgs.keeper_sync import (
@@ -110,6 +114,10 @@ from docverse_server.storage._http_retry import (
 )
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncState,
+    TombstoneReason,
+)
 from docverse_server.storage.ltd import RETRYABLE_SOURCE_TRANSPORT_ERRORS
 from docverse_server.storage.pagination import ProjectSortOrder
 from docverse_server.storage.queue_job_store import QueueJobStore
@@ -235,6 +243,75 @@ _KEEPER_SYNC_SERVICE_MODULE = "docverse_server.services.keeper_sync.service"
 
 _KEEPER_SYNC_TRACKING_MESSAGE = "Derived keeper-sync edition tracking and kind"
 """The debug line saying where a synced edition's tracking came from."""
+
+_REVIVAL_SECTION = "Lifecycle deletions come back with activity"
+"""GitHub-page section on reviving lifecycle-deleted editions (PRD #830)."""
+
+_AGGREGATE_SLUG_HELD = (
+    "Semver aggregate slug held by a non-aggregate edition; leaving it"
+    " untouched"
+)
+"""The line both aggregate paths write for an aggregate slug they skip.
+
+Listed under each module that writes it. The revival table gives it one
+row, so the two paths must write it with the same level and fields.
+"""
+
+_REVIVAL_LOG_LINES: dict[str, tuple[str, ...]] = {
+    _KEEPER_SYNC_SERVICE_MODULE: (
+        "Sync short-circuited: edition tombstoned",
+        "Lifecycle tombstone cleared",
+        "Lifecycle tombstone kept",
+        "Lifecycle tombstone kept: live refs unavailable",
+        "Edition slug reserved by manual delete; LTD edition not imported",
+        _AGGREGATE_SLUG_HELD,
+        (
+            "Semver aggregate slug reserved by manual delete; aggregate not"
+            " backfilled"
+        ),
+    ),
+    "docverse_server.storage.edition_store": ("Revived soft-deleted edition",),
+    "docverse_server.services.edition_tracking": (
+        "Edition slug reserved by manual delete; build not tracked",
+        _AGGREGATE_SLUG_HELD,
+    ),
+    "docverse_server.services.edition": ("Restored edition",),
+    "docverse_server.services.publish_enqueue": (
+        "Restored edition has no build to republish",
+        (
+            "Restored edition without republishing; its current build is"
+            " not live"
+        ),
+    ),
+}
+"""The lines the revival section tabulates, by the module that writes them.
+
+Each module writes many other lines, so the table is checked against
+this curated set: every line that says an edition came back, stayed
+retired, or was held back by an operator's delete.
+"""
+
+_TOMBSTONE_REVIEW_METHOD = "_review_lifecycle_tombstone"
+"""Keeper-sync method that judges a rebuilt lifecycle tombstone again."""
+
+_TOMBSTONE_REVIEW_FIELDS = "log_fields"
+"""The dict the judgement splats into each of its three log lines."""
+
+_SCOPE_TOMBSTONE_SECTION = "Tombstones"
+"""Scope-page section on keeper-sync tombstones and lifting them (#837)."""
+
+_RESTORE_EMITTERS = {
+    "build_processing": "docverse_server.worker.functions.build_processing",
+    "keeper_sync_project": "docverse_server.worker.functions.keeper_sync",
+}
+"""The workers that publish ``edition_lifecycle`` ``restore``, by module.
+
+The third emitter is the editions API's restore handler, which the
+metrics page names by its route.
+"""
+
+_API_SOFT_DELETED_SECTION = "Soft-deleted editions and builds"
+"""Conventions-page section on deleting and restoring editions (#837)."""
 
 _MEMORY_PAGE = "memory-diagnostics.md"
 """Operations page for the opt-in memory sampler (PRD #753)."""
@@ -659,6 +736,41 @@ def _bound_log_fields(module_name: str) -> set[str]:
     }
 
 
+def _dict_literal_keys(module_name: str, function: str, name: str) -> set[str]:
+    """Return the keys of the dict literal a function assigns to ``name``.
+
+    :func:`_log_calls` sees only literal keyword arguments, so a field a
+    log call splats in from a shared dict (``**log_fields``) is read off
+    that dict's assignment instead.
+    """
+    keys: set[str] = set()
+    for node in ast.walk(_module_tree(module_name)):
+        if not (
+            isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.name == function
+        ):
+            continue
+        for inner in ast.walk(node):
+            targets: list[ast.expr]
+            if isinstance(inner, ast.AnnAssign):
+                targets = [inner.target]
+            elif isinstance(inner, ast.Assign):
+                targets = inner.targets
+            else:
+                continue
+            if not isinstance(inner.value, ast.Dict) or not any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in targets
+            ):
+                continue
+            keys.update(
+                key.value
+                for key in inner.value.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            )
+    return keys
+
+
 def _documented_log_lines(
     page: str, *, section: str = "Reading an outcome"
 ) -> dict[str, _LogCall]:
@@ -1021,6 +1133,39 @@ def test_project_sort_orders_documented() -> None:
     orders = {order.value for order in ProjectSortOrder}
     assert orders, "the project listing accepts no orderings"
     assert not _uncoded(orders, page)
+
+
+def test_tombstone_reason_example_lists_every_reason() -> None:
+    """The enum-documentation example quotes every tombstone reason.
+
+    The conventions page holds ``KeeperSyncTombstoneReason``'s docstring
+    up as the model for documenting an enum, so the excerpt has to list
+    each value the wire enum has, as the docstring itself does.
+    """
+    section = _section(_read(_API_PAGE), "Documenting enums")
+    excerpt = section.split("```python\n", 1)[1].split("```", 1)[0]
+    doc = KeeperSyncTombstoneReason.__doc__ or ""
+    bullets = [f"- ``{reason.value}``" for reason in KeeperSyncTombstoneReason]
+    assert not [bullet for bullet in bullets if bullet not in doc]
+    assert not [bullet for bullet in bullets if bullet not in excerpt]
+
+
+def test_soft_deleted_editions_section_documented() -> None:
+    """The conventions page says how a deleted edition or build comes back.
+
+    The two ``restore`` routes are read off their routers, and the
+    edition's ``delete_reason`` values are what decide whether activity
+    alone brings the edition back.
+    """
+    section = _section(_read(_API_PAGE), _API_SOFT_DELETED_SECTION)
+    edition_restore = _route_path(
+        "post_edition_restore", router=editions_router
+    )
+    build_restore = _route_path("post_build_restore", router=builds_router)
+    assert f"POST {edition_restore}" in section
+    assert f"POST {build_restore}" in section
+    reasons = {reason.value for reason in EditionDeleteReason}
+    assert not _uncoded({"delete_reason", "date_deleted", *reasons}, section)
 
 
 def test_docs_index_links_the_transport_page() -> None:
@@ -1427,6 +1572,31 @@ def test_metrics_page_has_an_example_query_per_capability() -> None:
         )
     ]
     assert not unanswered
+
+
+def test_metrics_page_names_every_restore_emitter() -> None:
+    """The ``edition_lifecycle`` entry says where a ``restore`` comes from.
+
+    Three paths bring an edition back (PRD #830): the admin restore, a
+    client build for a lifecycle-deleted edition's ref, and a
+    keeper-sync visit that lifts a lifecycle tombstone. The section
+    names each, the catalog's emitter table lists the two workers, and
+    each worker named does publish the action.
+    """
+    page = _read(_METRICS_PAGE)
+    section = _event_section(page, "edition_lifecycle")
+    restore = _route_path("post_edition_restore", router=editions_router)
+    assert f"POST {restore}" in section
+    row = next(
+        line
+        for line in page.splitlines()
+        if line.startswith("| [`edition_lifecycle`]")
+    )
+    assert not _uncoded(_RESTORE_EMITTERS, section)
+    assert not _uncoded(_RESTORE_EMITTERS, row)
+    for module_name in _RESTORE_EMITTERS.values():
+        source = inspect.getsource(importlib.import_module(module_name))
+        assert "LifecycleAction.restore" in source, module_name
 
 
 def test_docs_index_links_the_metrics_page() -> None:
@@ -1908,6 +2078,114 @@ def test_github_push_check_log_lines_match_the_code() -> None:
         assert message in calls, f"tier_main no longer logs {message!r}"
         emitted[message] = {_as_logged(call) for call in calls[message]}
     assert documented == emitted
+
+
+def test_github_revival_names_both_records_of_a_delete() -> None:
+    """The revival section names every reason a delete is recorded with.
+
+    ``editions.delete_reason`` and the keeper-sync tombstone are where an
+    operator reads why an edition went; the rule types a lifecycle
+    tombstone's note carries tell a draft retired for idleness from one
+    whose branch is gone; and the state-row clocks and the sync's two
+    counts are how a re-evaluation is traced.
+    """
+    section = _section(_read(_GITHUB_PAGE), _REVIVAL_SECTION)
+    clocks = {"date_rebuilt_seen", "date_tombstoned", "date_last_synced"}
+    assert clocks <= set(KeeperSyncState.model_fields)
+    counts = {"tombstones_cleared", "tombstones_kept"}
+    assert all(hasattr(ProjectSyncResult, count) for count in counts)
+    names = {
+        "delete_reason",
+        "tombstone_note",
+        *clocks,
+        *counts,
+        *(reason.value for reason in EditionDeleteReason),
+        *(reason.value for reason in TombstoneReason),
+        DraftInactivityRule.model_fields["type"].default,
+        REF_DELETED_RULE_TYPE,
+    }
+    assert not _uncoded(names, section)
+
+
+def test_github_revival_quotes_the_edition_routes() -> None:
+    """The revival section quotes the delete it cannot undo and its undo.
+
+    Read off the editions router, so the section cannot keep naming a
+    path that has moved.
+    """
+    section = _section(_read(_GITHUB_PAGE), _REVIVAL_SECTION)
+    delete = _route_path("delete_edition", router=editions_router)
+    restore = _route_path("post_edition_restore", router=editions_router)
+    assert f"DELETE {delete}" in section
+    assert f"POST {restore}" in section
+
+
+def test_github_revival_log_lines_match_the_code() -> None:
+    """The revival log table is exactly the curated lines, as written.
+
+    Both ways for the curated set: every call site of each listed line
+    has a row with its level and its own fields, and no row describes a
+    line the code does not write.
+    """
+    table = _subsection(
+        _section(_read(_GITHUB_PAGE), _REVIVAL_SECTION), "Log lines"
+    )
+    documented: dict[str, set[_LogCall]] = {}
+    for message, call in _log_rows(table):
+        documented.setdefault(message, set()).add(call)
+    emitted: dict[str, set[_LogCall]] = {}
+    for module_name, messages in _REVIVAL_LOG_LINES.items():
+        calls = _log_calls(module_name)
+        for message in messages:
+            assert message in calls, (
+                f"{module_name} no longer logs {message!r}"
+            )
+            emitted.setdefault(message, set()).update(
+                _as_logged(call) for call in calls[message]
+            )
+    assert documented == emitted
+
+
+def test_github_revival_names_the_judgement_log_fields() -> None:
+    """The log table names what the judgement adds to its three lines.
+
+    ``_review_lifecycle_tombstone`` splats one dict into each of its
+    lines, which :func:`_log_calls` cannot see, so the fields are read
+    off that dict and the table has to name each of them.
+    """
+    table = _subsection(
+        _section(_read(_GITHUB_PAGE), _REVIVAL_SECTION), "Log lines"
+    )
+    fields = _dict_literal_keys(
+        _KEEPER_SYNC_SERVICE_MODULE,
+        _TOMBSTONE_REVIEW_METHOD,
+        _TOMBSTONE_REVIEW_FIELDS,
+    )
+    assert fields, "the tombstone judgement splats no shared log fields"
+    assert not _uncoded(fields, table)
+
+
+def test_scope_tombstone_section_quotes_every_recovery_route() -> None:
+    """The scope page's tombstone section gives the exact routes to use.
+
+    The listing to find a tombstone, the clear and the per-project
+    refresh that make up the hand-run recovery, and the edition restore
+    that replaces it for an edition with a Docverse row — all read off
+    their routers. The section names every tombstone reason and links
+    the GitHub page's account of how lifecycle tombstones lift.
+    """
+    section = _section(_read(_SCOPE_PAGE), _SCOPE_TOMBSTONE_SECTION)
+    routes = {
+        f"GET {_route_path('get_org_keeper_sync_tombstones')}",
+        f"DELETE {_route_path('delete_org_keeper_sync_tombstone')}",
+        f"POST {_route_path('post_org_keeper_sync_project_refresh')}",
+        "POST " + _route_path("post_edition_restore", router=editions_router),
+    }
+    assert not sorted(route for route in routes if route not in section)
+    assert not _uncoded({reason.value for reason in TombstoneReason}, section)
+    anchor = _REVIVAL_SECTION.lower().replace(" ", "-")
+    assert f"{_GITHUB_PAGE}#{anchor}" in section
+    assert _section(_read(_GITHUB_PAGE), _REVIVAL_SECTION)
 
 
 def _camel_case(name: str) -> str:

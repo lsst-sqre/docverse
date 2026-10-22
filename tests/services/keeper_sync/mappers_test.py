@@ -30,6 +30,7 @@ from docverse_server.services.keeper_sync.mappers import (
     derive_edition_source_prefix,
     derive_synced_build_git_ref,
     derive_tracking_source,
+    ltd_edition_slug_for_git_ref,
     map_edition_tracking,
     tracking_reads_live_refs,
 )
@@ -273,6 +274,27 @@ class TestDeriveEditionKind:
 )
 def test_derive_edition_slug(ltd_slug: str, expected: str) -> None:
     assert derive_edition_slug(ltd_slug) == expected
+
+
+@pytest.mark.parametrize(
+    ("git_ref", "expected"),
+    [
+        ("tickets/DM-53614", "DM-53614"),
+        ("tickets/LCR-758", "LCR-758"),
+        ("u/jsick/feature", "u-jsick-feature"),
+        ("tickets/DM-1-fix", "tickets-DM-1-fix"),
+        ("main", "main"),
+        ("1.2.3", "1.2.3"),
+    ],
+)
+def test_ltd_edition_slug_for_git_ref(git_ref: str, expected: str) -> None:
+    """The slug LTD Keeper gives the edition it auto-creates for a ref.
+
+    Mirrors ``keeper.utils.auto_slugify_edition`` for a single ref: a
+    ``tickets/<KEY>-<N>`` branch keeps only the ticket key, and any other
+    ref has its slashes replaced by hyphens.
+    """
+    assert ltd_edition_slug_for_git_ref(git_ref) == expected
 
 
 @pytest.mark.parametrize(

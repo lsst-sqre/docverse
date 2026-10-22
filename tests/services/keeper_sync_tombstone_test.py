@@ -19,6 +19,7 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.dbschema.build import SqlBuild
+from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.keeper_sync_state import SqlKeeperSyncState
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.exceptions import NotFoundError
@@ -616,6 +617,96 @@ async def test_list_for_org_display_path_falls_back_for_preemptive(
 
 
 @pytest.mark.asyncio
+async def test_keep_refreshes_note_and_stamps_the_judged_rebuild(
+    db_session: AsyncSession,
+) -> None:
+    """``keep`` upholds a tombstone: note and stamps move, the veto stays.
+
+    The re-evaluation of a rebuilt edition's lifecycle tombstone (PRD
+    #830) calls it when a rule still matches. The note names the rule
+    that matched this time and the row records the rebuild it judged,
+    while ``date_tombstoned`` and ``tombstone_reason`` keep the original
+    veto's values.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    service = _build_service(db_session)
+    async with db_session.begin():
+        recorded = await service.record(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=42,
+            ltd_slug="tickets-DM-1",
+            reason=TombstoneReason.lifecycle_preemptive,
+            note="draft_inactivity",
+        )
+    rebuilt = datetime(2026, 10, 20, 17, 34, tzinfo=UTC)
+    synced = datetime(2026, 10, 21, 8, 0, tzinfo=UTC)
+
+    async with db_session.begin():
+        await service.keep(
+            state_id=recorded.id,
+            note="ref_deleted",
+            date_rebuilt_seen=rebuilt,
+            date_last_synced=synced,
+        )
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        kept = await state_store.get_by_id_for_org(
+            state_id=recorded.id, org_id=org_id
+        )
+    assert kept is not None
+    assert kept.tombstone_note == "ref_deleted"
+    assert kept.date_rebuilt_seen == rebuilt
+    assert kept.date_last_synced == synced
+    assert kept.date_tombstoned == recorded.date_tombstoned
+    assert kept.tombstone_reason == TombstoneReason.lifecycle_preemptive.value
+
+
+@pytest.mark.asyncio
+async def test_keep_leaves_a_cleared_row_alone(
+    db_session: AsyncSession,
+) -> None:
+    """A row cleared before ``keep`` lands is not stamped by it."""
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    service = _build_service(db_session)
+    async with db_session.begin():
+        recorded = await service.record(
+            org_id=org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=42,
+            ltd_slug="tickets-DM-1",
+            reason=TombstoneReason.lifecycle_preemptive,
+        )
+        await service.clear(public_id=recorded.public_id, org_id=org_id)
+
+    async with db_session.begin():
+        await service.keep(
+            state_id=recorded.id,
+            note="ref_deleted",
+            date_rebuilt_seen=datetime(2026, 10, 20, tzinfo=UTC),
+            date_last_synced=datetime(2026, 10, 21, tzinfo=UTC),
+        )
+
+    state_store = KeeperSyncStateStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        state = await state_store.get_by_id_for_org(
+            state_id=recorded.id, org_id=org_id
+        )
+    assert state is not None
+    assert state.date_tombstoned is None
+    assert state.tombstone_note is None
+    assert state.date_rebuilt_seen is None
+    assert state.date_last_synced is None
+
+
+@pytest.mark.asyncio
 async def test_clear_un_tombstones_state_row(
     db_session: AsyncSession,
 ) -> None:
@@ -719,6 +810,77 @@ async def test_clear_revives_soft_deleted_edition(
         )
     assert revived is not None
     assert revived.id == edition.id
+
+
+@pytest.mark.asyncio
+async def test_clear_revive_drops_the_edition_delete_reason(
+    db_session: AsyncSession,
+) -> None:
+    """A revived edition is live again, so it carries no deletion reason."""
+    logger = structlog.get_logger("test")
+    org_store = OrganizationStore(session=db_session, logger=logger)
+    proj_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+
+    async with db_session.begin():
+        org = await org_store.create(
+            OrganizationCreate(
+                slug="ks-clear-reason",
+                title="ks-clear-reason",
+                base_domain="ks-clear-reason.example.com",
+            )
+        )
+        project = await proj_store.create(
+            org_id=org.id,
+            data=ProjectCreate(
+                slug="proj-cr",
+                title="Proj CR",
+                source_url="https://example.com/cr/cr",
+            ),
+        )
+        edition = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="ed-cr",
+                title="Ed CR",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+        await state_store.upsert(
+            org_id=org.id,
+            resource_type=ResourceType.edition,
+            ltd_id=101,
+            ltd_slug="ed-cr",
+            docverse_id=edition.id,
+        )
+        await edition_store.soft_delete(
+            org_id=org.id,
+            project_id=project.id,
+            slug="ed-cr",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org.id,
+            resource_type=ResourceType.edition,
+            ltd_id=101,
+            include_tombstoned=True,
+        )
+    assert state is not None
+
+    service = _build_service(db_session, logger=logger)
+    async with db_session.begin():
+        await service.clear(public_id=state.public_id, org_id=org.id)
+
+    async with db_session.begin():
+        revived = await edition_store.get_by_slug(
+            project_id=project.id, slug="ed-cr"
+        )
+    assert revived is not None
+    assert revived.delete_reason is None
 
 
 @pytest.mark.asyncio
@@ -1176,6 +1338,85 @@ async def test_clear_un_tombstones_the_cascade_deleted_editions(
     hand_row = by_docverse_id[hand_edition.id]
     assert hand_row.date_tombstoned is not None
     assert hand_row.tombstone_reason == TombstoneReason.lifecycle_delete.value
+
+
+@pytest.mark.asyncio
+async def test_clear_project_revive_drops_cascaded_delete_reasons(
+    db_session: AsyncSession,
+) -> None:
+    """Cascade siblings come back reasonless; a hand-deleted one keeps it."""
+    logger = structlog.get_logger("test")
+    proj_store = ProjectStore(session=db_session, logger=logger)
+    edition_store = EditionStore(session=db_session, logger=logger)
+    state_store = KeeperSyncStateStore(session=db_session, logger=logger)
+
+    async with db_session.begin():
+        (
+            org_id,
+            project_id,
+            cascade_edition_id,
+            _build_ids,
+        ) = await _seed_cascade_project(
+            db_session, org_slug="ks-edreason", project_slug="edreason-proj"
+        )
+        hand_edition = await edition_store.create(
+            project_id=project_id,
+            data=EditionCreate(
+                slug="edreason-hand",
+                title="edreason-hand",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+            ),
+        )
+
+    # Reaped first, in its own transaction, so its ``date_deleted`` is
+    # not the cascade's and the revive leaves it deleted.
+    async with db_session.begin():
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="edreason-hand",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+
+    async with db_session.begin():
+        await proj_store.soft_delete(
+            org_id=org_id,
+            slug="edreason-proj",
+            reason=TombstoneReason.manual_delete,
+        )
+
+    async with db_session.begin():
+        state = await state_store.get(
+            org_id=org_id,
+            resource_type=ResourceType.project,
+            ltd_slug="edreason-proj",
+            include_tombstoned=True,
+        )
+    assert state is not None
+
+    service = _build_service(db_session, logger=logger)
+    async with db_session.begin():
+        await service.clear(public_id=state.public_id, org_id=org_id)
+
+    async with db_session.begin():
+        rows = (
+            await db_session.execute(
+                select(
+                    SqlEdition.id,
+                    SqlEdition.date_deleted,
+                    SqlEdition.delete_reason,
+                ).where(
+                    SqlEdition.id.in_([cascade_edition_id, hand_edition.id])
+                )
+            )
+        ).all()
+    by_id = {row.id: row for row in rows}
+
+    assert by_id[cascade_edition_id].date_deleted is None
+    assert by_id[cascade_edition_id].delete_reason is None
+    assert by_id[hand_edition.id].date_deleted is not None
+    assert by_id[hand_edition.id].delete_reason == "lifecycle_delete"
 
 
 @pytest.mark.asyncio

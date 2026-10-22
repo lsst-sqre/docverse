@@ -273,7 +273,7 @@ and `github_webhook_received` has neither field.
 | [`edition_published`](#edition_published) | `publish_edition` worker | project |
 | [`dashboard_built`](#dashboard_built) | `dashboard_build` worker | project |
 | [`project_lifecycle`](#project_lifecycle) | projects API handler | project |
-| [`edition_lifecycle`](#edition_lifecycle) | editions API handler; default-branch convergence (GitHub webhook handler, `git_ref_audit` and `project_github_resolve` workers) | project |
+| [`edition_lifecycle`](#edition_lifecycle) | editions API handler; default-branch convergence (GitHub webhook handler, `git_ref_audit` and `project_github_resolve` workers); revivals (`build_processing` and `keeper_sync_project` workers) | project |
 | [`membership_changed`](#membership_changed) | members API handler | organization |
 | [`conditional_get`](#conditional_get) | conditional read endpoints | organization or project |
 | [`api_request`](#api_request) | API middleware | optional |
@@ -396,15 +396,38 @@ Published by the handler after the operation's final commit.
 | --- | --- | --- | --- |
 | `organization` | string | tag | Organization slug. |
 | `project` | string or null | tag | Project slug; always set on this event. |
-| `action` | enum | tag | `create`, `update`, or `delete`. The enum's fourth value, `rollback`, applies only to editions and never appears here. |
+| `action` | enum | tag | `create`, `update`, or `delete`. The enum's other values, `rollback` and `restore`, apply only to editions and never appear here. |
 
 ### `edition_lifecycle`
 
 Measurement: `lsst.square.metrics.events.docverse.edition_lifecycle`
 
 An edition was created, updated, deleted, or rolled back through the
-editions API. Published by the handler after the operation's final
-commit.
+editions API, or restored after a soft-delete. Published by the handler
+after the operation's final commit.
+
+A `restore` is published once for each edition that comes back after a
+soft delete (PRD #830), by whichever of three paths brought it back:
+
+- the editions API handler, for an admin
+  `POST /orgs/{org}/projects/{project}/editions/{edition}/restore`,
+  after its commit. This is the only path that brings back an edition
+  an operator deleted;
+- the `build_processing` worker, for each lifecycle-deleted edition a
+  client build for its git ref revived in place, after edition tracking
+  commits;
+- the `keeper_sync_project` worker, for each edition a sync brought
+  back: one whose soft-deleted row was revived when the sync cleared
+  its `lifecycle_delete` tombstone after LTD rebuilt it, a
+  lifecycle-deleted edition revived because it held the slug of the LTD
+  edition being imported, and a deleted semver aggregate (`N` or `N.M`)
+  a synced release's backfill revived. An LTD edition vetoed
+  `lifecycle_preemptive` before it was ever imported had no row to
+  revive, so clearing its tombstone makes its import a first one, with
+  no `restore` event.
+
+What sets each path off is in
+[Lifecycle deletions come back with activity](github-integration.md#lifecycle-deletions-come-back-with-activity).
 
 An `update` of a `main` edition is also published when Docverse
 rewrites a project's `__main` edition to track the repository's
@@ -417,7 +440,7 @@ it after the convergence commits.
 | --- | --- | --- | --- |
 | `organization` | string | tag | Organization slug. |
 | `project` | string or null | tag | Project slug; always set on this event. |
-| `action` | enum | tag | `create`, `update`, `delete`, or `rollback`. |
+| `action` | enum | tag | `create`, `update`, `delete`, `rollback`, or `restore`. |
 | `edition_kind` | enum | tag | The edition's kind: `main`, `release`, `draft`, `major`, `minor`, or `alternate`. |
 
 ### `membership_changed`

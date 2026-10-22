@@ -9,8 +9,9 @@ series instead of all at once.
 This page is for operators: the rule the four fields compose into, what
 a pattern does and does not match, what happens to a project that falls
 out of scope, the preview → `PATCH` → backfill workflow a wave
-actually uses, and why the editions and builds a sync imports carry
-LTD's timestamps rather than the moment of import
+actually uses, which tombstones keep LTD resources out and how to lift
+one ([Tombstones](#tombstones)), and why the editions and builds a sync
+imports carry LTD's timestamps rather than the moment of import
 ([Timestamps mirror LTD](#timestamps-mirror-ltd)).
 
 ## The four fields
@@ -383,7 +384,7 @@ sync, clear its
 tombstone with
 `DELETE /orgs/{org}/keeper-sync/tombstones/{tombstone}` — widening the
 scope will not do it, because the tombstone is a veto that outranks the
-config.
+config (see [Tombstones](#tombstones)).
 
 **`unmatched_project_slugs` catches the silent mistakes.** A misspelled
 entry in `project_slugs` admits nothing, and that error shows up
@@ -488,6 +489,92 @@ its `progress` when it completes: `in_scope_count` and `fan_out_count`,
 alongside `enqueued_count` — which is `fan_out_count` less the slugs
 whose per-project job was already running.
 
+## Tombstones
+
+A tombstone is keeper-sync's veto on one LTD resource: `date_tombstoned`,
+`tombstone_reason`, and `tombstone_note` stamped on its
+`keeper_sync_state` row. A project tombstone keeps the whole product out
+of every run and tier tick — the `tombstoned_slugs` above — and an
+edition tombstone makes each visit to the project skip that one LTD
+edition. An organization's tombstones are listed, newest first, by
+
+```
+GET /orgs/{org}/keeper-sync/tombstones
+```
+
+which filters on `resource_type` and `tombstone_reason`. Each entry's
+`id` is what the clear below takes, and its `display_path` names the
+project or edition.
+
+| `tombstone_reason` | Written when | Lifted by |
+| --- | --- | --- |
+| `manual_delete` | An operator deleted the Docverse project or edition; a project delete tombstones its editions too. Keeper-sync also writes one on an LTD edition whose Docverse slug a deleted edition still holds — a native edition on the same branch, say — naming that edition, so the tier crons stop re-syncing the project for it | An operator, only |
+| `lifecycle_delete` | A lifecycle rule soft-deleted the imported edition: `lifecycle_eval`, `git_ref_audit`, the GitHub `delete` webhook, or a default-branch rewrite retiring a duplicate draft | Keeper-sync itself, once LTD rebuilds the edition and no rule matches it any more; or an operator |
+| `lifecycle_preemptive` | Keeper-sync's proactive pass vetoed the LTD edition before importing it, because a rule would delete it at once; no Docverse edition exists | As `lifecycle_delete` |
+
+A lifecycle tombstone's `tombstone_note` names the rule that matched,
+`draft_inactivity` or `ref_deleted`; a `manual_delete` has none. How a
+visit judges a rebuilt edition's lifecycle tombstone, and what it does
+with each verdict, is on the GitHub page:
+[Lifecycle deletions come back with activity](github-integration.md#lifecycle-deletions-come-back-with-activity).
+
+### Lifting a tombstone by hand
+
+**A lifecycle tombstone usually needs nothing.** Every tombstone used to
+be a permanent veto. On 2026-10-21 the rubin drafts LTD had rebuilt
+after a lifecycle tombstone — rdo-151's `DM-53614` was the one that
+surfaced it — were still being skipped, and the eight whose branch was
+live were recovered by hand with the clear-then-refresh below. Since
+PRD #830 the sync that follows such a rebuild clears the tombstone
+itself. A lifecycle tombstone that survives
+a rebuild is one a rule still matches, most often a trailing LTD build
+of a branch that was merged and deleted. Clearing it by hand does not
+stick: the refresh's proactive pass vetoes the LTD edition again, or the
+next `lifecycle_eval` or `git_ref_audit` pass retires the revived
+edition again unless you set its `lifecycle_exempt` first. The other
+survivor is a draft a default-branch rewrite retired for duplicating
+`__main`, which stays retired while it still tracks `__main`'s ref.
+
+**Clear, then refresh.** Two admin calls:
+
+```
+DELETE /orgs/{org}/keeper-sync/tombstones/{tombstone}
+POST /orgs/{org}/keeper-sync/projects/{ltd_slug}/refresh
+```
+
+The clear (`204`) un-tombstones the row and, when the row names a
+soft-deleted Docverse project or edition, revives it in the same
+transaction — a project together with the editions and builds its
+delete took with it. The refresh (`202`, with the job's URL in
+`Location`) runs the project's `keeper_sync_project`, whose visit
+imports the LTD edition as if it were new. It is still the recipe for a
+tombstone with no Docverse edition to restore:
+
+- a **project tombstone** (`manual_delete`), which revives the project
+  and puts it back in the fan-out;
+- a **`lifecycle_preemptive` tombstone** that should import now rather
+  than at LTD's next rebuild, typically after you loosened the rule that
+  wrote it — raised `max_days_inactive`, say. A tombstone is judged only
+  on a rebuild, so the ones a rule wrote before you changed it stay
+  until then.
+
+**An edition with a Docverse row: restore it.** Any soft-deleted
+edition — a `manual_delete` included, and a native edition keeper-sync
+never imported — comes back with one admin call:
+
+```
+POST /orgs/{org}/projects/{project}/editions/{edition}/restore
+```
+
+It revives the edition in place, clears every keeper-sync tombstone that
+names it (so keeper-sync syncs it again) — the one on its own LTD
+edition, and any keeper-sync wrote on another LTD edition that met its
+slug — republishes its current build, and rebuilds the project's
+dashboard. Prefer it to a clear for an
+edition: the clear revives the row but neither republishes it nor
+rebuilds the dashboard. The restore answers `404` for an edition that
+is not deleted.
+
 ## Timestamps mirror LTD
 
 A project migrated from LTD Keeper is usually years older than its
@@ -554,7 +641,10 @@ Four refinements decide *which* rows are stamped:
   an edition on an aggregate's slug that does not track the way the
   aggregate does (an operator's own `15`, say).
 - **Only visited, live rows.** An edition whose `keeper_sync_state`
-  row is tombstoned short-circuits before the stamp, an edition
+  row stays tombstoned short-circuits before the stamp (a lifecycle
+  tombstone the visit clears after an LTD rebuild is imported and
+  stamped like any other edition; see [Tombstones](#tombstones)), an
+  edition
   soft-deleted mid-visit is skipped (build and aggregates included), and
   a native edition keeper-sync never visits is never stamped.
 
@@ -617,7 +707,8 @@ A visit is any `keeper_sync_project` job for the project:
 - a per-project refresh,
   `POST /orgs/{org}/keeper-sync/projects/{ltd_slug}/refresh`;
 - a tier-cron tick. `tier_other` revisits a project with any
-  non-`main` edition hourly while the project is hot (its LTD `main`
+  non-`main` edition, a lifecycle-tombstoned one included (not one an
+  operator deleted), hourly while the project is hot (its LTD `main`
   rebuilt within 14 days, or a
   [push](github-integration.md#a-push-counts-as-hot) is inside the
   push window) and every day or two once it is dormant.
@@ -672,7 +763,8 @@ fresh. On an organization or project whose lifecycle rules include
 `lifecycle_eval` tick matches it and handles it like any other
 lifecycle deletion: the edition is soft-deleted, unpublished from the
 CDN, and tombstoned `lifecycle_delete`, so keeper-sync does not import
-it again. There is no grace period. To keep a particular draft, set
+it again unless LTD rebuilds it and no rule matches it then (see
+[Tombstones](#tombstones)). There is no grace period. To keep a particular draft, set
 `lifecycle_exempt` on it **before** a visit restamps it: tier-cron
 visits start restamping as soon as a release carrying the stamp is
 deployed, and the backfill below reaches every project they have not.
@@ -781,7 +873,11 @@ row:
 - `client/src/docverse/models/lifecycle.py` — `DraftInactivityRule`,
   whose description points back at
   [Timestamps mirror LTD](#timestamps-mirror-ltd).
+- `src/docverse_server/services/keeper_sync_tombstone.py` —
+  `KeeperSyncTombstoneService`, which writes, lists, clears, and keeps
+  tombstones.
 - `tests/docs_test.py` — fails when this page stops naming every scope
-  field, preview field, cap, or endpoint the code has, or a column the
-  clock stamp writes.
-- SQR-112, PRD #667 (scope), and PRD #706 (timestamps).
+  field, preview field, cap, or endpoint the code has, a column the
+  clock stamp writes, or a tombstone reason or recovery route.
+- SQR-112, PRD #667 (scope), PRD #706 (timestamps), and PRD #830
+  (lifecycle tombstones that lift).

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import structlog
@@ -16,13 +16,19 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.domain.build import Build
-from docverse_server.domain.edition import Edition
+from docverse_server.domain.edition import (
+    Edition,
+    EnsuredEdition,
+    ReservedSlug,
+    SlugReservation,
+)
 from docverse_server.domain.edition_autocreation import (
     resolve_edition_autocreation,
 )
 from docverse_server.domain.edition_tracking import (
     EditionTrackingOutcome,
     EditionTrackingResult,
+    RevivedEdition,
 )
 from docverse_server.domain.semver_aggregate import semver_aggregate_specs
 from docverse_server.domain.slug import (
@@ -84,6 +90,20 @@ _VERSION_MODES = frozenset(
         TrackingMode.lsst_doc,
     }
 )
+
+
+@dataclass(slots=True)
+class _VersionEditions:
+    """The semver aggregates a stable release build reaches.
+
+    ``matched`` lists every aggregate the build advances; ``created_ids``
+    the ones this tracking inserted or revived, and ``revived_ids`` the
+    revived subset of those.
+    """
+
+    matched: list[Edition] = field(default_factory=list)
+    created_ids: set[int] = field(default_factory=set)
+    revived_ids: set[int] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -207,41 +227,46 @@ class EditionTrackingService:
             default_branch=default_branch,
         )
 
-        # 6. Auto-create git_ref edition if no match from slug path
+        # 6. Take the head-of-transaction lock, before steps 7 and 8
+        #    can lock an edition row. Their inserts take only the
+        #    project's ``FOR KEY SHARE``, which conflicts with nothing
+        #    the soft-delete cascade takes, but a revive updates an
+        #    existing edition row, and holding that while asking for
+        #    the project would walk ``editions -> projects``. Neither
+        #    step can produce the default edition — ``__main`` is never
+        #    deleted, so never revived — so the matches in hand already
+        #    say whether this build reaches it.
+        await self._lock_project_for_default_repoint(editions)
+
+        # 7. Auto-create (or revive) the git_ref edition if no match
+        #    from the slug path
         created_ids: set[int] = set()
+        revived_ids: set[int] = set()
         if not editions:
-            new_edition = await self._auto_create_edition(
+            ensured = await self._auto_create_edition(
                 project_id=project.id, derivation=derivation
             )
-            if new_edition is not None:
-                editions = [new_edition]
-                created_ids.add(new_edition.id)
+            if ensured is not None:
+                editions = [ensured.edition]
+                created_ids.add(ensured.edition.id)
+                if ensured.revived:
+                    revived_ids.add(ensured.edition.id)
 
-        # 7. Auto-create semver_major / semver_minor editions
+        # 8. Auto-create (or revive) semver_major / semver_minor editions
         autocreation = resolve_edition_autocreation(
             project=project.edition_autocreation,
             org=org.edition_autocreation,
         )
-        (
-            version_editions,
-            version_created_ids,
-        ) = await self._auto_create_version_editions(
+        version_editions = await self._auto_create_version_editions(
             project_id=project.id,
             build=build,
             autocreation=autocreation,
         )
-        created_ids |= version_created_ids
-        for ve in version_editions:
+        created_ids |= version_editions.created_ids
+        revived_ids |= version_editions.revived_ids
+        for ve in version_editions.matched:
             if not any(e.id == ve.id for e in editions):
                 editions.append(ve)
-
-        # 8. Take the head-of-transaction lock. Steps 6 and 7 insert
-        #    rows rather than locking existing ones — an INSERT's
-        #    foreign-key check takes ``FOR KEY SHARE`` on the project,
-        #    which conflicts with nothing the soft-delete cascade
-        #    takes — so this still lands ahead of every row lock the
-        #    transaction contends for.
-        await self._lock_project_for_default_repoint(editions)
 
         # 9. Converge kinds on the current derivation
         editions = await self._refresh_kinds(
@@ -251,7 +276,9 @@ class EditionTrackingService:
             project_id=project.id,
         )
 
-        # 10. Update each edition
+        # 10. Update each edition. A revived edition is in
+        #     ``created_ids``: it is new to everything that skips
+        #     soft-deleted rows, so it earns the same publish.
         outcomes = await self._update_editions(
             editions,
             build,
@@ -265,6 +292,13 @@ class EditionTrackingService:
             derived_slug=derivation.slug,
             suppressed=False,
             outcomes=outcomes,
+            revived=[
+                RevivedEdition(
+                    edition_id=edition.id, slug=edition.slug, kind=edition.kind
+                )
+                for edition in editions
+                if edition.id in revived_ids
+            ],
         )
 
     async def _lock_project_for_default_repoint(
@@ -635,11 +669,18 @@ class EditionTrackingService:
         *,
         project_id: int,
         derivation: SlugDerivationResult,
-    ) -> Edition | None:
+    ) -> EnsuredEdition | None:
         """Auto-create an edition from a slug derivation result.
 
         If an edition with the derived slug already exists (race guard),
-        the existing edition is returned instead.
+        the existing edition is returned instead. A slug held by a
+        lifecycle-deleted edition revives that edition through
+        :meth:`~docverse_server.storage.edition_store.EditionStore.revive_or_create`.
+
+        Returns ``None`` when an operator deleted the edition holding
+        the slug: their delete reserves it, so the build is stored but
+        tracks no edition. That is a decision, not a fault, so it is
+        logged at warning level rather than raised to Sentry.
         """
         # Race guard: check if another worker already created it
         existing = await self._deps.edition_store.get_by_slug(
@@ -651,9 +692,9 @@ class EditionTrackingService:
                 slug=derivation.slug,
                 project_id=project_id,
             )
-            return existing
+            return EnsuredEdition(edition=existing, revived=False)
 
-        edition = await self._deps.edition_store.create_internal(
+        ensured = await self._deps.edition_store.revive_or_create(
             project_id=project_id,
             slug=derivation.slug,
             title=derivation.slug,
@@ -662,14 +703,48 @@ class EditionTrackingService:
             tracking_params=derivation.tracking_params,
             alternate_name=derivation.tracking_params.get("alternate_name"),
         )
-        self._deps.logger.info(
-            "Auto-created edition",
-            slug=edition.slug,
-            kind=edition.kind,
-            tracking_mode=edition.tracking_mode,
+        if isinstance(ensured, ReservedSlug):
+            self._log_slug_reserved(
+                slug=derivation.slug, project_id=project_id
+            )
+            return None
+        if not ensured.revived:
+            self._deps.logger.info(
+                "Auto-created edition",
+                slug=ensured.edition.slug,
+                kind=ensured.edition.kind,
+                tracking_mode=ensured.edition.tracking_mode,
+                project_id=project_id,
+            )
+        return ensured
+
+    def _log_slug_reserved(self, *, slug: str, project_id: int) -> None:
+        """Warn that a manual delete keeps a build from tracking *slug*."""
+        self._deps.logger.warning(
+            "Edition slug reserved by manual delete; build not tracked",
+            slug=slug,
             project_id=project_id,
         )
-        return edition
+
+    def _log_aggregate_slug_held(
+        self, *, edition: Edition, project_id: int, deleted: bool
+    ) -> None:
+        """Say that *edition*, not an aggregate, holds an aggregate slug.
+
+        *deleted* tells a soft-deleted holder, which stays deleted, from
+        a live one, which stays as it is; either way the build leaves
+        the aggregate alone.
+        """
+        self._deps.logger.info(
+            "Semver aggregate slug held by a non-aggregate edition; leaving"
+            " it untouched",
+            project_id=project_id,
+            edition_id=edition.id,
+            edition_slug=edition.slug,
+            edition_kind=edition.kind.value,
+            tracking_mode=edition.tracking_mode.value,
+            edition_deleted=deleted,
+        )
 
     async def _auto_create_version_editions(
         self,
@@ -677,12 +752,12 @@ class EditionTrackingService:
         project_id: int,
         build: Build,
         autocreation: EditionAutocreationConfig,
-    ) -> tuple[list[Edition], set[int]]:
+    ) -> _VersionEditions:
         """Auto-create ``semver_major`` / ``semver_minor`` editions.
 
         Only triggers for stable semver tags (no prerelease), and only
         when the resolved ``autocreation`` config enables
-        ``semver_aggregates``.  Uses ``create_internal`` because
+        ``semver_aggregates``.  Uses ``revive_or_create`` because
         single-digit slugs like ``"2"`` don't pass ``EditionCreate``'s
         slug pattern.
 
@@ -709,39 +784,69 @@ class EditionTrackingService:
         same way, so a migrated project's ``/v/15`` does not freeze
         where an identically configured native project's keeps moving.
 
-        Returns a tuple of (matched editions, IDs of newly created ones).
+        An aggregate slug held by a lifecycle-deleted edition revives
+        it, and one an operator deleted stays deleted, through the same
+        :meth:`~docverse_server.storage.edition_store.EditionStore.revive_or_create`
+        primitive :meth:`_auto_create_edition` uses — but only a deleted
+        edition already on the aggregate's tracking mode is revived. One
+        tracking anything else (an operator's ``2`` on git ref ``2``,
+        reaped by ``draft_inactivity``) stays deleted and the aggregate
+        is skipped for this build, exactly as a live edition of another
+        tracking mode holding the slug is: neither is this build's to
+        turn into an aggregate. Keeper-sync's
+        ``_backfill_semver_aggregates`` settles the slug the same way.
         """
+        version_editions = _VersionEditions()
         if not autocreation.semver_aggregates:
-            return [], set()
+            return version_editions
 
         sv = parse_stable_semver(build.git_ref)
         if sv is None:
-            return [], set()
+            return version_editions
 
-        matched: list[Edition] = []
-        created_ids: set[int] = set()
         for spec in semver_aggregate_specs(sv):
             edition = await self._deps.edition_store.get_by_slug(
                 project_id=project_id, slug=spec.slug
             )
-            if edition is None:
-                edition = await self._deps.edition_store.create_internal(
-                    project_id=project_id,
-                    slug=spec.slug,
-                    title=spec.title,
-                    kind=spec.kind,
-                    tracking_mode=spec.tracking_mode,
-                    tracking_params=spec.tracking_params,
-                )
+            if edition is not None:
+                if edition.tracking_mode == spec.tracking_mode:
+                    version_editions.matched.append(edition)
+                else:
+                    self._log_aggregate_slug_held(
+                        edition=edition, project_id=project_id, deleted=False
+                    )
+                continue
+            ensured = await self._deps.edition_store.revive_or_create(
+                project_id=project_id,
+                slug=spec.slug,
+                title=spec.title,
+                kind=spec.kind,
+                tracking_mode=spec.tracking_mode,
+                tracking_params=spec.tracking_params,
+                match_tracking_mode=True,
+            )
+            if isinstance(ensured, ReservedSlug):
+                if ensured.reason is SlugReservation.manual_delete:
+                    self._log_slug_reserved(
+                        slug=spec.slug, project_id=project_id
+                    )
+                else:
+                    self._log_aggregate_slug_held(
+                        edition=ensured.edition,
+                        project_id=project_id,
+                        deleted=True,
+                    )
+                continue
+            if not ensured.revived:
                 self._deps.logger.info(
                     "Auto-created semver aggregate edition",
                     slug=spec.slug,
                     tracking_mode=spec.tracking_mode,
                     project_id=project_id,
                 )
-                matched.append(edition)
-                created_ids.add(edition.id)
-            elif edition.tracking_mode == spec.tracking_mode:
-                matched.append(edition)
+            version_editions.matched.append(ensured.edition)
+            version_editions.created_ids.add(ensured.edition.id)
+            if ensured.revived:
+                version_editions.revived_ids.add(ensured.edition.id)
 
-        return matched, created_ids
+        return version_editions

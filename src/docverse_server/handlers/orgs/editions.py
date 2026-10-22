@@ -363,6 +363,77 @@ async def post_edition_rollback(
     )
 
 
+@router.post(
+    "/orgs/{org}/projects/{project}/editions/{edition}/restore",
+    response_model=Edition,
+    summary="Restore a soft-deleted edition",
+    name="post_edition_restore",
+)
+async def post_edition_restore(
+    *,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    edition_slug: EditionSlugParam,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+) -> Edition:
+    """Bring back a deleted edition, whatever deleted it.
+
+    The edition returns in place — same slug, kind, tracking, and build
+    history — whether an operator deleted it or a lifecycle rule
+    retired it. This is the only way back from an operator's ``DELETE``:
+    a new build for the edition's ref, or a keeper-sync of its LTD
+    edition, revives a lifecycle deletion but honours a manual one as
+    permanent. Admin-only, like the ``DELETE`` it reverses. If the
+    edition was imported from LTD Keeper, its keeper-sync tombstone is
+    cleared too, so keeper-sync syncs it again.
+
+    The deletion took the edition off the CDN, so its current build is
+    published again and the project's dashboard rebuilt. A current
+    build that was itself deleted or purged is not republished: the
+    edition comes back without content until a new build or a rollback
+    gives it some.
+
+    Only deleted editions are addressed here, so a live edition answers
+    404, as does ``__main``, which cannot be deleted.
+    """
+    async with context.session.begin():
+        service = context.factory.create_edition_service()
+        org, project, edition = await service.restore(
+            org_slug=org_slug,
+            project_slug=project_slug,
+            edition_slug=edition_slug,
+        )
+        await context.session.commit()
+    # Hand over the publish the restore deferred (a no-op when its
+    # build was not live, so there was nothing to publish).
+    await context.factory.queue_dispatcher.dispatch()
+    # Publish after the commit (best-effort; raise_on_error=False).
+    await context.events.edition_lifecycle.publish(
+        EditionLifecycleEvent(
+            organization=org_slug,
+            project=project_slug,
+            action=LifecycleAction.restore,
+            edition_kind=MetricsEditionKind.from_api(edition.kind),
+        )
+    )
+    await try_enqueue_dashboard_build_by_slug(
+        factory=context.factory,
+        session=context.session,
+        logger=context.logger,
+        org_slug=org_slug,
+        project_slug=project_slug,
+    )
+    project_url = project_published_url(org, project)
+    return edition_from_domain(
+        edition,
+        context.request,
+        org_slug,
+        project_slug,
+        published_url=edition_published_url(project_url, edition),
+    )
+
+
 @router.patch(
     "/orgs/{org}/projects/{project}/editions/{edition}",
     response_model=Edition,

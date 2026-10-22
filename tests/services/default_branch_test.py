@@ -49,6 +49,10 @@ from docverse_server.storage.edition_build_history_store import (
     EditionBuildHistoryStore,
 )
 from docverse_server.storage.edition_store import EditionStore
+from docverse_server.storage.keeper_sync import (
+    KeeperSyncStateStore,
+    ResourceType,
+)
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from tests.support.lock_service_spy import LockEvent, RecordingLockService
@@ -461,6 +465,55 @@ async def test_apply_retires_the_duplicate_draft(
         assert await store.get_by_id(draft_id) is None
         for kept in (alternate_id, release_id, other_id):
             assert await store.get_by_id(kept) is not None
+
+
+@pytest.mark.asyncio
+async def test_apply_notes_the_retired_draft_tombstone_as_ref_deleted(
+    app: FastAPI, db_session: AsyncSession
+) -> None:
+    """A once-synced duplicate draft's tombstone names ``ref_deleted``.
+
+    The retirement only follows a rewrite, which only follows evidence
+    that ``__main``'s own ref is gone, so the rule it stands in for is
+    ``ref_deleted`` — the note every lifecycle tombstone carries
+    (PRD #830).
+    """
+    async with db_session.begin():
+        seeded = await _seed(db_session)
+        draft_id = await _seed_draft(
+            db_session,
+            project_id=seeded.project_id,
+            slug="main",
+            git_ref="main",
+        )
+        state_store = KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        )
+        await state_store.upsert(
+            org_id=seeded.org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=7171,
+            ltd_slug="main",
+            docverse_id=draft_id,
+        )
+        await db_session.commit()
+    harness = _harness(db_session)
+
+    outcome = await _apply(db_session, harness, seeded.project_id)
+
+    assert outcome.drafts_retired == (draft_id,)
+    async with db_session.begin():
+        state = await KeeperSyncStateStore(
+            session=db_session, logger=_logger()
+        ).get(
+            org_id=seeded.org_id,
+            resource_type=ResourceType.edition,
+            ltd_id=7171,
+            include_tombstoned=True,
+        )
+    assert state is not None
+    assert state.tombstone_reason == "lifecycle_delete"
+    assert state.tombstone_note == "ref_deleted"
 
 
 @pytest.mark.asyncio

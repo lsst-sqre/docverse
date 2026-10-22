@@ -11,8 +11,10 @@ anything on this page.
 
 This page is for operators: what each webhook delivery does, how a
 project's `__main` edition follows its repository's default branch
-across a rename, the knobs that shape both, how to read what happened,
-and what to do when Docverse deliberately leaves `__main` alone.
+across a rename, how a draft a lifecycle rule retired comes back when
+its branch is active again, the knobs that shape all of it, how to read
+what happened, and what to do when Docverse deliberately leaves
+`__main` alone.
 
 ## Webhook events
 
@@ -439,9 +441,12 @@ When a visit moves `__main` onto the default branch itself (case 2), it
 also retires the duplicate drafts, as step 3 of the rule does after a
 rewrite: every live, non-exempt `draft` in `git_ref` mode tracking that
 branch is soft-deleted and unpublished. A synced draft's
-`keeper_sync_state` row is tombstoned with reason `lifecycle_delete`, so
-later visits skip its LTD edition. Unlike the rule, a keeper-sync visit
-does not repoint `__main` (which build it serves stays LTD's), publish
+`keeper_sync_state` row is tombstoned with reason `lifecycle_delete` and
+note `ref_deleted`, so later visits skip its LTD edition until LTD
+rebuilds it; a visit after a rebuild judges the tombstone again, and
+keeps it while the draft still duplicates `__main` (see
+[Lifecycle deletions come back with activity](#lifecycle-deletions-come-back-with-activity)).
+Unlike the rule, a keeper-sync visit does not repoint `__main` (which build it serves stays LTD's), publish
 an `edition_lifecycle` event, or enqueue a `dashboard_build`; the `/v/`
 dashboard drops the retired draft at the project's next publish.
 
@@ -644,7 +649,11 @@ a project dormant for months:
 - `keeper_sync_tier_discovery` lists its LTD editions every 30 minutes,
   and enqueues its sync for any it has not seen.
 - `keeper_sync_tier_other` lists them every hour, and enqueues its sync
-  for any non-`main` edition last synced an hour or more ago.
+  for any non-`main` edition last synced an hour or more ago. An edition
+  a lifecycle rule tombstoned counts too, aging from its tombstoning
+  when keeper-sync never synced it, so the sync can judge the tombstone
+  again should LTD have rebuilt the edition; an edition an operator
+  deleted does not.
 
 When the window closes, the project drops back to its cohort and nothing
 else has to change: the stamp left on the row counts for nothing once
@@ -677,18 +686,38 @@ call, and is pruned. Then each live ref, oldest push first:
    `__main` edition for a push to the default branch, a draft for a
    branch, a release for a tag) are mapped to their `keeper_sync_state`
    edition rows and the LTD editions those record. When several LTD
-   editions feed the ref, the newest is checked.
+   editions feed the ref, the newest is checked. A draft a lifecycle
+   rule retired still counts, since its author pushing again is what
+   brings it back: an edition the rule soft-deleted (`delete_reason`
+   `lifecycle_delete`, or none on record) and a state row tombstoned
+   `lifecycle_delete` or `lifecycle_preemptive` are both looked at. An
+   edition an operator deleted (`manual_delete`) is not.
 2. **Ask LTD.** One `GET /editions/<id>`, skipped when the `main` check
    already fetched that edition this tick. The edition is `rebuilt` when
    its `date_rebuilt` is newer than the `date_rebuilt_seen` its state
    row recorded at the last sync (or, if the row recorded none, its
-   `date_last_synced`), and `unchanged` otherwise: the push's CI has not
-   uploaded yet.
-3. **Fall back to the listing.** When no synced edition tracks the ref,
-   or LTD answers `404` for the one that did, the project's edition
-   listing (`GET /products/<slug>/editions/`, read once per project per
-   tick) is checked the way `keeper_sync_tier_discovery` checks it, for
-   editions keeper-sync has no state row for. Each of those, newest
+   `date_last_synced`, or for a tombstoned row its `date_tombstoned`),
+   and `unchanged` otherwise: the push's CI has not uploaded yet. A
+   `rebuilt` tombstoned edition enqueues the project's sync, which
+   judges the tombstone again against the lifecycle rules: it clears
+   the tombstone and imports the edition when no rule matches the
+   rebuilt edition any more, and keeps it, stamped with the rebuild it
+   judged, when one still does.
+3. **Find a tombstone by name.** An edition a lifecycle rule vetoed at
+   import (`lifecycle_preemptive`) has no Docverse edition to track the
+   ref, and its state row records only LTD's slug for it. So when step
+   1 finds nothing, or LTD answers `404` for what it found, the
+   project's edition listing (`GET /products/<slug>/editions/`, read
+   once per project per tick, with the state rows of the editions it
+   lists) is searched for a lifecycle tombstone on the slug LTD gives
+   the ref's edition: the ticket key for a `tickets/DM-1234` branch
+   (`DM-1234`), and otherwise the ref with its slashes made hyphens
+   (`u/jsick/feature` → `u-jsick-feature`). That edition is fetched,
+   and when it tracks the pushed ref it is checked as in step 2.
+4. **Fall back to the listing.** When no edition keeper-sync has seen
+   tracks the ref, the listing is checked the way
+   `keeper_sync_tier_discovery` checks it, for editions keeper-sync has
+   no state row for. Each of those, newest
    first and at most three, is fetched (`GET /editions/<id>`, also once
    per project per tick) to read the ref it tracks. One that tracks the
    pushed ref is a `new_edition`: LTD created it for the push's CI
@@ -701,10 +730,10 @@ call, and is pruned. Then each live ref, oldest push first:
 
 | Outcome | What the visit found | The stamp |
 | --- | --- | --- |
-| `rebuilt` | LTD rebuilt the ref's edition since its last sync | Cleared once the sync is enqueued |
-| `new_edition` | No synced edition tracks the ref, and LTD lists one keeper-sync has not seen that tracks it | Cleared once the sync is enqueued |
-| `unchanged` | The ref's edition is as keeper-sync last synced it | Kept |
-| `not_found` | No synced edition tracks the ref, and LTD lists nothing new that tracks it | Kept |
+| `rebuilt` | LTD rebuilt the ref's edition since its last sync, or since a lifecycle rule tombstoned it | Cleared once the sync is enqueued |
+| `new_edition` | No edition keeper-sync has seen tracks the ref, and LTD lists one keeper-sync has not seen that tracks it | Cleared once the sync is enqueued |
+| `unchanged` | The ref's edition is as keeper-sync last synced or tombstoned it | Kept |
+| `not_found` | No edition keeper-sync has seen tracks the ref, and LTD lists nothing new that tracks it | Kept |
 | `error` | LTD failed to answer | Kept |
 | `expired` | The ref's window passed | Pruned |
 
@@ -733,9 +762,10 @@ record when they polled the project, read it `FOR UPDATE` for the same
 reason, so none of them can write back a map that predates a stamp.
 
 The check's cost is bounded: at most two LTD calls per stamped ref per
-tick (its edition, then the listing), plus at most three fetches of the
-unseen editions the listing shows, the listing and those fetches shared
-by the project's refs, and at most 20 refs per project. A dormant project the
+tick (its edition, then the edition of the lifecycle tombstone its name
+points to), plus the listing and at most three fetches of the unseen
+editions it shows, the listing and those fetches shared by the
+project's refs, and at most 20 refs per project. A dormant project the
 push woke adds its `main` check, usually one more call per tick for the
 window, which a push to `main` itself shares. Editions that follow a
 ref by a version rule rather than by name (`lsst_doc` and the `eups`
@@ -866,6 +896,260 @@ prune, and `pushed_at` is the time stamped. The handler's own
 `Processed push webhook` closes every push delivery: `enqueued` counts
 its `dashboard_sync` jobs, and `projects_stamped` the projects stamped,
 null when the keeper-sync step failed.
+
+## Lifecycle deletions come back with activity
+
+Lifecycle rules retire editions on evidence that can go stale. A draft
+`lifecycle_eval` retired under `draft_inactivity` had gone idle; a draft
+a `delete` delivery, the audit, or a `__main` rewrite retired under
+`ref_deleted` had lost its branch. When its author pushes to that branch
+again, the evidence is gone, so the deletion is undone: the edition
+comes back in place, with its id, slug, and build history, at its old
+URL. An edition an operator deleted is different. Their `DELETE` is a
+decision rather than evidence, and only an operator undoes it (PRD
+#830).
+
+### Why an edition was deleted
+
+Docverse records the reason in two places:
+
+- **`editions.delete_reason`**, stamped with `date_deleted` on every
+  soft delete and cleared when the edition comes back:
+  `manual_delete` for the edition `DELETE` and for a project delete's
+  cascade, `lifecycle_delete` for a lifecycle rule. A row deleted before
+  the column existed, with no tombstone to copy a reason from, reads
+  `null`, which every path treats as `lifecycle_delete`. The column is
+  server-side provenance; the edition resource does not carry it.
+- **The tombstone on a synced edition's `keeper_sync_state` row**, which
+  `GET /orgs/{org}/keeper-sync/tombstones` lists. Its
+  `tombstone_reason` is `manual_delete`; `lifecycle_delete`, when a rule
+  soft-deleted the imported edition; or `lifecycle_preemptive`, when
+  keeper-sync vetoed the LTD edition before importing it, so there is
+  no Docverse edition at all. On a lifecycle tombstone,
+  `tombstone_note` names the rule that matched, `draft_inactivity` or
+  `ref_deleted`; one recorded before Docverse began naming the rule has
+  no note. A native edition has no state row, so `delete_reason` is its
+  only record.
+
+### A build for the ref revives the edition
+
+Edition slugs are never reused: `uq_editions_project_lower_slug` ignores
+`date_deleted`, so a deleted edition keeps its slug. When a client build
+arrives for a git ref whose edition a soft-deleted row still holds,
+edition tracking settles the clash by that row's `delete_reason`:
+
+- **`lifecycle_delete`, or `null`: revived.** The edition comes back in
+  place with its id, slug, title, `lifecycle_exempt`, alternate name,
+  current build, and build history, and takes the tracking the build's
+  ref derives, and the derived kind too unless an operator declared
+  one. A keeper-sync tombstone on it is cleared in the same transaction.
+  The build then tracks onto it as onto a new edition: the edition
+  advances to the build and publishes, and the project's dashboard is
+  rebuilt. The `build_processing` worker publishes one
+  `edition_lifecycle` event with `action` `restore` per revived
+  edition. The semver aggregates (`N` and `N.M`) revive the same way,
+  but only a row that already tracks the aggregate's mode
+  (`semver_major` or `semver_minor`): an edition on any other tracking
+  mode, such as one an operator made to follow git ref `2`, stays
+  deleted and the release skips that aggregate, logged just as when a
+  live edition of another tracking mode holds the slug.
+- **`manual_delete`: left deleted.** The build is stored and processed,
+  but tracks no edition on that slug; edition tracking logs a warning,
+  and the build carries on with its other editions. Nothing reaches
+  Sentry.
+
+### Keeper-sync judges a rebuilt tombstone again
+
+A lifecycle tombstone on a synced edition once vetoed every later visit.
+Now a visit looks at a `lifecycle_delete` or `lifecycle_preemptive`
+tombstone again once LTD has rebuilt the edition since the state row
+last saw it: LTD's `date_rebuilt` is later than the row's
+`date_rebuilt_seen` or, on a row that never saw one, its
+`date_tombstoned`. Until then the visit short-circuits on the tombstone
+as before, at no cost beyond the edition it already fetched, and stamps
+only the row's `date_last_synced`, so `keeper_sync_tier_other` ages the
+tombstone from that visit as it does a synced edition.
+
+The judgement is the one the proactive pass makes at import: the
+rebuilt LTD edition, mapped as an import would map it, is evaluated
+against the project's resolved `draft_inactivity` and `ref_deleted`
+rules and the live ref set the visit already holds (see
+[Keeper-synced projects](#keeper-synced-projects)). No LTD request is
+added. The verdict is one of:
+
+- **No rule matches: cleared.** The tombstone is cleared exactly as
+  `DELETE /orgs/{org}/keeper-sync/tombstones/{tombstone}` clears one —
+  a `lifecycle_delete` edition's soft-deleted row is revived in place,
+  keeping its id — and the visit goes on to import the edition: its
+  build is synced and the edition published. When the clear revived an
+  edition row, the `keeper_sync_project` worker also publishes an
+  `edition_lifecycle` `restore` event for it. A `lifecycle_preemptive`
+  tombstone vetoed its LTD edition before Docverse ever imported it, so
+  clearing one revives nothing: the visit is the edition's first
+  import, published like any other and with no `restore` event, though
+  the cleared tombstone still counts in `tombstones_cleared`. A
+  revived edition whose LTD build Docverse already holds is published
+  at that build, unless the purgatory sweep reclaimed it while the
+  edition was retired: then it stays unpublished, with the `Restored
+  edition without republishing` line below, until its next build. The
+  tombstone leaves the listing. An LTD edition in `manual` mode, which
+  cannot be judged before its build is mapped, is cleared the same way
+  and left to the passes that judge imported editions.
+- **A rule still matches: kept.** The tombstone stands, with
+  `date_tombstoned` and `tombstone_reason` as recorded. Its
+  `tombstone_note` is refreshed with the rule that matched this time —
+  a draft vetoed as idle may now be vetoed because its branch is gone —
+  and the row is stamped with the rebuild it was judged on
+  (`date_rebuilt_seen`) and when (`date_last_synced`), so it is not
+  judged again until LTD rebuilds the edition once more. This is what
+  keeps a trailing LTD build of a merged-and-deleted branch vetoed: its
+  ref is still gone, so `ref_deleted` matches again.
+- **The edition duplicates `__main`: kept.** A `draft` tracking, in
+  `git_ref` mode, the ref `__main` tracks is the duplicate a
+  default-branch rewrite retires (see
+  [Keeper-synced projects](#keeper-synced-projects)). No rule matches
+  it — its branch is live, and LTD rebuilds it on every push — but
+  lifting its tombstone would only bring the duplicate back, so it is
+  kept as on a rule match, with note `ref_deleted` as the retirement
+  recorded it.
+- **The live ref set could not be read: kept, unjudged.** A failed
+  GitHub read is no evidence that the ref is live, so the tombstone
+  stands and nothing is stamped; the next visit judges it again. A
+  project with no GitHub binding, no installation id, or no commits has
+  no ref set to read at all, and is judged with `ref_deleted` matching
+  nothing, as it is everywhere else.
+
+A rebuild alone brings the project in for that visit:
+`keeper_sync_tier_other` counts a lifecycle-tombstoned edition when it
+looks for a stale one (see [A push counts as hot](#a-push-counts-as-hot)),
+and the push hot path finds the tombstoned edition a pushed ref feeds
+(see [The `tier_main` check](#the-tier_main-check)). A run or a
+per-project refresh judges every rebuilt tombstone it walks past too.
+Each `keeper_sync_project` completion line counts the visit's verdicts
+as `tombstones_cleared` and `tombstones_kept` (see
+[the budget page's log lines](keeper-sync-budget.md#log-lines)).
+
+A visit importing an LTD edition can also meet a soft-deleted Docverse
+edition holding its slug with no tombstone of its own in the way — a
+native edition on the same slug, say, or one deleted before tombstones
+existed. It settles that clash as edition tracking does: a
+`lifecycle_delete` or `null` row is revived and the edition imported
+onto it, and a `manual_delete` row is left deleted, the visit importing
+nothing for it and logging a warning rather than failing the edition.
+That visit also records the operator's veto on the LTD edition's
+`keeper_sync_state` row: a `manual_delete` tombstone whose `docverse_id`
+is the deleted edition, stamped with the visit's `date_last_synced`. It
+is written onto the LTD edition's existing row when there is one —
+including one whose lifecycle tombstone the same visit just cleared —
+and onto a new row otherwise. Without it, an LTD edition with no row
+would read as unseen to `keeper_sync_tier_discovery`, and a cleared
+lifecycle row as stale to `keeper_sync_tier_other`, and both crons would
+send the project back for the same empty visit on every tick. With it,
+discovery counts the edition as seen, tier_other leaves the
+`manual_delete` row out, and every later visit short-circuits on the
+tombstone, so the warning is logged once. The edition's restore lifts
+the tombstone with the edition (see below).
+The semver aggregates a synced release backfills follow the aggregate
+rule above: a deleted `N` or `N.M` comes back only from a
+`lifecycle_delete` or `null` row on the aggregate's own tracking mode,
+and the release skips the aggregate otherwise. An aggregate the backfill
+revives is restored as a revived edition is: the `keeper_sync_project`
+worker publishes one `edition_lifecycle` `restore` event for it and
+publishes it, at the release build when the revive moved its pointer
+there and otherwise at the build it already points at — the release's
+own, or a newer release the version guard keeps it on — unless that
+build is no longer live, which logs the `Restored edition without
+republishing` line below.
+
+### An operator's delete is permanent
+
+An edition deleted with
+
+```
+DELETE /orgs/{org}/projects/{project}/editions/{edition}
+```
+
+or with its project stays deleted: a new build for its ref tracks no
+edition, and keeper-sync short-circuits on its `manual_delete` tombstone
+however often LTD rebuilds it. The way back is the admin restore:
+
+```
+POST /orgs/{org}/projects/{project}/editions/{edition}/restore
+```
+
+It revives the edition in place whatever its `delete_reason` — same id,
+slug, kind, tracking, and build history — and clears its keeper-sync
+tombstones if it has any, so keeper-sync syncs it again. That includes
+the one a visit wrote for an LTD edition that met the edition's slug,
+since that tombstone names the edition too. It publishes
+the edition's current build again unless that build was itself deleted
+or purged, rebuilds the project's dashboard, and answers `200` with the
+edition; the editions API handler publishes one `edition_lifecycle`
+`restore` event. The URL addresses only deleted editions: a live or
+unknown edition answers `404`, and so does `__main`, which cannot be
+deleted. The restore works on a lifecycle deletion too, for an edition
+that should come back before its author pushes again. A tombstone with
+no Docverse edition behind it is lifted on the keeper-sync side instead;
+see [Tombstones](keeper-sync-scope.md#tombstones).
+
+### Log lines
+
+| Message | Level | Fields |
+| --- | --- | --- |
+| `Sync short-circuited: edition tombstoned` | info | `ltd_edition_id`, `ltd_edition_slug`, `tombstone_reason` |
+| `Lifecycle tombstone cleared` | info | `revived_docverse_row` |
+| `Lifecycle tombstone kept` | info | `rule_type` |
+| `Lifecycle tombstone kept: live refs unavailable` | info | — |
+| `Edition slug reserved by manual delete; LTD edition not imported` | warning | `ltd_edition_id`, `ltd_edition_slug`, `docverse_slug`, `edition_id`, `project_id`, `project` |
+| `Revived soft-deleted edition` | info | `edition_id`, `edition_slug`, `project_id`, `previous_delete_reason`, `tombstone_cleared` |
+| `Edition slug reserved by manual delete; build not tracked` | warning | `slug`, `project_id` |
+| `Semver aggregate slug held by a non-aggregate edition; leaving it untouched` | info | `project_id`, `edition_id`, `edition_slug`, `edition_kind`, `tracking_mode`, `edition_deleted` |
+| `Semver aggregate slug reserved by manual delete; aggregate not backfilled` | warning | `project_id`, `edition_id`, `edition_slug` |
+| `Restored edition` | info | `org`, `project`, `edition_id`, `edition_slug`, `republished` |
+| `Restored edition has no build to republish` | info | `edition_id`, `edition_slug` |
+| `Restored edition without republishing; its current build is not live` | warning | `edition_id`, `edition_slug`, `build_id`, `build_deleted`, `build_purged` |
+
+- The three `Lifecycle tombstone` lines are the verdicts, and each also
+  carries `ltd_edition_id`, `ltd_edition_slug`, `tombstone_reason`,
+  `ltd_date_rebuilt` (the rebuild judged), `project_id`, and `project`.
+  `rule_type` is the rule that matched. `revived_docverse_row` is true
+  when the clear brought a soft-deleted edition back.
+- `Sync short-circuited: edition tombstoned` follows a kept verdict, and
+  is the only line for a tombstone the visit did not judge: a
+  `manual_delete`, or a lifecycle tombstone LTD has not rebuilt since.
+- `Edition slug reserved by manual delete; LTD edition not imported`
+  comes once per LTD edition, from the visit that records the
+  `manual_delete` tombstone; later visits log the short-circuit line
+  instead. `edition_id` is the deleted edition holding the slug, which
+  the tombstone's `docverse_id` names.
+- `Revived soft-deleted edition` comes from every revive of an edition
+  row but a tombstone clear's: edition tracking's, keeper-sync's
+  import, and the admin restore. `previous_delete_reason` is the
+  `delete_reason` it cleared, and `tombstone_cleared` whether a
+  keeper-sync tombstone went with it.
+- `Semver aggregate slug held by a non-aggregate edition; leaving it
+  untouched` comes from edition tracking and from keeper-sync's
+  aggregate backfill alike, when an edition on another tracking mode
+  holds an `N` or `N.M` slug. `edition_deleted` is true when that
+  edition is soft-deleted and so stays deleted; `tracking_mode` is the
+  holder's. A native build reports an operator's delete of an aggregate
+  with `Edition slug reserved by manual delete; build not tracked`, the
+  backfill with `Semver aggregate slug reserved by manual delete;
+  aggregate not backfilled`.
+- `Restored edition` is the admin restore's; `republished` is whether
+  it queued a publish of the edition's current build.
+- `Restored edition has no build to republish` and `Restored edition
+  without republishing; its current build is not live` come from the
+  one guard every republish of a restored edition runs: the admin
+  restore's, and keeper-sync's for an edition its visit brought back
+  without importing a fresh build or a semver aggregate its backfill
+  revived without moving its pointer. The edition stays restored but
+  unpublished. `build_deleted` and `build_purged` say why the build
+  is not live; a `lifecycle_delete` edition retired long enough for
+  the purgatory sweep to reclaim its build reads `build_purged=true`,
+  and comes back on the CDN once LTD or a native upload gives it a
+  new build. `publish_edition` refuses a purged build at pickup too,
+  completing its job with `purged_skipped` rather than failing it.
 
 ## Configuration
 
@@ -1084,6 +1368,9 @@ it the fix for a synced project whose old branch still exists; see
   afterwards.
 - Offer an admin endpoint or CLI for the backfill: the audit is the
   backfill.
+- Undo an operator's delete. A new build, a push, or an LTD rebuild
+  revives only what a lifecycle rule retired; a `manual_delete` waits
+  for the admin restore.
 - Change anything in LTD Keeper.
 
 ## Related
@@ -1111,10 +1398,18 @@ it the fix for a synced project whose old branch still exists; see
   `src/docverse_server/services/keeper_sync/push_hints.py` — the
   `push` delivery's keeper-sync step and the rules of the
   `github_pushed_refs` map it writes.
+- `src/docverse_server/storage/edition_store.py` —
+  `EditionStore.revive_or_create`, which revives a lifecycle-deleted
+  edition for a build or a sync, and `EditionStore.restore`, behind the
+  admin restore.
+- `src/docverse_server/services/keeper_sync/service.py` —
+  `KeeperSyncService._review_lifecycle_tombstone`, keeper-sync's
+  judgement of a rebuilt edition's lifecycle tombstone.
 - [Metrics events](metrics.md) — `github_webhook_received`,
   `edition_lifecycle`, and `edition_published`.
 - `tests/docs_test.py` — fails when this page stops matching the event
   router, the GitHub and push hot-path settings, the rule's triggers
-  and log lines, the push step's skip reasons and log lines, or the
-  edition endpoints the operators' section relies on.
+  and log lines, the push step's skip reasons and log lines, the
+  edition endpoints the operators' section relies on, or the revival
+  section's delete reasons, restore route, and log lines.
 - SQR-112, the Docverse design.
