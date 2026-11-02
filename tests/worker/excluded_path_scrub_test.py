@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
 import pytest
 import structlog
 from safir.dependencies.db_session import db_session_dependency
+from safir.metrics import MockEventPublisher
 from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +35,7 @@ from docverse.models import (
     ProjectCreate,
     TrackingMode,
 )
+from docverse_server.config import Configuration, config
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.queue_job import SqlQueueJob
@@ -43,6 +45,7 @@ from docverse_server.domain.build import Build
 from docverse_server.domain.queue import JobStatus
 from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.factory import Factory
+from docverse_server.metrics import build_event_manager
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.objectstore import (
@@ -55,6 +58,9 @@ from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions.excluded_path_scrub import (
     excluded_path_scrub,
+)
+from docverse_server.worker.functions.excluded_path_scrub_reaper import (
+    excluded_path_scrub_reaper,
 )
 from tests.worker.conftest import make_worker_ctx
 
@@ -1037,3 +1043,253 @@ async def test_a_rejected_inventory_write_fails_the_build(
     row = await _read_build(build.id)
     assert row.object_count == len(_SPHINX_FILES)
     assert row.annotations is None
+
+
+async def _seed_running_scrub(
+    db_session: AsyncSession,
+    *,
+    org_id: int,
+    project_id: int,
+    project_slug: str,
+    started_minutes_ago: int,
+    progress: ExcludedPathScrubProgress,
+) -> int:
+    """Create a scrub row a worker picked up ``started_minutes_ago``."""
+    store = QueueJobStore(session=db_session, logger=_logger())
+    queue_job = await store.create(
+        kind=JobKind.excluded_path_scrub,
+        org_id=org_id,
+        project_id=project_id,
+        subject_label=project_slug,
+        backend_job_id=f"arq-scrub-{project_slug}",
+    )
+    await db_session.execute(
+        update(SqlQueueJob)
+        .where(SqlQueueJob.id == queue_job.id)
+        .values(
+            status=JobStatus.in_progress.value,
+            date_started=(
+                datetime.now(tz=UTC) - timedelta(minutes=started_minutes_ago)
+            ),
+            progress=progress.model_dump(mode="json"),
+        )
+    )
+    return queue_job.id
+
+
+def _build_state(row: SqlBuild) -> dict[str, Any]:
+    """Return the build-level state a reaped scrub must leave alone."""
+    return {
+        "status": row.status,
+        "object_count": row.object_count,
+        "total_size_bytes": row.total_size_bytes,
+        "content_hash": row.content_hash,
+        "annotations": row.annotations,
+        "date_deleted": row.date_deleted,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reaper_fails_a_dead_scrub_and_leaves_its_builds_alone(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A scrub whose worker died is failed; its builds stay as they were.
+
+    The dead job had scrubbed and stamped one build and not reached the
+    other. Reaping the row releases the project for a new scrub without
+    touching either build: the stamp, the corrected inventory and the
+    untouched build's full inventory all survive, so the next scrub
+    resumes with just the unstamped build. The report the job last
+    flushed stays readable on the failed row. A scrub of another project
+    that started a minute ago is left running.
+    """
+    threshold = timedelta(
+        seconds=config.excluded_path_scrub_reaper_threshold_seconds
+    )
+    partial = ExcludedPathScrubProgress(
+        dry_run=False,
+        builds_examined=1,
+        builds_affected=1,
+        objects_removed=3,
+        bytes_removed=1007,
+    )
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(db_session)
+        scrubbed = await _seed_build(
+            db_session,
+            project_id=project_id,
+            git_ref="scrubbed",
+            files=_SPHINX_FILES,
+        )
+        unreached = await _seed_build(
+            db_session,
+            project_id=project_id,
+            git_ref="unreached",
+            files=_SPHINX_FILES,
+        )
+        build_store = BuildStore(session=db_session, logger=_logger())
+        await build_store.decrement_inventory(
+            build_id=scrubbed.id, object_count=3, total_size_bytes=1007
+        )
+        await build_store.set_annotation(
+            build_id=scrubbed.id,
+            key="excluded_paths_scrubbed",
+            value={"objects_removed": 3, "bytes_removed": 1007},
+        )
+        other_project = await ProjectStore(
+            session=db_session, logger=_logger()
+        ).create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="scrub-other",
+                title="Other Scrub Project",
+                source_url="https://example.com/example/scrub-other",
+            ),
+        )
+        dead_id = await _seed_running_scrub(
+            db_session,
+            org_id=org_id,
+            project_id=project_id,
+            project_slug=_PROJECT_SLUG,
+            started_minutes_ago=int(threshold.total_seconds() // 60) + 60,
+            progress=partial,
+        )
+        fresh_id = await _seed_running_scrub(
+            db_session,
+            org_id=org_id,
+            project_id=other_project.id,
+            project_slug="scrub-other",
+            started_minutes_ago=1,
+            progress=ExcludedPathScrubProgress(dry_run=True),
+        )
+    before = {
+        build.id: _build_state(await _read_build(build.id))
+        for build in (scrubbed, unreached)
+    }
+
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient())
+    try:
+        result = await excluded_path_scrub_reaper(ctx)
+    finally:
+        await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    dead = await _read_queue_job(dead_id)
+    assert dead.status == JobStatus.failed.value
+    assert dead.date_completed is not None
+    assert dead.errors is not None
+    assert dead.errors["type"] == "SilentWorker"
+    assert dead.progress == partial.model_dump(mode="json")
+    fresh = await _read_queue_job(fresh_id)
+    assert fresh.status == JobStatus.in_progress.value
+    assert fresh.date_completed is None
+    for build in (scrubbed, unreached):
+        assert _build_state(await _read_build(build.id)) == before[build.id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [True, False], ids=["dry_run", "real"])
+async def test_completion_event_carries_the_report_counters(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dry_run: bool,
+) -> None:
+    """One project-scoped event repeats the counters the report ends on.
+
+    In a real run one build's delete is refused, so the event carries a
+    failed build and only the objects that actually went; in a dry run
+    the same project reports everything it would remove. Either way the
+    event and the job's final ``progress`` agree, field for field.
+    """
+    manager, events = await build_event_manager(Configuration())
+    store = _HookedStore()
+    org_id, project_id, (_, refused) = await _seed_sphinx_project(
+        db_session, store, "one", "two"
+    )
+    store.failing_keys.add(f"{refused.storage_prefix}.buildinfo")
+    async with db_session.begin():
+        queue_job_id = await _seed_queue_job(
+            db_session, org_id=org_id, project_id=project_id, dry_run=dry_run
+        )
+    monkeypatch.setattr(
+        Factory, "create_objectstore_for_org", _mock_create_objectstore(store)
+    )
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client, events=events)
+    try:
+        await excluded_path_scrub(
+            ctx,
+            _payload(
+                org_id=org_id,
+                project_id=project_id,
+                queue_job_id=queue_job_id,
+                dry_run=dry_run,
+            ),
+        )
+    finally:
+        await http_client.aclose()
+
+    report = ExcludedPathScrubProgress.model_validate(
+        (await _read_queue_job(queue_job_id)).progress
+    )
+    publisher = events.excluded_path_scrub_completed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.organization == _ORG_SLUG
+    assert event.project == _PROJECT_SLUG
+    assert event.dry_run is dry_run
+    assert event.builds_examined == report.builds_examined == 2
+    assert event.builds_affected == report.builds_affected == 2
+    assert event.objects_removed == report.objects_removed
+    assert event.bytes_removed == report.bytes_removed
+    assert event.builds_failed == report.builds_failed
+    assert event.builds_skipped == report.builds_skipped == 0
+    assert event.elapsed >= timedelta(0)
+    if dry_run:
+        assert (event.objects_removed, event.bytes_removed) == (6, 2014)
+        assert event.builds_failed == 0
+    else:
+        assert (event.objects_removed, event.bytes_removed) == (5, 2007)
+        assert event.builds_failed == 1
+
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_scrub_that_cannot_run_publishes_nothing(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """A failed job is recorded on its row, never as a zero-count scrub."""
+    manager, events = await build_event_manager(Configuration())
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(
+            db_session, store_label=None
+        )
+        queue_job_id = await _seed_queue_job(
+            db_session, org_id=org_id, project_id=project_id, dry_run=True
+        )
+    http_client = httpx.AsyncClient()
+    ctx = make_worker_ctx(http_client=http_client, events=events)
+    try:
+        with pytest.raises(RuntimeError, match="No object store service"):
+            await excluded_path_scrub(
+                ctx,
+                _payload(
+                    org_id=org_id,
+                    project_id=project_id,
+                    queue_job_id=queue_job_id,
+                ),
+            )
+    finally:
+        await http_client.aclose()
+
+    publisher = events.excluded_path_scrub_completed
+    assert isinstance(publisher, MockEventPublisher)
+    assert publisher.published == []
+
+    await manager.aclose()

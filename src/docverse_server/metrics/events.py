@@ -22,6 +22,7 @@ from .payloads import (
     EditionLifecycleEvent,
     EditionPublishedEvent,
     EditionReconcileCompletedEvent,
+    ExcludedPathScrubCompletedEvent,
     GitHubWebhookReceivedEvent,
     KeeperSyncPushCheckEvent,
     KeeperSyncRunCompletedEvent,
@@ -56,6 +57,9 @@ class DocverseEvents(EventMaker):
     lifecycle_action: EventPublisher[LifecycleActionEvent]
     resource_inventory: EventPublisher[ResourceInventoryEvent]
     purgatory_cleanup_completed: EventPublisher[PurgatoryCleanupCompletedEvent]
+    excluded_path_scrub_completed: EventPublisher[
+        ExcludedPathScrubCompletedEvent
+    ]
     conditional_get: EventPublisher[ConditionalGetEvent]
     build_content_copied: EventPublisher[BuildContentCopiedEvent]
     api_request: EventPublisher[ApiRequestEvent]
@@ -102,6 +106,9 @@ class DocverseEvents(EventMaker):
         )
         self.purgatory_cleanup_completed = await manager.create_publisher(
             "purgatory_cleanup_completed", PurgatoryCleanupCompletedEvent
+        )
+        self.excluded_path_scrub_completed = await manager.create_publisher(
+            "excluded_path_scrub_completed", ExcludedPathScrubCompletedEvent
         )
         self.edition_reconcile_completed = await manager.create_publisher(
             "edition_reconcile_completed", EditionReconcileCompletedEvent

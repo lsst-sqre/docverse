@@ -10,6 +10,7 @@ from .edition_reconcile import edition_reconcile
 from .edition_reconcile_dispatcher import edition_reconcile_dispatcher
 from .edition_reconcile_reaper import edition_reconcile_reaper
 from .excluded_path_scrub import excluded_path_scrub
+from .excluded_path_scrub_reaper import excluded_path_scrub_reaper
 from .git_ref_audit import git_ref_audit
 from .git_ref_audit_discovery import git_ref_audit_discovery
 from .inventory_census import inventory_census
@@ -43,6 +44,7 @@ __all__ = [
     "edition_reconcile_dispatcher",
     "edition_reconcile_reaper",
     "excluded_path_scrub",
+    "excluded_path_scrub_reaper",
     "git_ref_audit",
     "git_ref_audit_discovery",
     "inventory_census",

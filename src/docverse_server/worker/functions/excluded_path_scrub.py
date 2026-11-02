@@ -41,13 +41,21 @@ write the database rejects) becomes an error row and the loop moves on,
 so the job ends ``completed`` or ``completed_with_errors``. Only a
 failure that makes the whole scrub impossible — the organization is
 gone, or it has no object store — fails the queue-job row and re-raises.
+
+Once the job's terminal transition has committed, it publishes one
+``excluded_path_scrub_completed`` metrics event carrying the report's
+counters, the durable record of the scrub once retention takes the
+queue row. A job that fails or is cancelled publishes nothing; its row
+is its record.
 """
 
 from __future__ import annotations
 
+import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 import structlog
@@ -66,6 +74,7 @@ from docverse_server.domain.build import Build
 from docverse_server.domain.excluded_path_scrub import BuildScrubMatch
 from docverse_server.exceptions import NotFoundError
 from docverse_server.factory import Factory
+from docverse_server.metrics import ExcludedPathScrubCompletedEvent
 from docverse_server.services.excluded_path_scrub import (
     ExcludedPathScrubService,
 )
@@ -240,6 +249,7 @@ async def excluded_path_scrub(
         "docverse_server.worker.excluded_path_scrub"
     ).bind(org=org_slug, project=project_slug, dry_run=dry_run)
     report = ScrubReport(dry_run=dry_run)
+    started = time.monotonic()
 
     async for session in db_session_dependency():
         factory = ctx["factory_builder"](session=session, logger=logger)
@@ -313,6 +323,17 @@ async def excluded_path_scrub(
                 bytes_removed=report.bytes_removed,
                 builds_failed=report.builds_failed,
                 builds_skipped=report.builds_skipped,
+            )
+            # Published from the report the queue row just recorded, and
+            # only now that the row's terminal transition is durable.
+            # Best-effort: production runs raise_on_error=False so a
+            # metrics outage can never fail a scrub.
+            await _publish_completed_event(
+                ctx=ctx,
+                org_slug=org_slug,
+                project_slug=project_slug,
+                report=report,
+                started=started,
             )
             return (
                 "completed_with_errors" if report.has_errors else "completed"
@@ -560,6 +581,40 @@ async def _remove_excluded(
         bytes_removed=deletion.bytes_deleted,
         skip_reason=skip_reason,
         error="; ".join(errors) if errors else None,
+    )
+
+
+async def _publish_completed_event(
+    *,
+    ctx: dict[str, Any],
+    org_slug: str,
+    project_slug: str,
+    report: ScrubReport,
+    started: float,
+) -> None:
+    """Emit the scrub's ``excluded_path_scrub_completed`` event.
+
+    Called once, after the queue row's terminal transition has
+    committed, with the same counters the row's ``progress`` ends on.
+    Skips silently when the process has no event manager (tests that do
+    not assert on metrics).
+    """
+    events = ctx.get("events")
+    if events is None:
+        return
+    await events.excluded_path_scrub_completed.publish(
+        ExcludedPathScrubCompletedEvent(
+            organization=org_slug,
+            project=project_slug,
+            dry_run=report.dry_run,
+            builds_examined=report.builds_examined,
+            builds_affected=report.builds_affected,
+            objects_removed=report.objects_removed,
+            bytes_removed=report.bytes_removed,
+            builds_failed=report.builds_failed,
+            builds_skipped=report.builds_skipped,
+            elapsed=timedelta(seconds=time.monotonic() - started),
+        )
     )
 
 

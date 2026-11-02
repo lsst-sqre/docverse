@@ -23,6 +23,7 @@ from docverse_server.worker.functions import (
     edition_reconcile_dispatcher,
     edition_reconcile_reaper,
     excluded_path_scrub,
+    excluded_path_scrub_reaper,
     inventory_census,
     lifecycle_eval,
     lifecycle_eval_dispatcher,
@@ -520,6 +521,9 @@ def test_maintenance_pool_reaper_crons_are_staggered() -> None:
         build_processing_reaper,
         dashboard_sync_reaper,
         dashboard_build_reaper,
+        purgatory_cleanup_reaper,
+        edition_reconcile_reaper,
+        excluded_path_scrub_reaper,
     }
     cron_jobs = list(getattr(MaintenanceWorkerSettings, "cron_jobs", []))
     seen: dict[int, str] = {}
@@ -933,14 +937,14 @@ def test_edition_reconcile_reaper_runs_every_thirty_minutes() -> None:
 def test_edition_reconcile_reaper_slot_collides_with_nothing() -> None:
     """``{15, 45}`` is free of every database-bound maintenance cron.
 
-    This closes the pool's minute allocation: ``{0, 30}`` the lifecycle
-    reaper, ``{3, 18, 33, 48}`` dashboard_build, ``{6, 36}``
-    publish_edition, ``{9, 39}`` the reconcile dispatcher, ``{12, 42}``
-    build_processing, ``{15, 45}`` here, ``{21, 51}`` purgatory_cleanup
-    and ``{24, 54}`` dashboard_sync, with the census, the audit and the
-    sweep's dispatcher on daily minutes of their own. Asserted against
-    whatever is actually registered, so a seventh reaper landing on a
-    taken minute fails here rather than racing for the same Postgres
+    The pool's minute allocation: ``{0, 30}`` the lifecycle reaper,
+    ``{3, 18, 33, 48}`` dashboard_build, ``{6, 36}`` publish_edition,
+    ``{9, 39}`` the reconcile dispatcher, ``{12, 42}`` build_processing,
+    ``{15, 45}`` here, ``{21, 51}`` purgatory_cleanup, ``{24, 54}``
+    dashboard_sync and ``{27, 57}`` excluded_path_scrub, with the census,
+    the audit and the sweep's dispatcher on daily minutes of their own.
+    Asserted against whatever is actually registered, so a reaper landing
+    on a taken minute fails here rather than racing for the same Postgres
     connection-pool slots in production.
 
     The five-minute ``publish_queue_stats_cron`` is excluded because it
@@ -1014,3 +1018,74 @@ def test_default_worker_does_not_register_excluded_path_scrub() -> None:
         for entry in WorkerSettings.functions
     }
     assert excluded_path_scrub not in registered
+
+
+def test_excluded_path_scrub_reaper_registered_as_plain_coroutine() -> None:
+    """``excluded_path_scrub_reaper`` is on the maintenance pool, unwrapped.
+
+    Registered plainly, like the other run-less reapers and unlike the
+    scrub it backstops: it is a cron-only backstop with no per-job
+    timeout budget of its own, so it inherits arq's defaults rather than
+    the pool's ``maintenance_job_timeout_seconds`` wrapper.
+    """
+    underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in MaintenanceWorkerSettings.functions
+    }
+    assert excluded_path_scrub_reaper in underlying
+    assert not any(
+        isinstance(entry, Function)
+        and _underlying(entry.coroutine) is excluded_path_scrub_reaper
+        for entry in MaintenanceWorkerSettings.functions
+    )
+
+
+def test_excluded_path_scrub_reaper_runs_every_thirty_minutes() -> None:
+    """The scrub reaper fires twice an hour on its own slot.
+
+    A wedged scrub row has the same cost shape as a wedged purgatory
+    row — the endpoint hands it back instead of queueing a new scrub,
+    so the project cannot be scrubbed again until it is reaped — and
+    gets the same 30-minute cadence its run-less siblings use.
+    """
+    cron_jobs = list(getattr(MaintenanceWorkerSettings, "cron_jobs", []))
+    reaper_crons = [
+        job
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+        and _underlying(job.coroutine) is excluded_path_scrub_reaper
+    ]
+    assert len(reaper_crons) == 1
+    assert reaper_crons[0].minute == {27, 57}
+    assert reaper_crons[0].hour is None
+
+
+def test_excluded_path_scrub_reaper_slot_collides_with_nothing() -> None:
+    """``{27, 57}`` is free of every other maintenance cron.
+
+    Neither minute is a multiple of five, so the pair stays off the
+    queue-stats cadence too and needs no ``ignore``. Asserted against
+    whatever is actually registered, so a later cron landing on one of
+    these minutes fails here rather than racing the reaper for the same
+    Postgres connection-pool slots in production.
+    """
+    assert {27, 57}.isdisjoint(
+        _other_maintenance_cron_minutes(excluded_path_scrub_reaper)
+    )
+
+
+def test_default_worker_does_not_register_excluded_path_scrub_reaper() -> None:
+    """The default queue stays free of the scrub reaper."""
+    default_underlying = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert excluded_path_scrub_reaper not in default_underlying
+
+    cron_jobs = list(getattr(WorkerSettings, "cron_jobs", []) or [])
+    coroutines = {
+        _underlying(job.coroutine)
+        for job in cron_jobs
+        if isinstance(job, CronJob)
+    }
+    assert excluded_path_scrub_reaper not in coroutines

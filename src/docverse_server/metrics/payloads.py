@@ -49,6 +49,7 @@ __all__ = [
     "EditionLifecycleEvent",
     "EditionPublishedEvent",
     "EditionReconcileCompletedEvent",
+    "ExcludedPathScrubCompletedEvent",
     "GitHubWebhookReceivedEvent",
     "KeeperSyncPushCheckEvent",
     "KeeperSyncRunCompletedEvent",
@@ -574,6 +575,57 @@ class PurgatoryCleanupCompletedEvent(DocverseEventBase):
 
     elapsed: timedelta
     """Wall-clock time the sweep spent on this organization."""
+
+
+class ExcludedPathScrubCompletedEvent(DocverseEventBase):
+    """One project's ``excluded_path_scrub`` job finished (PRD #853).
+
+    Emitted by the scrub worker once, after the queue row's terminal
+    commit, with the same counters the job's ``progress`` report ends
+    on. The report is the per-build detail but lives on a
+    ``queue_jobs`` row that retention eventually takes, so this event is
+    the durable record that a scrub ran and what it found or removed.
+    The scrub endpoint is per project, so the event is project-scoped.
+
+    ``dry_run`` says how to read the ``*_removed`` counters: in a dry
+    run they are what the scrub *would* remove and nothing was deleted;
+    in a real run they are what was actually deleted, which a skipped or
+    failed build can make smaller than what was found. Summing
+    ``bytes_removed`` over the real runs is how much storage the scrub
+    has given back; the ``resource_inventory`` gauge's
+    ``total_build_bytes`` drops by the same amount at the next census.
+
+    A scrub that could not run at all — the organization vanished or has
+    no object store — publishes nothing and fails its queue row instead,
+    as ``purgatory_cleanup_completed`` does. So does a scrub cancelled
+    by arq's timeout or a worker shutdown: its row keeps the report so
+    far, and a new request resumes from the builds it did not stamp.
+    """
+
+    dry_run: bool
+    """Whether the scrub only reported what it would remove."""
+
+    builds_examined: int
+    """Builds whose prefix the scrub listed, affected or not."""
+
+    builds_affected: int
+    """Builds found holding at least one excluded path."""
+
+    objects_removed: int
+    """Excluded objects deleted (in a dry run, that would be deleted)."""
+
+    bytes_removed: int
+    """Combined size of ``objects_removed``."""
+
+    builds_failed: int
+    """Builds the scrub could not examine or finish."""
+
+    builds_skipped: int
+    """Affected builds a real run left alone because they were retired
+    or scrubbed by another run after this one listed them."""
+
+    elapsed: timedelta
+    """Wall-clock time the scrub spent on the project."""
 
 
 class ResourceInventoryEvent(DocverseEventBase):
