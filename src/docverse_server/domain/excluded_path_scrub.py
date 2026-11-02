@@ -1,0 +1,163 @@
+"""Domain rules for the excluded-path scrub.
+
+The scrub removes, from builds already stored, the cache paths that every
+ingest point now leaves out (`docverse.excluded_paths`). This module holds
+the part of that job with no I/O: which of a build's objects are
+excluded, and how they are grouped for the report an operator reads.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Protocol
+
+from docverse.excluded_paths import EXCLUDED_PATH_NAMES
+
+__all__ = [
+    "SCRUBBED_ANNOTATION",
+    "BuildScrubMatch",
+    "ExcludedEntry",
+    "SizedObject",
+    "excluded_entry_path",
+    "match_excluded_objects",
+]
+
+SCRUBBED_ANNOTATION = "excluded_paths_scrubbed"
+"""Build annotation key a real scrub stamps on each build it finishes.
+
+A build carrying it is left out of later scrubs of its project, so a
+re-run after a partial failure revisits only the builds the first run
+did not get through.
+"""
+
+
+class SizedObject(Protocol):
+    """A stored object's key and size, as an object-store listing gives.
+
+    Structural, so the object store's ``ObjectEntry`` satisfies it
+    without this module depending on the storage layer.
+    """
+
+    @property
+    def key(self) -> str:
+        """Full object key, prefix included."""
+        ...
+
+    @property
+    def size(self) -> int:
+        """Size of the object in bytes."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ExcludedEntry:
+    """Excluded objects of one build that share an excluded entry."""
+
+    path: str
+    """Build-relative entry path; see `excluded_entry_path`."""
+
+    keys: tuple[str, ...]
+    """Full object keys under the entry, in key order."""
+
+    total_size_bytes: int
+    """Combined size of those objects."""
+
+    @property
+    def object_count(self) -> int:
+        """Number of objects under the entry."""
+        return len(self.keys)
+
+
+@dataclass(frozen=True, slots=True)
+class BuildScrubMatch:
+    """The excluded objects found under one build's storage prefix."""
+
+    entries: tuple[ExcludedEntry, ...]
+    """Excluded entries, in entry-path order. Empty when none matched."""
+
+    @property
+    def object_count(self) -> int:
+        """Number of excluded objects across every entry."""
+        return sum(entry.object_count for entry in self.entries)
+
+    @property
+    def total_size_bytes(self) -> int:
+        """Combined size of the excluded objects across every entry."""
+        return sum(entry.total_size_bytes for entry in self.entries)
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        """Every excluded object key, entry by entry."""
+        return tuple(key for entry in self.entries for key in entry.keys)
+
+
+def excluded_entry_path(relative_path: str) -> str | None:
+    """Return the excluded entry a build-relative object path falls under.
+
+    The entry is the path up to and including its first segment named in
+    `~docverse.excluded_paths.EXCLUDED_PATH_NAMES`, the same any-segment
+    rule `~docverse.excluded_paths.is_excluded_path` applies. When that
+    segment is a directory (anything follows it) the entry ends with
+    ``/``, so ``.doctrees/environment.pickle`` falls under
+    ``.doctrees/``; when it is the object itself, the entry is the whole
+    path, as for ``.buildinfo``. A cache inside a nested sub-site keeps
+    its parent segments (``v1/.doctrees/``), so the report says where in
+    the tree it was found.
+
+    Parameters
+    ----------
+    relative_path
+        Object key with the build's storage prefix removed.
+
+    Returns
+    -------
+    str or None
+        The entry path, or `None` when the path is not excluded.
+    """
+    segments = relative_path.split("/")
+    for index, segment in enumerate(segments):
+        if segment in EXCLUDED_PATH_NAMES:
+            entry = "/".join(segments[: index + 1])
+            return entry if index == len(segments) - 1 else f"{entry}/"
+    return None
+
+
+def match_excluded_objects(
+    objects: Iterable[SizedObject], *, storage_prefix: str
+) -> BuildScrubMatch:
+    """Select a build's excluded objects and group them by entry.
+
+    Parameters
+    ----------
+    objects
+        The build's objects, as listed under ``storage_prefix``. An
+        object outside the prefix is ignored rather than trusted: its
+        path relative to this build is undefined.
+    storage_prefix
+        The build's storage prefix, which is stripped from each key
+        before the excluded-path rule is applied, so a cache name that
+        happens to appear in the prefix itself never matches.
+
+    Returns
+    -------
+    BuildScrubMatch
+        The excluded objects grouped by `excluded_entry_path`.
+    """
+    grouped: dict[str, list[SizedObject]] = {}
+    for obj in objects:
+        if not obj.key.startswith(storage_prefix):
+            continue
+        entry = excluded_entry_path(obj.key[len(storage_prefix) :])
+        if entry is not None:
+            grouped.setdefault(entry, []).append(obj)
+    return BuildScrubMatch(
+        entries=tuple(
+            ExcludedEntry(
+                path=path,
+                keys=tuple(sorted(obj.key for obj in matched)),
+                total_size_bytes=sum(obj.size for obj in matched),
+            )
+            for path, matched in sorted(grouped.items())
+        )
+    )

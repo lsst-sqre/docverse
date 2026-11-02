@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 import structlog
 
-from ._protocol import require_nonblank_prefix
+from ._protocol import ObjectEntry, require_nonblank_prefix
 
 __all__ = ["MockObjectStore"]
 
@@ -104,6 +104,13 @@ class MockObjectStore:
     async def list_objects(self, *, prefix: str) -> list[str]:
         """List objects matching a prefix."""
         return sorted(k for k in self._objects if k.startswith(prefix))
+
+    async def list_object_entries(self, *, prefix: str) -> list[ObjectEntry]:
+        """List objects matching a prefix, sized by their stored data."""
+        return [
+            ObjectEntry(key=key, size=len(self._objects[key].data))
+            for key in sorted(k for k in self._objects if k.startswith(prefix))
+        ]
 
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str

@@ -23,7 +23,7 @@ from .._http_retry import (
     retry_request,
 )
 from ._exceptions import ObjectStoreError
-from ._protocol import require_nonblank_prefix
+from ._protocol import ObjectEntry, require_nonblank_prefix
 
 __all__ = ["S3ObjectStore"]
 
@@ -337,6 +337,25 @@ class S3ObjectStore:
         ):
             keys.extend(obj["Key"] for obj in page.get("Contents", []))
         return keys
+
+    async def list_object_entries(self, *, prefix: str) -> list[ObjectEntry]:
+        """List objects with the given prefix, with their sizes.
+
+        Reads ``Size`` off the same ``list_objects_v2`` pages
+        :meth:`list_objects` pages through, so it issues no extra
+        requests.
+        """
+        client = self._get_client()
+        entries: list[ObjectEntry] = []
+        paginator = client.get_paginator("list_objects_v2")
+        async for page in paginator.paginate(
+            Bucket=self._bucket, Prefix=prefix
+        ):
+            entries.extend(
+                ObjectEntry(key=obj["Key"], size=obj["Size"])
+                for obj in page.get("Contents", [])
+            )
+        return entries
 
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str

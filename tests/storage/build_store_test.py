@@ -2148,3 +2148,118 @@ async def test_set_sync_dates_matching_row_is_not_written(
             stamped,
             stamped,
         )
+
+
+async def _build_with(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    *,
+    project_id: int,
+    git_ref: str,
+    status: BuildStatus,
+    deleted: bool = False,
+    annotations: dict[str, Any] | None = None,
+) -> Build:
+    """Create a build and force its status, deletion and annotations."""
+    build = await build_store.create(
+        project_id=project_id,
+        project_slug="build-proj",
+        data=BuildCreate(git_ref=git_ref),
+        uploader="testuser",
+    )
+    values: dict[str, Any] = {"status": status}
+    if deleted:
+        values["date_deleted"] = func.now()
+    if annotations is not None:
+        values["annotations"] = annotations
+    await db_session.execute(
+        update(SqlBuild).where(SqlBuild.id == build.id).values(**values)
+    )
+    return build
+
+
+@pytest.mark.asyncio
+async def test_list_scrub_candidates_takes_completed_live_unscrubbed_builds(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The excluded-path scrub walks a project's finished, live builds.
+
+    A build still in flight has no settled tree to scrub, a failed or
+    retired one serves nothing, and a soft-deleted one is purgatory's to
+    reclaim whole. A build already stamped ``excluded_paths_scrubbed``
+    has been through a real scrub, so a re-run after a partial failure
+    only revisits the rest. Other annotations do not count as a stamp.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        other_project = await ProjectStore(
+            session=db_session, logger=structlog.get_logger("docverse")
+        ).create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="other-proj",
+                title="Other Project",
+                source_url="https://example.com/example/other",
+            ),
+        )
+        plain = await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="plain",
+            status=BuildStatus.completed,
+        )
+        annotated = await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="annotated",
+            status=BuildStatus.completed,
+            annotations={"commit_sha": "abc123"},
+        )
+        for status in (
+            BuildStatus.pending,
+            BuildStatus.processing,
+            BuildStatus.failed,
+            BuildStatus.superseded,
+            BuildStatus.cancelled,
+        ):
+            await _build_with(
+                db_session,
+                build_store,
+                project_id=project_id,
+                git_ref=f"not-{status.value}",
+                status=status,
+            )
+        await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="deleted",
+            status=BuildStatus.completed,
+            deleted=True,
+        )
+        await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="scrubbed",
+            status=BuildStatus.completed,
+            annotations={
+                "excluded_paths_scrubbed": {"date": "2026-11-02T00:00:00Z"}
+            },
+        )
+        await _build_with(
+            db_session,
+            build_store,
+            project_id=other_project.id,
+            git_ref="elsewhere",
+            status=BuildStatus.completed,
+        )
+        candidates = await build_store.list_scrub_candidates(
+            project_id=project_id
+        )
+        await db_session.commit()
+
+    assert [build.id for build in candidates] == [plain.id, annotated.id]

@@ -26,7 +26,7 @@ from typing import Any, Self
 import httpx
 import structlog
 
-from ._protocol import ObjectStore
+from ._protocol import ObjectEntry, ObjectStore
 
 __all__ = ["ObjectStoreBuild", "ObjectStoreCache", "ObjectStoreKey"]
 
@@ -386,6 +386,10 @@ class _CachedObjectStore:
     async def list_objects(self, *, prefix: str) -> list[str]:
         """List objects under ``prefix`` through the shared store."""
         return await self._require_store().list_objects(prefix=prefix)
+
+    async def list_object_entries(self, *, prefix: str) -> list[ObjectEntry]:
+        """List sized objects under ``prefix`` through the shared store."""
+        return await self._require_store().list_object_entries(prefix=prefix)
 
     async def download_object(self, *, key: str) -> bytes:
         """Download an object through the shared store."""

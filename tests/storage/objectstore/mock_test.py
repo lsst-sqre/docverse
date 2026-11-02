@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from docverse_server.storage.objectstore import MockObjectStore
+from docverse_server.storage.objectstore import MockObjectStore, ObjectEntry
 
 
 @pytest.mark.asyncio
@@ -50,6 +50,28 @@ async def test_list_objects() -> None:
     )
     keys = await store.list_objects(prefix="prefix/")
     assert keys == ["prefix/a.txt", "prefix/b.txt"]
+
+
+@pytest.mark.asyncio
+async def test_list_object_entries_reports_each_object_size() -> None:
+    """Entries pair each matching key with its stored size, key-sorted."""
+    store = MockObjectStore()
+    await store.upload_object(
+        key="prefix/b.txt", data=b"bbb", content_type="text/plain"
+    )
+    await store.upload_object(
+        key="prefix/a.txt", data=b"a", content_type="text/plain"
+    )
+    await store.upload_object(
+        key="other/c.txt", data=b"cc", content_type="text/plain"
+    )
+
+    entries = await store.list_object_entries(prefix="prefix/")
+
+    assert entries == [
+        ObjectEntry(key="prefix/a.txt", size=1),
+        ObjectEntry(key="prefix/b.txt", size=3),
+    ]
 
 
 @pytest.mark.asyncio

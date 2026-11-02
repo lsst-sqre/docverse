@@ -6,7 +6,12 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
 
-from docverse.models import BuildCreate, BuildStatus, BuildUpdate
+from docverse.models import (
+    BuildCreate,
+    BuildStatus,
+    BuildUpdate,
+    ExcludedPathScrubRequest,
+)
 from docverse_server.dependencies.auth import (
     AuthenticatedUser,
     require_admin,
@@ -32,7 +37,7 @@ from docverse_server.storage.pagination import (
     MAX_PAGE_LIMIT,
 )
 
-from .models import Build
+from .models import Build, ExcludedPathScrubAccepted
 
 router = APIRouter()
 
@@ -314,3 +319,49 @@ async def post_build_restore(
         )
         await context.session.commit()
     return Build.from_domain(build, context.request, org_slug, project_slug)
+
+
+@router.post(
+    "/orgs/{org}/projects/{project}/builds/scrub-excluded-paths",
+    response_model=ExcludedPathScrubAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Scrub excluded cache paths from a project's builds",
+    name="post_builds_scrub_excluded_paths",
+)
+async def post_builds_scrub_excluded_paths(
+    *,
+    org_slug: OrgSlugParam,
+    project_slug: ProjectSlugParam,
+    scrub_request: ExcludedPathScrubRequest,
+    context: Annotated[RequestContext, Depends(context_dependency)],
+    user: Annotated[AuthenticatedUser, Depends(require_admin)],
+) -> ExcludedPathScrubAccepted:
+    """Queue a scrub of the excluded cache paths in a project's builds.
+
+    The scrub examines every completed, non-deleted build of the project
+    for the paths ``docverse.excluded_paths`` names (``.doctrees/``,
+    ``.buildinfo`` and the rest), which builds ingested before those
+    paths were filtered out may still hold. Its report — counters plus
+    one row per affected build, with the editions serving it and what
+    each excluded entry weighs — is the ``progress`` of the queue job
+    the response links to, updated as the scrub runs.
+
+    A project runs one scrub at a time: while one is queued or in
+    progress, a further request returns that job instead of queueing
+    another.
+    """
+    async with context.session.begin():
+        service = context.factory.create_excluded_path_scrub_service()
+        queue_job = await service.enqueue(
+            org=user.org,
+            project_slug=project_slug,
+            dry_run=scrub_request.dry_run,
+        )
+        await context.session.commit()
+    await context.factory.queue_dispatcher.dispatch()
+
+    response_model = ExcludedPathScrubAccepted.from_queue_job(
+        queue_job, context.request, org_slug
+    )
+    context.response.headers["Location"] = response_model.job_url
+    return response_model

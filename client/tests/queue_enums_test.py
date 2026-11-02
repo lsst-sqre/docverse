@@ -19,3 +19,8 @@ def test_job_kind_publish_edition() -> None:
 def test_job_kind_edition_reconcile() -> None:
     """The reconciliation loop's per-org job kind (PRD #612)."""
     assert JobKind.edition_reconcile == "edition_reconcile"
+
+
+def test_job_kind_excluded_path_scrub() -> None:
+    """The per-project excluded-path scrub's job kind (PRD #853)."""
+    assert JobKind.excluded_path_scrub == "excluded_path_scrub"

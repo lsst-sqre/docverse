@@ -465,6 +465,7 @@ tier's `tier_cron_timeout` instead (see
 | `keeper_sync_tier_discovery` | keeper-sync | `tier_cron_timeout` (1500 s) | `record_handoff_cancellation` | The project jobs it enqueues. |
 | `keeper_sync_tier_other` | keeper-sync | `tier_cron_timeout` (3000 s) | `record_handoff_cancellation` | The project jobs it enqueues. |
 | `edition_reconcile` | maintenance | `maintenance_job_timeout_seconds` | `record_cancellation` | Nothing; the row is the tick's whole record. |
+| `excluded_path_scrub` | maintenance | `maintenance_job_timeout_seconds` | `record_cancellation` | Records the scrub report so far on its row. |
 | `git_ref_audit` | maintenance | `maintenance_job_timeout_seconds` | `record_cancellation` | Rolls up its audit run. |
 | `lifecycle_eval` | maintenance | `maintenance_job_timeout_seconds` | `record_cancellation` | Rolls up its lifecycle run. |
 | `purgatory_cleanup` | maintenance | `maintenance_job_timeout_seconds` | `record_cancellation` | Nothing; the builds it already purged are stamped, and the next tick resumes. |

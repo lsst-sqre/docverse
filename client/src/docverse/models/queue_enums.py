@@ -37,6 +37,10 @@ class JobKind(StrEnum):
     - ``keeper_sync_run_discovery`` — fan out per-project sync jobs for
       a keeper-sync run.
     - ``keeper_sync_project`` — sync one LTD product into Docverse.
+    - ``excluded_path_scrub`` — report (and, unless it is a dry run,
+      remove) the excluded cache paths, such as ``.doctrees/``, already
+      stored in one project's builds. Its ``progress`` is an
+      :class:`~docverse.models.ExcludedPathScrubProgress` report.
     """
 
     build_processing = "build_processing"
@@ -51,6 +55,7 @@ class JobKind(StrEnum):
     credential_reencrypt = "credential_reencrypt"
     keeper_sync_run_discovery = "keeper_sync_run_discovery"
     keeper_sync_project = "keeper_sync_project"
+    excluded_path_scrub = "excluded_path_scrub"
 
 
 class JobStatus(StrEnum):

@@ -48,6 +48,7 @@ from .services.edition_tracking import (
     EditionTrackingDeps,
     EditionTrackingService,
 )
+from .services.excluded_path_scrub import ExcludedPathScrubService
 from .services.infrastructure import InfrastructureService
 from .services.inventory_census import InventoryCensusService
 from .services.keeper_sync import (
@@ -597,6 +598,20 @@ class Factory:
             queue_backend=self.create_queue_backend(),
             publisher_provider=self.create_edition_publisher_for_org,
             publishing_service=self.create_edition_publishing_service(),
+            logger=self._logger,
+        )
+
+    def create_excluded_path_scrub_service(self) -> ExcludedPathScrubService:
+        """Create an :class:`ExcludedPathScrubService`.
+
+        Built by the scrub endpoint, whose enqueue defers onto this
+        factory's shared dispatcher, and once per ``excluded_path_scrub``
+        job, which only uses the session-free per-build scan.
+        """
+        return ExcludedPathScrubService(
+            project_store=self.create_project_store(),
+            queue_job_store=self.create_queue_job_store(),
+            dispatcher=self.queue_dispatcher,
             logger=self._logger,
         )
 

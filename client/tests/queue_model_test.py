@@ -8,6 +8,9 @@ from docverse.models import (
     BuildProcessingProgress,
     BuildStatus,
     EditionUpdateRef,
+    ExcludedPathScrubBuild,
+    ExcludedPathScrubEntry,
+    ExcludedPathScrubProgress,
     PublishJobRef,
     QueueJob,
     RetiredBuildStatus,
@@ -315,3 +318,112 @@ def test_queue_job_subject_back_reference_fields_round_trip() -> None:
     assert job.build_url == build
     assert job.edition_url == edition
     assert job.subject_url == edition
+
+
+def _scrub_progress() -> dict[str, object]:
+    return {
+        "dry_run": True,
+        "builds_examined": 3,
+        "builds_affected": 1,
+        "objects_removed": 3,
+        "bytes_removed": 4200,
+        "builds_failed": 1,
+        "builds": [
+            {
+                "build_id": "0000-0000-0000-05",
+                "build_url": (
+                    "https://example.com/orgs/o/projects/p/builds/"
+                    "0000-0000-0000-05"
+                ),
+                "edition_slugs": ["__main"],
+                "entries": [
+                    {
+                        "path": ".doctrees/",
+                        "object_count": 2,
+                        "total_size_bytes": 4096,
+                    },
+                    {
+                        "path": ".buildinfo",
+                        "object_count": 1,
+                        "total_size_bytes": 104,
+                    },
+                ],
+            },
+            {
+                "build_id": "0000-0000-0000-06",
+                "edition_slugs": [],
+                "entries": [],
+                "error": "ObjectStoreError: listing refused",
+            },
+        ],
+    }
+
+
+def test_excluded_path_scrub_progress_typed_fields() -> None:
+    """A scrub report parses into typed counters, rows and entries."""
+    progress = ExcludedPathScrubProgress.model_validate(_scrub_progress())
+
+    assert progress.dry_run is True
+    assert progress.builds_examined == 3
+    assert progress.builds_affected == 1
+    assert progress.objects_removed == 3
+    assert progress.bytes_removed == 4200
+    assert progress.builds_failed == 1
+
+    affected, failed = progress.builds
+    assert isinstance(affected, ExcludedPathScrubBuild)
+    assert affected.build_id == "0000-0000-0000-05"
+    assert affected.build_url is not None
+    assert affected.edition_slugs == ["__main"]
+    assert affected.error is None
+    assert [entry.path for entry in affected.entries] == [
+        ".doctrees/",
+        ".buildinfo",
+    ]
+    assert isinstance(affected.entries[0], ExcludedPathScrubEntry)
+    assert affected.entries[0].object_count == 2
+    assert affected.entries[0].total_size_bytes == 4096
+
+    assert failed.build_url is None
+    assert failed.error == "ObjectStoreError: listing refused"
+
+
+def test_queue_job_progress_is_scrub_model_for_scrub_kind() -> None:
+    """``QueueJob.progress`` types a scrub job's payload as the scrub model.
+
+    The model is chosen by the job's ``kind``, so the build-processing
+    model's ``extra='allow'`` cannot swallow a scrub report as untyped
+    extras.
+    """
+    job = QueueJob.model_validate(
+        _queue_job(
+            kind=JobKind.excluded_path_scrub, progress=_scrub_progress()
+        )
+    )
+
+    assert isinstance(job.progress, ExcludedPathScrubProgress)
+    assert job.progress.builds[0].entries[0].path == ".doctrees/"
+
+
+def test_queue_job_scrub_progress_round_trips_through_json() -> None:
+    """A dumped scrub job validates back into the scrub model."""
+    job = QueueJob.model_validate(
+        _queue_job(
+            kind=JobKind.excluded_path_scrub, progress=_scrub_progress()
+        )
+    )
+
+    again = QueueJob.model_validate_json(job.model_dump_json())
+
+    assert isinstance(again.progress, ExcludedPathScrubProgress)
+    assert again.progress == job.progress
+
+
+def test_queue_job_scrub_shaped_progress_of_other_kind_stays_build() -> None:
+    """Only the scrub kind selects the scrub model, whatever the keys."""
+    job = QueueJob.model_validate(
+        _queue_job(kind=JobKind.purgatory_cleanup, progress={"dry_run": True})
+    )
+
+    assert isinstance(job.progress, BuildProcessingProgress)
+    assert job.progress.model_dump(mode="json") == {"dry_run": True}

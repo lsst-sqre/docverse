@@ -56,6 +56,7 @@ RECORDS_CANCELLATION = frozenset(
         # Maintenance pool; ``project_github_resolve`` uses the hand-off
         # helper for the ``dashboard_sync`` rows it creates.
         "edition_reconcile",
+        "excluded_path_scrub",
         "git_ref_audit",
         "lifecycle_eval",
         "project_github_resolve",

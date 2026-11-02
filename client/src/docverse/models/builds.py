@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ._examples import (
     EXAMPLE_BUILD_ID,
     EXAMPLE_BUILD_URL,
+    EXAMPLE_JOB_ID,
     EXAMPLE_JOB_URL,
     EXAMPLE_PROJECT_URL,
 )
@@ -21,6 +22,8 @@ __all__ = [
     "BuildCreate",
     "BuildStatus",
     "BuildUpdate",
+    "ExcludedPathScrubAccepted",
+    "ExcludedPathScrubRequest",
 ]
 
 
@@ -360,4 +363,55 @@ class BuildUpdate(BaseModel):
             "Signal value. Set to 'uploaded' to indicate upload is "
             "complete and trigger processing."
         ),
+    )
+
+
+class ExcludedPathScrubRequest(BaseModel):
+    """Request body for scrubbing excluded paths from a project's builds.
+
+    Sent to
+    ``POST /orgs/{org}/projects/{project}/builds/scrub-excluded-paths``.
+    The scrub looks for the cache paths named by
+    `docverse.excluded_paths.EXCLUDED_PATH_NAMES` (such as ``.doctrees/``
+    and ``.buildinfo``) in every completed, non-deleted build of the
+    project, and reports what it finds in its queue job's ``progress``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dry_run: bool = Field(
+        default=False,
+        description=(
+            "Report what the scrub would remove without deleting"
+            " anything. Defaults to ``false``, a real scrub."
+        ),
+    )
+
+
+class ExcludedPathScrubAccepted(BaseModel):
+    """Response body for an accepted excluded-path scrub request.
+
+    Returned with ``202 Accepted`` by
+    ``POST /orgs/{org}/projects/{project}/builds/scrub-excluded-paths``.
+    A project runs at most one scrub at a time: when one is already
+    queued or in progress, the response names that job rather than a
+    new one.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    job_id: str = Field(
+        description=(
+            "Public Base32 identifier of the ``excluded_path_scrub``"
+            " queue job."
+        ),
+        examples=[EXAMPLE_JOB_ID],
+    )
+
+    job_url: str = Field(
+        description=(
+            "URL of the queue job resource, whose ``progress`` carries"
+            " the scrub report."
+        ),
+        examples=[EXAMPLE_JOB_URL],
     )

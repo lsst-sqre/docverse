@@ -22,6 +22,7 @@ from docverse_server.worker.functions import (
     edition_reconcile,
     edition_reconcile_dispatcher,
     edition_reconcile_reaper,
+    excluded_path_scrub,
     inventory_census,
     lifecycle_eval,
     lifecycle_eval_dispatcher,
@@ -992,3 +993,24 @@ def test_project_github_resolve_registers_explicit_max_tries() -> None:
     entry = _function_by_coroutine(project_github_resolve)
 
     assert entry.max_tries == PROJECT_GITHUB_RESOLVE_MAX_TRIES
+
+
+def test_excluded_path_scrub_registered_single_attempt() -> None:
+    """The per-project scrub runs on this pool, timed out, one attempt.
+
+    Its object-store listings are long non-publishing work, so it must
+    not contend with the default pool. A retry would re-walk builds the
+    first attempt already reported, so recovery is a fresh request.
+    """
+    scrub = _function_by_coroutine(excluded_path_scrub)
+    assert scrub.timeout_s == float(_config.maintenance_job_timeout_seconds)
+    assert scrub.max_tries == 1
+
+
+def test_default_worker_does_not_register_excluded_path_scrub() -> None:
+    """The scrub is never picked up by the publishing pool."""
+    registered = {
+        _underlying(entry.coroutine if isinstance(entry, Function) else entry)
+        for entry in WorkerSettings.functions
+    }
+    assert excluded_path_scrub not in registered

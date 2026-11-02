@@ -24,6 +24,9 @@ from docverse.models import Edition as _EditionBase
 from docverse.models import (
     EditionBuildHistoryEntry as _EditionBuildHistoryEntryBase,
 )
+from docverse.models import (
+    ExcludedPathScrubAccepted as _ExcludedPathScrubAcceptedBase,
+)
 from docverse.models import Organization as _OrganizationBase
 from docverse.models import (
     OrganizationCredential as _OrganizationCredentialBase,
@@ -478,6 +481,23 @@ class DashboardRebuildResponse(_DashboardRebuildResponseBase):
         cls, queue_job: QueueJobDomain, request: Request, org_slug: str
     ) -> Self:
         """Create from a domain queue job, adding the job_url."""
+        job_id = serialize_base32_id(queue_job.public_id)
+        return cls(
+            job_id=job_id,
+            job_url=str(
+                request.url_for("get_org_job", org=org_slug, job=job_id)
+            ),
+        )
+
+
+class ExcludedPathScrubAccepted(_ExcludedPathScrubAcceptedBase):
+    """Excluded-path scrub 202 envelope with a HATEOAS job URL."""
+
+    @classmethod
+    def from_queue_job(
+        cls, queue_job: QueueJobDomain, request: Request, org_slug: str
+    ) -> Self:
+        """Create from the scrub's domain queue job, adding the job_url."""
         job_id = serialize_base32_id(queue_job.public_id)
         return cls(
             job_id=job_id,

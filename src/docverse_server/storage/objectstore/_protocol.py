@@ -2,10 +2,28 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import TracebackType
 from typing import Protocol, Self, runtime_checkable
 
-__all__ = ["ObjectStore", "require_nonblank_prefix"]
+__all__ = ["ObjectEntry", "ObjectStore", "require_nonblank_prefix"]
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectEntry:
+    """One object in a store listing, with its size.
+
+    Returned by :meth:`ObjectStore.list_object_entries` for callers that
+    need to know how many bytes a set of keys occupies without
+    downloading any of them, such as the excluded-path scrub's report of
+    what a build's cache directories weigh.
+    """
+
+    key: str
+    """Full object key, prefix included."""
+
+    size: int
+    """Size of the object in bytes, as the store reports it."""
 
 
 def require_nonblank_prefix(prefix: str) -> str:
@@ -169,6 +187,28 @@ class ObjectStore(Protocol):
         -------
         list of str
             List of matching object keys.
+        """
+        ...
+
+    async def list_object_entries(self, *, prefix: str) -> list[ObjectEntry]:
+        """List objects with the given prefix, with their sizes.
+
+        The sized sibling of :meth:`list_objects`. S3's
+        ``ListObjectsV2`` already reports every object's size, so this
+        costs the same requests as the key-only listing; it is a
+        separate method only so that callers that need keys alone keep
+        their simpler return type.
+
+        Parameters
+        ----------
+        prefix
+            Key prefix to filter by.
+
+        Returns
+        -------
+        list of ObjectEntry
+            One entry per matching object, carrying its full key and
+            size in bytes.
         """
         ...
 

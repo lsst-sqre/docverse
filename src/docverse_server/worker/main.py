@@ -68,6 +68,7 @@ from .functions import (
     edition_reconcile,
     edition_reconcile_dispatcher,
     edition_reconcile_reaper,
+    excluded_path_scrub,
     git_ref_audit,
     git_ref_audit_discovery,
     inventory_census,
@@ -1301,6 +1302,18 @@ class MaintenanceWorkerSettings:
         ),
         func(
             instrument_arq_task(edition_reconcile),
+            timeout=config.maintenance_job_timeout_seconds,
+            max_tries=1,
+        ),
+        # The admin-triggered, per-project ``excluded_path_scrub`` (PRD
+        # #853). Its object-store listings are exactly the long,
+        # non-publishing work this pool exists to keep off the default
+        # one. ``max_tries=1`` because a retry would re-walk builds the
+        # first attempt already reported on; recovery is the operator
+        # re-posting the request, and a real scrub's stamps leave a
+        # re-run only the builds it did not get through.
+        func(
+            instrument_arq_task(excluded_path_scrub),
             timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),

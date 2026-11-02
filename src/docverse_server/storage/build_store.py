@@ -19,6 +19,7 @@ from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
+from docverse_server.domain.excluded_path_scrub import SCRUBBED_ANNOTATION
 from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.storage._public_id import (
     insert_with_time_ordered_public_id,
@@ -907,6 +908,43 @@ class BuildStore:
         row.date_deleted = func.now()
         await self._session.flush()
         return True
+
+    async def list_scrub_candidates(self, *, project_id: int) -> list[Build]:
+        """List the builds an excluded-path scrub of a project examines.
+
+        A build qualifies when it is ``completed`` (anything earlier has
+        no settled tree, anything else serves nothing), not soft-deleted
+        (purgatory reclaims those whole), and not yet stamped with the
+        :data:`~docverse_server.domain.excluded_path_scrub.SCRUBBED_ANNOTATION`
+        annotation a real scrub leaves on each build it finishes, so a
+        re-run after a partial failure only revisits the rest. A null
+        ``annotations`` column (SQL or JSON ``null``) is unstamped.
+
+        Parameters
+        ----------
+        project_id
+            Project whose builds to list.
+
+        Returns
+        -------
+        list of Build
+            Eligible builds, oldest (lowest ``id``) first, so a scrub
+            walks a project in the order its builds were created.
+        """
+        result = await self._session.execute(
+            select(SqlBuild)
+            .where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.status == BuildStatus.completed,
+                SqlBuild.date_deleted.is_(None),
+                or_(
+                    SqlBuild.annotations.is_(None),
+                    ~SqlBuild.annotations.has_key(SCRUBBED_ANNOTATION),
+                ),
+            )
+            .order_by(SqlBuild.id)
+        )
+        return [Build.model_validate(row) for row in result.scalars().all()]
 
     async def list_purgeable(
         self, *, org_id: int, cutoff: datetime, limit: int

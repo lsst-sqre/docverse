@@ -22,6 +22,7 @@ from structlog.testing import capture_logs
 
 from docverse_server.storage.objectstore import (
     MockObjectStore,
+    ObjectEntry,
     ObjectStore,
     ObjectStoreCache,
     ObjectStoreKey,
@@ -273,6 +274,9 @@ async def test_handle_borrows_the_shared_store_while_entered() -> None:
         )
     async with second:
         assert await second.list_objects(prefix="proj/") == ["proj/a.html"]
+        assert await second.list_object_entries(prefix="proj/") == [
+            ObjectEntry(key="proj/a.html", size=1)
+        ]
         assert await second.download_object(key="proj/a.html") == b"a"
         assert await second.delete_prefix(prefix="proj/") == 1
 
