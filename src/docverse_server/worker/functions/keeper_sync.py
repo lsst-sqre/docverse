@@ -1481,6 +1481,7 @@ def _build_on_build_copied(
                 build_retry_used=report.build_retry_used,
                 succeeded=report.succeeded,
                 ltd_lag_seconds=report.ltd_lag_seconds,
+                excluded_object_count=report.excluded_object_count,
             )
         )
 

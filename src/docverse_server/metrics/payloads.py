@@ -461,6 +461,17 @@ class BuildContentCopiedEvent(DocverseEventBase):
     zero.
     """
 
+    excluded_object_count: int | None
+    """LTD keys the copy's last pass left behind as excluded cache paths.
+
+    Keys under the build's LTD prefix whose relative path
+    ``docverse.excluded_paths.is_excluded_path`` matches, such as
+    Sphinx's ``.doctrees/`` pickles and ``.buildinfo`` (PRD #853). They
+    are never downloaded, so this is a key count with no byte total:
+    LTD's listing carries no sizes. Directory markers are not counted.
+    ``None`` when the last pass failed before it had listed the prefix.
+    """
+
 
 class LifecycleActionEvent(DocverseEventBase):
     """A maintenance worker retired a resource.

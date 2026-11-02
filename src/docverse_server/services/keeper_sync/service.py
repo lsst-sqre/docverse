@@ -387,6 +387,14 @@ class BuildCopyReport:
     exhausted_object_count: int
     """Objects whose upload ran out of its retry budget, over both passes."""
 
+    excluded_object_count: int | None
+    """Content keys the last pass left behind as excluded cache paths.
+
+    Counted from the last pass's listing of the LTD prefix, like
+    ``object_count``; ``None`` when that pass failed before the listing
+    completed. See :attr:`CopyResult.excluded_object_count`.
+    """
+
     build_retry_used: bool
     """Whether the copy was re-run after a transport error."""
 
@@ -4199,6 +4207,7 @@ class KeeperSyncService:
                 exhausted_object_count=sum(
                     tally.exhausted_object_count for tally in passes
                 ),
+                excluded_object_count=last.excluded_object_count,
                 build_retry_used=len(passes) > 1,
                 succeeded=succeeded,
                 ltd_lag_seconds=_measure_ltd_lag_seconds(

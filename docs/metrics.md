@@ -352,6 +352,7 @@ read these events across a sync campaign.
 | `build_retry_used` | boolean | field | Whether the build-level retry re-ran the copy. |
 | `succeeded` | boolean | field | Whether the copy, after any build-level retry, stored every object. Not named `success`, so not a tag. |
 | `ltd_lag_seconds` | float or null | field | Seconds from LTD's `date_rebuilt` for the edition to the copy's end: the copy half of `ltd_lag`, set when the copy is a rebuild of an edition Docverse already mirrors. Null on the edition's first import and when LTD reports no `date_rebuilt`; negative under clock skew. See [Measuring lag behind LTD Keeper](#measuring-lag-behind-ltd-keeper). |
+| `excluded_object_count` | integer or null | field | LTD keys the copy's last pass left behind as excluded cache paths (`.doctrees/`, `.buildinfo` and the rest of `docverse.excluded_paths`); never downloaded, so there is no byte total. Null when that pass failed before listing the prefix. |
 
 ### `edition_published`
 
@@ -791,8 +792,8 @@ counts every visit, since every point carries `enqueued`.
   scalar-only, because InfluxDB stores no nested structures.
 - **An existing event** changes only by gaining a nullable field, as
   `edition_published` gained `ltd_lag`, `build_content_copied`
-  gained `ltd_lag_seconds`, and `github_webhook_received` gained
-  `projects_stamped`. Every consumer reads the topic through the
+  gained `ltd_lag_seconds` and `excluded_object_count`, and
+  `github_webhook_received` gained `projects_stamped`. Every consumer reads the topic through the
   event's registered Avro schema, so renaming, retyping, or removing a
   field breaks them.
 - **A new enum value** is appended to its enum, as `WebhookOutcome`

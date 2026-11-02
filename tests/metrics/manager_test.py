@@ -353,6 +353,7 @@ async def test_build_content_copied_reports_transport_health() -> None:
             build_retry_used=True,
             succeeded=True,
             ltd_lag_seconds=95.5,
+            excluded_object_count=81,
         )
     )
 
@@ -371,6 +372,7 @@ async def test_build_content_copied_reports_transport_health() -> None:
                 "build_retry_used": True,
                 "succeeded": True,
                 "ltd_lag_seconds": 95.5,
+                "excluded_object_count": 81,
             }
         ]
     )

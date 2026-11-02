@@ -13,6 +13,13 @@ double as the ``content_hash`` on the resulting Docverse build row —
 and so a build synced from LTD hashes identically to the same content
 uploaded through the client.
 
+Not every listed key is content. LTD's zero-byte directory markers and
+the build caches it published beside the HTML (``.doctrees/`` pickles,
+``.buildinfo`` and the rest of :mod:`docverse.excluded_paths`) are
+dropped from the listing before anything is downloaded, by both the
+copy and the hash-only pass; see
+:meth:`BuildContentCopier._list_content_keys`.
+
 Object bodies are still buffered whole rather than streamed:
 :meth:`~docverse_server.storage.objectstore.ObjectStore.upload_object`
 takes ``bytes``, so streaming the copy path would mean reworking the
@@ -47,6 +54,7 @@ from dataclasses import dataclass
 
 import structlog
 
+from docverse.excluded_paths import is_excluded_path
 from docverse_server.domain.content_hash import (
     EMPTY_MANIFEST_HASH,
     hash_manifest_pairs,
@@ -87,6 +95,16 @@ class CopyResult:
     content_hash: str
     """``sha256:<64 hex chars>`` over the deterministic manifest."""
 
+    excluded_object_count: int
+    """Content keys left behind as excluded cache paths.
+
+    Keys whose path relative to the source prefix
+    :func:`docverse.excluded_paths.is_excluded_path` matches, such as
+    Sphinx's ``.doctrees/`` pickles and ``.buildinfo``. They are never
+    downloaded, so only their number is known: LTD's listing carries
+    key names and no sizes.
+    """
+
 
 @dataclass
 class CopyTally:
@@ -113,6 +131,16 @@ class CopyTally:
 
     exhausted_object_count: int = 0
     """Objects whose upload ran out of the destination's retry budget."""
+
+    excluded_object_count: int | None = None
+    """Content keys left behind as excluded cache paths.
+
+    Set as soon as the copy has listed its source, before any object is
+    downloaded, so a copy that fails part-way still reports it. ``None``
+    when the copy failed before that listing completed, since nothing is
+    known about the prefix then. See
+    :attr:`CopyResult.excluded_object_count`.
+    """
 
 
 class BuildContentCopier:
@@ -153,8 +181,7 @@ class BuildContentCopier:
         the same ``sha256:<hex>`` shape :meth:`copy_build` produces.
         """
         normalized_source_prefix = _ensure_trailing_slash(source_prefix)
-        listed = await self._source.list_keys(prefix=normalized_source_prefix)
-        keys = _select_content_keys(sorted(listed), normalized_source_prefix)
+        keys = (await self._list_content_keys(normalized_source_prefix)).keys
         if not keys:
             return EMPTY_MANIFEST_HASH
         _reject_escaping_keys(keys, normalized_source_prefix, verb="hash")
@@ -203,17 +230,20 @@ class BuildContentCopier:
             tally = CopyTally()
         normalized_source_prefix = _ensure_trailing_slash(source_prefix)
         normalized_dest_prefix = _ensure_trailing_slash(dest_prefix)
-        listed = await self._source.list_keys(prefix=normalized_source_prefix)
-        keys = _select_content_keys(sorted(listed), normalized_source_prefix)
+        content = await self._list_content_keys(normalized_source_prefix)
+        tally.excluded_object_count = content.excluded_count
+        keys = content.keys
         if not keys:
             self._logger.warning(
                 "Empty source prefix; nothing to copy",
                 source_prefix=normalized_source_prefix,
+                excluded_object_count=content.excluded_count,
             )
             return CopyResult(
                 object_count=0,
                 total_size_bytes=0,
                 content_hash=EMPTY_MANIFEST_HASH,
+                excluded_object_count=content.excluded_count,
             )
 
         _reject_escaping_keys(keys, normalized_source_prefix, verb="copy")
@@ -273,13 +303,30 @@ class BuildContentCopier:
             peak_concurrent_copies=in_flight.peak,
             retried_object_count=tally.retried_object_count,
             exhausted_object_count=tally.exhausted_object_count,
+            excluded_object_count=content.excluded_count,
         )
 
         return CopyResult(
             object_count=len(manifest_entries),
             total_size_bytes=total_bytes,
             content_hash=manifest_hash,
+            excluded_object_count=content.excluded_count,
         )
+
+    async def _list_content_keys(self, source_prefix: str) -> _ContentKeys:
+        """List the keys under ``source_prefix`` that hold build content.
+
+        The one place both :meth:`compute_manifest_hash` and
+        :meth:`copy_build` take their keys from, so the hash the
+        keeper-sync engine branches on and the bytes it then copies are
+        always selected by the same rules: directory markers are dropped
+        (:func:`_select_content_keys`), and then so is every key whose
+        path relative to ``source_prefix`` is an excluded cache path
+        (:func:`_drop_excluded_keys`). Neither kind is ever downloaded.
+        """
+        listed = await self._source.list_keys(prefix=source_prefix)
+        content_keys = _select_content_keys(sorted(listed), source_prefix)
+        return _drop_excluded_keys(content_keys, source_prefix)
 
     async def _run_bounded(
         self,
@@ -337,6 +384,17 @@ class BuildContentCopier:
             # blanking it leaves Sentry and ``queue_jobs.errors`` holding
             # a bare Docverse wrapper with no underlying fault to triage.
             raise leaf from leaf.__cause__
+
+
+@dataclass(frozen=True)
+class _ContentKeys:
+    """The keys under a source prefix that a copy or hash pass reads."""
+
+    keys: list[str]
+    """Content keys to download, in sorted order."""
+
+    excluded_count: int
+    """Content keys dropped because they are excluded cache paths."""
 
 
 class _ConcurrencyTracker:
@@ -412,6 +470,36 @@ def _select_content_keys(keys: Sequence[str], prefix: str) -> list[str]:
         and not key.endswith("/")
         and key not in directory_keys
     ]
+
+
+def _drop_excluded_keys(keys: Sequence[str], prefix: str) -> _ContentKeys:
+    """Drop the keys under ``prefix`` that are excluded cache paths.
+
+    A key is dropped when its path relative to ``prefix`` satisfies
+    :func:`docverse.excluded_paths.is_excluded_path`, the predicate
+    shared by every Docverse ingest path; the client applies it when it
+    builds an upload tarball. LTD published whatever the build
+    directory held, so its prefixes carry Sphinx's ``.doctrees/``
+    pickles and ``.buildinfo`` alongside the HTML; filtering them here,
+    before either caller downloads a byte, keeps them out of the
+    destination and out of the manifest hash, so a keeper-synced build
+    still hashes identically to a client upload of the same tree
+    (PRD #853).
+
+    Runs after :func:`_select_content_keys`, so the directory marker
+    LTD writes for an excluded directory (``<prefix>.doctrees``) is
+    dropped as a marker and not counted here: the count is of content
+    objects left behind, comparable with the object count copied. As
+    with markers, a prefix holding nothing but excluded keys collapses
+    into both callers' empty-prefix branch.
+
+    Returns the surviving keys in the order given, and how many were
+    dropped.
+    """
+    kept = [
+        key for key in keys if not is_excluded_path(key.removeprefix(prefix))
+    ]
+    return _ContentKeys(keys=kept, excluded_count=len(keys) - len(kept))
 
 
 def _reject_escaping_keys(

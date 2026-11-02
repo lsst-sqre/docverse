@@ -63,13 +63,15 @@ def test_edition_published_adds_only_a_nullable_ltd_lag() -> None:
     EditionPublishedEvent.validate_structure()
 
 
-def test_build_content_copied_adds_only_a_nullable_ltd_lag_seconds() -> None:
-    """``build_content_copied`` grows exactly one nullable float field.
+def test_build_content_copied_adds_only_nullable_fields() -> None:
+    """``build_content_copied`` grows only nullable fields, appended.
 
     ``ltd_lag_seconds`` is null when LTD reports no ``date_rebuilt`` to
     measure from, and otherwise a float, the same Avro type as the
-    ``duration_seconds`` it is read against; the fields that were
-    already there keep their names and order.
+    ``duration_seconds`` it is read against. ``excluded_object_count``
+    (PRD #853) is null when the copy failed before listing its source,
+    and otherwise an integer, the same Avro type as ``object_count``.
+    The fields that were already there keep their names and order.
     """
     fields = _avro_field_types(BuildContentCopiedEvent)
 
@@ -86,11 +88,17 @@ def test_build_content_copied_adds_only_a_nullable_ltd_lag_seconds() -> None:
         "build_retry_used",
         "succeeded",
         "ltd_lag_seconds",
+        "excluded_object_count",
     ]
     assert isinstance(fields["ltd_lag_seconds"], list)
     assert set(fields["ltd_lag_seconds"]) == {
         "null",
         fields["duration_seconds"],
+    }
+    assert isinstance(fields["excluded_object_count"], list)
+    assert set(fields["excluded_object_count"]) == {
+        "null",
+        fields["object_count"],
     }
     # Every union member must still be one InfluxDB can store.
     BuildContentCopiedEvent.validate_structure()
