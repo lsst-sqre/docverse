@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import overload
+from typing import Any, overload
 
 import structlog
 from safir.database import CountedPaginatedList, CountedPaginatedQueryRunner
@@ -19,6 +19,7 @@ from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.content_hash import PLACEHOLDER_CONTENT_HASH
+from docverse_server.domain.excluded_path_scrub import SCRUBBED_ANNOTATION
 from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.storage._public_id import (
     insert_with_time_ordered_public_id,
@@ -775,6 +776,134 @@ class BuildStore:
         await self._session.refresh(row)
         return Build.model_validate(row)
 
+    async def correct_inventory(
+        self,
+        *,
+        build_id: int,
+        object_count: int,
+        total_size_bytes: int,
+    ) -> Build:
+        """Replace a completed build's inventory with measured counts.
+
+        The excluded-path scrub's inventory correction: once it has
+        deleted a live build's cache objects, the build's
+        ``object_count`` and ``total_size_bytes`` must stop counting
+        them, or the inventory census goes on reporting bytes the store
+        no longer holds. The scrub passes what its listing of the
+        build's prefix held less what it deleted, so the write is
+        absolute rather than a decrement: objects an earlier, interrupted
+        scrub deleted without recording are no longer listed and so come
+        off too, and a counter that was never recorded (``NULL``) gets
+        the measured value. Unlike :meth:`update_inventory`, which writes
+        the counts a fresh build was unpacked with, this corrects the
+        counts of a build that is already serving, so it is refused for
+        any build that is not ``completed`` and live.
+
+        ``content_hash`` is deliberately left alone: it records the
+        build's identity as ingested, and keeper-sync's state
+        short-circuit, not the hash, is what keeps a scrubbed build from
+        being copied again.
+
+        The row is read under ``SELECT ... FOR UPDATE``, so the status
+        check and the write cannot straddle a concurrent soft delete.
+
+        Parameters
+        ----------
+        build_id
+            The build to correct.
+        object_count
+            Number of objects the build's prefix now holds.
+        total_size_bytes
+            Combined size of those objects.
+
+        Returns
+        -------
+        Build
+            The build with its corrected inventory.
+
+        Raises
+        ------
+        InvalidBuildStateError
+            If the build is not found, is not ``completed``, or is
+            soft-deleted.
+        """
+        row = await self._load_locked(build_id)
+        if row is None:
+            raise InvalidBuildStateError(
+                message=f"Build id={build_id} not found"
+            )
+        public_id = serialize_base32_id(row.public_id)
+        if row.status != BuildStatus.completed:
+            current = BuildStatus(row.status)
+            raise InvalidBuildStateError(
+                current_state=current.value,
+                target_state=BuildStatus.completed.value,
+                build_public_id=public_id,
+                message=(
+                    f"Cannot correct the inventory of build {public_id}: "
+                    f"status is {current.value!r}, expected "
+                    f"{BuildStatus.completed.value!r}"
+                ),
+            )
+        if row.date_deleted is not None:
+            raise InvalidBuildStateError(
+                build_public_id=public_id,
+                message=(
+                    f"Cannot correct the inventory of build {public_id}: "
+                    "it is deleted"
+                ),
+            )
+        row.object_count = object_count
+        row.total_size_bytes = total_size_bytes
+        await self._session.flush()
+        await self._session.refresh(row)
+        return Build.model_validate(row)
+
+    async def set_annotation(
+        self, *, build_id: int, key: str, value: Any
+    ) -> Build:
+        """Set one key of a build's ``annotations``, keeping the others.
+
+        The server's way of leaving a record on a build, such as the
+        excluded-path scrub's
+        :data:`~docverse_server.domain.excluded_path_scrub.SCRUBBED_ANNOTATION`
+        stamp. The uploader's provenance keys stay as they are; a build
+        with no annotations gets a mapping holding just ``key``, and an
+        existing ``key`` is replaced.
+
+        The merge is a read-modify-write, so the row is read under
+        ``SELECT ... FOR UPDATE``: two writers stamping different keys
+        at once each see the other's key rather than overwriting it.
+
+        Parameters
+        ----------
+        build_id
+            The build to annotate.
+        key
+            Annotation key to set.
+        value
+            JSON-serializable value for the key.
+
+        Returns
+        -------
+        Build
+            The build with its updated annotations.
+
+        Raises
+        ------
+        InvalidBuildStateError
+            If the build is not found.
+        """
+        row = await self._load_locked(build_id)
+        if row is None:
+            raise InvalidBuildStateError(
+                message=f"Build id={build_id} not found"
+            )
+        row.annotations = {**(row.annotations or {}), key: value}
+        await self._session.flush()
+        await self._session.refresh(row)
+        return Build.model_validate(row)
+
     async def update_content_hash(
         self,
         *,
@@ -907,6 +1036,43 @@ class BuildStore:
         row.date_deleted = func.now()
         await self._session.flush()
         return True
+
+    async def list_scrub_candidates(self, *, project_id: int) -> list[Build]:
+        """List the builds an excluded-path scrub of a project examines.
+
+        A build qualifies when it is ``completed`` (anything earlier has
+        no settled tree, anything else serves nothing), not soft-deleted
+        (purgatory reclaims those whole), and not yet stamped with the
+        :data:`~docverse_server.domain.excluded_path_scrub.SCRUBBED_ANNOTATION`
+        annotation a real scrub leaves on each build it finishes, so a
+        re-run after a partial failure only revisits the rest. A null
+        ``annotations`` column (SQL or JSON ``null``) is unstamped.
+
+        Parameters
+        ----------
+        project_id
+            Project whose builds to list.
+
+        Returns
+        -------
+        list of Build
+            Eligible builds, oldest (lowest ``id``) first, so a scrub
+            walks a project in the order its builds were created.
+        """
+        result = await self._session.execute(
+            select(SqlBuild)
+            .where(
+                SqlBuild.project_id == project_id,
+                SqlBuild.status == BuildStatus.completed,
+                SqlBuild.date_deleted.is_(None),
+                or_(
+                    SqlBuild.annotations.is_(None),
+                    ~SqlBuild.annotations.has_key(SCRUBBED_ANNOTATION),
+                ),
+            )
+            .order_by(SqlBuild.id)
+        )
+        return [Build.model_validate(row) for row in result.scalars().all()]
 
     async def list_purgeable(
         self, *, org_id: int, cutoff: datetime, limit: int

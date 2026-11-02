@@ -56,6 +56,7 @@ RECORDS_CANCELLATION = frozenset(
         # Maintenance pool; ``project_github_resolve`` uses the hand-off
         # helper for the ``dashboard_sync`` rows it creates.
         "edition_reconcile",
+        "excluded_path_scrub",
         "git_ref_audit",
         "lifecycle_eval",
         "project_github_resolve",
@@ -88,6 +89,7 @@ DELIBERATELY_UNWRAPPED: Mapping[str, str] = {
     "dashboard_build_reaper": _REAPER,
     "dashboard_sync_reaper": _REAPER,
     "edition_reconcile_reaper": _REAPER,
+    "excluded_path_scrub_reaper": _REAPER,
     "publish_edition_reaper": _REAPER,
     "purgatory_cleanup_reaper": _REAPER,
     "edition_reconcile_dispatcher": _DISPATCHER,

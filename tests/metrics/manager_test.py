@@ -33,6 +33,7 @@ from docverse_server.metrics import (
     DocverseEvents,
     EditionPublishedEvent,
     EditionPublishTrigger,
+    ExcludedPathScrubCompletedEvent,
     MetricsEditionKind,
     PurgatoryCleanupCompletedEvent,
     ResourceInventoryEvent,
@@ -61,6 +62,7 @@ async def test_build_event_manager_registers_every_publisher() -> None:
     assert isinstance(events.lifecycle_action, MockEventPublisher)
     assert isinstance(events.resource_inventory, MockEventPublisher)
     assert isinstance(events.purgatory_cleanup_completed, MockEventPublisher)
+    assert isinstance(events.excluded_path_scrub_completed, MockEventPublisher)
     assert isinstance(events.conditional_get, MockEventPublisher)
     assert isinstance(events.build_content_copied, MockEventPublisher)
     assert isinstance(events.api_request, MockEventPublisher)
@@ -106,6 +108,8 @@ async def test_publishers_record_payloads() -> None:
             editions_skipped=0,
             stale_skipped=False,
             elapsed=timedelta(seconds=1),
+            excluded_object_count=2,
+            excluded_bytes=4096,
         )
     )
     await edition_published.publish(
@@ -288,6 +292,52 @@ async def test_purgatory_cleanup_completed_is_the_record_of_a_sweep() -> None:
 
 
 @pytest.mark.asyncio
+async def test_excluded_path_scrub_completed_reports_a_scrub() -> None:
+    """One project-scoped event carries a finished scrub's counters.
+
+    The scrub's report lives on its ``queue_jobs`` row, which retention
+    eventually takes, so this event is the durable record of what a
+    scrub found and — unless ``dry_run`` — removed. It is project-scoped
+    because the scrub endpoint is per project.
+    """
+    config = Configuration()
+    manager, events = await build_event_manager(config)
+    publisher = events.excluded_path_scrub_completed
+    assert isinstance(publisher, MockEventPublisher)
+
+    await publisher.publish(
+        ExcludedPathScrubCompletedEvent(
+            organization="org",
+            project="ts-xml",
+            dry_run=False,
+            builds_examined=12,
+            builds_affected=9,
+            objects_removed=720,
+            bytes_removed=576_000_000,
+            builds_failed=1,
+            builds_skipped=2,
+            elapsed=timedelta(seconds=95),
+        )
+    )
+
+    published = publisher.published
+    assert len(published) == 1
+    event = published[0]
+    assert event.organization == "org"
+    assert event.project == "ts-xml"
+    assert event.dry_run is False
+    assert event.builds_examined == 12
+    assert event.builds_affected == 9
+    assert event.objects_removed == 720
+    assert event.bytes_removed == 576_000_000
+    assert event.builds_failed == 1
+    assert event.builds_skipped == 2
+    assert event.elapsed == timedelta(seconds=95)
+
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
 async def test_conditional_get_records_which_header_decided() -> None:
     """The event names the endpoint, the header, and the outcome.
 
@@ -353,6 +403,7 @@ async def test_build_content_copied_reports_transport_health() -> None:
             build_retry_used=True,
             succeeded=True,
             ltd_lag_seconds=95.5,
+            excluded_object_count=81,
         )
     )
 
@@ -371,6 +422,7 @@ async def test_build_content_copied_reports_transport_health() -> None:
                 "build_retry_used": True,
                 "succeeded": True,
                 "ltd_lag_seconds": 95.5,
+                "excluded_object_count": 81,
             }
         ]
     )

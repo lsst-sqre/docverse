@@ -80,7 +80,8 @@ ACTIVE_JOB_INDEX_SUFFIX = "_active_uq"
 
 Every partial unique index on ``queue_jobs`` whose predicate is
 ``status IN ('queued', 'in_progress')`` — the per-``(org, subject_label)``
-keeper-sync mutex, the per-org lifecycle-eval and git-ref-audit mutexes,
+keeper-sync and excluded-path-scrub mutexes, the per-org lifecycle-eval
+and git-ref-audit mutexes,
 and the per-``(org, project)`` dashboard-build mutex — is named with this
 suffix. :data:`_ACTIVE_JOB_UNIQUE_INDEXES` is derived from the table
 metadata rather than hand-listed so a mutex added later participates in
@@ -831,6 +832,43 @@ class QueueJobStore:
         )
         result = await self._session.execute(stmt)
         return result.first() is not None
+
+    async def get_active_for_subject(
+        self,
+        *,
+        org_id: int,
+        kind: JobKind,
+        subject_label: str,
+    ) -> QueueJob | None:
+        """Return the active job for a subject, if there is one.
+
+        The same ``(org_id, kind, subject_label)`` match on
+        ``status IN ('queued', 'in_progress')`` as
+        :meth:`has_active_for_subject`, for callers that hand the running
+        job back rather than refusing: a repeat
+        ``excluded_path_scrub`` request for a project returns the scrub
+        already queued or running for it. Should more than one row match
+        (nothing but a pre-check like this keeps a kind without a partial
+        unique index to one), the oldest is returned, so repeat requests
+        agree.
+        """
+        stmt = (
+            select(SqlQueueJob)
+            .where(
+                SqlQueueJob.org_id == org_id,
+                SqlQueueJob.kind == kind.value,
+                SqlQueueJob.subject_label == subject_label,
+                SqlQueueJob.status.in_(
+                    [JobStatus.queued.value, JobStatus.in_progress.value]
+                ),
+            )
+            .order_by(SqlQueueJob.id)
+            .limit(1)
+        )
+        row = (await self._session.execute(stmt)).scalar_one_or_none()
+        if row is None:
+            return None
+        return QueueJob.model_validate(row, from_attributes=True)
 
     async def has_active_dashboard_build(
         self,

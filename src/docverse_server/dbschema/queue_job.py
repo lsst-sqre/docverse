@@ -220,6 +220,23 @@ class SqlQueueJob(Base):
                 "AND status IN ('queued', 'in_progress')"
             ),
         ),
+        # Per-project mutex for ``excluded_path_scrub`` jobs: at most
+        # one queued or in_progress row per (org_id, subject_label),
+        # where subject_label is the project slug — the same shape as
+        # the keeper_sync_project mutex. Backstops the
+        # ``get_active_for_subject`` pre-check in
+        # ``ExcludedPathScrubService.enqueue``: two scrubs of a project
+        # would list and delete the same builds in parallel.
+        Index(
+            "idx_queue_jobs_excluded_path_scrub_active_uq",
+            "org_id",
+            "subject_label",
+            unique=True,
+            postgresql_where=text(
+                "kind = 'excluded_path_scrub' "
+                "AND status IN ('queued', 'in_progress')"
+            ),
+        ),
         # Per-project mutex for dashboard_build jobs: at most one
         # queued or in_progress row per (org_id, project_id). Backstops
         # the application-side ``has_active_dashboard_build`` pre-check

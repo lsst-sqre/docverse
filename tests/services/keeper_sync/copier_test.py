@@ -31,7 +31,11 @@ from tests.support.objectstore import ScriptedUploadStore
 
 
 class _FakeSource(LtdSourceProtocol):
-    """In-memory LTD source for copier tests."""
+    """In-memory LTD source for copier tests.
+
+    Every key handed to ``download_object`` is appended to
+    ``downloaded``, so a test can assert that a key was never fetched.
+    """
 
     def __init__(
         self,
@@ -44,11 +48,13 @@ class _FakeSource(LtdSourceProtocol):
         self._download_delay = download_delay
         self._failed: set[str] = set()
         self._fail_once_for = fail_once_for or set()
+        self.downloaded: list[str] = []
 
     async def list_keys(self, *, prefix: str) -> list[str]:
         return [k for k in self._objects if k.startswith(prefix)]
 
     async def download_object(self, *, key: str) -> bytes:
+        self.downloaded.append(key)
         if key in self._fail_once_for and key not in self._failed:
             self._failed.add(key)
             msg = f"Simulated transient download error for {key}"
@@ -786,3 +792,205 @@ async def test_copied_build_content_log_reports_transport_counts() -> None:
     assert len(copied) == 1
     assert copied[0]["retried_object_count"] == 1
     assert copied[0]["exhausted_object_count"] == 0
+
+
+# Sphinx leaves its build caches next to the HTML, and LTD published
+# them verbatim: ``.doctrees/`` pickles (tens of megabytes per build)
+# and ``.buildinfo``. Every key whose path relative to the build prefix
+# has an excluded segment — at the top level or inside a nested
+# sub-site — is dropped before it is downloaded (PRD #853).
+_EXCLUDED_OBJECTS = {
+    "src/builds/1/.doctrees/environment.pickle": b"pickle" * 64,
+    "src/builds/1/.doctrees/index.doctree": b"doctree",
+    "src/builds/1/.buildinfo": b"# Sphinx build info",
+    "src/builds/1/_static/sub/.doctrees/page.doctree": b"nested",
+}
+
+
+@pytest.mark.asyncio
+async def test_excluded_keys_are_neither_downloaded_nor_copied() -> None:
+    """The copy pass never fetches, stores, or counts an excluded key."""
+    source = _FakeSource({**_MARKER_FREE_OBJECTS, **_EXCLUDED_OBJECTS})
+    dest = MockObjectStore()
+
+    result = await BuildContentCopier(
+        source=source, destination=dest, logger=_logger()
+    ).copy_build(source_prefix="src/builds/1/", dest_prefix="dst/")
+
+    assert set(source.downloaded) == set(_MARKER_FREE_OBJECTS)
+    assert set(dest.objects) == {
+        "dst/index.html",
+        "dst/_static/app.js",
+        "dst/_static/css/site.css",
+    }
+    assert result.object_count == len(_MARKER_FREE_OBJECTS)
+    assert result.total_size_bytes == sum(
+        len(v) for v in _MARKER_FREE_OBJECTS.values()
+    )
+    assert result.content_hash == _expected_manifest_hash(
+        [
+            (key.removeprefix("src/builds/1/"), data)
+            for key, data in _MARKER_FREE_OBJECTS.items()
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_excluded_keys_are_neither_downloaded_nor_hashed() -> None:
+    """The hash pass skips excluded keys before downloading them.
+
+    The hash equals the hash of the same tree with the excluded keys
+    absent, so a keeper-synced build keeps converging with a client
+    upload, whose tarball never carries them.
+    """
+    source = _FakeSource({**_MARKER_FREE_OBJECTS, **_EXCLUDED_OBJECTS})
+
+    hashed = await BuildContentCopier(
+        source=source, destination=MockObjectStore(), logger=_logger()
+    ).compute_manifest_hash(source_prefix="src/builds/1/")
+
+    assert set(source.downloaded) == set(_MARKER_FREE_OBJECTS)
+    without_excluded = await BuildContentCopier(
+        source=_FakeSource(dict(_MARKER_FREE_OBJECTS)),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    ).compute_manifest_hash(source_prefix="src/builds/1/")
+    assert hashed == without_excluded
+
+
+@pytest.mark.asyncio
+async def test_excluded_only_prefix_copies_as_an_empty_prefix() -> None:
+    """A prefix holding only caches (and their markers) copies nothing."""
+    source = _FakeSource(
+        {
+            **_EXCLUDED_OBJECTS,
+            "src/builds/1/": b"",
+            "src/builds/1/.doctrees": b"",
+        }
+    )
+    dest = MockObjectStore()
+
+    result = await BuildContentCopier(
+        source=source, destination=dest, logger=_logger()
+    ).copy_build(source_prefix="src/builds/1/", dest_prefix="dst/")
+
+    assert source.downloaded == []
+    assert result.object_count == 0
+    assert result.content_hash == EMPTY_MANIFEST_HASH
+    assert dest.objects == {}
+
+
+@pytest.mark.asyncio
+async def test_excluded_only_prefix_hashes_as_an_empty_prefix() -> None:
+    """The hash path collapses a cache-only prefix the same way.
+
+    Load-bearing for the #516 ``AccessDenied`` fallback: an edition
+    prefix holding nothing but ``.doctrees/`` reads as "nothing
+    recovered", so the denial is re-raised rather than importing a
+    zero-object build.
+    """
+    source = _FakeSource(dict(_EXCLUDED_OBJECTS))
+
+    hashed = await BuildContentCopier(
+        source=source, destination=MockObjectStore(), logger=_logger()
+    ).compute_manifest_hash(source_prefix="src/builds/1/")
+
+    assert hashed == EMPTY_MANIFEST_HASH
+    assert source.downloaded == []
+
+
+@pytest.mark.asyncio
+async def test_copy_result_counts_the_excluded_keys() -> None:
+    """The result says how many content keys the copy left behind.
+
+    Only bytes the copy read can be counted, and an excluded key is never
+    read (LTD's listing carries names, not sizes), so the count is of
+    keys alone. The directory marker for an excluded directory is a
+    marker, not a left-behind object, so it is not counted.
+    """
+    result = await BuildContentCopier(
+        source=_FakeSource(
+            {
+                **_MARKER_FREE_OBJECTS,
+                **_EXCLUDED_OBJECTS,
+                "src/builds/1/.doctrees": b"",
+            }
+        ),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    ).copy_build(source_prefix="src/builds/1/", dest_prefix="dst/")
+
+    assert result.excluded_object_count == len(_EXCLUDED_OBJECTS)
+
+
+@pytest.mark.asyncio
+async def test_copy_tallies_the_excluded_keys() -> None:
+    """The tally carries the excluded count to the metrics event."""
+    tally = CopyTally()
+    assert tally.excluded_object_count is None
+
+    await BuildContentCopier(
+        source=_FakeSource({**_MARKER_FREE_OBJECTS, **_EXCLUDED_OBJECTS}),
+        destination=MockObjectStore(),
+        logger=_logger(),
+    ).copy_build(
+        source_prefix="src/builds/1/", dest_prefix="dst/", tally=tally
+    )
+
+    assert tally.excluded_object_count == len(_EXCLUDED_OBJECTS)
+
+
+@pytest.mark.asyncio
+async def test_failed_copy_still_tallies_the_excluded_keys() -> None:
+    """The count is known once the source is listed, before any upload.
+
+    So a copy that fails mid-pass still reports it, the way it reports
+    the objects it stored before stopping.
+    """
+    tally = CopyTally()
+    copier = BuildContentCopier(
+        source=_FakeSource({**_MARKER_FREE_OBJECTS, **_EXCLUDED_OBJECTS}),
+        destination=ScriptedUploadStore(
+            {"index.html": [httpx.ConnectTimeout("")]}
+        ),
+        logger=_logger(),
+    )
+
+    with pytest.raises(httpx.ConnectTimeout):
+        await copier.copy_build(
+            source_prefix="src/builds/1/", dest_prefix="dst/", tally=tally
+        )
+
+    assert tally.excluded_object_count == len(_EXCLUDED_OBJECTS)
+
+
+@pytest.mark.asyncio
+async def test_copied_build_content_log_reports_excluded_keys() -> None:
+    """The "Copied build content" line says how many keys were left out."""
+    with capture_logs() as logs:
+        await BuildContentCopier(
+            source=_FakeSource({**_MARKER_FREE_OBJECTS, **_EXCLUDED_OBJECTS}),
+            destination=MockObjectStore(),
+            logger=_logger(),
+        ).copy_build(source_prefix="src/builds/1/", dest_prefix="dst/")
+
+    copied = [e for e in logs if e["event"] == "Copied build content"]
+    assert len(copied) == 1
+    assert copied[0]["excluded_object_count"] == len(_EXCLUDED_OBJECTS)
+
+
+@pytest.mark.asyncio
+async def test_empty_source_prefix_log_reports_excluded_keys() -> None:
+    """A cache-only prefix says why it was empty."""
+    with capture_logs() as logs:
+        await BuildContentCopier(
+            source=_FakeSource(dict(_EXCLUDED_OBJECTS)),
+            destination=MockObjectStore(),
+            logger=_logger(),
+        ).copy_build(source_prefix="src/builds/1/", dest_prefix="dst/")
+
+    empty = [
+        e for e in logs if e["event"] == "Empty source prefix; nothing to copy"
+    ]
+    assert len(empty) == 1
+    assert empty[0]["excluded_object_count"] == len(_EXCLUDED_OBJECTS)

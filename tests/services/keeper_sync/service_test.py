@@ -3078,10 +3078,17 @@ async def test_dual_upload_convergence_repoints_edition_when_pointer_differs(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client_ships_caches",
+    [False, True],
+    ids=["current-client", "old-client"],
+)
 async def test_client_upload_and_ltd_sync_converge_on_same_content(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
+    *,
+    client_ships_caches: bool,
 ) -> None:
     """Convergence fires between two genuinely independent producers.
 
@@ -3102,11 +3109,21 @@ async def test_client_upload_and_ltd_sync_converge_on_same_content(
     listing — is the layout of every Sphinx build in the bucket. Hashing
     them left the two producers permanently apart for any build with a
     subdirectory (#576).
+
+    Both sides also carry Sphinx's build caches (``.doctrees/``,
+    ``.buildinfo``), which each producer drops before hashing (PRD
+    #853): the copier from LTD's listing, and the unpacker from the
+    tarball of a client that predates the client-side filter
+    (``old-client``). A ``current-client`` tarball never carries them.
     """
     logger = structlog.get_logger("test")
     content = {
         "index.html": b"<html>v1</html>",
         "assets/app.js": b"console.log(1)",
+    }
+    caches = {
+        ".doctrees/environment.pickle": b"pickle",
+        ".buildinfo": b"# Sphinx build info",
     }
 
     async with db_session.begin():
@@ -3152,7 +3169,9 @@ async def test_client_upload_and_ltd_sync_converge_on_same_content(
 
     await object_store.upload_object(
         key=staged.staging_key,
-        data=_make_client_tarball(content),
+        data=_make_client_tarball(
+            {**content, **caches} if client_ships_caches else content
+        ),
         content_type="application/gzip",
     )
     async with db_session.begin():
@@ -3188,6 +3207,14 @@ async def test_client_upload_and_ltd_sync_converge_on_same_content(
     # (#576).
     source_objects["pipelines/builds/42/"] = b""
     source_objects["pipelines/builds/42/assets"] = b""
+    # LTD also published Sphinx's build caches beside the HTML. The
+    # copier drops them before hashing (PRD #853), as the unpacker does
+    # for an old client's tarball, so they cannot hold the two producers
+    # apart either.
+    source_objects["pipelines/builds/42/.doctrees"] = b""
+    source_objects.update(
+        {f"pipelines/builds/42/{name}": data for name, data in caches.items()}
+    )
     service = _build_service(
         db_session, http_client, object_store, source_objects
     )
@@ -4955,6 +4982,89 @@ async def test_sync_build_reports_a_copy_that_failed_without_a_rerun(
     assert report.succeeded is False
     assert report.build_retry_used is False
     assert report.exhausted_object_count == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reports_the_excluded_keys_it_left_behind(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """The report counts the cache keys the copy skipped (PRD #853).
+
+    Sphinx's ``.doctrees/`` pickles and ``.buildinfo`` that LTD
+    published beside the HTML never reach the destination, and the
+    report says how many were left behind.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-excluded")
+
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    body = b"<html>v1</html>"
+    object_store = MockObjectStore()
+    service = _build_service(
+        db_session,
+        http_client,
+        object_store,
+        {
+            "pipelines/builds/42/index.html": body,
+            "pipelines/builds/42/.doctrees": b"",
+            "pipelines/builds/42/.doctrees/environment.pickle": b"pickle",
+            "pipelines/builds/42/.doctrees/index.doctree": b"doctree",
+            "pipelines/builds/42/.buildinfo": b"# Sphinx build info",
+        },
+        on_build_copied=on_build_copied,
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(reports) == 1
+    report = reports[0]
+    assert report.excluded_object_count == 3
+    assert report.object_count == 1
+    assert report.total_size_bytes == len(body)
+    assert [key.rsplit("/", 1)[-1] for key in object_store.objects] == [
+        "index.html"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_build_reports_no_excluded_count_before_listing(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy that failed before listing its source counts nothing.
+
+    The excluded count is a fact about the listing, so a pass that never
+    got one reports ``None`` rather than a zero it never measured.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-copy-report-unlisted")
+
+    _seed_ltd(mock_discovery)
+    reports, on_build_copied = _record_copy_reports()
+    calls: list[tuple[str, str]] = []
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        wrap_copy=_flaky_copy(
+            {"pipelines/builds/42": [RuntimeError("before listing")]}, calls
+        ),
+        on_build_copied=on_build_copied,
+    )
+    monkeypatch.setattr(sentry_sdk, "capture_exception", lambda _exc: None)
+
+    with pytest.raises(KeeperSyncSystemicFailureError):
+        await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(reports) == 1
+    assert reports[0].succeeded is False
+    assert reports[0].excluded_object_count is None
 
 
 @pytest.mark.asyncio
@@ -10504,6 +10614,53 @@ async def test_denied_build_prefix_with_empty_edition_prefix_still_fails(
     assert release.current_build_id is None
 
 
+@pytest.mark.asyncio
+async def test_denied_build_prefix_with_cache_only_edition_prefix_fails(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """An edition prefix holding only build caches recovers nothing.
+
+    The copier drops excluded cache paths before hashing (PRD #853), so
+    a ``v/`` prefix whose only keys are ``.doctrees/`` pickles and
+    ``.buildinfo`` hashes as empty and the ``AccessDenied`` stands,
+    rather than importing a build with no servable content.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-cache-only-fallback")
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_version_edition_payload(slug="0.3.0", git_ref="0.3.0"),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>denied</html>",
+        "pipelines/v/0.3.0/.doctrees": b"",
+        "pipelines/v/0.3.0/.doctrees/environment.pickle": b"pickle",
+        "pipelines/v/0.3.0/.buildinfo": b"# Sphinx build info",
+    }
+    source = _FakeLtdSource(
+        source_objects, denied_prefixes=frozenset({"pipelines/builds/43/"})
+    )
+    service = _build_service(
+        db_session, http_client, object_store, source_objects, source=source
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    assert len(result.edition_failures) == 1
+    failure = result.edition_failures[0]
+    assert failure.ltd_edition_slug == "0.3.0"
+    assert failure.error_type == "LtdSourceAccessDeniedError"
+    # The fallback was attempted, and found only caches.
+    assert "pipelines/v/0.3.0/" in source.listed_prefixes
+    assert not [key for key in object_store.objects if "/.doctrees" in key]
+
+
 _REPUBLISHED_EDITION_PREFIX = "pipelines/v/0.3.0/"
 
 
@@ -10887,6 +11044,7 @@ async def test_finalize_synced_build_does_not_deadlock_with_delete(
         object_count=2,
         total_size_bytes=64,
         content_hash="sha256:" + "b" * 64,
+        excluded_object_count=0,
     )
     finalize_error: list[BaseException | None] = []
 

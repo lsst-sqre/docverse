@@ -2148,3 +2148,294 @@ async def test_set_sync_dates_matching_row_is_not_written(
             stamped,
             stamped,
         )
+
+
+async def _build_with(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    *,
+    project_id: int,
+    git_ref: str,
+    status: BuildStatus,
+    deleted: bool = False,
+    annotations: dict[str, Any] | None = None,
+) -> Build:
+    """Create a build and force its status, deletion and annotations."""
+    build = await build_store.create(
+        project_id=project_id,
+        project_slug="build-proj",
+        data=BuildCreate(git_ref=git_ref),
+        uploader="testuser",
+    )
+    values: dict[str, Any] = {"status": status}
+    if deleted:
+        values["date_deleted"] = func.now()
+    if annotations is not None:
+        values["annotations"] = annotations
+    await db_session.execute(
+        update(SqlBuild).where(SqlBuild.id == build.id).values(**values)
+    )
+    return build
+
+
+@pytest.mark.asyncio
+async def test_list_scrub_candidates_takes_completed_live_unscrubbed_builds(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """The excluded-path scrub walks a project's finished, live builds.
+
+    A build still in flight has no settled tree to scrub, a failed or
+    retired one serves nothing, and a soft-deleted one is purgatory's to
+    reclaim whole. A build already stamped ``excluded_paths_scrubbed``
+    has been through a real scrub, so a re-run after a partial failure
+    only revisits the rest. Other annotations do not count as a stamp.
+    """
+    async with db_session.begin():
+        org_id, project_id = await _create_org_and_project(db_session)
+        other_project = await ProjectStore(
+            session=db_session, logger=structlog.get_logger("docverse")
+        ).create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="other-proj",
+                title="Other Project",
+                source_url="https://example.com/example/other",
+            ),
+        )
+        plain = await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="plain",
+            status=BuildStatus.completed,
+        )
+        annotated = await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="annotated",
+            status=BuildStatus.completed,
+            annotations={"commit_sha": "abc123"},
+        )
+        for status in (
+            BuildStatus.pending,
+            BuildStatus.processing,
+            BuildStatus.failed,
+            BuildStatus.superseded,
+            BuildStatus.cancelled,
+        ):
+            await _build_with(
+                db_session,
+                build_store,
+                project_id=project_id,
+                git_ref=f"not-{status.value}",
+                status=status,
+            )
+        await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="deleted",
+            status=BuildStatus.completed,
+            deleted=True,
+        )
+        await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="scrubbed",
+            status=BuildStatus.completed,
+            annotations={
+                "excluded_paths_scrubbed": {"date": "2026-11-02T00:00:00Z"}
+            },
+        )
+        await _build_with(
+            db_session,
+            build_store,
+            project_id=other_project.id,
+            git_ref="elsewhere",
+            status=BuildStatus.completed,
+        )
+        candidates = await build_store.list_scrub_candidates(
+            project_id=project_id
+        )
+        await db_session.commit()
+
+    assert [build.id for build in candidates] == [plain.id, annotated.id]
+
+
+async def _completed_with_inventory(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    *,
+    project_id: int,
+    object_count: int | None,
+    total_size_bytes: int | None,
+    status: BuildStatus = BuildStatus.completed,
+    deleted: bool = False,
+) -> Build:
+    """Create a build in ``status`` carrying a given inventory."""
+    build = await _build_with(
+        db_session,
+        build_store,
+        project_id=project_id,
+        git_ref="main",
+        status=status,
+        deleted=deleted,
+    )
+    await db_session.execute(
+        update(SqlBuild)
+        .where(SqlBuild.id == build.id)
+        .values(object_count=object_count, total_size_bytes=total_size_bytes)
+    )
+    return build
+
+
+@pytest.mark.asyncio
+async def test_correct_inventory_writes_the_measured_counts(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A completed build's counters become the counts it is given.
+
+    The write is absolute, not a decrement: a build whose recorded
+    inventory had drifted above what its prefix holds ends up with the
+    measured counts, and ``content_hash`` is left as it was ingested.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await _completed_with_inventory(
+            db_session,
+            build_store,
+            project_id=project_id,
+            object_count=10,
+            total_size_bytes=5000,
+        )
+        updated = await build_store.correct_inventory(
+            build_id=build.id, object_count=7, total_size_bytes=3993
+        )
+        await db_session.commit()
+
+    assert updated.object_count == 7
+    assert updated.total_size_bytes == 3993
+    assert updated.content_hash == build.content_hash
+
+
+@pytest.mark.asyncio
+async def test_correct_inventory_records_unrecorded_counts(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A counter that was never recorded gets the measured value."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await _completed_with_inventory(
+            db_session,
+            build_store,
+            project_id=project_id,
+            object_count=None,
+            total_size_bytes=None,
+        )
+        updated = await build_store.correct_inventory(
+            build_id=build.id, object_count=2, total_size_bytes=30
+        )
+        await db_session.commit()
+
+    assert updated.object_count == 2
+    assert updated.total_size_bytes == 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "deleted"),
+    [
+        (BuildStatus.processing, False),
+        (BuildStatus.failed, False),
+        (BuildStatus.completed, True),
+    ],
+)
+async def test_correct_inventory_refuses_builds_that_are_not_serving(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    status: BuildStatus,
+    deleted: bool,  # noqa: FBT001
+) -> None:
+    """Only a live, completed build's inventory is corrected."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await _completed_with_inventory(
+            db_session,
+            build_store,
+            project_id=project_id,
+            object_count=10,
+            total_size_bytes=5000,
+            status=status,
+            deleted=deleted,
+        )
+        with pytest.raises(InvalidBuildStateError):
+            await build_store.correct_inventory(
+                build_id=build.id, object_count=7, total_size_bytes=3993
+            )
+        unchanged = await build_store.get_by_id(build.id)
+        await db_session.commit()
+
+    assert unchanged is not None
+    assert unchanged.object_count == 10
+    assert unchanged.total_size_bytes == 5000
+
+
+@pytest.mark.asyncio
+async def test_set_annotation_merges_one_key(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A stamp joins the build's annotations without disturbing the rest.
+
+    A build with no annotations at all gets a mapping holding just the
+    stamp; writing the key again replaces its value.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        annotated = await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="annotated",
+            status=BuildStatus.completed,
+            annotations={"commit_sha": "abc123"},
+        )
+        bare = await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="bare",
+            status=BuildStatus.completed,
+        )
+        await build_store.set_annotation(
+            build_id=annotated.id, key="stamp", value={"n": 1}
+        )
+        await build_store.set_annotation(
+            build_id=annotated.id, key="stamp", value={"n": 2}
+        )
+        await build_store.set_annotation(
+            build_id=bare.id, key="stamp", value={"n": 3}
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        rows = {
+            row.id: row.annotations
+            for row in (
+                await db_session.execute(
+                    select(SqlBuild).where(
+                        SqlBuild.id.in_([annotated.id, bare.id])
+                    )
+                )
+            ).scalars()
+        }
+
+    assert rows == {
+        annotated.id: {"commit_sha": "abc123", "stamp": {"n": 2}},
+        bare.id: {"stamp": {"n": 3}},
+    }

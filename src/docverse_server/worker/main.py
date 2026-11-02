@@ -68,6 +68,8 @@ from .functions import (
     edition_reconcile,
     edition_reconcile_dispatcher,
     edition_reconcile_reaper,
+    excluded_path_scrub,
+    excluded_path_scrub_reaper,
     git_ref_audit,
     git_ref_audit_discovery,
     inventory_census,
@@ -1200,10 +1202,13 @@ class MaintenanceWorkerSettings:
     Both wedge the same way: the stuck row holds that organization's
     per-org mutex, so every following tick skips the org — and with it
     the nightly reclamation of its expired builds' object-store content,
-    or the half-hourly repair of its drifted editions. The maintenance
-    name reflects that the pool is the shared home for this
-    non-publishing periodic work, no longer scoped to lifecycle
-    evaluation alone.
+    or the half-hourly repair of its drifted editions.
+    ``excluded_path_scrub_reaper`` (PRD #853) backstops the
+    admin-triggered per-project scrub the same way; its stuck row is
+    what the scrub endpoint would hand back to every later request for
+    that project. The maintenance name reflects that the pool is the
+    shared home for this non-publishing periodic work, no longer scoped
+    to lifecycle evaluation alone.
 
     The opportunistic ``project_github_resolve`` job (PRD #346) also
     runs here: PRD #419 moves it off the default publishing pool because
@@ -1304,6 +1309,18 @@ class MaintenanceWorkerSettings:
             timeout=config.maintenance_job_timeout_seconds,
             max_tries=1,
         ),
+        # The admin-triggered, per-project ``excluded_path_scrub`` (PRD
+        # #853). Its object-store listings are exactly the long,
+        # non-publishing work this pool exists to keep off the default
+        # one. ``max_tries=1`` because a retry would re-walk builds the
+        # first attempt already reported on; recovery is the operator
+        # re-posting the request, and a real scrub's stamps leave a
+        # re-run only the builds it did not get through.
+        func(
+            instrument_arq_task(excluded_path_scrub),
+            timeout=config.maintenance_job_timeout_seconds,
+            max_tries=1,
+        ),
         instrument_arq_task(lifecycle_reaper),
         instrument_arq_task(dashboard_build_reaper),
         instrument_arq_task(publish_edition_reaper),
@@ -1311,6 +1328,7 @@ class MaintenanceWorkerSettings:
         instrument_arq_task(dashboard_sync_reaper),
         instrument_arq_task(purgatory_cleanup_reaper),
         instrument_arq_task(edition_reconcile_reaper),
+        instrument_arq_task(excluded_path_scrub_reaper),
         # ``project_github_resolve`` is the opportunistic GitHub-id
         # resolve (PRD #346). PRD #419 moves it off the default
         # publishing pool onto this maintenance pool: its work is not
@@ -1477,7 +1495,8 @@ class MaintenanceWorkerSettings:
         # ``{6, 36}`` publish_edition, ``{9, 39}`` the
         # edition_reconcile dispatcher, ``{12, 42}`` build_processing,
         # ``{15, 45}`` the edition_reconcile reaper, ``{21, 51}``
-        # here, ``{24, 54}`` dashboard_sync, plus
+        # here, ``{24, 54}`` dashboard_sync, ``{27, 57}`` the
+        # excluded_path_scrub reaper, plus
         # the three daily ticks at 05:17, 04:47 and 03:23 — so nothing
         # on this pool queries ``queue_jobs`` at the same instant on a
         # horizontally scaled deployment, the same precedent that puts
@@ -1493,9 +1512,9 @@ class MaintenanceWorkerSettings:
             instrument_arq_task(purgatory_cleanup_reaper),
             minute={21, 51},
         ),
-        # ``edition_reconcile_reaper`` takes the last free pair,
-        # ``{15, 45}`` — six minutes behind the dispatcher it backstops
-        # so a tick's own fan-out is never what the sweep is looking at.
+        # ``edition_reconcile_reaper`` takes ``{15, 45}`` — six minutes
+        # behind the dispatcher it backstops so a tick's own fan-out is
+        # never what the sweep is looking at.
         # It shares those minutes with the five-minute
         # ``arq_queue_stats`` cron below, which is deliberate and the
         # same overlap the lifecycle reaper already lives with on
@@ -1514,6 +1533,22 @@ class MaintenanceWorkerSettings:
         cron(
             instrument_arq_task(edition_reconcile_reaper),
             minute={15, 45},
+        ),
+        # ``excluded_path_scrub_reaper`` (PRD #853) runs on the same
+        # 30-minute cadence as its run-less siblings, on ``{27, 57}``:
+        # the pair after dashboard_sync's in the pool's three-minute
+        # grid, and — neither minute being a multiple of five — off the
+        # queue-stats cadence as well. The scrub is admin-triggered, so
+        # a wedged row is not a nightly tick lost but the operator's
+        # next request: the endpoint hands back a project's queued or
+        # in-progress scrub rather than queueing another, so until the
+        # row is reaped the project cannot be scrubbed again. The
+        # 6-hour threshold mirrors purgatory_cleanup's, the other long
+        # object-store job on this pool; arq's per-job timeout cancels
+        # a healthy scrub long before it.
+        cron(
+            instrument_arq_task(excluded_path_scrub_reaper),
+            minute={27, 57},
         ),
         # Generic arq-queue metrics (SQR-112): per-pool ``arq_queue_stats``
         # gauge for the maintenance queue. Queue-depth stats only touch

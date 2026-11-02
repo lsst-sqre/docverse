@@ -584,6 +584,33 @@ def test_purgatory_cleanup_env_var_overrides(
     assert config.purgatory_cleanup_reaper_threshold_seconds == 60
 
 
+def test_excluded_path_scrub_reaper_threshold_default() -> None:
+    """The scrub's reaper waits as long as the purgatory sweep's.
+
+    Both are long object-store jobs on the maintenance pool, cancelled by
+    arq at ``maintenance_job_timeout_seconds`` well before six hours, so
+    the reaper only ever sees a row whose worker died outright. A flat
+    literal far above the timeout keeps it from failing a scrub that is
+    still running.
+    """
+    config = Configuration()
+    assert config.excluded_path_scrub_reaper_threshold_seconds == 21600
+    assert config.excluded_path_scrub_reaper_threshold_seconds > (
+        config.maintenance_job_timeout_seconds
+    )
+
+
+def test_excluded_path_scrub_reaper_threshold_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-prod can drive the scrub reaper's threshold down to seconds."""
+    monkeypatch.setenv(
+        "DOCVERSE_EXCLUDED_PATH_SCRUB_REAPER_THRESHOLD_SECONDS", "60"
+    )
+    config = Configuration()
+    assert config.excluded_path_scrub_reaper_threshold_seconds == 60
+
+
 def test_purgatory_cleanup_cap_refuses_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

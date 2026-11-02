@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, Self
 
 from starlette.requests import Request
 
-from docverse.models import BuildProcessingProgress
+from docverse.models import (
+    BuildProcessingProgress,
+    ExcludedPathScrubProgress,
+    JobKind,
+)
 from docverse.models import QueueJob as _QueueJobBase
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.queue import QueueJob as QueueJobDomain
@@ -54,13 +58,6 @@ class QueueJob(_QueueJobBase):
         per-job project-store query; single-job callers omit it.
         """
         job_id_str = serialize_base32_id(domain.public_id)
-        # JSONB progress is stored untyped; validate it into the typed
-        # model here. Non-build kinds round-trip via ``extra="allow"``.
-        progress = (
-            BuildProcessingProgress.model_validate(domain.progress)
-            if domain.progress is not None
-            else None
-        )
         build_url, edition_url, subject_url = await _resolve_subject_urls(
             domain,
             request,
@@ -84,12 +81,29 @@ class QueueJob(_QueueJobBase):
             build_url=build_url,
             edition_url=edition_url,
             phase=domain.phase,
-            progress=progress,
+            progress=_typed_progress(domain),
             errors=domain.errors,
             date_created=domain.date_created,
             date_started=domain.date_started,
             date_completed=domain.date_completed,
         )
+
+
+def _typed_progress(
+    domain: QueueJobDomain,
+) -> BuildProcessingProgress | ExcludedPathScrubProgress | None:
+    """Validate a job's untyped JSONB ``progress`` into its kind's model.
+
+    The same choice the client ``QueueJob``'s ``progress`` validator
+    makes from ``kind``: an ``excluded_path_scrub`` report, otherwise
+    ``BuildProcessingProgress``, whose ``extra="allow"`` round-trips the
+    fields of kinds it does not model.
+    """
+    if domain.progress is None:
+        return None
+    if domain.kind is JobKind.excluded_path_scrub:
+        return ExcludedPathScrubProgress.model_validate(domain.progress)
+    return BuildProcessingProgress.model_validate(domain.progress)
 
 
 async def _resolve_keeper_sync_run_public_id(

@@ -952,6 +952,32 @@ class Configuration(BaseSettings):
         ),
     )
 
+    excluded_path_scrub_reaper_threshold_seconds: int = Field(
+        21600,
+        title="Excluded_path_scrub stuck-job reaper threshold, in seconds",
+        description=(
+            "Cron-driven backstop for arq losing an"
+            " admin-triggered ``excluded_path_scrub`` job (e.g. an"
+            " OOM-killed worker pod, or an API pod that crashed between"
+            " the ``queue_jobs`` SQL commit and ``arq_queue.enqueue``)."
+            " ``excluded_path_scrub_reaper`` fails any"
+            " ``kind='excluded_path_scrub'`` ``queue_jobs`` row that has"
+            " been ``in_progress`` longer than this without"
+            " ``date_completed``. The scrub endpoint hands back a"
+            " project's queued or in-progress scrub instead of starting"
+            " another, so until the row is reaped every request for"
+            " that project would return the dead job. The reaper only"
+            " fails the row: the builds the job already scrubbed keep"
+            " their stamps, and a new request resumes from the rest."
+            " Matches ``purgatory_cleanup_reaper_threshold_seconds``,"
+            " the other long object-store job on the maintenance pool;"
+            " arq cancels a scrub at ``maintenance_job_timeout_seconds``,"
+            " so a healthy one never comes near it. The env-overridable"
+            " default lets non-prod environments drive the threshold"
+            " down to seconds for fast verification."
+        ),
+    )
+
     memory_diagnostics_enabled: bool = Field(
         default=False,
         title="Whether each process runs the memory sampler",

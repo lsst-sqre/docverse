@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -10,10 +11,13 @@ from pydantic import (
     ConfigDict,
     Field,
     SerializerFunctionWrapHandler,
+    ValidationInfo,
+    field_validator,
     model_serializer,
 )
 
 from ._examples import (
+    EXAMPLE_BUILD_ID,
     EXAMPLE_BUILD_URL,
     EXAMPLE_EDITION_URL,
     EXAMPLE_JOB_ID,
@@ -32,6 +36,9 @@ if TYPE_CHECKING:
 __all__ = [
     "BuildProcessingProgress",
     "EditionUpdateRef",
+    "ExcludedPathScrubBuild",
+    "ExcludedPathScrubEntry",
+    "ExcludedPathScrubProgress",
     "PublishJobRef",
     "QueueJob",
 ]
@@ -217,6 +224,184 @@ class BuildProcessingProgress(BaseModel):
         return handler(core_schema)
 
 
+class ExcludedPathScrubEntry(BaseModel):
+    """One excluded path found in a build, in a scrub report row.
+
+    Unknown keys are preserved (``extra="allow"``) so the report can grow
+    without breaking older clients.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    path: str = Field(
+        description=(
+            "Build-relative path of the excluded entry, up to and"
+            " including its first excluded segment. A directory ends"
+            " with ``/`` and stands for every object under it (for"
+            " example ``.doctrees/``); a file has no trailing slash (for"
+            " example ``.buildinfo``). An entry inside a nested sub-site"
+            " keeps its parent segments, as in ``v1/.doctrees/``."
+        ),
+        examples=[".doctrees/"],
+    )
+
+    object_count: int = Field(
+        description="Number of objects stored under the entry.",
+        examples=[80],
+    )
+
+    total_size_bytes: int = Field(
+        description="Total size in bytes of the entry's objects.",
+        examples=[64_000_000],
+    )
+
+
+class ExcludedPathScrubBuild(BaseModel):
+    """One build's row in an ``excluded_path_scrub`` report.
+
+    A row is written for every build the scrub found excluded paths in,
+    and for every build it could not examine or finish (with ``error``
+    set). A build a real scrub left alone because it was deleted or
+    scrubbed by another run in the meantime has ``skip_reason`` set. A
+    build that holds no excluded paths is counted in ``builds_examined``
+    but gets no row. Unknown keys are preserved (``extra="allow"``).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    build_id: str = Field(
+        description="Public Crockford Base32 identifier of the build.",
+        examples=[EXAMPLE_BUILD_ID],
+    )
+
+    build_url: str | None = Field(
+        default=None,
+        description=(
+            "Absolute URL of the build resource (a HATEOAS link clients"
+            " follow instead of reconstructing the path). ``null`` when"
+            " the Docverse API base URL could not be resolved."
+        ),
+        examples=[EXAMPLE_BUILD_URL],
+    )
+
+    edition_slugs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Slugs of the live editions whose current build this is, so"
+            " an operator can see what serves the build being scrubbed."
+        ),
+        examples=[["__main", "v1"]],
+    )
+
+    entries: list[ExcludedPathScrubEntry] = Field(
+        default_factory=list,
+        description=(
+            "Excluded entries found in the build, in path order. Empty"
+            " when the build could not be examined."
+        ),
+    )
+
+    error: str | None = Field(
+        default=None,
+        description=(
+            "Why the build could not be examined or its excluded paths"
+            " could not all be removed and recorded, or ``null`` when"
+            " nothing failed. A failed build is counted in"
+            " ``builds_failed``, is left unstamped so a later scrub"
+            " retries it, and the scrub moves on to the next build."
+        ),
+    )
+
+    skip_reason: str | None = Field(
+        default=None,
+        description=(
+            "Why a real scrub left the build alone although it held"
+            " excluded paths: the build was deleted or retired, or"
+            " another scrub finished it, after this one listed it."
+            " ``null`` for a build the scrub went on to scrub, and always"
+            " ``null`` in a dry run. A skipped build is counted in"
+            " ``builds_skipped``."
+        ),
+        examples=["the build was deleted during the scrub"],
+    )
+
+
+class ExcludedPathScrubProgress(BaseModel):
+    """Typed ``progress`` payload for an ``excluded_path_scrub`` queue job.
+
+    The scrub's report: summary counters plus one row per build it found
+    excluded paths in or failed to examine. The worker rewrites it as it
+    goes, so a long scrub can be read before it finishes. In a dry run
+    the ``*_removed`` counters and the rows describe what the scrub
+    *would* remove; nothing is deleted. In a real run the ``*_removed``
+    counters are what was actually deleted, so a build skipped before
+    its deletes contributes nothing to them. Unknown keys are preserved
+    (``extra="allow"``).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    dry_run: bool = Field(
+        description=(
+            "``true`` when the scrub only reports what it would remove."
+        ),
+    )
+
+    builds_examined: int = Field(
+        default=0,
+        description=(
+            "Builds the scrub has listed so far, whether or not they"
+            " held excluded paths."
+        ),
+    )
+
+    builds_affected: int = Field(
+        default=0,
+        description="Builds found holding at least one excluded path.",
+    )
+
+    objects_removed: int = Field(
+        default=0,
+        description=(
+            "Excluded objects removed across the affected builds (in a"
+            " dry run, the objects that would be removed)."
+        ),
+    )
+
+    bytes_removed: int = Field(
+        default=0,
+        description=(
+            "Total size in bytes of ``objects_removed`` (in a dry run,"
+            " the bytes that would be removed)."
+        ),
+    )
+
+    builds_failed: int = Field(
+        default=0,
+        description=(
+            "Builds the scrub could not examine or finish; each has a"
+            " row with ``error`` set."
+        ),
+    )
+
+    builds_skipped: int = Field(
+        default=0,
+        description=(
+            "Builds a real scrub found excluded paths in but left alone,"
+            " because they were retired or scrubbed by another run"
+            " after this one listed them; each has a row with"
+            " ``skip_reason`` set."
+        ),
+    )
+
+    builds: list[ExcludedPathScrubBuild] = Field(
+        default_factory=list,
+        description=(
+            "One row per affected, skipped or failed build, in scrub order."
+        ),
+    )
+
+
 class QueueJob(BaseModel):
     """Response model for a queue job."""
 
@@ -293,12 +478,17 @@ class QueueJob(BaseModel):
         examples=["editions"],
     )
 
-    progress: BuildProcessingProgress | None = Field(
-        default=None,
-        description=(
-            "Structured progress data. Typed for ``build_processing`` jobs;"
-            " other kinds round-trip their fields via ``extra='allow'``."
-        ),
+    progress: BuildProcessingProgress | ExcludedPathScrubProgress | None = (
+        Field(
+            default=None,
+            description=(
+                "Structured progress data. An ``excluded_path_scrub`` job"
+                " carries an ``ExcludedPathScrubProgress`` report; every"
+                " other kind is validated as ``BuildProcessingProgress``,"
+                " which types ``build_processing`` jobs and round-trips"
+                " other kinds' fields via ``extra='allow'``."
+            ),
+        )
     )
 
     errors: dict[str, Any] | None = Field(
@@ -319,3 +509,23 @@ class QueueJob(BaseModel):
         default=None,
         description="Timestamp when the job finished.",
     )
+
+    @field_validator("progress", mode="before")
+    @classmethod
+    def _validate_progress_for_kind(
+        cls, value: Any, info: ValidationInfo
+    ) -> Any:
+        """Validate a raw ``progress`` mapping into its kind's model.
+
+        Both progress models accept unknown keys, so letting the union
+        choose by shape alone could type one kind's payload as the
+        other's. The job's ``kind`` (declared, and so validated, before
+        ``progress``) decides instead: ``excluded_path_scrub`` gets
+        `ExcludedPathScrubProgress`, every other kind
+        `BuildProcessingProgress`. A model instance passes through.
+        """
+        if not isinstance(value, Mapping):
+            return value
+        if info.data.get("kind") == JobKind.excluded_path_scrub:
+            return ExcludedPathScrubProgress.model_validate(value)
+        return BuildProcessingProgress.model_validate(value)

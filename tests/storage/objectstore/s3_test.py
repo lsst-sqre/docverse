@@ -29,6 +29,7 @@ from structlog.testing import capture_logs
 from docverse_server.storage import _http_retry
 from docverse_server.storage._http_retry import MAX_BACKOFF_SECONDS
 from docverse_server.storage.objectstore import (
+    ObjectEntry,
     ObjectStoreError,
     S3ObjectStore,
     _s3,
@@ -928,6 +929,38 @@ async def test_delete_prefix_refuses_a_blank_prefix() -> None:
         await store.delete_prefix(prefix="  ")
 
     assert client.paginate_kwargs is None
+    assert client.delete_calls == []
+
+
+def _sized_page(entries: Sequence[tuple[str, int]]) -> dict[str, Any]:
+    """Render one ``list_objects_v2`` page of ``(key, size)`` pairs."""
+    return {"Contents": [{"Key": key, "Size": size} for key, size in entries]}
+
+
+@pytest.mark.asyncio
+async def test_list_object_entries_pairs_keys_with_sizes() -> None:
+    """Every page's ``Contents`` becomes ``(key, size)`` entries, in order.
+
+    ``list_objects_v2`` already reports each object's ``Size``, so the
+    sized listing costs the same requests as the key-only one.
+    """
+    client = _StubS3Client(
+        pages=[
+            _sized_page([(f"{_PREFIX}.doctrees/env.pickle", 4096)]),
+            {"KeyCount": 0},
+            _sized_page([(f"{_PREFIX}index.html", 12)]),
+        ]
+    )
+    store = _make_store_with_client(client)
+
+    entries = await store.list_object_entries(prefix=_PREFIX)
+
+    assert entries == [
+        ObjectEntry(key=f"{_PREFIX}.doctrees/env.pickle", size=4096),
+        ObjectEntry(key=f"{_PREFIX}index.html", size=12),
+    ]
+    assert client.paginator_names == ["list_objects_v2"]
+    assert client.paginate_kwargs == {"Bucket": "docs", "Prefix": _PREFIX}
     assert client.delete_calls == []
 
 

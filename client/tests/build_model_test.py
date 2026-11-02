@@ -7,7 +7,13 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from docverse.models import Build, BuildCreate, BuildStatus
+from docverse.models import (
+    Build,
+    BuildCreate,
+    BuildStatus,
+    ExcludedPathScrubAccepted,
+    ExcludedPathScrubRequest,
+)
 
 
 def test_content_hash_is_optional() -> None:
@@ -178,3 +184,22 @@ def test_build_date_purged_defaults_to_none() -> None:
         date_created=datetime(2026, 9, 8, 12, 0, tzinfo=UTC),
     )
     assert build.date_purged is None
+
+
+def test_excluded_path_scrub_request_defaults_to_a_real_run() -> None:
+    """An empty body asks for a real scrub; ``dry_run`` must be opted into."""
+    assert ExcludedPathScrubRequest.model_validate({}).dry_run is False
+    assert ExcludedPathScrubRequest(dry_run=True).dry_run is True
+
+
+def test_excluded_path_scrub_accepted_carries_the_job_link() -> None:
+    """The 202 envelope names the scrub job and where to poll it."""
+    url = "https://example.com/orgs/o/jobs/0000-0000-0000-05"
+    accepted = ExcludedPathScrubAccepted(
+        job_id="0000-0000-0000-05", job_url=url
+    )
+
+    assert accepted.model_dump(mode="json") == {
+        "job_id": "0000-0000-0000-05",
+        "job_url": url,
+    }

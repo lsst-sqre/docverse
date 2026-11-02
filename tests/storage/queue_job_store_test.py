@@ -4374,6 +4374,7 @@ def test_active_job_unique_indexes_cover_every_mutex() -> None:
         "idx_queue_jobs_dashboard_build_active_uq",
         "idx_queue_jobs_purgatory_cleanup_active_uq",
         "idx_queue_jobs_edition_reconcile_active_uq",
+        "idx_queue_jobs_excluded_path_scrub_active_uq",
     } == _ACTIVE_JOB_UNIQUE_INDEXES
 
 
@@ -4518,3 +4519,63 @@ async def test_list_live_publish_pairs_ignores_other_orgs_and_kinds(
         pairs = await store.list_live_publish_pairs(org_id=org_id)
 
     assert pairs == set()
+
+
+@pytest.mark.asyncio
+async def test_get_active_for_subject_returns_the_live_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """The active row for ``(org_id, kind, subject_label)`` comes back.
+
+    Terminal rows, other kinds, other subjects and other orgs are passed
+    over, so a caller can hand the running job back to a repeat request
+    rather than queue a second one.
+    """
+    async with db_session.begin():
+        finished = await store.create(
+            kind=JobKind.excluded_path_scrub, org_id=42, subject_label="docs"
+        )
+        await store.start_if_queued(finished.id)
+        await store.complete(finished.id)
+        await store.create(
+            kind=JobKind.keeper_sync_project, org_id=42, subject_label="docs"
+        )
+        await store.create(
+            kind=JobKind.excluded_path_scrub, org_id=42, subject_label="other"
+        )
+        await store.create(
+            kind=JobKind.excluded_path_scrub, org_id=7, subject_label="docs"
+        )
+        running = await store.create(
+            kind=JobKind.excluded_path_scrub, org_id=42, subject_label="docs"
+        )
+        await store.start_if_queued(running.id)
+        active = await store.get_active_for_subject(
+            org_id=42, kind=JobKind.excluded_path_scrub, subject_label="docs"
+        )
+        await db_session.commit()
+
+    assert active is not None
+    assert active.id == running.id
+    assert active.status == JobStatus.in_progress
+
+
+@pytest.mark.asyncio
+async def test_get_active_for_subject_returns_none_without_a_live_row(
+    db_session: AsyncSession,
+    store: QueueJobStore,
+) -> None:
+    """Only terminal rows for the subject means there is nothing active."""
+    async with db_session.begin():
+        job = await store.create(
+            kind=JobKind.excluded_path_scrub, org_id=42, subject_label="docs"
+        )
+        await store.start_if_queued(job.id)
+        await store.fail(job.id)
+        active = await store.get_active_for_subject(
+            org_id=42, kind=JobKind.excluded_path_scrub, subject_label="docs"
+        )
+        await db_session.commit()
+
+    assert active is None

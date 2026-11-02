@@ -13,6 +13,7 @@ import respx
 from click.testing import CliRunner
 
 from docverse._cli import main
+from docverse._tar import Tarball, create_tarball
 from docverse.models.queue_enums import JobStatus
 
 BASE_URL = "https://docverse.example.com"
@@ -375,3 +376,88 @@ def test_upload_git_ref_detection(tmp_path: Path) -> None:
     assert result.exit_code == 0
     # The detected SHA should appear in the output
     assert detected_sha in result.output
+
+
+def test_upload_reports_excluded_paths(tmp_path: Path) -> None:
+    """Excluded cache paths are left out and their count is reported."""
+    source = tmp_path / "docs"
+    source.mkdir()
+    (source / "index.html").write_text("<h1>Hello</h1>")
+    (source / ".doctrees").mkdir()
+    (source / ".doctrees" / "environment.pickle").write_bytes(b"pickle")
+    (source / ".buildinfo").write_text("# Sphinx build info version 1\n")
+
+    with respx.mock() as router:
+        _setup_routes(router, job_overrides={"status": "completed"})
+        with patch("docverse._client.asyncio.sleep"):
+            result = _invoke(source)
+
+    assert result.exit_code == 0
+    assert "Excluded 2 cache paths" in result.output
+
+
+def test_upload_does_not_report_zero_excluded_paths(tmp_path: Path) -> None:
+    """A tree without caches gets no exclusion message."""
+    source = tmp_path / "docs"
+    source.mkdir()
+    (source / "index.html").write_text("<h1>Hello</h1>")
+
+    with respx.mock() as router:
+        _setup_routes(router, job_overrides={"status": "completed"})
+        with patch("docverse._client.asyncio.sleep"):
+            result = _invoke(source)
+
+    assert result.exit_code == 0
+    assert "Excluded" not in result.output
+
+
+def test_upload_refuses_only_excluded_paths(tmp_path: Path) -> None:
+    """A directory holding only cache paths is refused before any API call."""
+    source = tmp_path / "docs"
+    source.mkdir()
+    (source / ".doctrees").mkdir()
+    (source / ".doctrees" / "environment.pickle").write_bytes(b"pickle")
+
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
+        build_route = router.post(f"/orgs/{ORG}/projects/{PROJECT}/builds")
+        result = _invoke(source)
+
+    assert result.exit_code != 0
+    assert "Excluded 1 cache path" in result.output
+    assert "Nothing to upload" in result.output
+    assert not build_route.called
+    assert len(router.calls) == 0
+
+
+def test_upload_refuses_empty_directory(tmp_path: Path) -> None:
+    """An empty directory is refused before any API call."""
+    source = tmp_path / "docs"
+    source.mkdir()
+
+    with respx.mock(base_url=BASE_URL, assert_all_called=False) as router:
+        result = _invoke(source)
+
+    assert result.exit_code != 0
+    assert "Nothing to upload" in result.output
+    assert len(router.calls) == 0
+
+
+def test_upload_refusal_deletes_tarball(tmp_path: Path) -> None:
+    """The refused tarball does not leak as a temporary file."""
+    source = tmp_path / "docs"
+    source.mkdir()
+    (source / ".buildinfo").write_text("# Sphinx build info version 1\n")
+
+    created: list[Tarball] = []
+
+    def _recording_create_tarball(source_dir: Path) -> Tarball:
+        tarball = create_tarball(source_dir)
+        created.append(tarball)
+        return tarball
+
+    with patch("docverse._cli.create_tarball", _recording_create_tarball):
+        result = _invoke(source)
+
+    assert result.exit_code != 0
+    assert len(created) == 1
+    assert not created[0].path.exists()

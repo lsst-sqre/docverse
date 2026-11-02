@@ -6,6 +6,8 @@ from .builds import (
     BuildCreate,
     BuildStatus,
     BuildUpdate,
+    ExcludedPathScrubAccepted,
+    ExcludedPathScrubRequest,
 )
 from .credentials import (
     AwsCredentials,
@@ -100,6 +102,9 @@ from .projects import (
 from .queue import (
     BuildProcessingProgress,
     EditionUpdateRef,
+    ExcludedPathScrubBuild,
+    ExcludedPathScrubEntry,
+    ExcludedPathScrubProgress,
     PublishJobRef,
     QueueJob,
 )
@@ -138,6 +143,11 @@ __all__ = [
     "EditionRollback",
     "EditionUpdate",
     "EditionUpdateRef",
+    "ExcludedPathScrubAccepted",
+    "ExcludedPathScrubBuild",
+    "ExcludedPathScrubEntry",
+    "ExcludedPathScrubProgress",
+    "ExcludedPathScrubRequest",
     "FastlyCredentials",
     "GcpCredentials",
     "GitRefAuditRunStatus",

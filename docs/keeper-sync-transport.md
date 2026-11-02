@@ -564,6 +564,7 @@ Keeper](metrics.md#measuring-lag-behind-ltd-keeper).
 | `build_retry_used` | Whether the build-level retry re-ran the copy, after a transport error on either end. |
 | `succeeded` | Whether the copy, after any build-level retry, stored every object. |
 | `ltd_lag_seconds` | Seconds from LTD's `date_rebuilt` for the edition to the copy's end, success or failure, with any build-level retry inside it; subtract it from `edition_published.ltd_lag` to leave the queue wait and CDN publish. A float in seconds like `duration_seconds`, set only when the copy is a rebuild of an edition Docverse already mirrors: null on the edition's first import (whose `date_rebuilt` predates the mirror) and when LTD reports no `date_rebuilt`, and negative (not clamped) under clock skew. |
+| `excluded_object_count` | LTD keys the last pass left behind because they are excluded cache paths, such as Sphinx's `.doctrees/` pickles and `.buildinfo` (the list in `docverse.excluded_paths`). They are never downloaded, hashed, or written, so the count has no byte total: LTD's listing carries no sizes. Directory markers are not counted. Null when the last pass failed before it had listed the prefix. |
 
 A build whose content Docverse already holds (the manifest-hash dedupe)
 copies nothing and publishes no event, and neither does a copy
@@ -604,7 +605,8 @@ and the retry log line's `error_type` names the botocore class.
 | `Retrying presigned upload` | warning | An upload attempt got a `429`/`5xx` and the budget has attempts left | `key`, `status_code`, `attempt`, `max_attempts`, `retry_delay` |
 | `Presigned upload failed` | error | One object's upload failed for good | Transport: `key`, `error`, `error_type`, `attempts`, `elapsed_seconds`, `retryable`. Status: `key`, `status_code`, `response_body`, `attempts`, `elapsed_seconds`, `retryable` |
 | `Retrying build copy after transport error` | warning | The build-level retry is about to wait and re-run the copy | `error`, `error_type`, `retry_delay`, `dest_prefix`, `project`, `edition_slug`, `ltd_build_id`, `docverse_build_public_id`, `ltd_source_prefix` |
-| `Copied build content` | info | A copy pass stored every object | `object_count`, `total_size_bytes`, `content_hash`, `peak_concurrent_copies`, `retried_object_count`, `exhausted_object_count` |
+| `Copied build content` | info | A copy pass stored every object | `object_count`, `total_size_bytes`, `content_hash`, `peak_concurrent_copies`, `retried_object_count`, `exhausted_object_count`, `excluded_object_count` |
+| `Empty source prefix; nothing to copy` | warning | A copy pass found no content under the LTD prefix, after dropping directory markers and excluded cache paths | `source_prefix`, `excluded_object_count` |
 | `Edition sync failed; skipping edition and continuing` | error | The edition failed, after or without the build-level retry | `ltd_edition_id`, `ltd_edition_slug`, `project` |
 
 `attempts` and `elapsed_seconds` on `Presigned upload failed` say

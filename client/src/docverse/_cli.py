@@ -15,7 +15,7 @@ import click
 from ._annotations import detect_github_actions_annotations, merge_annotations
 from ._client import DocverseClient
 from ._exceptions import BuildProcessingError, DocverseClientError
-from ._tar import create_tarball
+from ._tar import Tarball, create_tarball
 from .models.queue_enums import JobStatus
 
 __all__ = ["main"]
@@ -328,6 +328,42 @@ def _detect_git_ref() -> str:
     return result.stdout.strip()
 
 
+def _create_upload_tarball(source_dir: Path) -> Tarball:
+    """Create the upload tarball, reporting any excluded cache paths.
+
+    Parameters
+    ----------
+    source_dir
+        Directory containing the built documentation.
+
+    Returns
+    -------
+    Tarball
+        The tarball to upload. The caller deletes ``Tarball.path``.
+
+    Raises
+    ------
+    click.ClickException
+        If no files are left once excluded cache paths are left out. The
+        temporary tarball is deleted before raising, and no API call has
+        been made.
+    """
+    click.echo(f"Creating tarball from {source_dir}")
+    tarball = create_tarball(source_dir)
+    if tarball.excluded_count:
+        noun = "path" if tarball.excluded_count == 1 else "paths"
+        click.echo(f"Excluded {tarball.excluded_count} cache {noun}")
+    if tarball.file_count == 0:
+        tarball.path.unlink(missing_ok=True)
+        msg = (
+            f"Nothing to upload: {source_dir} contains no files once cache "
+            "paths (such as .doctrees/ and .buildinfo) are excluded."
+        )
+        raise click.ClickException(msg)
+    click.echo(f"Content hash: {tarball.content_hash}")
+    return tarball
+
+
 async def _upload_async(
     *,
     org: str,
@@ -345,9 +381,8 @@ async def _upload_async(
     """Run the upload workflow."""
     tarball_path: Path | None = None
     try:
-        click.echo(f"Creating tarball from {source_dir}")
-        tarball_path, content_hash = create_tarball(source_dir)
-        click.echo(f"Content hash: {content_hash}")
+        tarball = _create_upload_tarball(source_dir)
+        tarball_path, content_hash = tarball.path, tarball.content_hash
 
         # Build annotations from auto-detection and manual entries
         auto = (

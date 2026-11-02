@@ -1,15 +1,15 @@
-"""Tests for the six run-less reaper cron worker functions.
+"""Tests for the seven run-less reaper cron worker functions.
 
 Covers ``dashboard_build_reaper``, ``publish_edition_reaper``,
 ``build_processing_reaper``, ``dashboard_sync_reaper``,
-``purgatory_cleanup_reaper``, and ``edition_reconcile_reaper`` — the
-cron-driven backstops for the case where arq itself loses a queue
-job (worker pod OOM-killed mid-job that never gets to surface a
-timeout, or dispatcher crashed between the ``queue_jobs`` SQL commit
-and ``arq_queue.enqueue``). Each reaper marks any silently-stuck row
-as ``failed``, sweeps orphan queued rows, and — per PRD #538 — fails
-``queued`` rows that reached arq and were then lost by it, verified
-against the queue backend first.
+``purgatory_cleanup_reaper``, ``edition_reconcile_reaper``, and
+``excluded_path_scrub_reaper`` — the cron-driven backstops for the case
+where arq itself loses a queue job (worker pod OOM-killed mid-job that
+never gets to surface a timeout, or dispatcher crashed between the
+``queue_jobs`` SQL commit and ``arq_queue.enqueue``). Each reaper marks
+any silently-stuck row as ``failed``, sweeps orphan queued rows, and —
+per PRD #538 — fails ``queued`` rows that reached arq and were then lost
+by it, verified against the queue backend first.
 
 Parametrized over :data:`RUNLESS_REAPER_SPECS` so the same behaviors
 are exercised against every run-less kind without copy-pasted per-kind
@@ -59,6 +59,9 @@ from docverse_server.worker.functions.dashboard_sync_reaper import (
 )
 from docverse_server.worker.functions.edition_reconcile_reaper import (
     edition_reconcile_reaper,
+)
+from docverse_server.worker.functions.excluded_path_scrub_reaper import (
+    excluded_path_scrub_reaper,
 )
 from docverse_server.worker.functions.publish_edition_reaper import (
     publish_edition_reaper,
@@ -129,6 +132,14 @@ RUNLESS_REAPER_SPECS: list[ReaperSpec] = [
         threshold_attr="edition_reconcile_reaper_threshold_seconds",
         well_past_minutes=120,
         slug_prefix="ecr",
+    ),
+    ReaperSpec(
+        name="excluded_path_scrub",
+        reaper=excluded_path_scrub_reaper,
+        kind=JobKind.excluded_path_scrub,
+        threshold_attr="excluded_path_scrub_reaper_threshold_seconds",
+        well_past_minutes=480,
+        slug_prefix="epr",
     ),
 ]
 

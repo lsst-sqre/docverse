@@ -1248,13 +1248,15 @@ async def _prepare_copy_metrics_sync(
     monkeypatch: pytest.MonkeyPatch,
     *,
     object_store: MockObjectStore,
+    source_objects: dict[str, bytes] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], DocverseEvents]:
     """Set up one ``keeper_sync_project`` run with metrics recording on.
 
     Seeds the single-edition ``pipelines`` product, routes the copier's
     destination to ``object_store``, and stubs the build-level copy
-    retry's 30 s wait. Returns the worker ctx, the job payload, and the
-    events whose ``build_content_copied`` publisher the test reads.
+    retry's 30 s wait. ``source_objects`` replaces the LTD bucket's
+    default one-page build. Returns the worker ctx, the job payload, and
+    the events whose ``build_content_copied`` publisher the test reads.
     """
     _manager, events = await build_event_manager(Configuration())
     async with db_session.begin():
@@ -1267,7 +1269,8 @@ async def _prepare_copy_metrics_sync(
     _patch_factory_io(
         monkeypatch,
         object_store=object_store,
-        source_objects={"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        source_objects=source_objects
+        or {"pipelines/builds/42/index.html": b"<html>v1</html>"},
     )
 
     async def _no_wait(delay: float) -> None:
@@ -1351,6 +1354,36 @@ async def test_keeper_sync_project_publishes_build_content_copied(
     assert event.duration_seconds >= 0
     # The copy is ``main``'s first import, which measures no sync lag.
     assert event.ltd_lag_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_reports_excluded_cache_keys(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The event counts the cache keys the copy left in LTD (PRD #853)."""
+    ctx, payload, events = await _prepare_copy_metrics_sync(
+        db_session,
+        mock_discovery,
+        monkeypatch,
+        object_store=MockObjectStore(),
+        source_objects={
+            "pipelines/builds/42/index.html": b"<html>v1</html>",
+            "pipelines/builds/42/.doctrees/environment.pickle": b"pickle",
+            "pipelines/builds/42/.buildinfo": b"# Sphinx build info",
+        },
+    )
+
+    result = await keeper_sync_project(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    published = _copied_events(events)
+    assert len(published) == 1
+    assert published[0].excluded_object_count == 2
+    assert published[0].object_count == 1
 
 
 @pytest.mark.asyncio

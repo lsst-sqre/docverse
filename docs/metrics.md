@@ -282,6 +282,7 @@ and `github_webhook_received` has neither field.
 | [`keeper_sync_push_check`](#keeper_sync_push_check) | `keeper_sync_tier_main` worker | project |
 | [`lifecycle_action`](#lifecycle_action) | `lifecycle_eval`, `git_ref_audit`, `purgatory_cleanup` workers | project |
 | [`purgatory_cleanup_completed`](#purgatory_cleanup_completed) | `purgatory_cleanup` worker | organization |
+| [`excluded_path_scrub_completed`](#excluded_path_scrub_completed) | `excluded_path_scrub` worker | project |
 | [`edition_reconcile_completed`](#edition_reconcile_completed) | `edition_reconcile` worker | organization |
 | [`resource_inventory`](#resource_inventory) | `inventory_census` worker | organization and project |
 
@@ -326,6 +327,8 @@ ref superseded it.
 | `editions_skipped` | integer | field | Tracking editions left unchanged. |
 | `stale_skipped` | boolean | field | Whether the build was skipped as superseded. |
 | `elapsed` | duration | field | Time the worker spent on the build. |
+| `excluded_object_count` | integer or null | field | Tarball files skipped as excluded cache paths (`.doctrees/`, `.buildinfo` and the rest of `docverse.excluded_paths`), which a client from before the filter still uploads; not counted in `object_count`. Null when nothing was unpacked. |
+| `excluded_bytes` | integer or null | field | Bytes of those files, from their tar headers. Null when nothing was unpacked. |
 
 ### `build_content_copied`
 
@@ -352,6 +355,7 @@ read these events across a sync campaign.
 | `build_retry_used` | boolean | field | Whether the build-level retry re-ran the copy. |
 | `succeeded` | boolean | field | Whether the copy, after any build-level retry, stored every object. Not named `success`, so not a tag. |
 | `ltd_lag_seconds` | float or null | field | Seconds from LTD's `date_rebuilt` for the edition to the copy's end: the copy half of `ltd_lag`, set when the copy is a rebuild of an edition Docverse already mirrors. Null on the edition's first import and when LTD reports no `date_rebuilt`; negative under clock skew. See [Measuring lag behind LTD Keeper](#measuring-lag-behind-ltd-keeper). |
+| `excluded_object_count` | integer or null | field | LTD keys the copy's last pass left behind as excluded cache paths (`.doctrees/`, `.buildinfo` and the rest of `docverse.excluded_paths`); never downloaded, so there is no byte total. Null when that pass failed before listing the prefix. |
 
 ### `edition_published`
 
@@ -659,6 +663,39 @@ per-tick deltas; the standing footprint the sweep has yet to reclaim is
 | `capped` | boolean | field | Whether the per-job cap, not the backlog, ended the work list. |
 | `elapsed` | duration | field | Time the sweep spent on the organization. |
 
+### `excluded_path_scrub_completed`
+
+Measurement: `lsst.square.metrics.events.docverse.excluded_path_scrub_completed`
+
+One project's `excluded_path_scrub` job finished: the admin-triggered
+scrub of cache paths such as `.doctrees/` and `.buildinfo` from the
+project's stored builds (`POST
+/orgs/{org}/projects/{project}/builds/scrub-excluded-paths`). Published
+once, after the job's queue row reaches `completed` or
+`completed_with_errors`, with the same counters the row's `progress`
+report ends on. The report has the per-build detail; the event is what
+remains once retention takes the row. A job that fails outright or is
+cancelled publishes nothing.
+
+In a dry run the `*_removed` counters are what the scrub would remove,
+and nothing was deleted. In a real run they are what was actually
+deleted, and a real run's `bytes_removed` is how far the project's
+`resource_inventory` `total_build_bytes` drops at the next census.
+Filter on `dry_run` before summing them.
+
+| Field | Type | Stored as | Meaning |
+| --- | --- | --- | --- |
+| `organization` | string | tag | Organization slug. |
+| `project` | string or null | tag | Project slug; always set on this event. |
+| `dry_run` | boolean | field | Whether the scrub only reported what it would remove. |
+| `builds_examined` | integer | field | Builds whose prefix the scrub listed, affected or not. |
+| `builds_affected` | integer | field | Builds found holding at least one excluded path. |
+| `objects_removed` | integer | field | Excluded objects deleted, or in a dry run that would be deleted. |
+| `bytes_removed` | integer | field | Combined size of `objects_removed`. |
+| `builds_failed` | integer | field | Builds the scrub could not examine or finish; the job ended `completed_with_errors`. |
+| `builds_skipped` | integer | field | Affected builds a real run left alone because they were deleted, retired, or scrubbed by another run after this one listed them. |
+| `elapsed` | duration | field | Time the scrub spent on the project. |
+
 ### `edition_reconcile_completed`
 
 Measurement: `lsst.square.metrics.events.docverse.edition_reconcile_completed`
@@ -790,9 +827,10 @@ counts every visit, since every point carries `enqueued`.
   `DocverseEvents.initialize`, and a section on this page. Payloads are
   scalar-only, because InfluxDB stores no nested structures.
 - **An existing event** changes only by gaining a nullable field, as
-  `edition_published` gained `ltd_lag`, `build_content_copied`
-  gained `ltd_lag_seconds`, and `github_webhook_received` gained
-  `projects_stamped`. Every consumer reads the topic through the
+  `edition_published` gained `ltd_lag`, `build_processed` gained
+  `excluded_object_count` and `excluded_bytes`, `build_content_copied`
+  gained `ltd_lag_seconds` and `excluded_object_count`, and
+  `github_webhook_received` gained `projects_stamped`. Every consumer reads the topic through the
   event's registered Avro schema, so renaming, retyping, or removing a
   field breaks them.
 - **A new enum value** is appended to its enum, as `WebhookOutcome`
