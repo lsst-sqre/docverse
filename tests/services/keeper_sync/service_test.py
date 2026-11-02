@@ -3078,10 +3078,17 @@ async def test_dual_upload_convergence_repoints_edition_when_pointer_differs(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client_ships_caches",
+    [False, True],
+    ids=["current-client", "old-client"],
+)
 async def test_client_upload_and_ltd_sync_converge_on_same_content(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
+    *,
+    client_ships_caches: bool,
 ) -> None:
     """Convergence fires between two genuinely independent producers.
 
@@ -3102,11 +3109,21 @@ async def test_client_upload_and_ltd_sync_converge_on_same_content(
     listing — is the layout of every Sphinx build in the bucket. Hashing
     them left the two producers permanently apart for any build with a
     subdirectory (#576).
+
+    Both sides also carry Sphinx's build caches (``.doctrees/``,
+    ``.buildinfo``), which each producer drops before hashing (PRD
+    #853): the copier from LTD's listing, and the unpacker from the
+    tarball of a client that predates the client-side filter
+    (``old-client``). A ``current-client`` tarball never carries them.
     """
     logger = structlog.get_logger("test")
     content = {
         "index.html": b"<html>v1</html>",
         "assets/app.js": b"console.log(1)",
+    }
+    caches = {
+        ".doctrees/environment.pickle": b"pickle",
+        ".buildinfo": b"# Sphinx build info",
     }
 
     async with db_session.begin():
@@ -3152,7 +3169,9 @@ async def test_client_upload_and_ltd_sync_converge_on_same_content(
 
     await object_store.upload_object(
         key=staged.staging_key,
-        data=_make_client_tarball(content),
+        data=_make_client_tarball(
+            {**content, **caches} if client_ships_caches else content
+        ),
         content_type="application/gzip",
     )
     async with db_session.begin():
@@ -3188,15 +3207,14 @@ async def test_client_upload_and_ltd_sync_converge_on_same_content(
     # (#576).
     source_objects["pipelines/builds/42/"] = b""
     source_objects["pipelines/builds/42/assets"] = b""
-    # LTD also published Sphinx's build caches beside the HTML, which a
-    # current client leaves out of its tarball. The copier drops them
-    # before hashing (PRD #853), so they cannot hold the two producers
+    # LTD also published Sphinx's build caches beside the HTML. The
+    # copier drops them before hashing (PRD #853), as the unpacker does
+    # for an old client's tarball, so they cannot hold the two producers
     # apart either.
     source_objects["pipelines/builds/42/.doctrees"] = b""
-    source_objects["pipelines/builds/42/.doctrees/environment.pickle"] = (
-        b"pickle"
+    source_objects.update(
+        {f"pipelines/builds/42/{name}": data for name, data in caches.items()}
     )
-    source_objects["pipelines/builds/42/.buildinfo"] = b"# Sphinx build info"
     service = _build_service(
         db_session, http_client, object_store, source_objects
     )

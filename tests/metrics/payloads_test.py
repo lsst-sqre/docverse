@@ -19,6 +19,7 @@ from safir.metrics import EventPayload
 from docverse_server.metrics import (
     ApiRequestEvent,
     BuildContentCopiedEvent,
+    BuildProcessedEvent,
     DocverseEventBase,
     EditionPublishedEvent,
     GitHubWebhookReceivedEvent,
@@ -61,6 +62,38 @@ def test_edition_published_adds_only_a_nullable_ltd_lag() -> None:
     assert "null" in fields["ltd_lag"]
     # Every union member must still be one InfluxDB can store.
     EditionPublishedEvent.validate_structure()
+
+
+def test_build_processed_adds_only_nullable_excluded_fields() -> None:
+    """``build_processed`` grows two nullable integer fields, appended.
+
+    ``excluded_object_count`` and ``excluded_bytes`` (PRD #853) are null
+    on every outcome that unpacked nothing — a failure or a skip — like
+    ``object_count`` and ``total_size_bytes``, whose Avro types they
+    share. The fields that were already there keep their names and
+    order.
+    """
+    fields = _avro_field_types(BuildProcessedEvent)
+
+    assert list(fields) == [
+        "organization",
+        "project",
+        "success",
+        "object_count",
+        "total_size_bytes",
+        "editions_updated",
+        "editions_skipped",
+        "stale_skipped",
+        "elapsed",
+        "excluded_object_count",
+        "excluded_bytes",
+    ]
+    assert fields["excluded_object_count"] == fields["object_count"]
+    assert fields["excluded_bytes"] == fields["total_size_bytes"]
+    assert isinstance(fields["excluded_bytes"], list)
+    assert "null" in fields["excluded_bytes"]
+    # Every union member must still be one InfluxDB can store.
+    BuildProcessedEvent.validate_structure()
 
 
 def test_build_content_copied_adds_only_nullable_fields() -> None:

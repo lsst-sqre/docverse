@@ -326,6 +326,8 @@ ref superseded it.
 | `editions_skipped` | integer | field | Tracking editions left unchanged. |
 | `stale_skipped` | boolean | field | Whether the build was skipped as superseded. |
 | `elapsed` | duration | field | Time the worker spent on the build. |
+| `excluded_object_count` | integer or null | field | Tarball files skipped as excluded cache paths (`.doctrees/`, `.buildinfo` and the rest of `docverse.excluded_paths`), which a client from before the filter still uploads; not counted in `object_count`. Null when nothing was unpacked. |
+| `excluded_bytes` | integer or null | field | Bytes of those files, from their tar headers. Null when nothing was unpacked. |
 
 ### `build_content_copied`
 
@@ -791,7 +793,8 @@ counts every visit, since every point carries `enqueued`.
   `DocverseEvents.initialize`, and a section on this page. Payloads are
   scalar-only, because InfluxDB stores no nested structures.
 - **An existing event** changes only by gaining a nullable field, as
-  `edition_published` gained `ltd_lag`, `build_content_copied`
+  `edition_published` gained `ltd_lag`, `build_processed` gained
+  `excluded_object_count` and `excluded_bytes`, `build_content_copied`
   gained `ltd_lag_seconds` and `excluded_object_count`, and
   `github_webhook_received` gained `projects_stamped`. Every consumer reads the topic through the
   event's registered Avro schema, so renaming, retyping, or removing a

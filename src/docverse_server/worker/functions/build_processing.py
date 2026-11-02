@@ -25,6 +25,7 @@ import structlog
 from safir.dependencies.db_session import db_session_dependency
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from docverse.excluded_paths import is_excluded_path
 from docverse.models import (
     BuildProcessingProgress,
     BuildStatus,
@@ -103,6 +104,39 @@ class _BuildProcessedOutcome:
     editions_updated: int
     editions_skipped: int
     stale_skipped: bool
+    excluded_object_count: int | None = None
+    """Tarball members skipped as excluded cache paths (PRD #853).
+
+    ``None`` on every outcome but a completed upload, matching
+    :attr:`object_count`: nothing was unpacked to count.
+    """
+
+    excluded_bytes: int | None = None
+    """Bytes of those members, from their tar headers; ``None`` likewise."""
+
+
+@dataclass(frozen=True, slots=True)
+class _UploadInventory:
+    """What :func:`_process_build` uploaded, and what it left out."""
+
+    object_count: int
+    """Files uploaded under the build's prefix."""
+
+    total_size_bytes: int
+    """Bytes of those files."""
+
+    excluded_object_count: int
+    """Regular-file members skipped as excluded cache paths.
+
+    Members whose path :func:`docverse.excluded_paths.is_excluded_path`
+    matches, such as Sphinx's ``.doctrees/`` pickles and ``.buildinfo``,
+    which a client from before PRD #853 still puts in its tarball.
+    Directory members are not counted, so this compares with
+    :attr:`object_count`.
+    """
+
+    excluded_bytes: int
+    """Bytes of the excluded members, from their tar headers."""
 
 
 class _StaleGuardOutcome(Enum):
@@ -422,6 +456,8 @@ async def _publish_build_processed(
             editions_skipped=outcome.editions_skipped,
             stale_skipped=outcome.stale_skipped,
             elapsed=timedelta(seconds=time.monotonic() - started),
+            excluded_object_count=outcome.excluded_object_count,
+            excluded_bytes=outcome.excluded_bytes,
         )
     )
 
@@ -689,7 +725,6 @@ async def _process_build_locked(
                     deleted=upload.deleted,
                     logger=logger,
                 )
-            object_count, total_size_bytes = upload
             editions_updated, editions_skipped = await _finalize_success(
                 session=session,
                 factory=factory,
@@ -703,17 +738,19 @@ async def _process_build_locked(
                 build_id=build_id,
                 build_public_id=build_public_id,
                 queue_job_id=queue_job_id,
-                object_count=object_count,
-                total_size_bytes=total_size_bytes,
+                object_count=upload.object_count,
+                total_size_bytes=upload.total_size_bytes,
                 logger=logger,
             )
             return "completed", _BuildProcessedOutcome(
                 success=True,
-                object_count=object_count,
-                total_size_bytes=total_size_bytes,
+                object_count=upload.object_count,
+                total_size_bytes=upload.total_size_bytes,
                 editions_updated=editions_updated,
                 editions_skipped=editions_skipped,
                 stale_skipped=False,
+                excluded_object_count=upload.excluded_object_count,
+                excluded_bytes=upload.excluded_bytes,
             )
 
 
@@ -1637,7 +1674,7 @@ async def _process_build(
     org_slug: str,
     project_slug: str,
     logger: structlog.stdlib.BoundLogger,
-) -> tuple[int, int] | _MidUploadRetirement:
+) -> _UploadInventory | _MidUploadRetirement:
     """Download, unpack, and upload build files.
 
     Each extracted file is hashed as it goes by, so the build's content
@@ -1648,10 +1685,18 @@ async def _process_build(
     which is what lets the same documentation arriving by either route
     be recognized as the same content.
 
+    Members whose path is an excluded cache path
+    (:func:`docverse.excluded_paths.is_excluded_path`), such as Sphinx's
+    ``.doctrees/`` pickles and ``.buildinfo``, are skipped before they
+    are read, so they are never hashed, uploaded or counted in the
+    inventory. A current client never puts them in its tarball; this is
+    the backstop for one that predates the filter (PRD #853). The
+    copier drops the same paths, so the two routes keep converging.
+
     Returns
     -------
-    tuple of int, int or _MidUploadRetirement
-        The number of objects uploaded and the total size in bytes, or
+    _UploadInventory or _MidUploadRetirement
+        What was uploaded and what was skipped as excluded, or
         a :class:`_MidUploadRetirement` naming the status found when
         somebody retired the build while those uploads were in flight,
         so it must not be completed (see
@@ -1682,6 +1727,8 @@ async def _process_build(
 
     tasks: list[asyncio.Task[int]] = []
     manifest_entries: list[tuple[str, str]] = []
+    excluded_object_count = 0
+    excluded_bytes = 0
     # TODO(DM-54426): All extracted files
     # held in memory before uploads begin. Streaming extraction with
     # concurrent upload would lower peak memory for large builds.
@@ -1689,11 +1736,15 @@ async def _process_build(
         for member in tar.getmembers():
             if not member.isfile():
                 continue
+            name = member.name.removeprefix("./")
+            if is_excluded_path(name):
+                excluded_object_count += 1
+                excluded_bytes += member.size
+                continue
             f = tar.extractfile(member)
             if f is None:
                 continue
             file_data = f.read()
-            name = member.name.removeprefix("./")
             manifest_entries.append(
                 (name, hashlib.sha256(file_data).hexdigest())
             )
@@ -1711,6 +1762,7 @@ async def _process_build(
         logger.warning(
             "Tarball contained no extractable files",
             staging_key=build.staging_key,
+            excluded_object_count=excluded_object_count,
         )
 
     logger.info(
@@ -1718,6 +1770,8 @@ async def _process_build(
         object_count=object_count,
         total_size_bytes=total_size,
         content_hash=content_hash,
+        excluded_object_count=excluded_object_count,
+        excluded_bytes=excluded_bytes,
     )
 
     # Nothing that retires a ``processing`` build takes the
@@ -1812,4 +1866,9 @@ async def _process_build(
         project_slug=project_slug,
     )
 
-    return object_count, total_size
+    return _UploadInventory(
+        object_count=object_count,
+        total_size_bytes=total_size,
+        excluded_object_count=excluded_object_count,
+        excluded_bytes=excluded_bytes,
+    )

@@ -106,6 +106,8 @@ async def test_publishers_record_payloads() -> None:
             editions_skipped=0,
             stale_skipped=False,
             elapsed=timedelta(seconds=1),
+            excluded_object_count=2,
+            excluded_bytes=4096,
         )
     )
     await edition_published.publish(

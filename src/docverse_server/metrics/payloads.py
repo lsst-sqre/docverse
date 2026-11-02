@@ -134,6 +134,23 @@ class BuildProcessedEvent(DocverseEventBase):
     elapsed: timedelta
     """Wall-clock time the worker spent on this build."""
 
+    excluded_object_count: int | None
+    """Tarball members skipped as excluded cache paths.
+
+    Regular-file members whose path
+    ``docverse.excluded_paths.is_excluded_path`` matches, such as
+    Sphinx's ``.doctrees/`` pickles and ``.buildinfo``, which a client
+    from before PRD #853 still puts in its tarball. They are neither
+    uploaded nor counted in :attr:`object_count`. ``None`` when nothing
+    was unpacked, like :attr:`object_count`.
+    """
+
+    excluded_bytes: int | None
+    """Bytes of the excluded members, from their tar headers.
+
+    ``None`` when nothing was unpacked, like :attr:`total_size_bytes`.
+    """
+
 
 class DashboardBuiltEvent(DocverseEventBase):
     """A dashboard finished building in the ``dashboard_build`` worker.

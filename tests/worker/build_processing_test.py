@@ -7,7 +7,7 @@ import hashlib
 import io
 import tarfile
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
@@ -52,6 +52,7 @@ from docverse_server.domain.queue import JobKind, JobStatus, QueueJob
 from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.factory import Factory
 from docverse_server.metrics import (
+    DocverseEvents,
     LifecycleAction,
     MetricsEditionKind,
     build_event_manager,
@@ -533,6 +534,249 @@ async def test_build_processing_publishes_build_processed(
     assert event.editions_skipped == 0
     assert event.stale_skipped is False
     assert event.elapsed >= timedelta(0)
+    # Nothing in the tarball was an excluded cache path (PRD #853).
+    assert event.excluded_object_count == 0
+    assert event.excluded_bytes == 0
+
+
+#: The files of a Sphinx output tree that Docverse serves, as an old
+#: client tarballs them: ``./``-prefixed, the layout ``arcname="."``
+#: produces. ``sub/`` is a nested sub-site.
+_SURVIVING_MEMBERS = {
+    "./index.html": b"<html>hello</html>",
+    "./_static/app.css": b"body { margin: 0; }",
+    "./sub/index.html": b"<html>sub-site</html>",
+}
+
+#: The build caches an old client still put in the same tarball, which a
+#: current client leaves out (PRD #853): Sphinx's ``.doctrees/`` pickles
+#: and ``.buildinfo`` at the top level, and a nested sub-site's own
+#: ``.doctrees/``.
+_EXCLUDED_MEMBERS = {
+    "./.doctrees/environment.pickle": b"pickle" * 64,
+    "./.doctrees/index.doctree": b"doctree",
+    "./.buildinfo": b"# Sphinx build info",
+    "./sub/.doctrees/x": b"nested",
+}
+
+
+async def _process_staged_tarball(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    files: dict[str, bytes],
+    job_id: str,
+    events: DocverseEvents | None = None,
+) -> tuple[Build, MockObjectStore, list[MutableMapping[str, Any]]]:
+    """Stage ``files`` as a build's tarball and run ``build_processing``.
+
+    Asserts the job completes, then returns the build row as the worker
+    left it, the object store it wrote to, and the log events captured
+    while it ran.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(
+            db_session, project.id, git_ref="main"
+        )
+        queue_job_store = QueueJobStore(session=db_session, logger=logger)
+        await queue_job_store.create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id=job_id,
+        )
+
+    await mock_store.upload_object(
+        key=build.staging_key,
+        data=_make_tarball(files),
+        content_type="application/gzip",
+    )
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id=job_id,
+        events=events,
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    with capture_logs() as captured:
+        result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    assert result == "completed"
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            build_store = BuildStore(session=session, logger=_logger())
+            processed = await build_store.get_by_id(build.id)
+    assert processed is not None
+    return processed, mock_store, captured
+
+
+@pytest.mark.asyncio
+async def test_build_processing_uploads_only_surviving_members(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Excluded cache members of an old client's tarball are not uploaded.
+
+    The unpacker is the backstop for clients that predate the tarball
+    filter (PRD #853): whatever the tarball carries, the build's prefix
+    holds only what Docverse serves, nested sub-site caches included.
+    """
+    build, mock_store, _ = await _process_staged_tarball(
+        db_session,
+        monkeypatch,
+        files={**_SURVIVING_MEMBERS, **_EXCLUDED_MEMBERS},
+        job_id="test-arq-excluded-upload",
+    )
+
+    assert build.status == BuildStatus.completed
+    # The staging tarball is gone too, so the store holds exactly the
+    # surviving files under the build's prefix.
+    assert set(mock_store.objects) == {
+        f"{build.storage_prefix}{name.removeprefix('./')}"
+        for name in _SURVIVING_MEMBERS
+    }
+
+
+@pytest.mark.asyncio
+async def test_build_processing_inventory_counts_survivors_only(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The build's inventory leaves excluded members out of both counts.
+
+    ``object_count`` and ``total_size_bytes`` describe what the build's
+    prefix holds, which is what the inventory census and the project's
+    ``total_build_bytes`` add up, so skipped caches must not inflate
+    them.
+    """
+    build, _, _ = await _process_staged_tarball(
+        db_session,
+        monkeypatch,
+        files={**_SURVIVING_MEMBERS, **_EXCLUDED_MEMBERS},
+        job_id="test-arq-excluded-inventory",
+    )
+
+    assert build.object_count == len(_SURVIVING_MEMBERS)
+    assert build.total_size_bytes == sum(
+        len(data) for data in _SURVIVING_MEMBERS.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_processing_hashes_survivors_only(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manifest hash covers the surviving members only.
+
+    So an old client's tarball and a current client's (which never
+    carries the caches) of the same tree hash alike, and both converge
+    with a keeper-synced copy, whose copier drops the same paths.
+    """
+    build, _, _ = await _process_staged_tarball(
+        db_session,
+        monkeypatch,
+        files={**_SURVIVING_MEMBERS, **_EXCLUDED_MEMBERS},
+        job_id="test-arq-excluded-hash",
+    )
+
+    assert build.content_hash == hash_manifest_pairs(
+        (name.removeprefix("./"), hashlib.sha256(data).hexdigest())
+        for name, data in _SURVIVING_MEMBERS.items()
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_processing_excluded_only_tarball_completes_empty(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tarball holding nothing but caches completes as an empty build.
+
+    The same outcome as a tarball with no files at all: a zero-object
+    ``completed`` build carrying ``EMPTY_MANIFEST_HASH`` and the
+    existing warning, rather than a failure.
+    """
+    build, mock_store, captured = await _process_staged_tarball(
+        db_session,
+        monkeypatch,
+        files=_EXCLUDED_MEMBERS,
+        job_id="test-arq-excluded-only",
+    )
+
+    assert build.status == BuildStatus.completed
+    assert build.object_count == 0
+    assert build.total_size_bytes == 0
+    assert build.content_hash == EMPTY_MANIFEST_HASH
+    assert mock_store.objects == {}
+    warnings = [
+        event
+        for event in captured
+        if event["event"] == "Tarball contained no extractable files"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_build_processing_reports_excluded_members(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The upload log line and ``build_processed`` count what was skipped.
+
+    Both carry the number of excluded members and their bytes (the tar
+    headers' sizes, since they are never read), so an operator can see
+    which builds still arrive from a client that ships its caches.
+    """
+    _manager, events = await build_event_manager(Configuration())
+    excluded_bytes = sum(len(data) for data in _EXCLUDED_MEMBERS.values())
+
+    _, _, captured = await _process_staged_tarball(
+        db_session,
+        monkeypatch,
+        files={**_SURVIVING_MEMBERS, **_EXCLUDED_MEMBERS},
+        job_id="test-arq-excluded-report",
+        events=events,
+    )
+
+    uploads = [
+        event for event in captured if event["event"] == "Upload complete"
+    ]
+    assert len(uploads) == 1
+    assert uploads[0]["excluded_object_count"] == len(_EXCLUDED_MEMBERS)
+    assert uploads[0]["excluded_bytes"] == excluded_bytes
+
+    publisher = events.build_processed
+    assert isinstance(publisher, MockEventPublisher)
+    assert len(publisher.published) == 1
+    event = publisher.published[0]
+    assert event.object_count == len(_SURVIVING_MEMBERS)
+    assert event.excluded_object_count == len(_EXCLUDED_MEMBERS)
+    assert event.excluded_bytes == excluded_bytes
 
 
 @pytest.mark.asyncio
@@ -1150,6 +1394,9 @@ async def test_build_processing_skips_stale_build(
     assert len(publisher.published) == 1
     assert publisher.published[0].success is True
     assert publisher.published[0].stale_skipped is True
+    # Nothing was unpacked, so there is no exclusion count either.
+    assert publisher.published[0].excluded_object_count is None
+    assert publisher.published[0].excluded_bytes is None
 
     # No uploads or downloads occurred — the mock store stayed empty.
     assert mock_store.objects == {}
@@ -2498,6 +2745,9 @@ async def test_build_processing_pending_row_mid_upload_raises(
     assert len(publisher.published) == 1
     assert publisher.published[0].success is False
     assert publisher.published[0].stale_skipped is False
+    # A failed run reports no exclusion count, like its object count.
+    assert publisher.published[0].excluded_object_count is None
+    assert publisher.published[0].excluded_bytes is None
 
     async for session in db_session_dependency():
         async with session.begin():
