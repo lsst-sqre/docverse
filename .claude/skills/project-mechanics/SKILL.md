@@ -27,8 +27,8 @@ Node/TypeScript). The named commands below target the primary
 
 ## Lint
 
-- `lint_touched`: `uv run --only-group=lint pre-commit run --files {files}`
-- `lint_all`: `uv run --only-group=lint pre-commit run --all-files`
+- `lint_touched`: `uv run --only-group=lint prek run --files {files}`
+- `lint_all`: `uv run --only-group=lint prek run --all-files`
 
 ## Typing
 
