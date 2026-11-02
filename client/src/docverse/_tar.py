@@ -9,8 +9,51 @@ import tarfile
 import tempfile
 from collections.abc import Buffer
 from pathlib import Path
+from typing import NamedTuple
 
-__all__ = ["create_tarball"]
+from .excluded_paths import is_excluded_path
+
+__all__ = ["Tarball", "create_tarball"]
+
+
+class Tarball(NamedTuple):
+    """A tarball written by `create_tarball`."""
+
+    path: Path
+    """Path to the temporary ``.tar.gz`` file. The caller deletes it."""
+
+    content_hash: str
+    """SHA-256 digest of the compressed bytes, as ``sha256:<hex>``."""
+
+    excluded_count: int
+    """Number of paths left out because `is_excluded_path` matched them.
+
+    An excluded directory counts once: it is not traversed, so the files
+    beneath it are neither archived nor counted.
+    """
+
+    file_count: int
+    """Number of regular files archived (directories are not counted)."""
+
+
+class _ExcludedPathFilter:
+    """``tarfile`` member filter that drops excluded paths and counts.
+
+    Returning `None` from a ``TarFile.add`` filter leaves the member out;
+    for a directory it also stops ``tarfile`` from descending into it.
+    """
+
+    def __init__(self) -> None:
+        self.excluded_count = 0
+        self.file_count = 0
+
+    def __call__(self, tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        if is_excluded_path(tarinfo.name):
+            self.excluded_count += 1
+            return None
+        if tarinfo.isfile():
+            self.file_count += 1
+        return tarinfo
 
 
 class _HashingWriter(io.RawIOBase):
@@ -38,8 +81,13 @@ class _HashingWriter(io.RawIOBase):
         return True
 
 
-def create_tarball(source_dir: str | Path) -> tuple[Path, str]:
+def create_tarball(source_dir: str | Path) -> Tarball:
     """Create a gzipped tarball from a directory.
+
+    Paths matched by `docverse.excluded_paths.is_excluded_path` (Sphinx's
+    ``.doctrees/`` and ``.buildinfo``, VCS directories, Python caches, and
+    so on) are left out of the archive, so they never reach Docverse and
+    never affect the digest.
 
     Parameters
     ----------
@@ -48,10 +96,10 @@ def create_tarball(source_dir: str | Path) -> tuple[Path, str]:
 
     Returns
     -------
-    tuple
-        ``(tarball_path, content_hash)`` where *content_hash* is formatted
-        as ``sha256:<hex>``. The caller is responsible for deleting the
-        temporary file.
+    Tarball
+        The temporary tarball's path, its ``sha256:<hex>`` content hash,
+        the number of excluded paths, and the number of files archived.
+        The caller is responsible for deleting the temporary file.
 
     Notes
     -----
@@ -62,6 +110,7 @@ def create_tarball(source_dir: str | Path) -> tuple[Path, str]:
     explicitly with ``mtime=0``.
     """
     source = Path(source_dir).resolve()
+    member_filter = _ExcludedPathFilter()
     tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
         suffix=".tar.gz", delete=False
     )
@@ -74,9 +123,14 @@ def create_tarball(source_dir: str | Path) -> tuple[Path, str]:
                 ) as gz,
                 tarfile.open(mode="w", fileobj=gz) as tar,
             ):
-                tar.add(str(source), arcname=".")
+                tar.add(str(source), arcname=".", filter=member_filter)
     except BaseException:
         Path(tmp.name).unlink(missing_ok=True)
         raise
 
-    return Path(tmp.name), f"sha256:{writer.hex_digest}"
+    return Tarball(
+        path=Path(tmp.name),
+        content_hash=f"sha256:{writer.hex_digest}",
+        excluded_count=member_filter.excluded_count,
+        file_count=member_filter.file_count,
+    )
