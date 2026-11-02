@@ -10,7 +10,7 @@ This repository was originally created for LTD Keeper. During the codebase migra
 
 ## Development commands
 
-- **Lint all files**: `uv run --only-group=lint pre-commit run --all-files`
+- **Lint all files**: `uv run --only-group=lint prek run --all-files`
 - **Lint a specific file**: `uv run --only-group=lint ruff check path/to/file.py`
 - **Format a specific file**: `uv run --only-group=lint ruff format path/to/file.py`
 - **Type checking**: `uv run --only-group=nox nox -s typing`
