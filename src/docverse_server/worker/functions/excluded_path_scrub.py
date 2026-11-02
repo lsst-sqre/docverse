@@ -16,13 +16,19 @@ A dry run stops there. A real run then, for each affected build:
 2. deletes the excluded objects, a bounded number at a time;
 3. in one transaction, re-reads the build under its row lock, skips it
    (objects already gone) if it was retired or stamped in the meantime,
-   and otherwise subtracts what was removed from ``object_count`` and
-   ``total_size_bytes`` and stamps it ``excluded_paths_scrubbed`` —
-   only when every delete succeeded, so a later run retries the rest.
+   and otherwise sets ``object_count`` and ``total_size_bytes`` to what
+   the listing held less what was removed, and stamps it
+   ``excluded_paths_scrubbed`` — only when every delete succeeded, so a
+   later run retries the rest.
 
 ``content_hash`` is never rewritten. A stamped build is left out of
 later scrubs, so a re-run only revisits the builds this one did not
-finish.
+finish. Because the inventory is written as measured rather than
+decremented, a re-run also takes off whatever an interrupted run
+deleted from a build without recording it, as long as some of that
+build's excluded objects were still left to find; see
+:meth:`~docverse_server.services.excluded_path_scrub.ExcludedPathScrubService.record_scrub`
+for the one window it leaves.
 
 The job's ``progress`` is its report, an
 `~docverse.models.ExcludedPathScrubProgress`: summary counters plus one
@@ -184,7 +190,13 @@ class ScrubReport:
     def add_failed(
         self, *, build_id: str, build_url: str | None, error: str
     ) -> None:
-        """Count a build that could not be examined and add its row."""
+        """Count a build that could not be examined and add its row.
+
+        Only for a build whose listing failed, so it is not counted in
+        :attr:`builds_examined`. A build that fails once listed is
+        examined, and goes through :meth:`add_affected` with an
+        ``error``.
+        """
         self.builds_failed += 1
         self.rows.append(
             ExcludedPathScrubBuild(
@@ -390,10 +402,13 @@ async def _scrub_builds(
 ) -> None:
     """Scrub each build in turn, isolating per-build failures.
 
-    A build whose listing fails, or that fails before anything is
-    deleted, gets an error row from here; once its objects are being
-    deleted, :func:`_remove_excluded` records the outcome itself, so the
-    objects already gone are still counted.
+    A build whose listing fails was never examined, and gets an
+    entry-less error row from :meth:`ScrubReport.add_failed`. Once a
+    build is listed it is examined: a failure before anything is deleted
+    gets an error row carrying the excluded entries the listing found,
+    and once its objects are being deleted :func:`_remove_excluded`
+    records the outcome itself, so the objects already gone are still
+    counted.
     """
     service = factory.create_excluded_path_scrub_service()
     edition_store = factory.create_edition_store()
@@ -406,9 +421,19 @@ async def _scrub_builds(
             match = await service.scan_build(
                 build=build, object_store=object_store
             )
-            if not match.entries:
-                report.add_clean()
-            else:
+        except Exception as exc:
+            report.add_failed(
+                build_id=public_id,
+                build_url=url,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            log.exception("Failed to list a build for the excluded-path scrub")
+            match = None
+        if match is not None and not match.entries:
+            report.add_clean()
+        elif match is not None:
+            slugs: list[str] = []
+            try:
                 # Edition slugs are read only for an affected build,
                 # since an unaffected one gets no row to put them in.
                 async with session.begin():
@@ -435,13 +460,17 @@ async def _scrub_builds(
                     ),
                     logger=log,
                 )
-        except Exception as exc:
-            report.add_failed(
-                build_id=public_id,
-                build_url=url,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            log.exception("Failed to scrub a build of excluded paths")
+            except Exception as exc:
+                report.add_affected(
+                    build_id=public_id,
+                    build_url=url,
+                    edition_slugs=slugs,
+                    match=match,
+                    objects_removed=0,
+                    bytes_removed=0,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                log.exception("Failed to scrub a build of excluded paths")
         if index % PROGRESS_FLUSH_BUILDS == 0:
             async with session.begin():
                 await queue_job_store.update_progress(
@@ -548,7 +577,7 @@ async def _remove_excluded(
     try:
         async with session.begin():
             skip_reason = await service.record_scrub(
-                build_id=build.id, deletion=deletion
+                build_id=build.id, match=match, deletion=deletion
             )
     except Exception as exc:
         errors.append(f"{type(exc).__name__}: {exc}")

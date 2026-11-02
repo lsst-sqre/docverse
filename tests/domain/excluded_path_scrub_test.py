@@ -72,6 +72,28 @@ def test_match_groups_excluded_objects_by_entry() -> None:
     assert f"{_PREFIX}index.html" not in match.keys
 
 
+def test_match_measures_everything_listed_under_the_prefix() -> None:
+    """The listed totals count served and excluded objects alike.
+
+    They are the build's inventory as the store holds it, which a real
+    scrub records less what it deleted. An object outside the prefix is
+    no part of this build's inventory.
+    """
+    match = match_excluded_objects(
+        [
+            ObjectEntry(key=f"{_PREFIX}index.html", size=10),
+            ObjectEntry(key=f"{_PREFIX}.buildinfo", size=7),
+            ObjectEntry(key="proj/__builds/OTHER/index.html", size=500),
+        ],
+        storage_prefix=_PREFIX,
+    )
+
+    assert match.listed_object_count == 2
+    assert match.listed_size_bytes == 17
+    assert match.object_count == 1
+    assert match.total_size_bytes == 7
+
+
 def test_match_ignores_cache_names_in_the_prefix_itself() -> None:
     """Only the path below the build prefix is tested against the list."""
     prefix = "proj/.git/__builds/01ABCDEF/"

@@ -776,21 +776,26 @@ class BuildStore:
         await self._session.refresh(row)
         return Build.model_validate(row)
 
-    async def decrement_inventory(
+    async def correct_inventory(
         self,
         *,
         build_id: int,
         object_count: int,
         total_size_bytes: int,
     ) -> Build:
-        """Subtract removed objects from a completed build's inventory.
+        """Replace a completed build's inventory with measured counts.
 
         The excluded-path scrub's inventory correction: once it has
         deleted a live build's cache objects, the build's
         ``object_count`` and ``total_size_bytes`` must stop counting
         them, or the inventory census goes on reporting bytes the store
-        no longer holds. Unlike :meth:`update_inventory`, which writes
-        the counts a fresh build was unpacked with, this adjusts the
+        no longer holds. The scrub passes what its listing of the
+        build's prefix held less what it deleted, so the write is
+        absolute rather than a decrement: objects an earlier, interrupted
+        scrub deleted without recording are no longer listed and so come
+        off too, and a counter that was never recorded (``NULL``) gets
+        the measured value. Unlike :meth:`update_inventory`, which writes
+        the counts a fresh build was unpacked with, this corrects the
         counts of a build that is already serving, so it is refused for
         any build that is not ``completed`` and live.
 
@@ -800,24 +805,21 @@ class BuildStore:
         being copied again.
 
         The row is read under ``SELECT ... FOR UPDATE``, so the status
-        check and the write cannot straddle a concurrent soft delete. A
-        counter never goes below zero, and one that was never recorded
-        (``NULL``) stays unrecorded rather than becoming a negative
-        guess.
+        check and the write cannot straddle a concurrent soft delete.
 
         Parameters
         ----------
         build_id
-            The build to adjust.
+            The build to correct.
         object_count
-            Number of objects removed from the build.
+            Number of objects the build's prefix now holds.
         total_size_bytes
-            Combined size of the removed objects.
+            Combined size of those objects.
 
         Returns
         -------
         Build
-            The build with its adjusted inventory.
+            The build with its corrected inventory.
 
         Raises
         ------
@@ -838,7 +840,7 @@ class BuildStore:
                 target_state=BuildStatus.completed.value,
                 build_public_id=public_id,
                 message=(
-                    f"Cannot adjust the inventory of build {public_id}: "
+                    f"Cannot correct the inventory of build {public_id}: "
                     f"status is {current.value!r}, expected "
                     f"{BuildStatus.completed.value!r}"
                 ),
@@ -847,16 +849,12 @@ class BuildStore:
             raise InvalidBuildStateError(
                 build_public_id=public_id,
                 message=(
-                    f"Cannot adjust the inventory of build {public_id}: "
+                    f"Cannot correct the inventory of build {public_id}: "
                     "it is deleted"
                 ),
             )
-        if row.object_count is not None:
-            row.object_count = max(row.object_count - object_count, 0)
-        if row.total_size_bytes is not None:
-            row.total_size_bytes = max(
-                row.total_size_bytes - total_size_bytes, 0
-            )
+        row.object_count = object_count
+        row.total_size_bytes = total_size_bytes
         await self._session.flush()
         await self._session.refresh(row)
         return Build.model_validate(row)

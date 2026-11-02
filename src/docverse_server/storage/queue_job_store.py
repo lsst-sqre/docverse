@@ -80,7 +80,8 @@ ACTIVE_JOB_INDEX_SUFFIX = "_active_uq"
 
 Every partial unique index on ``queue_jobs`` whose predicate is
 ``status IN ('queued', 'in_progress')`` — the per-``(org, subject_label)``
-keeper-sync mutex, the per-org lifecycle-eval and git-ref-audit mutexes,
+keeper-sync and excluded-path-scrub mutexes, the per-org lifecycle-eval
+and git-ref-audit mutexes,
 and the per-``(org, project)`` dashboard-build mutex — is named with this
 suffix. :data:`_ACTIVE_JOB_UNIQUE_INDEXES` is derived from the table
 metadata rather than hand-listed so a mutex added later participates in
@@ -847,8 +848,9 @@ class QueueJobStore:
         job back rather than refusing: a repeat
         ``excluded_path_scrub`` request for a project returns the scrub
         already queued or running for it. Should more than one row match
-        (nothing but this pre-check keeps a kind without a partial unique
-        index to one), the oldest is returned, so repeat requests agree.
+        (nothing but a pre-check like this keeps a kind without a partial
+        unique index to one), the oldest is returned, so repeat requests
+        agree.
         """
         stmt = (
             select(SqlQueueJob)

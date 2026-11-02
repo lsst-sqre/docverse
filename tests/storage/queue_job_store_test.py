@@ -4374,6 +4374,7 @@ def test_active_job_unique_indexes_cover_every_mutex() -> None:
         "idx_queue_jobs_dashboard_build_active_uq",
         "idx_queue_jobs_purgatory_cleanup_active_uq",
         "idx_queue_jobs_edition_reconcile_active_uq",
+        "idx_queue_jobs_excluded_path_scrub_active_uq",
     } == _ACTIVE_JOB_UNIQUE_INDEXES
 
 

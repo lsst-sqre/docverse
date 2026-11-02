@@ -8,6 +8,8 @@ covered by ``tests/worker/excluded_path_scrub_test.py``.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import structlog
 from httpx import AsyncClient
@@ -25,6 +27,7 @@ from docverse.models import (
     QueueJob,
 )
 from docverse_server.domain.base32id import validate_base32_id
+from docverse_server.domain.queue import QueueJob as QueueJobDomain
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME
 from tests.conftest import seed_member, seed_org_with_admin
@@ -152,6 +155,63 @@ async def test_scrub_repeat_returns_the_active_job(
     assert second.status_code == 202
     assert second.json() == first.json()
     assert second.headers["Location"] == first.headers["Location"]
+    jobs = await client.get(
+        f"/docverse/orgs/{_ORG}/jobs",
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    scrubs = [
+        job
+        for job in jobs.json()
+        if job["kind"] == JobKind.excluded_path_scrub.value
+    ]
+    assert [job["id"] for job in scrubs] == [first.json()["job_id"]]
+    assert _maintenance_scrub_jobs() == 1
+
+
+@pytest.mark.asyncio
+async def test_scrub_that_loses_the_insert_race_returns_the_winner(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request whose pre-check missed a concurrent scrub gets that job.
+
+    The pre-check is a plain read, so a request racing another can read
+    "no active scrub" and go on to insert. The partial unique index
+    refuses that second active row, and the request hands back the job
+    that won rather than failing or queueing a duplicate.
+    """
+    await _setup(client)
+    first = await client.post(
+        _URL,
+        json={"dry_run": True},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+    assert first.status_code == 202
+
+    real_get_active = QueueJobStore.get_active_for_subject
+    misses = [True]
+
+    async def _stale_first_read(
+        self: QueueJobStore, **kwargs: Any
+    ) -> QueueJobDomain | None:
+        if misses:
+            misses.pop()
+            return None
+        return await real_get_active(self, **kwargs)
+
+    monkeypatch.setattr(
+        QueueJobStore, "get_active_for_subject", _stale_first_read
+    )
+
+    second = await client.post(
+        _URL,
+        json={"dry_run": False},
+        headers={"X-Auth-Request-User": _ADMIN},
+    )
+
+    assert misses == []
+    assert second.status_code == 202
+    assert second.json() == first.json()
     jobs = await client.get(
         f"/docverse/orgs/{_ORG}/jobs",
         headers={"X-Auth-Request-User": _ADMIN},

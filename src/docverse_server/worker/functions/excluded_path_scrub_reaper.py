@@ -21,8 +21,13 @@ dead job finished keeps its ``excluded_paths_scrubbed`` stamp and its
 corrected inventory, and every other build is exactly as the job found
 it, so the next real scrub passes the stamped builds by and resumes with
 the rest. A build the job died part-way through deleting is unstamped,
-and the next run lists it again and subtracts only what is left. The
-report the job last flushed stays on the failed row's ``progress``.
+with an inventory that still counts what the job removed from it. The
+next run lists it again and writes its inventory as listed less what
+that run removes, so the dead job's deletes come off as well. Only a
+job that died after the last of a build's excluded objects was gone but
+before its inventory write committed leaves that build over-counted: the
+next run finds no excluded paths in it and does not write it. The report
+the job last flushed stays on the failed row's ``progress``.
 """
 
 from __future__ import annotations

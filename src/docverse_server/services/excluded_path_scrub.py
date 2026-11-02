@@ -46,6 +46,15 @@ __all__ = [
 EXCLUDED_PATH_SCRUB_JOB_TYPE = "excluded_path_scrub"
 """arq function name the scrub's queue job is enqueued under."""
 
+_ENQUEUE_ATTEMPTS = 3
+"""Passes :meth:`ExcludedPathScrubService.enqueue` makes at the mutex.
+
+Each pass reads the project's active scrub and, finding none, tries to
+insert one. A pass only fails when a concurrent request's insert won and
+that scrub was no longer active by the time this one read it back, which
+takes a scrub finishing within a few statements of being queued.
+"""
+
 DELETE_CONCURRENCY = 16
 """Object deletes one build's scrub keeps in flight at once.
 
@@ -136,7 +145,10 @@ class ExcludedPathScrubService:
         subject, as keeper-sync keys its per-project jobs. When a scrub
         is already queued or in progress for the project it is returned
         as is, whatever ``dry_run`` this request asked for: the caller
-        reads the running job's report to see which kind it is.
+        reads the running job's report to see which kind it is. The
+        ``idx_queue_jobs_excluded_path_scrub_active_uq`` partial unique
+        index enforces the rule against concurrent requests: one that
+        loses the insert race returns the winner's job instead.
 
         A new job's ``progress`` starts as an empty
         `~docverse.models.ExcludedPathScrubProgress` carrying
@@ -161,6 +173,9 @@ class ExcludedPathScrubService:
         ------
         NotFoundError
             If the organization has no live project with that slug.
+        RuntimeError
+            If every attempt lost the insert race to a scrub that had
+            already finished by the time it was read back.
         """
         project = await self._project_store.get_by_slug(
             org_id=org.id, slug=project_slug
@@ -169,28 +184,41 @@ class ExcludedPathScrubService:
             msg = f"Project {project_slug!r} not found"
             raise NotFoundError(msg)
 
-        active = await self._queue_job_store.get_active_for_subject(
-            org_id=org.id,
-            kind=JobKind.excluded_path_scrub,
-            subject_label=project.slug,
-        )
-        if active is not None:
-            self._logger.info(
-                "Excluded-path scrub already active for project",
-                org=org.slug,
-                project=project.slug,
-                queue_job_id=active.id,
+        # The pre-check is the fast path; the
+        # ``idx_queue_jobs_excluded_path_scrub_active_uq`` index is what
+        # enforces the rule. A request that loses the insert race to a
+        # concurrent one reads the winner back on its next pass.
+        for _ in range(_ENQUEUE_ATTEMPTS):
+            active = await self._queue_job_store.get_active_for_subject(
+                org_id=org.id,
+                kind=JobKind.excluded_path_scrub,
+                subject_label=project.slug,
             )
-            return active
+            if active is not None:
+                self._logger.info(
+                    "Excluded-path scrub already active for project",
+                    org=org.slug,
+                    project=project.slug,
+                    queue_job_id=active.id,
+                )
+                return active
+            created = await self._queue_job_store.create_unless_active(
+                kind=JobKind.excluded_path_scrub,
+                org_id=org.id,
+                project_id=project.id,
+                subject_label=project.slug,
+            )
+            if created is not None:
+                break
+        else:
+            msg = (
+                f"Could not queue or find an active excluded-path scrub of"
+                f" project {project.slug!r}"
+            )
+            raise RuntimeError(msg)
 
-        queue_job = await self._queue_job_store.create(
-            kind=JobKind.excluded_path_scrub,
-            org_id=org.id,
-            project_id=project.id,
-            subject_label=project.slug,
-        )
         queue_job = await self._queue_job_store.update_progress(
-            queue_job.id,
+            created.id,
             ExcludedPathScrubProgress(dry_run=dry_run).model_dump(mode="json"),
         )
         self._dispatcher.defer(
@@ -315,7 +343,7 @@ class ExcludedPathScrubService:
         )
 
     async def record_scrub(
-        self, *, build_id: int, deletion: ScrubDeletion
+        self, *, build_id: int, match: BuildScrubMatch, deletion: ScrubDeletion
     ) -> str | None:
         """Correct a scrubbed build's inventory and stamp it as scrubbed.
 
@@ -325,21 +353,34 @@ class ExcludedPathScrubService:
         already carries the
         `~docverse_server.domain.excluded_path_scrub.SCRUBBED_ANNOTATION`
         stamp. That last check is what stops two scrubs of one project
-        that raced over the same build from both subtracting its cache:
-        their deletes are idempotent, and only the first to take the lock
+        that raced over the same build from both writing it: their
+        deletes are idempotent, and only the first to take the lock
         writes.
 
-        Otherwise the removed objects are subtracted from the build's
-        ``object_count`` and ``total_size_bytes``, and, only when every
-        delete succeeded, the stamp records when and how much was
-        removed. A build with failed deletes stays unstamped, so a re-run
-        lists it again and subtracts just what this run left behind.
+        Otherwise the build's ``object_count`` and ``total_size_bytes``
+        are set to what :meth:`scan_build`'s listing held under its
+        prefix, less what was removed, and, only when every delete
+        succeeded, the stamp records when and how much was removed.
         ``content_hash`` is not touched.
+
+        The inventory is written as measured, not decremented, so it
+        heals rather than drifts. A build with failed deletes stays
+        unstamped, and a re-run lists it again and writes what is left.
+        A scrub that died part-way through a build's deletes left the
+        objects it removed uncounted, but they are gone from the re-run's
+        listing, so its write takes them off too. The window this does
+        not cover is a scrub that dies after the last of a build's
+        excluded objects is gone but before this write commits: the
+        re-run finds the build clean and never writes it, so its
+        inventory goes on counting the deleted cache.
 
         Parameters
         ----------
         build_id
             The scrubbed build.
+        match
+            The build's listing and excluded objects, from
+            :meth:`scan_build`.
         deletion
             What :meth:`delete_excluded` removed from it.
 
@@ -357,12 +398,11 @@ class ExcludedPathScrubService:
         reason = scrub_skip_reason(current)
         if reason is not None:
             return reason
-        if deletion.objects_deleted:
-            await self._build_store.decrement_inventory(
-                build_id=build_id,
-                object_count=deletion.objects_deleted,
-                total_size_bytes=deletion.bytes_deleted,
-            )
+        await self._build_store.correct_inventory(
+            build_id=build_id,
+            object_count=match.listed_object_count - deletion.objects_deleted,
+            total_size_bytes=match.listed_size_bytes - deletion.bytes_deleted,
+        )
         if deletion.complete:
             await self._build_store.set_annotation(
                 build_id=build_id,

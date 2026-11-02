@@ -347,10 +347,10 @@ async def post_builds_scrub_excluded_paths(
     the response links to, updated as the scrub runs.
 
     Unless ``dry_run`` is set, the scrub also deletes those objects,
-    subtracts them from each build's ``object_count`` and
-    ``total_size_bytes``, and stamps the build's annotations with
-    ``excluded_paths_scrubbed``, so a later scrub of the project only
-    revisits the builds this one did not finish. A build's
+    sets each build's ``object_count`` and ``total_size_bytes`` to what
+    its prefix holds without them, and stamps the build's annotations
+    with ``excluded_paths_scrubbed``, so a later scrub of the project
+    only revisits the builds this one did not finish. A build's
     ``content_hash`` is left as it was ingested.
 
     A project runs one scrub at a time: while one is queued or in

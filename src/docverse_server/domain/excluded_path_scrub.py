@@ -87,6 +87,13 @@ class BuildScrubMatch:
     entries: tuple[ExcludedEntry, ...]
     """Excluded entries, in entry-path order. Empty when none matched."""
 
+    listed_object_count: int
+    """Number of objects the listing held under the prefix, excluded
+    or not: the build's inventory as the store measured it."""
+
+    listed_size_bytes: int
+    """Combined size of :attr:`listed_object_count`."""
+
     @property
     def object_count(self) -> int:
         """Number of excluded objects across every entry."""
@@ -148,8 +155,9 @@ def match_excluded_objects(
     ----------
     objects
         The build's objects, as listed under ``storage_prefix``. An
-        object outside the prefix is ignored rather than trusted: its
-        path relative to this build is undefined.
+        object outside the prefix is ignored rather than trusted, and
+        left out of the listed totals: its path relative to this build
+        is undefined.
     storage_prefix
         The build's storage prefix, which is stripped from each key
         before the excluded-path rule is applied, so a cache name that
@@ -158,12 +166,17 @@ def match_excluded_objects(
     Returns
     -------
     BuildScrubMatch
-        The excluded objects grouped by `excluded_entry_path`.
+        The excluded objects grouped by `excluded_entry_path`, with the
+        count and size of every object listed under the prefix.
     """
     grouped: dict[str, list[SizedObject]] = {}
+    listed_object_count = 0
+    listed_size_bytes = 0
     for obj in objects:
         if not obj.key.startswith(storage_prefix):
             continue
+        listed_object_count += 1
+        listed_size_bytes += obj.size
         entry = excluded_entry_path(obj.key[len(storage_prefix) :])
         if entry is not None:
             grouped.setdefault(entry, []).append(obj)
@@ -174,7 +187,9 @@ def match_excluded_objects(
                 objects=tuple(sorted(matched, key=lambda obj: obj.key)),
             )
             for path, matched in sorted(grouped.items())
-        )
+        ),
+        listed_object_count=listed_object_count,
+        listed_size_bytes=listed_size_bytes,
     )
 
 

@@ -2293,11 +2293,16 @@ async def _completed_with_inventory(
 
 
 @pytest.mark.asyncio
-async def test_decrement_inventory_subtracts_removed_objects(
+async def test_correct_inventory_writes_the_measured_counts(
     db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
-    """A completed build's counters drop by what was removed from it."""
+    """A completed build's counters become the counts it is given.
+
+    The write is absolute, not a decrement: a build whose recorded
+    inventory had drifted above what its prefix holds ends up with the
+    measured counts, and ``content_hash`` is left as it was ingested.
+    """
     async with db_session.begin():
         _, project_id = await _create_org_and_project(db_session)
         build = await _completed_with_inventory(
@@ -2307,8 +2312,8 @@ async def test_decrement_inventory_subtracts_removed_objects(
             object_count=10,
             total_size_bytes=5000,
         )
-        updated = await build_store.decrement_inventory(
-            build_id=build.id, object_count=3, total_size_bytes=1007
+        updated = await build_store.correct_inventory(
+            build_id=build.id, object_count=7, total_size_bytes=3993
         )
         await db_session.commit()
 
@@ -2318,27 +2323,27 @@ async def test_decrement_inventory_subtracts_removed_objects(
 
 
 @pytest.mark.asyncio
-async def test_decrement_inventory_keeps_unrecorded_counts_and_floors(
+async def test_correct_inventory_records_unrecorded_counts(
     db_session: AsyncSession,
     build_store: BuildStore,
 ) -> None:
-    """An unrecorded counter stays ``NULL``; a recorded one stops at 0."""
+    """A counter that was never recorded gets the measured value."""
     async with db_session.begin():
         _, project_id = await _create_org_and_project(db_session)
         build = await _completed_with_inventory(
             db_session,
             build_store,
             project_id=project_id,
-            object_count=2,
+            object_count=None,
             total_size_bytes=None,
         )
-        updated = await build_store.decrement_inventory(
-            build_id=build.id, object_count=5, total_size_bytes=100
+        updated = await build_store.correct_inventory(
+            build_id=build.id, object_count=2, total_size_bytes=30
         )
         await db_session.commit()
 
-    assert updated.object_count == 0
-    assert updated.total_size_bytes is None
+    assert updated.object_count == 2
+    assert updated.total_size_bytes == 30
 
 
 @pytest.mark.asyncio
@@ -2350,13 +2355,13 @@ async def test_decrement_inventory_keeps_unrecorded_counts_and_floors(
         (BuildStatus.completed, True),
     ],
 )
-async def test_decrement_inventory_refuses_builds_that_are_not_serving(
+async def test_correct_inventory_refuses_builds_that_are_not_serving(
     db_session: AsyncSession,
     build_store: BuildStore,
     status: BuildStatus,
     deleted: bool,  # noqa: FBT001
 ) -> None:
-    """Only a live, completed build's inventory is adjusted."""
+    """Only a live, completed build's inventory is corrected."""
     async with db_session.begin():
         _, project_id = await _create_org_and_project(db_session)
         build = await _completed_with_inventory(
@@ -2369,8 +2374,8 @@ async def test_decrement_inventory_refuses_builds_that_are_not_serving(
             deleted=deleted,
         )
         with pytest.raises(InvalidBuildStateError):
-            await build_store.decrement_inventory(
-                build_id=build.id, object_count=3, total_size_bytes=1007
+            await build_store.correct_inventory(
+                build_id=build.id, object_count=7, total_size_bytes=3993
             )
         unchanged = await build_store.get_by_id(build.id)
         await db_session.commit()

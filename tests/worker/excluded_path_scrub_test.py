@@ -5,8 +5,8 @@ objects with their sizes, and reports the excluded cache paths it finds
 (``.doctrees/``, ``.buildinfo`` and the rest of
 ``docverse.excluded_paths``) in its queue job's ``progress``. A dry run
 leaves the store and the build rows untouched; a real run deletes those
-objects, subtracts them from each build's inventory and stamps the build
-so a later run passes it by.
+objects, records each build's inventory as listed less them and stamps
+the build so a later run passes it by.
 """
 
 from __future__ import annotations
@@ -459,6 +459,70 @@ async def test_a_failing_build_is_reported_and_the_scrub_continues(
     assert failed_row.entries == []
     assert failed_row.error is not None
     assert failed_row.error.startswith("ObjectStoreError:")
+    assert affected_row.build_id == serialize_base32_id(after.public_id)
+    assert affected_row.error is None
+
+
+@pytest.mark.asyncio
+async def test_a_build_that_fails_once_listed_still_counts_as_examined(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after a build's listing is an examined, affected error.
+
+    Only a build whose listing failed goes unexamined. One whose
+    edition-slug read fails was listed, so it counts toward
+    ``builds_examined`` and ``builds_affected`` as well as
+    ``builds_failed``, and its row names the excluded entries the
+    listing found while removing nothing.
+    """
+    store = MockObjectStore()
+    org_id, project_id, (broken, after) = await _seed_sphinx_project(
+        db_session, store, "broken", "after"
+    )
+    async with db_session.begin():
+        queue_job_id = await _seed_queue_job(
+            db_session, org_id=org_id, project_id=project_id, dry_run=True
+        )
+    real_list_slugs = EditionStore.list_live_slugs_by_current_build
+
+    async def _refuse_broken(self: EditionStore, *, build_id: int) -> Any:
+        if build_id == broken.id:
+            msg = "edition read refused"
+            raise RuntimeError(msg)
+        return await real_list_slugs(self, build_id=build_id)
+
+    monkeypatch.setattr(
+        EditionStore, "list_live_slugs_by_current_build", _refuse_broken
+    )
+    monkeypatch.setattr(
+        Factory, "create_objectstore_for_org", _mock_create_objectstore(store)
+    )
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient())
+
+    result = await excluded_path_scrub(
+        ctx,
+        _payload(
+            org_id=org_id, project_id=project_id, queue_job_id=queue_job_id
+        ),
+    )
+
+    assert result == "completed_with_errors"
+    progress = ExcludedPathScrubProgress.model_validate(
+        (await _read_queue_job(queue_job_id)).progress
+    )
+    assert progress.builds_examined == 2
+    assert progress.builds_affected == 2
+    assert progress.builds_failed == 1
+    assert progress.objects_removed == 3
+    failed_row, affected_row = progress.builds
+    assert failed_row.build_id == serialize_base32_id(broken.public_id)
+    assert failed_row.error == "RuntimeError: edition read refused"
+    assert [entry.path for entry in failed_row.entries] == [
+        ".buildinfo",
+        ".doctrees/",
+    ]
     assert affected_row.build_id == serialize_base32_id(after.public_id)
     assert affected_row.error is None
 
@@ -964,6 +1028,44 @@ async def test_a_failed_delete_is_recorded_and_other_builds_are_scrubbed(
 
 
 @pytest.mark.asyncio
+async def test_a_rerun_heals_an_interrupted_scrubs_unrecorded_deletes(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-run writes the inventory the store holds, not a decrement.
+
+    A scrub that died part-way through a build's deletes removed
+    ``.buildinfo`` without recording it, so the build's inventory still
+    counts it. The re-run lists what is left, deletes the ``.doctrees/``
+    objects, and records the build as listed less those: the dead
+    scrub's delete comes off the inventory too.
+    """
+    store = MockObjectStore()
+    org_id, project_id, (interrupted,) = await _seed_sphinx_project(
+        db_session, store, "interrupted"
+    )
+    await store.delete_object(key=f"{interrupted.storage_prefix}.buildinfo")
+    row = await _read_build(interrupted.id)
+    assert row.object_count == len(_SPHINX_FILES)
+    assert row.total_size_bytes == sum(_SPHINX_FILES.values())
+
+    result, progress = await _run_scrub(
+        store, monkeypatch, org_id=org_id, project_id=project_id, dry_run=False
+    )
+
+    assert result == "completed"
+    assert progress.objects_removed == 2
+    assert progress.bytes_removed == 1000
+    assert _relative_keys(store, interrupted) == _SPHINX_SURVIVORS
+    row = await _read_build(interrupted.id)
+    assert row.object_count == 2
+    assert row.total_size_bytes == 30
+    assert row.annotations is not None
+    assert row.annotations["excluded_paths_scrubbed"]["objects_removed"] == 2
+
+
+@pytest.mark.asyncio
 async def test_a_racing_scrub_corrects_the_inventory_only_once(
     app: None,
     db_session: AsyncSession,
@@ -984,8 +1086,8 @@ async def test_a_racing_scrub_corrects_the_inventory_only_once(
         async for session in db_session_dependency():
             async with session.begin():
                 build_store = BuildStore(session=session, logger=_logger())
-                await build_store.decrement_inventory(
-                    build_id=raced.id, object_count=3, total_size_bytes=1007
+                await build_store.correct_inventory(
+                    build_id=raced.id, object_count=2, total_size_bytes=30
                 )
                 await build_store.set_annotation(
                     build_id=raced.id,
@@ -1028,7 +1130,7 @@ async def test_a_rejected_inventory_write_fails_the_build(
     async def _reject(self: BuildStore, **kwargs: Any) -> Build:
         raise InvalidBuildStateError(message="inventory write refused")
 
-    monkeypatch.setattr(BuildStore, "decrement_inventory", _reject)
+    monkeypatch.setattr(BuildStore, "correct_inventory", _reject)
 
     result, progress = await _run_scrub(
         store, monkeypatch, org_id=org_id, project_id=project_id, dry_run=False
@@ -1129,8 +1231,8 @@ async def test_reaper_fails_a_dead_scrub_and_leaves_its_builds_alone(
             files=_SPHINX_FILES,
         )
         build_store = BuildStore(session=db_session, logger=_logger())
-        await build_store.decrement_inventory(
-            build_id=scrubbed.id, object_count=3, total_size_bytes=1007
+        await build_store.correct_inventory(
+            build_id=scrubbed.id, object_count=2, total_size_bytes=30
         )
         await build_store.set_annotation(
             build_id=scrubbed.id,
