@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from docverse.excluded_paths import EXCLUDED_PATH_NAMES
+from docverse.models import BuildStatus
+
+from .build import Build
 
 __all__ = [
     "SCRUBBED_ANNOTATION",
@@ -21,6 +24,7 @@ __all__ = [
     "SizedObject",
     "excluded_entry_path",
     "match_excluded_objects",
+    "scrub_skip_reason",
 ]
 
 SCRUBBED_ANNOTATION = "excluded_paths_scrubbed"
@@ -57,16 +61,23 @@ class ExcludedEntry:
     path: str
     """Build-relative entry path; see `excluded_entry_path`."""
 
-    keys: tuple[str, ...]
-    """Full object keys under the entry, in key order."""
+    objects: tuple[SizedObject, ...]
+    """The objects under the entry, with their sizes, in key order."""
 
-    total_size_bytes: int
-    """Combined size of those objects."""
+    @property
+    def keys(self) -> tuple[str, ...]:
+        """Full object keys under the entry, in key order."""
+        return tuple(obj.key for obj in self.objects)
 
     @property
     def object_count(self) -> int:
         """Number of objects under the entry."""
-        return len(self.keys)
+        return len(self.objects)
+
+    @property
+    def total_size_bytes(self) -> int:
+        """Combined size of the objects under the entry."""
+        return sum(obj.size for obj in self.objects)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,9 +98,14 @@ class BuildScrubMatch:
         return sum(entry.total_size_bytes for entry in self.entries)
 
     @property
+    def objects(self) -> tuple[SizedObject, ...]:
+        """Every excluded object with its size, entry by entry."""
+        return tuple(obj for entry in self.entries for obj in entry.objects)
+
+    @property
     def keys(self) -> tuple[str, ...]:
         """Every excluded object key, entry by entry."""
-        return tuple(key for entry in self.entries for key in entry.keys)
+        return tuple(obj.key for obj in self.objects)
 
 
 def excluded_entry_path(relative_path: str) -> str | None:
@@ -155,9 +171,46 @@ def match_excluded_objects(
         entries=tuple(
             ExcludedEntry(
                 path=path,
-                keys=tuple(sorted(obj.key for obj in matched)),
-                total_size_bytes=sum(obj.size for obj in matched),
+                objects=tuple(sorted(matched, key=lambda obj: obj.key)),
             )
             for path, matched in sorted(grouped.items())
         )
     )
+
+
+def scrub_skip_reason(build: Build | None) -> str | None:
+    """Say why a real scrub must leave a build's row alone, if it must.
+
+    The scrub lists its candidate builds once, at the start, and then
+    spends seconds to minutes on each. By the time it comes to delete a
+    build's objects or write its row, the build may have been deleted,
+    or another scrub of the same project may already have finished it.
+    The worker asks this of a fresh read before it deletes anything and
+    again, under the row lock, before it corrects the inventory, so a
+    retired build is never written to and a build two scrubs raced over
+    has its inventory corrected only once.
+
+    Parameters
+    ----------
+    build
+        The build as it stands now, or `None` if its row is gone.
+
+    Returns
+    -------
+    str or None
+        A short reason for the report, or `None` when the build is
+        still completed, live and unstamped.
+    """
+    if build is None:
+        return "the build no longer exists"
+    if build.date_deleted is not None:
+        return "the build was deleted during the scrub"
+    if build.status is not BuildStatus.completed:
+        return (
+            f"the build's status is now {build.status.value!r}, not"
+            f" {BuildStatus.completed.value!r}"
+        )
+    extras = build.annotations.model_extra if build.annotations else None
+    if extras and SCRUBBED_ANNOTATION in extras:
+        return "another scrub already scrubbed the build"
+    return None

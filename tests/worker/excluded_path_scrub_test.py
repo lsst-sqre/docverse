@@ -3,13 +3,17 @@
 The scrub walks one project's completed, live builds, lists each build's
 objects with their sizes, and reports the excluded cache paths it finds
 (``.doctrees/``, ``.buildinfo`` and the rest of
-``docverse.excluded_paths``) in its queue job's ``progress``. Deletion
-is not wired yet, so every run here must leave the store untouched.
+``docverse.excluded_paths``) in its queue job's ``progress``. A dry run
+leaves the store and the build rows untouched; a real run deletes those
+objects, subtracts them from each build's inventory and stamps the build
+so a later run passes it by.
 """
 
 from __future__ import annotations
 
 import importlib
+from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -37,6 +41,7 @@ from docverse_server.domain.api_urls import build_url
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
 from docverse_server.domain.queue import JobStatus
+from docverse_server.exceptions import InvalidBuildStateError
 from docverse_server.factory import Factory
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
@@ -118,8 +123,13 @@ async def _seed_build(
     git_ref: str,
     status: BuildStatus = BuildStatus.completed,
     deleted: bool = False,
+    files: dict[str, int] | None = None,
 ) -> Build:
-    """Create a build in a chosen status, optionally soft-deleted."""
+    """Create a build in a chosen status, optionally soft-deleted.
+
+    ``files`` (relative path -> size) sets the build's inventory to what
+    unpacking those files would have recorded; `_put` stores them.
+    """
     build = await BuildStore(session=db_session, logger=_logger()).create(
         project_id=project_id,
         project_slug=_PROJECT_SLUG,
@@ -127,6 +137,9 @@ async def _seed_build(
         uploader="testuser",
     )
     values: dict[str, Any] = {"status": status}
+    if files is not None:
+        values["object_count"] = len(files)
+        values["total_size_bytes"] = sum(files.values())
     if deleted:
         values["date_deleted"] = func.now()
     await db_session.execute(
@@ -183,6 +196,17 @@ async def _put(
             data=b"x" * size,
             content_type="application/octet-stream",
         )
+
+
+async def _read_build(build_id: int) -> SqlBuild:
+    async for session in db_session_dependency():
+        async with session.begin():
+            row = await session.get(SqlBuild, build_id)
+            assert row is not None
+            await session.refresh(row)
+            return row
+    msg = "No database session available"
+    raise RuntimeError(msg)
 
 
 async def _read_queue_job(job_id: int) -> SqlQueueJob:
@@ -319,6 +343,7 @@ async def test_dry_run_reports_excluded_paths_per_build(
         "objects_removed": 5,
         "bytes_removed": 1042,
         "builds_failed": 0,
+        "builds_skipped": 0,
         "builds": [
             {
                 "build_id": serialize_base32_id(sphinx.public_id),
@@ -337,6 +362,7 @@ async def test_dry_run_reports_excluded_paths_per_build(
                     },
                 ],
                 "error": None,
+                "skip_reason": None,
             },
             {
                 "build_id": serialize_base32_id(nested.public_id),
@@ -355,6 +381,7 @@ async def test_dry_run_reports_excluded_paths_per_build(
                     },
                 ],
                 "error": None,
+                "skip_reason": None,
             },
         ],
     }
@@ -542,3 +569,471 @@ async def test_org_without_a_store_fails_the_job(
     assert row.status == JobStatus.failed.value
     assert row.errors is not None
     assert row.errors["type"] == "RuntimeError"
+
+
+_SPHINX_FILES = {
+    "index.html": 10,
+    "_static/app.js": 20,
+    ".doctrees/environment.pickle": 900,
+    ".doctrees/index.doctree": 100,
+    ".buildinfo": 7,
+}
+"""A Sphinx build's tree: two served files and three cache objects."""
+
+_SPHINX_SURVIVORS = {"index.html", "_static/app.js"}
+
+
+def _relative_keys(store: MockObjectStore, build: Build) -> set[str]:
+    """Return the keys under ``build``'s prefix, relative to it."""
+    return {
+        key[len(build.storage_prefix) :]
+        for key in store.objects
+        if key.startswith(build.storage_prefix)
+    }
+
+
+@pytest.mark.asyncio
+async def test_real_run_removes_excluded_objects_and_corrects_inventory(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real scrub deletes exactly the excluded keys and stamps the build.
+
+    The served files survive, the build's ``object_count`` and
+    ``total_size_bytes`` drop by what was removed, the build carries the
+    ``excluded_paths_scrubbed`` stamp recording when and how much, and
+    its ``content_hash`` stays the one it was ingested with.
+    """
+    store = MockObjectStore()
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(db_session)
+        sphinx = await _seed_build(
+            db_session,
+            project_id=project_id,
+            git_ref="sphinx",
+            files=_SPHINX_FILES,
+        )
+        queue_job_id = await _seed_queue_job(
+            db_session, org_id=org_id, project_id=project_id, dry_run=False
+        )
+    await _put(store, sphinx, _SPHINX_FILES)
+    monkeypatch.setattr(
+        Factory, "create_objectstore_for_org", _mock_create_objectstore(store)
+    )
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient())
+
+    result = await excluded_path_scrub(
+        ctx,
+        _payload(
+            org_id=org_id,
+            project_id=project_id,
+            queue_job_id=queue_job_id,
+            dry_run=False,
+        ),
+    )
+
+    assert result == "completed"
+    assert _relative_keys(store, sphinx) == _SPHINX_SURVIVORS
+    row = await _read_build(sphinx.id)
+    assert row.object_count == 2
+    assert row.total_size_bytes == 30
+    assert row.content_hash == sphinx.content_hash
+    assert row.annotations is not None
+    stamp = row.annotations["excluded_paths_scrubbed"]
+    assert stamp["objects_removed"] == 3
+    assert stamp["bytes_removed"] == 1007
+    assert datetime.fromisoformat(stamp["date_scrubbed"]).tzinfo is not None
+    progress = ExcludedPathScrubProgress.model_validate(
+        (await _read_queue_job(queue_job_id)).progress
+    )
+    assert progress.dry_run is False
+    assert progress.builds_affected == 1
+    assert progress.objects_removed == 3
+    assert progress.bytes_removed == 1007
+    assert progress.builds_failed == 0
+
+
+async def _run_scrub(
+    store: MockObjectStore,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    org_id: int,
+    project_id: int,
+    dry_run: bool,
+) -> tuple[str, ExcludedPathScrubProgress]:
+    """Queue and run one scrub of the project; return result and report."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            queue_job_id = await _seed_queue_job(
+                session, org_id=org_id, project_id=project_id, dry_run=dry_run
+            )
+    monkeypatch.setattr(
+        Factory, "create_objectstore_for_org", _mock_create_objectstore(store)
+    )
+    result = await excluded_path_scrub(
+        make_worker_ctx(http_client=httpx.AsyncClient()),
+        _payload(
+            org_id=org_id,
+            project_id=project_id,
+            queue_job_id=queue_job_id,
+            dry_run=dry_run,
+        ),
+    )
+    row = await _read_queue_job(queue_job_id)
+    assert row.status == result
+    return result, ExcludedPathScrubProgress.model_validate(row.progress)
+
+
+async def _seed_sphinx_project(
+    db_session: AsyncSession, store: MockObjectStore, *git_refs: str
+) -> tuple[int, int, list[Build]]:
+    """Seed the project with one stored Sphinx build per git ref."""
+    async with db_session.begin():
+        org_id, project_id = await _seed_org_and_project(db_session)
+        builds = [
+            await _seed_build(
+                db_session,
+                project_id=project_id,
+                git_ref=git_ref,
+                files=_SPHINX_FILES,
+            )
+            for git_ref in git_refs
+        ]
+    for build in builds:
+        await _put(store, build, _SPHINX_FILES)
+    return org_id, project_id, builds
+
+
+async def _soft_delete(build_id: int) -> None:
+    """Soft-delete a build from outside the scrub's session."""
+    async for session in db_session_dependency():
+        async with session.begin():
+            await session.execute(
+                update(SqlBuild)
+                .where(SqlBuild.id == build_id)
+                .values(date_deleted=func.now())
+            )
+        return
+
+
+@pytest.mark.asyncio
+async def test_dry_run_leaves_build_rows_untouched(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dry run deletes nothing, writes no build row and stamps nothing.
+
+    So a second dry run finds the same build again.
+    """
+    store = MockObjectStore()
+    org_id, project_id, (sphinx,) = await _seed_sphinx_project(
+        db_session, store, "sphinx"
+    )
+    before = {key: obj.data for key, obj in store.objects.items()}
+
+    for _ in range(2):
+        result, progress = await _run_scrub(
+            store,
+            monkeypatch,
+            org_id=org_id,
+            project_id=project_id,
+            dry_run=True,
+        )
+        assert result == "completed"
+        assert progress.builds_affected == 1
+        assert progress.objects_removed == 3
+
+    assert {key: obj.data for key, obj in store.objects.items()} == before
+    row = await _read_build(sphinx.id)
+    assert row.object_count == len(_SPHINX_FILES)
+    assert row.total_size_bytes == sum(_SPHINX_FILES.values())
+    assert row.annotations is None
+
+
+@pytest.mark.asyncio
+async def test_second_real_run_reports_no_affected_builds(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stamped builds are passed by, so a re-run has nothing to do."""
+    store = MockObjectStore()
+    org_id, project_id, _ = await _seed_sphinx_project(
+        db_session, store, "one", "two"
+    )
+
+    _, first = await _run_scrub(
+        store, monkeypatch, org_id=org_id, project_id=project_id, dry_run=False
+    )
+    result, second = await _run_scrub(
+        store, monkeypatch, org_id=org_id, project_id=project_id, dry_run=False
+    )
+
+    assert first.builds_affected == 2
+    assert result == "completed"
+    assert second.builds_examined == 0
+    assert second.builds_affected == 0
+    assert second.objects_removed == 0
+    assert second.builds == []
+
+
+class _HookedStore(MockObjectStore):
+    """Mock store that runs a side effect at a chosen point of the scrub.
+
+    ``on_list`` runs before the listing of a given prefix and
+    ``on_delete`` before the first delete under it, each once, so a test
+    can retire a build at exactly the moment it means to. ``failing_keys``
+    are refused deletes.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.on_list: dict[str, Callable[[], Awaitable[None]]] = {}
+        self.on_delete: dict[str, Callable[[], Awaitable[None]]] = {}
+        self.failing_keys: set[str] = set()
+
+    async def list_object_entries(self, *, prefix: str) -> list[ObjectEntry]:
+        hook = self.on_list.pop(prefix, None)
+        if hook is not None:
+            await hook()
+        return await super().list_object_entries(prefix=prefix)
+
+    async def delete_object(self, *, key: str) -> None:
+        for prefix in list(self.on_delete):
+            if key.startswith(prefix):
+                await self.on_delete.pop(prefix)()
+        if key in self.failing_keys:
+            raise ObjectStoreError(
+                bucket="docs",
+                prefix=key,
+                operation="DeleteObject",
+                failures=["delete refused"],
+            )
+        await super().delete_object(key=key)
+
+
+@pytest.mark.asyncio
+async def test_build_deleted_before_its_objects_go_is_skipped(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build soft-deleted after the job listed it keeps its objects.
+
+    It is reported as skipped, its row is not written, the other build
+    is still scrubbed, and a skip alone is not an error.
+    """
+    store = _HookedStore()
+    org_id, project_id, (retired, live) = await _seed_sphinx_project(
+        db_session, store, "retired", "live"
+    )
+    store.on_list[retired.storage_prefix] = lambda: _soft_delete(retired.id)
+
+    result, progress = await _run_scrub(
+        store, monkeypatch, org_id=org_id, project_id=project_id, dry_run=False
+    )
+
+    assert result == "completed"
+    assert _relative_keys(store, retired) == set(_SPHINX_FILES)
+    assert _relative_keys(store, live) == _SPHINX_SURVIVORS
+    retired_row = await _read_build(retired.id)
+    assert retired_row.object_count == len(_SPHINX_FILES)
+    assert retired_row.annotations is None
+    assert progress.builds_affected == 2
+    assert progress.builds_skipped == 1
+    assert progress.builds_failed == 0
+    assert progress.objects_removed == 3
+    skipped, scrubbed = progress.builds
+    assert skipped.build_id == serialize_base32_id(retired.public_id)
+    assert skipped.skip_reason is not None
+    assert "deleted" in skipped.skip_reason
+    assert skipped.error is None
+    assert [entry.path for entry in skipped.entries] == [
+        ".buildinfo",
+        ".doctrees/",
+    ]
+    assert scrubbed.skip_reason is None
+
+
+@pytest.mark.asyncio
+async def test_build_deleted_while_its_objects_go_is_not_written(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build retired mid-delete loses its cache but keeps its row as is.
+
+    The locked re-read before the inventory write sees the deletion, so
+    neither the counters nor the stamp are written, and the report
+    names the build as skipped while counting the objects already gone.
+    """
+    store = _HookedStore()
+    org_id, project_id, (retired,) = await _seed_sphinx_project(
+        db_session, store, "retired"
+    )
+    store.on_delete[retired.storage_prefix] = lambda: _soft_delete(retired.id)
+
+    result, progress = await _run_scrub(
+        store, monkeypatch, org_id=org_id, project_id=project_id, dry_run=False
+    )
+
+    assert result == "completed"
+    assert _relative_keys(store, retired) == _SPHINX_SURVIVORS
+    row = await _read_build(retired.id)
+    assert row.object_count == len(_SPHINX_FILES)
+    assert row.total_size_bytes == sum(_SPHINX_FILES.values())
+    assert row.annotations is None
+    assert progress.builds_skipped == 1
+    assert progress.objects_removed == 3
+    assert progress.builds[0].skip_reason is not None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_delete_is_recorded_and_other_builds_are_scrubbed(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One build's refused delete fails that build, not the job.
+
+    The other excluded objects of that build still go and come off its
+    inventory, but it is not stamped, so a re-run lists it again and
+    finishes it. The build after it is scrubbed as usual, and the job
+    ends ``completed_with_errors``.
+    """
+    store = _HookedStore()
+    org_id, project_id, (broken, after) = await _seed_sphinx_project(
+        db_session, store, "broken", "after"
+    )
+    refused = f"{broken.storage_prefix}.doctrees/environment.pickle"
+    store.failing_keys.add(refused)
+
+    result, progress = await _run_scrub(
+        store, monkeypatch, org_id=org_id, project_id=project_id, dry_run=False
+    )
+
+    assert result == "completed_with_errors"
+    assert progress.builds_failed == 1
+    assert progress.builds_affected == 2
+    assert progress.objects_removed == 5
+    assert progress.bytes_removed == 107 + 1007
+    failed_row, scrubbed_row = progress.builds
+    assert failed_row.build_id == serialize_base32_id(broken.public_id)
+    assert failed_row.error is not None
+    assert "1 of 3 object deletes failed" in failed_row.error
+    assert refused in failed_row.error
+    assert scrubbed_row.error is None
+    assert _relative_keys(store, broken) == {
+        *_SPHINX_SURVIVORS,
+        ".doctrees/environment.pickle",
+    }
+    assert _relative_keys(store, after) == _SPHINX_SURVIVORS
+    broken_row = await _read_build(broken.id)
+    assert broken_row.object_count == 3
+    assert broken_row.total_size_bytes == 930
+    assert broken_row.annotations is None
+    after_row = await _read_build(after.id)
+    assert after_row.annotations is not None
+    assert "excluded_paths_scrubbed" in after_row.annotations
+
+    store.failing_keys.clear()
+    result, rerun = await _run_scrub(
+        store, monkeypatch, org_id=org_id, project_id=project_id, dry_run=False
+    )
+
+    assert result == "completed"
+    assert rerun.builds_examined == 1
+    assert rerun.objects_removed == 1
+    assert _relative_keys(store, broken) == _SPHINX_SURVIVORS
+    broken_row = await _read_build(broken.id)
+    assert broken_row.object_count == 2
+    assert broken_row.total_size_bytes == 30
+    assert broken_row.annotations is not None
+    assert (
+        broken_row.annotations["excluded_paths_scrubbed"]["objects_removed"]
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_racing_scrub_corrects_the_inventory_only_once(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A build another scrub finished while this one deleted is left alone.
+
+    Two scrubs of one project can both list and delete the same build;
+    deletes are idempotent, and the locked re-read before the write sees
+    the other scrub's stamp, so the cache comes off the inventory once.
+    """
+    store = _HookedStore()
+    org_id, project_id, (raced,) = await _seed_sphinx_project(
+        db_session, store, "raced"
+    )
+
+    async def _other_scrub_finishes() -> None:
+        async for session in db_session_dependency():
+            async with session.begin():
+                build_store = BuildStore(session=session, logger=_logger())
+                await build_store.decrement_inventory(
+                    build_id=raced.id, object_count=3, total_size_bytes=1007
+                )
+                await build_store.set_annotation(
+                    build_id=raced.id,
+                    key="excluded_paths_scrubbed",
+                    value={"objects_removed": 3, "bytes_removed": 1007},
+                )
+            return
+
+    store.on_delete[raced.storage_prefix] = _other_scrub_finishes
+
+    result, progress = await _run_scrub(
+        store, monkeypatch, org_id=org_id, project_id=project_id, dry_run=False
+    )
+
+    assert result == "completed"
+    assert progress.builds_skipped == 1
+    assert progress.builds[0].skip_reason is not None
+    assert "already scrubbed" in progress.builds[0].skip_reason
+    row = await _read_build(raced.id)
+    assert row.object_count == 2
+    assert row.total_size_bytes == 30
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_inventory_write_fails_the_build(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inventory write the database refuses becomes the row's error.
+
+    The objects are already gone, so they are still counted as removed;
+    the build is left unstamped for a re-run.
+    """
+    store = MockObjectStore()
+    org_id, project_id, (build,) = await _seed_sphinx_project(
+        db_session, store, "rejected"
+    )
+
+    async def _reject(self: BuildStore, **kwargs: Any) -> Build:
+        raise InvalidBuildStateError(message="inventory write refused")
+
+    monkeypatch.setattr(BuildStore, "decrement_inventory", _reject)
+
+    result, progress = await _run_scrub(
+        store, monkeypatch, org_id=org_id, project_id=project_id, dry_run=False
+    )
+
+    assert result == "completed_with_errors"
+    assert progress.builds_failed == 1
+    assert progress.objects_removed == 3
+    assert progress.builds[0].error == (
+        "InvalidBuildStateError: inventory write refused"
+    )
+    row = await _read_build(build.id)
+    assert row.object_count == len(_SPHINX_FILES)
+    assert row.annotations is None

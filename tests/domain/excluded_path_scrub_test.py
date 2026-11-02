@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from typing import Any
+
 import pytest
 
+from docverse.models import BuildStatus
+from docverse_server.domain.build import Build
 from docverse_server.domain.excluded_path_scrub import (
+    SCRUBBED_ANNOTATION,
     excluded_entry_path,
     match_excluded_objects,
+    scrub_skip_reason,
 )
 from docverse_server.storage.objectstore import ObjectEntry
 
@@ -87,3 +94,80 @@ def test_match_ignores_objects_outside_the_prefix() -> None:
     )
 
     assert match.entries == ()
+
+
+def test_match_keeps_each_objects_size() -> None:
+    """The match carries every excluded object's own size, in key order.
+
+    A deletion that only partly succeeds can then subtract exactly the
+    bytes it removed from the build's inventory.
+    """
+    match = match_excluded_objects(
+        [
+            ObjectEntry(key=f"{_PREFIX}index.html", size=10),
+            ObjectEntry(key=f"{_PREFIX}.doctrees/b.doctree", size=200),
+            ObjectEntry(key=f"{_PREFIX}.buildinfo", size=7),
+            ObjectEntry(key=f"{_PREFIX}.doctrees/a.doctree", size=900),
+        ],
+        storage_prefix=_PREFIX,
+    )
+
+    assert [(obj.key, obj.size) for obj in match.objects] == [
+        (f"{_PREFIX}.buildinfo", 7),
+        (f"{_PREFIX}.doctrees/a.doctree", 900),
+        (f"{_PREFIX}.doctrees/b.doctree", 200),
+    ]
+
+
+def _build(**overrides: Any) -> Build:
+    fields: dict[str, Any] = {
+        "id": 1,
+        "public_id": 1,
+        "project_id": 1,
+        "git_ref": "main",
+        "content_hash": "sha256:" + "0" * 64,
+        "status": BuildStatus.completed,
+        "staging_key": "__staging/x.tar.gz",
+        "storage_prefix": _PREFIX,
+        "uploader": "testuser",
+        "date_created": datetime(2026, 11, 2, tzinfo=UTC),
+    }
+    fields.update(overrides)
+    return Build.model_validate(fields)
+
+
+def test_scrub_skip_reason_is_none_for_a_live_unscrubbed_build() -> None:
+    """A completed, live build without the stamp is still the scrub's."""
+    assert scrub_skip_reason(_build()) is None
+    assert (
+        scrub_skip_reason(_build(annotations={"commit_sha": "abc123"})) is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("build", "reason"),
+    [
+        (None, "no longer exists"),
+        (
+            _build(date_deleted=datetime(2026, 11, 2, tzinfo=UTC)),
+            "was deleted",
+        ),
+        (_build(status=BuildStatus.superseded), "'superseded'"),
+        (
+            _build(
+                annotations={
+                    SCRUBBED_ANNOTATION: {"date_scrubbed": "2026-11-02"}
+                }
+            ),
+            "already scrubbed",
+        ),
+    ],
+)
+def test_scrub_skip_reason_names_why_a_build_is_left_alone(
+    build: Build | None, reason: str
+) -> None:
+    """A build retired or stamped since it was listed is skipped."""
+    skip = scrub_skip_reason(build)
+
+    assert skip is not None
+    assert reason in skip

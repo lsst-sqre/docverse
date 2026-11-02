@@ -2263,3 +2263,174 @@ async def test_list_scrub_candidates_takes_completed_live_unscrubbed_builds(
         await db_session.commit()
 
     assert [build.id for build in candidates] == [plain.id, annotated.id]
+
+
+async def _completed_with_inventory(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    *,
+    project_id: int,
+    object_count: int | None,
+    total_size_bytes: int | None,
+    status: BuildStatus = BuildStatus.completed,
+    deleted: bool = False,
+) -> Build:
+    """Create a build in ``status`` carrying a given inventory."""
+    build = await _build_with(
+        db_session,
+        build_store,
+        project_id=project_id,
+        git_ref="main",
+        status=status,
+        deleted=deleted,
+    )
+    await db_session.execute(
+        update(SqlBuild)
+        .where(SqlBuild.id == build.id)
+        .values(object_count=object_count, total_size_bytes=total_size_bytes)
+    )
+    return build
+
+
+@pytest.mark.asyncio
+async def test_decrement_inventory_subtracts_removed_objects(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A completed build's counters drop by what was removed from it."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await _completed_with_inventory(
+            db_session,
+            build_store,
+            project_id=project_id,
+            object_count=10,
+            total_size_bytes=5000,
+        )
+        updated = await build_store.decrement_inventory(
+            build_id=build.id, object_count=3, total_size_bytes=1007
+        )
+        await db_session.commit()
+
+    assert updated.object_count == 7
+    assert updated.total_size_bytes == 3993
+    assert updated.content_hash == build.content_hash
+
+
+@pytest.mark.asyncio
+async def test_decrement_inventory_keeps_unrecorded_counts_and_floors(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """An unrecorded counter stays ``NULL``; a recorded one stops at 0."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await _completed_with_inventory(
+            db_session,
+            build_store,
+            project_id=project_id,
+            object_count=2,
+            total_size_bytes=None,
+        )
+        updated = await build_store.decrement_inventory(
+            build_id=build.id, object_count=5, total_size_bytes=100
+        )
+        await db_session.commit()
+
+    assert updated.object_count == 0
+    assert updated.total_size_bytes is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "deleted"),
+    [
+        (BuildStatus.processing, False),
+        (BuildStatus.failed, False),
+        (BuildStatus.completed, True),
+    ],
+)
+async def test_decrement_inventory_refuses_builds_that_are_not_serving(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+    status: BuildStatus,
+    deleted: bool,  # noqa: FBT001
+) -> None:
+    """Only a live, completed build's inventory is adjusted."""
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        build = await _completed_with_inventory(
+            db_session,
+            build_store,
+            project_id=project_id,
+            object_count=10,
+            total_size_bytes=5000,
+            status=status,
+            deleted=deleted,
+        )
+        with pytest.raises(InvalidBuildStateError):
+            await build_store.decrement_inventory(
+                build_id=build.id, object_count=3, total_size_bytes=1007
+            )
+        unchanged = await build_store.get_by_id(build.id)
+        await db_session.commit()
+
+    assert unchanged is not None
+    assert unchanged.object_count == 10
+    assert unchanged.total_size_bytes == 5000
+
+
+@pytest.mark.asyncio
+async def test_set_annotation_merges_one_key(
+    db_session: AsyncSession,
+    build_store: BuildStore,
+) -> None:
+    """A stamp joins the build's annotations without disturbing the rest.
+
+    A build with no annotations at all gets a mapping holding just the
+    stamp; writing the key again replaces its value.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_org_and_project(db_session)
+        annotated = await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="annotated",
+            status=BuildStatus.completed,
+            annotations={"commit_sha": "abc123"},
+        )
+        bare = await _build_with(
+            db_session,
+            build_store,
+            project_id=project_id,
+            git_ref="bare",
+            status=BuildStatus.completed,
+        )
+        await build_store.set_annotation(
+            build_id=annotated.id, key="stamp", value={"n": 1}
+        )
+        await build_store.set_annotation(
+            build_id=annotated.id, key="stamp", value={"n": 2}
+        )
+        await build_store.set_annotation(
+            build_id=bare.id, key="stamp", value={"n": 3}
+        )
+        await db_session.commit()
+
+    async with db_session.begin():
+        rows = {
+            row.id: row.annotations
+            for row in (
+                await db_session.execute(
+                    select(SqlBuild).where(
+                        SqlBuild.id.in_([annotated.id, bare.id])
+                    )
+                )
+            ).scalars()
+        }
+
+    assert rows == {
+        annotated.id: {"commit_sha": "abc123", "stamp": {"n": 2}},
+        bare.id: {"stamp": {"n": 3}},
+    }

@@ -427,3 +427,39 @@ def test_queue_job_scrub_shaped_progress_of_other_kind_stays_build() -> None:
 
     assert isinstance(job.progress, BuildProcessingProgress)
     assert job.progress.model_dump(mode="json") == {"dry_run": True}
+
+
+def test_excluded_path_scrub_progress_types_skipped_builds() -> None:
+    """A build a real scrub left alone carries its reason, and is counted.
+
+    Reports written before skips existed still parse, with no skips.
+    """
+    progress = ExcludedPathScrubProgress.model_validate(
+        {
+            **_scrub_progress(),
+            "dry_run": False,
+            "builds_skipped": 1,
+            "builds": [
+                {
+                    "build_id": "0000-0000-0000-07",
+                    "entries": [
+                        {
+                            "path": ".buildinfo",
+                            "object_count": 1,
+                            "total_size_bytes": 104,
+                        }
+                    ],
+                    "skip_reason": "the build was deleted during the scrub",
+                }
+            ],
+        }
+    )
+    legacy = ExcludedPathScrubProgress.model_validate(_scrub_progress())
+
+    assert progress.builds_skipped == 1
+    assert progress.builds[0].skip_reason == (
+        "the build was deleted during the scrub"
+    )
+    assert progress.builds[0].error is None
+    assert legacy.builds_skipped == 0
+    assert all(row.skip_reason is None for row in legacy.builds)

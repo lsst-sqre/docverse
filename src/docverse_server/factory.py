@@ -606,10 +606,11 @@ class Factory:
 
         Built by the scrub endpoint, whose enqueue defers onto this
         factory's shared dispatcher, and once per ``excluded_path_scrub``
-        job, which only uses the session-free per-build scan.
+        job, which uses the per-build scan, delete and inventory write.
         """
         return ExcludedPathScrubService(
             project_store=self.create_project_store(),
+            build_store=self.create_build_store(),
             queue_job_store=self.create_queue_job_store(),
             dispatcher=self.queue_dispatcher,
             logger=self._logger,

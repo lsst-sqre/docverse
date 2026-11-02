@@ -260,10 +260,11 @@ class ExcludedPathScrubBuild(BaseModel):
     """One build's row in an ``excluded_path_scrub`` report.
 
     A row is written for every build the scrub found excluded paths in,
-    and for every build it could not examine (with ``error`` set). A
-    build that holds no excluded paths is counted in
-    ``builds_examined`` but gets no row. Unknown keys are preserved
-    (``extra="allow"``).
+    and for every build it could not examine or finish (with ``error``
+    set). A build a real scrub left alone because it was deleted or
+    scrubbed by another run in the meantime has ``skip_reason`` set. A
+    build that holds no excluded paths is counted in ``builds_examined``
+    but gets no row. Unknown keys are preserved (``extra="allow"``).
     """
 
     model_config = ConfigDict(extra="allow")
@@ -303,10 +304,25 @@ class ExcludedPathScrubBuild(BaseModel):
     error: str | None = Field(
         default=None,
         description=(
-            "Why the build could not be examined, or ``null`` when it"
-            " was. A failed build is counted in ``builds_failed`` and the"
-            " scrub moves on to the next build."
+            "Why the build could not be examined or its excluded paths"
+            " could not all be removed and recorded, or ``null`` when"
+            " nothing failed. A failed build is counted in"
+            " ``builds_failed``, is left unstamped so a later scrub"
+            " retries it, and the scrub moves on to the next build."
         ),
+    )
+
+    skip_reason: str | None = Field(
+        default=None,
+        description=(
+            "Why a real scrub left the build alone although it held"
+            " excluded paths: the build was deleted or retired, or"
+            " another scrub finished it, after this one listed it."
+            " ``null`` for a build the scrub went on to scrub, and always"
+            " ``null`` in a dry run. A skipped build is counted in"
+            " ``builds_skipped``."
+        ),
+        examples=["the build was deleted during the scrub"],
     )
 
 
@@ -317,7 +333,9 @@ class ExcludedPathScrubProgress(BaseModel):
     excluded paths in or failed to examine. The worker rewrites it as it
     goes, so a long scrub can be read before it finishes. In a dry run
     the ``*_removed`` counters and the rows describe what the scrub
-    *would* remove; nothing is deleted. Unknown keys are preserved
+    *would* remove; nothing is deleted. In a real run the ``*_removed``
+    counters are what was actually deleted, so a build skipped before
+    its deletes contributes nothing to them. Unknown keys are preserved
     (``extra="allow"``).
     """
 
@@ -361,14 +379,26 @@ class ExcludedPathScrubProgress(BaseModel):
     builds_failed: int = Field(
         default=0,
         description=(
-            "Builds the scrub could not examine; each has a row with"
-            " ``error`` set."
+            "Builds the scrub could not examine or finish; each has a"
+            " row with ``error`` set."
+        ),
+    )
+
+    builds_skipped: int = Field(
+        default=0,
+        description=(
+            "Builds a real scrub found excluded paths in but left alone,"
+            " because they were retired or scrubbed by another run"
+            " after this one listed them; each has a row with"
+            " ``skip_reason`` set."
         ),
     )
 
     builds: list[ExcludedPathScrubBuild] = Field(
         default_factory=list,
-        description="One row per affected or failed build, in scrub order.",
+        description=(
+            "One row per affected, skipped or failed build, in scrub order."
+        ),
     )
 
 
