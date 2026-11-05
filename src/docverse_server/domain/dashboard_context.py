@@ -88,6 +88,13 @@ class EditionsContext:
     major: list[EditionContext] = field(default_factory=list)
     minor: list[EditionContext] = field(default_factory=list)
     alternates: list[EditionContext] = field(default_factory=list)
+    by_slug: dict[str, EditionContext] = field(default_factory=dict)
+    """Every live edition keyed by slug, ``__main`` included.
+
+    Values are the same objects the grouped lists hold, so a template can
+    pick an edition by name (``editions.by_slug['weekly']``) and compare
+    it against the lists by identity.
+    """
 
 
 @dataclass(frozen=True)

@@ -28,7 +28,7 @@ from docverse_server.domain.published_url import (
     edition_published_url,
     project_published_url,
 )
-from docverse_server.domain.version import SemverVersion
+from docverse_server.domain.version import EupsReleaseVersion, SemverVersion
 from docverse_server.exceptions import NotFoundError
 from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.edition_store import EditionStore
@@ -71,20 +71,42 @@ def _edition_context(
     )
 
 
-def _semver_release_sort_key(
-    edition: EditionContext,
-) -> tuple[int, int, int, int]:
-    """Descending semver sort key for ``release`` editions.
+_UNPARSEABLE_RELEASE_KEY = (-1, 0, 0, 0, 0)
+"""Release sort key for a slug no version grammar parses.
 
-    Editions whose slug doesn't parse as semver sort last.
+The ``-1`` major sorts it after every parseable slug under
+``reverse=True``; ties among such slugs keep the store's slug order.
+"""
+
+
+def _release_sort_key(
+    edition: EditionContext,
+) -> tuple[int, int, int, int, int]:
+    """Descending version sort key for ``release`` editions.
+
+    The slug is read as semver first (``v1.2.3``), then as an EUPS
+    release tag (``v30_0_12``, two-component ``v17_0``, legacy ``13-0``),
+    so both kinds of project list their releases newest version first and
+    the two grammars share one ``(major, minor, patch)`` space. The last
+    two components rank a final release above its candidates: an EUPS
+    ``rcN`` sorts below its final and by its number. A semver prerelease
+    keeps its final's key, as it always has, so semver-slugged projects
+    order exactly as they did before EUPS slugs were understood. Slugs
+    that neither grammar parses sort last.
     """
-    candidate = edition.slug.lstrip("v")
-    parsed = SemverVersion.parse(candidate)
-    if parsed is None:
-        # ``-1`` ensures unparseable slugs sort after parseable ones
-        # under reverse=True.
-        return (-1, 0, 0, 0)
-    return (parsed.major, parsed.minor, parsed.patch, 0)
+    semver = SemverVersion.parse(edition.slug.lstrip("v"))
+    if semver is not None:
+        return (semver.major, semver.minor, semver.patch, 1, 0)
+    eups = EupsReleaseVersion.parse(edition.slug)
+    if eups is not None:
+        return (
+            eups.major,
+            eups.minor,
+            eups.patch,
+            int(eups.is_final),
+            eups.rc or 0,
+        )
+    return _UNPARSEABLE_RELEASE_KEY
 
 
 def _group_editions(
@@ -112,7 +134,7 @@ def _group_editions(
         elif edition.kind == EditionKind.alternate:
             alternates.append(edition)
 
-    releases.sort(key=_semver_release_sort_key, reverse=True)
+    releases.sort(key=_release_sort_key, reverse=True)
     drafts.sort(key=lambda e: e.date_updated, reverse=True)
     major.sort(key=version_sort_key, reverse=True)
     minor.sort(key=version_sort_key, reverse=True)
@@ -125,6 +147,7 @@ def _group_editions(
         major=major,
         minor=minor,
         alternates=alternates,
+        by_slug={edition.slug: edition for edition in editions},
     )
 
 
