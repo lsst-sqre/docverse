@@ -75,10 +75,20 @@ switcher template — renders with the same variables:
 - `editions` — the project's live editions, grouped and sorted:
   `main` (the `__main` edition, or none), `releases` (newest version
   first), `drafts` (most recently updated first), `major` and `minor`
-  (newest version first), and `alternates` (by title). Each edition
-  has `slug`, `title`, `kind`, `alternate_name`, `date_updated`,
-  `published_url`, and `build`, the current build (`slug`, `git_ref`,
-  `date`) or none.
+  (newest version first), and `alternates` (by title). `by_slug` maps
+  every live edition's slug, `__main` included, to the same edition the
+  lists hold, so a template can pick one by name
+  (`editions.by_slug['weekly']`, or `editions.by_slug.get('daily')` when
+  it may be absent). Each edition has `slug`, `title`, `kind`,
+  `alternate_name`, `date_updated`, `published_url`, and `build`, the
+  current build (`slug`, `git_ref`, `date`) or none.
+
+  `releases` reads each slug as a semver version (`v1.2.3`) first, then
+  as an EUPS release tag: `v30_0_12`, two-component `v17_0` (which
+  sorts below `v17_0_1`), a release candidate such as `v30_0_12_rc3`
+  (below its final release), and the legacy `13-0` and `v30.0.12`
+  forms. Slugs neither grammar reads, such as `weekly` or `w_2026_45`,
+  follow in slug order.
 - `assets` — the inlined `css`, `js`, and `images` of the file's own
   `assets` table.
 - `docverse` — the server: `api_url` and `version`.
