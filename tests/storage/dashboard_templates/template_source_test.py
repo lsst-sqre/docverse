@@ -78,3 +78,23 @@ include_kinds = ["draft"]
 """
     config = parse_template_toml(payload)
     assert config.switcher.include_kinds == ("draft",)
+
+
+def test_parse_template_toml_switcher_template_alongside_include_kinds() -> (
+    None
+):
+    payload = b"""
+[dashboard]
+
+[switcher]
+include_kinds = ["main", "release"]
+template = "switcher.json.jinja"
+"""
+    config = parse_template_toml(payload)
+    assert config.switcher.template == "switcher.json.jinja"
+    assert config.switcher.include_kinds == ("main", "release")
+
+
+def test_parse_template_toml_switcher_template_defaults_to_none() -> None:
+    config = parse_template_toml(b"[switcher]\ninclude_kinds = []\n")
+    assert config.switcher.template is None

@@ -51,9 +51,16 @@ class Switcher404Config:
 
 @dataclass(frozen=True)
 class SwitcherConfig:
-    """``[switcher]`` section."""
+    """``[switcher]`` section.
+
+    ``template`` names a Jinja file in the template set that renders the
+    whole switcher JSON array itself. When it is set, ``include_kinds``
+    is ignored; when it is ``None``, the built-in renderer lists the
+    editions of ``include_kinds``.
+    """
 
     include_kinds: tuple[str, ...] = _DEFAULT_INCLUDE_KINDS
+    template: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +107,7 @@ def parse_template_toml(data: bytes) -> ParsedTemplateConfig:
         include_kinds=tuple(
             switcher_section.get("include_kinds", _DEFAULT_INCLUDE_KINDS)
         ),
+        template=switcher_section.get("template"),
     )
 
     return ParsedTemplateConfig(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import timedelta
 from typing import Any
@@ -1055,3 +1056,225 @@ async def test_dashboard_build_edition_upload_failure_fails_the_job(
             assert job.errors is not None
             assert job.errors["type"] == "RuntimeError"
             assert job.errors["message"] == "Object store went away"
+
+
+_SWITCHER_TEMPLATE_TOML = b"""\
+[dashboard]
+template = "dashboard.html.jinja"
+
+[switcher]
+include_kinds = ["main", "release"]
+template = "switcher.json.jinja"
+"""
+
+# Emits ``__main`` and the three newest releases only.
+_DEMO_SWITCHER_JINJA = b"""\
+[
+  {"name": {{ editions.main.title | tojson }},
+   "version": {{ editions.main.slug | tojson }},
+   "url": {{ editions.main.published_url | tojson }},
+   "preferred": true}
+  {%- for release in editions.releases[:3] %},
+  {"name": {{ release.title | tojson }},
+   "version": {{ release.slug | tojson }},
+   "url": {{ release.published_url | tojson }}}
+  {%- endfor %}
+]
+"""
+
+
+async def _bind_switcher_template_set(
+    db_session: AsyncSession, *, org_id: int, switcher_jinja: bytes
+) -> None:
+    """Seed a synced template set with a switcher template as org default."""
+    logger = _logger()
+    key = GitHubTemplateKey(
+        github_owner="acme",
+        github_repo="dashboard-templates",
+        github_ref="main",
+        root_path="/",
+    )
+    template_result = await DashboardGitHubTemplateStore(
+        session=db_session, logger=logger
+    ).upsert(
+        key=key,
+        commit_sha="deadbeef",
+        etag="etag-switcher",
+        template_toml=_SWITCHER_TEMPLATE_TOML,
+        files=[
+            GitHubTemplateFileInput(
+                relative_path="dashboard.html.jinja",
+                is_text=True,
+                data=_CUSTOM_DASHBOARD_JINJA,
+            ),
+            GitHubTemplateFileInput(
+                relative_path="switcher.json.jinja",
+                is_text=True,
+                data=switcher_jinja,
+            ),
+        ],
+    )
+    binding_store = DashboardGitHubTemplateBindingStore(
+        session=db_session, logger=logger
+    )
+    binding = await binding_store.create(
+        DashboardGitHubTemplateBindingCreate(
+            org_id=org_id,
+            project_id=None,
+            github_owner=key.github_owner,
+            github_repo=key.github_repo,
+            github_ref=key.github_ref,
+            root_path=key.root_path,
+        )
+    )
+    await binding_store.update_sync_state(
+        binding_id=binding.id,
+        last_sync_status="succeeded",
+        github_template_id=template_result.template.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_renders_template_set_switcher(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A template set's ``switcher.json.jinja`` writes ``__switcher.json``.
+
+    The demo template lists ``__main`` and the three newest of four
+    releases, so the uploaded file is exactly those four entries — not
+    the fourth release the ``include_kinds`` renderer would have added.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        edition_store = EditionStore(session=db_session, logger=logger)
+        for slug in ("v1.0.0", "v1.1.0", "v2.0.0", "v2.1.0"):
+            await edition_store.create_internal(
+                project_id=project.id,
+                slug=slug,
+                title=slug,
+                kind=EditionKind.release,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": slug},
+            )
+        await _bind_switcher_template_set(
+            db_session, org_id=org.id, switcher_jinja=_DEMO_SWITCHER_JINJA
+        )
+        queue_job = await QueueJobStore(
+            session=db_session, logger=logger
+        ).create(
+            kind=JobKind.dashboard_build,
+            org_id=org.id,
+            project_id=project.id,
+            backend_job_id="test-arq-dash-switcher",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), job_id="test-arq-dash-switcher"
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+    }
+
+    result = await dashboard_build(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    switcher = mock_store.objects["dash-proj/__switcher.json"].data
+    entries = json.loads(switcher)
+    assert [e["version"] for e in entries] == [
+        "__main",
+        "v2.1.0",
+        "v2.0.0",
+        "v1.1.0",
+    ]
+    assert entries[0]["preferred"] is True
+    assert all("preferred" not in e for e in entries[1:])
+    assert switcher == json.dumps(entries, indent=2).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_fails_on_invalid_template_set_switcher(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed switcher output fails the job like a broken template.
+
+    The typed error reaches Sentry and the job's ``errors``, and nothing
+    is uploaded: the project keeps serving its previous artifacts.
+    """
+    logger = _logger()
+    mock_store = MockObjectStore()
+
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        await _bind_switcher_template_set(
+            db_session,
+            org_id=org.id,
+            switcher_jinja=b'{"name": "Latest"}',
+        )
+        queue_job = await QueueJobStore(
+            session=db_session, logger=logger
+        ).create(
+            kind=JobKind.dashboard_build,
+            org_id=org.id,
+            project_id=project.id,
+            backend_job_id="test-arq-dash-bad-switcher",
+        )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(mock_store),
+    )
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), job_id="test-arq-dash-bad-switcher"
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+    }
+
+    with sentry_init_fixture() as init:
+        init(environment="test")
+        sentry_events = capture_events_fixture(monkeypatch)()
+        result = await dashboard_build(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "failed"
+    assert mock_store.objects == {}
+
+    assert len(sentry_events.errors) == 1
+    exc_values = sentry_events.errors[0]["exception"]["values"]
+    assert any(v["type"] == "InvalidSwitcherJsonError" for v in exc_values)
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            job = await QueueJobStore(session=session, logger=logger).get(
+                queue_job.id
+            )
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.errors is not None
+            assert job.errors["type"] == "InvalidSwitcherJsonError"
+            assert "'switcher.json.jinja'" in job.errors["message"]
+            assert "not an array" in job.errors["message"]
