@@ -328,6 +328,44 @@ async def test_releases_sorted_by_eups_release_version_descending(
 
 
 @pytest.mark.asyncio
+async def test_releases_sorted_by_two_component_version_descending(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """lsst_doc ``vMAJOR.MINOR`` release slugs order numerically.
+
+    These slugs are not semver, so before EUPS slugs were understood
+    they all sorted as unparseable and kept slug order (``v1.10``,
+    ``v1.2``, ``v2.0``). The EUPS grammar's dotted two-component form
+    reads them, so they now list newest version first.
+    """
+    async with db_session.begin():
+        org, project = await _seed_org_and_project(
+            db_session, org_slug="lsstdoc-org", project_slug="lsstdoc-proj"
+        )
+        # Insert in slug order, which is also the store's list order.
+        for slug in ("v1.10", "v1.2", "v2.0"):
+            await _create_edition(
+                db_session,
+                project.id,
+                slug=slug,
+                title=slug,
+                kind=EditionKind.release,
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        builder = _make_builder(db_session, discovery_client)
+        ctx = await builder.build(org_id=org.id, project_id=project.id)
+
+    assert [e.slug for e in ctx.editions.releases] == [
+        "v2.0",
+        "v1.10",
+        "v1.2",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_drafts_sorted_by_date_updated_descending(
     db_session: AsyncSession,
     discovery_client: DiscoveryClient,

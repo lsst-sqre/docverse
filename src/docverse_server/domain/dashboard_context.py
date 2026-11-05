@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from docverse.models import EditionKind
+from docverse_server.domain.version import EupsReleaseVersion
 
 __all__ = [
     "MAIN_SLUG",
@@ -23,6 +24,7 @@ __all__ = [
     "EditionsContext",
     "OrgContext",
     "ProjectContext",
+    "eups_release_sort_key",
     "version_sort_key",
 ]
 
@@ -31,6 +33,13 @@ MAIN_SLUG = "__main"
 """Reserved slug for a project's canonical main edition."""
 
 _VERSION_PREFIX = re.compile(r"^v?(\d+(?:\.\d+){0,2})")
+
+_EUPS_CONTINUATION = re.compile(r"[-_]\d")
+"""An EUPS separator that carries a version on past its leading dotted run.
+
+``v30_0_12`` and the legacy ``13-0`` continue this way; a semver
+prerelease such as ``v1.2.3-rc1`` does not.
+"""
 
 
 @dataclass(frozen=True)
@@ -132,13 +141,42 @@ class DashboardContext:
     rendered_at: datetime
 
 
+def eups_release_sort_key(
+    version: EupsReleaseVersion,
+) -> tuple[int, int, int, int, int]:
+    """Compute a descending sort key for a parsed EUPS release tag.
+
+    The key is ``(major, minor, patch, is_final, rc)``, so a final release
+    sorts above its candidates and candidates sort by their number. Both
+    the grouped ``releases`` list and `version_sort_key` use it, so the
+    two agree on how EUPS release tags order.
+    """
+    return (
+        version.major,
+        version.minor,
+        version.patch,
+        int(version.is_final),
+        version.rc or 0,
+    )
+
+
 def version_sort_key(edition: EditionContext) -> tuple[int, ...]:
     """Compute a descending sort key from an edition slug.
 
-    The key is parsed from the leading numeric run of ``edition.slug``.
-    Non-version slugs sort last (``(-1,)``).
+    The key is parsed from the leading numeric run of ``edition.slug``,
+    except that a slug whose version carries on past that run with an
+    EUPS ``_`` or ``-`` separator (``v30_0_12``, ``v30_0_12_rc3``, the
+    legacy ``13-0``) and parses as an EUPS release tag keys by
+    `eups_release_sort_key`, so such tags order by their full version
+    rather than tying on their major. Non-version slugs sort last
+    (``(-1,)``).
     """
-    match = _VERSION_PREFIX.match(edition.slug)
+    slug = edition.slug
+    match = _VERSION_PREFIX.match(slug)
     if match is None:
         return (-1,)
+    if _EUPS_CONTINUATION.match(slug, match.end()):
+        eups = EupsReleaseVersion.parse(slug)
+        if eups is not None:
+            return eups_release_sort_key(eups)
     return tuple(int(p) for p in match.group(1).split("."))

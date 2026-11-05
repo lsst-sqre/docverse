@@ -87,8 +87,9 @@ switcher template — renders with the same variables:
   as an EUPS release tag: `v30_0_12`, two-component `v17_0` (which
   sorts below `v17_0_1`), a release candidate such as `v30_0_12_rc3`
   (below its final release), and the legacy `13-0` and `v30.0.12`
-  forms. Slugs neither grammar reads, such as `weekly` or `w_2026_45`,
-  follow in slug order.
+  forms. The dotted two-component form also reads lsst_doc slugs, so
+  `v1.10` sorts above `v1.2`. Slugs neither grammar reads, such as
+  `weekly` or `w_2026_45`, follow in slug order.
 - `assets` — the inlined `css`, `js`, and `images` of the file's own
   `assets` table.
 - `docverse` — the server: `api_url` and `version`.
@@ -102,8 +103,9 @@ typo fails the render rather than shipping a blank. The dashboard and
 
 Without `[switcher] template`, Docverse builds `__switcher.json` from
 the editions of `include_kinds`: `__main` first, then alternates by
-title, then the rest by version, newest first, with `preferred` set on
-`__main` and the alternates. A set that needs a different list — a
+title, then the rest by version, newest first (an EUPS release tag
+such as `v30_0_12` by its full version, a final above its candidates),
+with `preferred` set on `__main` and the alternates. A set that needs a different list — a
 fixed number of recent releases, editions picked by slug, its own
 labels — names a Jinja file in `[switcher] template` instead, and
 `include_kinds` is then ignored.
