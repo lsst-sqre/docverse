@@ -615,8 +615,13 @@ def test_other_reaper_thresholds_unchanged() -> None:
 
     The two derived thresholds each back a job whose own timeout bounds
     it (``keeper_sync_job_timeout_seconds`` and the shared
-    ``maintenance_job_timeout_seconds``). The five below backstop jobs
-    with no such pairing, so they stay flat literals.
+    ``maintenance_job_timeout_seconds``), so their defaults are computed
+    from it. The five below keep flat literal defaults instead.
+    ``build_processing_reaper_threshold_seconds`` is still paired with
+    ``build_processing_job_timeout_seconds``, but as a floor that
+    ``_check_build_processing_reaper_threshold`` enforces (timeout plus
+    ``BUILD_PROCESSING_REAPER_MARGIN_SECONDS``) rather than a
+    derivation: its 8 h default clears the stock floor by hours.
     """
     config = Configuration()
     assert config.lifecycle_reaper_threshold_seconds == 21600

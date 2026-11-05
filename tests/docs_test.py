@@ -382,8 +382,15 @@ _BUILD_PROCESSING_PHALANX_VALUES: dict[str, str | None] = {
 }
 """The build-processing settings, each with its Phalanx value.
 
-``None`` for the timeout, which the chart does not render yet (#873).
+``None`` for the timeout, which the chart does not render yet (#873):
+the docs row must then say so (see :data:`_NOT_RENDERED_BY_CHART`).
+When the chart renders it, replace ``None`` with its values key and the
+row's placeholder with the same key, in one change; the settings-table
+test fails if only one of the two moves.
 """
+
+_NOT_RENDERED_BY_CHART = "Not rendered by the chart yet"
+"""Phalanx-value cell text for a setting the chart does not render."""
 
 _WORKER_POOLS = (
     (WorkerSettings, "default"),
@@ -2854,8 +2861,9 @@ def test_build_processing_settings_documented_side_by_side() -> None:
     """The settings table is the timeout and the reaper threshold, together.
 
     Each row names the setting's environment variable and its stock
-    value, and the threshold's row its Phalanx value. The two sit in one
-    table because neither can be moved far without the other.
+    value, and its Phalanx value, or says the chart does not render it
+    yet. The two sit in one table because neither can be moved far
+    without the other.
     """
     section = _build_section("Settings")
     env_prefix = Configuration.model_config.get("env_prefix", "")
@@ -2866,7 +2874,9 @@ def test_build_processing_settings_documented_side_by_side() -> None:
         assert cells[1] == f"`{env_prefix}{name}`".upper(), name
         default = Configuration.model_fields[name].default
         assert _documented_default(default) in cells[2], name
-        if phalanx_value is not None:
+        if phalanx_value is None:
+            assert cells[3].startswith(_NOT_RENDERED_BY_CHART), name
+        else:
             assert cells[3] == f"`{phalanx_value}`", name
 
 
