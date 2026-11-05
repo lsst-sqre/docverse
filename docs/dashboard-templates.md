@@ -57,11 +57,12 @@ Every key is optional. Paths are relative to the directory holding
 | `[switcher]` | `include_kinds` | `["main", "release", "major", "alternate"]` | Edition kinds the built-in switcher lists. Ignored when `template` is set. |
 | `[switcher]` | `template` | unset | Jinja file that renders `__switcher.json` itself; see [Switcher templates](#switcher-templates). Unset, the built-in switcher renders. |
 
-A sync that cannot parse `template.toml` marks the binding's
-`last_sync_status` failed with the parse error in `last_sync_error`,
-and projects keep rendering from the last set that synced. The sync
-does not check that the files `template.toml` names exist; a missing
-file fails the next `dashboard_build` instead.
+A sync that cannot parse `template.toml`, or that finds `[switcher]
+template` set to anything but a non-empty string, marks the binding's
+`last_sync_status` failed with the reason in `last_sync_error`, and
+projects keep rendering from the last set that synced. The sync does
+not check that the files `template.toml` names exist; a missing file
+fails the next `dashboard_build` instead.
 
 ## Template variables
 

@@ -51,6 +51,7 @@ from docverse_server.storage.queue_job_store import (
 )
 from docverse_server.worker.functions.dashboard_build import dashboard_build
 from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
+from tests.support.dashboard_templates import DEMO_SWITCHER_JINJA
 from tests.support.lock_service_spy import install_recording_lock_service
 from tests.support.objectstore import seed_minio_service
 from tests.worker.conftest import make_worker_ctx
@@ -1067,21 +1068,6 @@ include_kinds = ["main", "release"]
 template = "switcher.json.jinja"
 """
 
-# Emits ``__main`` and the three newest releases only.
-_DEMO_SWITCHER_JINJA = b"""\
-[
-  {"name": {{ editions.main.title | tojson }},
-   "version": {{ editions.main.slug | tojson }},
-   "url": {{ editions.main.published_url | tojson }},
-   "preferred": true}
-  {%- for release in editions.releases[:3] %},
-  {"name": {{ release.title | tojson }},
-   "version": {{ release.slug | tojson }},
-   "url": {{ release.published_url | tojson }}}
-  {%- endfor %}
-]
-"""
-
 
 async def _bind_switcher_template_set(
     db_session: AsyncSession, *, org_id: int, switcher_jinja: bytes
@@ -1162,7 +1148,9 @@ async def test_dashboard_build_renders_template_set_switcher(
                 tracking_params={"git_ref": slug},
             )
         await _bind_switcher_template_set(
-            db_session, org_id=org.id, switcher_jinja=_DEMO_SWITCHER_JINJA
+            db_session,
+            org_id=org.id,
+            switcher_jinja=DEMO_SWITCHER_JINJA.encode(),
         )
         queue_job = await QueueJobStore(
             session=db_session, logger=logger
