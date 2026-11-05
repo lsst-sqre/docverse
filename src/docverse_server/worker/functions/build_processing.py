@@ -1714,14 +1714,16 @@ async def _process_build(
     tarball_data = await object_store.download_object(key=build.staging_key)
 
     build_prefix = build.storage_prefix
-    # The job's own fan-out, at the worker-wide upload cap. On the
-    # presigned path the store from
-    # ``create_build_upload_objectstore_for_org`` holds the process-wide
-    # limiter of that size around each PUT, and that limiter is what
-    # caps PUTs across jobs. This bound covers the rest: a store that
-    # takes no slot (the aiobotocore fallback, which manages its own
-    # pool), and one job queueing its whole build on the shared limiter
-    # ahead of every other upload in the process.
+    # The job's own fan-out, sized from the setting every pool's
+    # ``_startup`` also sizes the process-wide upload limiter from, so in
+    # a worker the two match. On the presigned path the store from
+    # ``create_build_upload_objectstore_for_org`` holds that limiter
+    # around each PUT, and the limiter is what caps PUTs across jobs: a
+    # factory given a limiter of another size (as tests inject) is capped
+    # by the limiter, whatever this bound is. This bound covers the
+    # rest: a store that takes no slot (the aiobotocore fallback, which
+    # manages its own pool), and one job queueing its whole build on the
+    # shared limiter ahead of every other upload in the process.
     semaphore = asyncio.Semaphore(config.keeper_sync_upload_concurrency)
 
     async def _upload_file(name: str, data: bytes) -> int:

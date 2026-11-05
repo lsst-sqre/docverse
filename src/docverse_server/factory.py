@@ -1317,9 +1317,13 @@ class Factory:
         The same store :meth:`create_objectstore_for_org` resolves, on
         the keeper-sync copier's transport: its presigned PUTs go over
         :attr:`copy_http_client` and each one holds
-        :attr:`keeper_sync_upload_limiter`, so build processing and
-        keeper-sync copies in one worker process share one cap on PUTs
-        in flight, over a pool sized to that cap. Over the shared client
+        :attr:`keeper_sync_upload_limiter`, so build processing uploads
+        under the same size of cap on PUTs in flight, over the same kind
+        of pool sized to that cap, as keeper-sync copies do. The limiter
+        is per worker process, and ``build_processing`` runs on the
+        default pool while keeper-sync runs on the sync pool, so the two
+        never share one limiter; concurrent ``build_processing`` jobs on
+        one default-pool worker split its slots. Over the shared client
         (5 s connect timeout, 20 connections kept alive) a pipelines
         build's first burst of presigned PUTs all timed out connecting to
         R2 (#877).
