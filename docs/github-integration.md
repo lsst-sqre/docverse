@@ -768,10 +768,11 @@ editions it shows, the listing and those fetches shared by the
 project's refs, and at most 20 refs per project. A dormant project the
 push woke adds its `main` check, usually one more call per tick for the
 window, which a push to `main` itself shares. Editions that follow a
-ref by a version rule rather than by name (`lsst_doc` and the `eups`
-modes) are not looked up: a tag push to such a project is caught by the
-listing when LTD creates an edition for the tag, and otherwise on the
-project's ordinary cadence.
+ref by a version rule rather than by name (`lsst_doc`,
+`eups_major_release`, `eups_weekly_release`, `eups_daily_release` and
+`eups_release`) are not looked up: a tag push to such a project is
+caught by the listing when LTD creates an edition for the tag, and
+otherwise on the project's ordinary cadence.
 
 ### `tier_main` log lines
 

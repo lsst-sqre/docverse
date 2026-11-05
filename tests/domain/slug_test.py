@@ -13,6 +13,7 @@ from docverse_server.domain.slug import (
     BUILTIN_SLUG_REWRITE_RULES,
     AnySlugRewriteRule,
     EupsMajorRule,
+    EupsReleaseRule,
     EupsWeeklyRule,
     IgnoreRule,
     InvalidSlugError,
@@ -546,8 +547,15 @@ def test_rubin_alternate() -> None:
         ("v1.0", "v1.0", EditionKind.release, "lsst_doc"),
         ("1.0", "1.0", EditionKind.release, "lsst_doc"),
         ("v27_0", "v27_0", EditionKind.release, "eups_major"),
+        ("v17_0", "v17_0", EditionKind.release, "eups_major"),
         ("27.0", "27.0", EditionKind.release, "lsst_doc"),
         ("13-0", "13-0", EditionKind.release, "eups_major"),
+        ("v30_0_12", "v30_0_12", EditionKind.release, "eups_release"),
+        ("v17_0_1", "v17_0_1", EditionKind.release, "eups_release"),
+        ("v30-0-12", "v30-0-12", EditionKind.release, "eups_release"),
+        ("v30.0.12", "v30.0.12", EditionKind.release, "semver"),
+        ("v30_0_12_rc3", "v30_0_12_rc3", EditionKind.draft, None),
+        ("v15_0_rc1", "v15_0_rc1", EditionKind.draft, None),
         ("w_2026_10", "w_2026_10", EditionKind.release, "eups_weekly"),
         ("w-2018-06", "w-2018-06", EditionKind.release, "eups_weekly"),
         ("d_2026_08_10", "d_2026_08_10", EditionKind.draft, None),
@@ -565,8 +573,15 @@ def test_rubin_alternate() -> None:
         "lsstdoc-v-prefix",
         "lsstdoc-bare",
         "eups-major-underscore",
+        "eups-major-two-component-release-matches-eups-major-first",
         "eups-major-dotted-matches-lsstdoc-first",
         "eups-major-legacy-hyphen",
+        "eups-release-final",
+        "eups-release-final-patch",
+        "eups-release-legacy-hyphen",
+        "eups-release-dotted-matches-semver-first",
+        "eups-release-rc-draft",
+        "eups-release-two-component-rc-draft",
         "eups-weekly",
         "eups-weekly-legacy-hyphen",
         "eups-daily-draft",
@@ -591,11 +606,17 @@ def test_builtin_version_rules(
 
 
 def test_builtin_precedence_order() -> None:
-    """Built-ins are ordered semver → lsst_doc → eups_major → eups_weekly."""
+    """Built-ins run semver → lsst_doc → eups_major → eups_release → weekly.
+
+    ``eups_major`` precedes ``eups_release`` so a two-component tag such
+    as ``v17_0``, which both grammars accept, keeps reporting
+    ``eups_major``.
+    """
     assert [rule.type for rule in BUILTIN_SLUG_REWRITE_RULES] == [
         "semver",
         "lsst_doc",
         "eups_major",
+        "eups_release",
         "eups_weekly",
     ]
 
@@ -747,6 +768,7 @@ class TestVersionRuleParsing:
                 {"type": "semver"},
                 {"type": "lsst_doc"},
                 {"type": "eups_major"},
+                {"type": "eups_release"},
                 {"type": "eups_weekly"},
             ]
         )
@@ -754,8 +776,41 @@ class TestVersionRuleParsing:
             SemverRule,
             LsstDocRule,
             EupsMajorRule,
+            EupsReleaseRule,
             EupsWeeklyRule,
         ]
+
+    def test_eups_release_round_trips(self) -> None:
+        """A bare ``eups_release`` rule parses and dumps back unchanged."""
+        rule = parse_slug_rewrite_rules([{"type": "eups_release"}])[0]
+        assert isinstance(rule, EupsReleaseRule)
+        assert rule.edition_kind == EditionKind.release
+        assert rule.model_dump(mode="json") == {
+            "type": "eups_release",
+            "edition_kind": "release",
+        }
+        assert parse_slug_rewrite_rules([rule.model_dump(mode="json")]) == [
+            rule
+        ]
+
+    def test_explicit_eups_release_rule_demotes(self) -> None:
+        """A project rule re-tags final releases the way other rules do.
+
+        The project's rule runs before the built-ins, so it wins for a
+        final release; a release candidate it does not match still lands
+        on the draft fallback.
+        """
+        rules = parse_slug_rewrite_rules(
+            [{"type": "eups_release", "edition_kind": "draft"}]
+        )
+        result = derive_edition_slug("v30_0_12", rules)
+        assert result is not None
+        assert result.edition_kind == EditionKind.draft
+        assert result.matched_rule_type == "eups_release"
+        rc = derive_edition_slug("v30_0_12_rc3", rules)
+        assert rc is not None
+        assert rc.edition_kind == EditionKind.draft
+        assert rc.matched_rule_type is None
 
     def test_default_edition_kind_is_release(self) -> None:
         rule = parse_slug_rewrite_rules([{"type": "semver"}])[0]

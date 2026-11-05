@@ -1992,6 +1992,52 @@ async def test_track_build_promotes_pre_existing_draft_edition(
 
 
 @pytest.mark.asyncio
+async def test_track_build_promotes_a_draft_eups_release_edition(
+    db_session: AsyncSession,
+) -> None:
+    """A derived-kind ``v30_0_11`` draft converges to release on rebuild.
+
+    Before the built-in ``eups_release`` rule, a three-component EUPS
+    tag matched nothing and its edition was stamped ``draft``. The next
+    build of that tag re-derives the kind through the new rule, so the
+    edition heals without a per-project regex rule.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="eups-heal-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        stale = await edition_store.create_internal(
+            project_id=project.id,
+            slug="v30_0_11",
+            title="v30_0_11",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "v30_0_11"},
+        )
+        build = await _create_build(db_session, project.id, git_ref="v30_0_11")
+
+        with capture_logs() as logs:
+            await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        healed = await edition_store.get_by_id(stale.id)
+        assert healed is not None
+        assert healed.kind == EditionKind.release
+        assert healed.kind_source == EditionKindSource.derived
+        assert healed.current_build_id == build.id
+        await db_session.commit()
+
+    events = [e for e in logs if e["event"] == "Converged edition kind"]
+    assert len(events) == 1
+    assert events[0]["edition_slug"] == "v30_0_11"
+    assert events[0]["previous_kind"] == "draft"
+    assert events[0]["edition_kind"] == "release"
+    assert events[0]["matched_rule_type"] == "eups_release"
+
+
+@pytest.mark.asyncio
 async def test_track_build_demotes_when_the_rules_change(
     db_session: AsyncSession,
 ) -> None:
