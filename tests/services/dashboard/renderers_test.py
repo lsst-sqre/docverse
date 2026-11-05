@@ -194,6 +194,59 @@ def test_switcher_versions_sorted_descending_for_rest() -> None:
     assert versions == ["__main", "v10.0.0", "v2.5.10", "v2.5.3", "v1.0.0"]
 
 
+def test_switcher_orders_eups_release_tags_by_full_version() -> None:
+    """EUPS release tags key by their full version, not the leading run.
+
+    The leading dotted run reads ``v30_0_12``, ``v30_0_11`` and
+    ``v30_0_12_rc3`` all as ``30``, so given the releases out of order
+    the switcher must still list a final above its candidates,
+    ``v17_0`` below ``v17_0_1`` and the legacy ``13-0`` last, rather
+    than lean on the grouped list's pre-sort.
+    """
+    main = _edition(slug="__main", title="Latest", kind=EditionKind.main)
+    releases = [
+        _edition(slug=s, title=s, kind=EditionKind.release)
+        for s in (
+            "v17_0",
+            "v30_0_12_rc3",
+            "13-0",
+            "v30_0_11",
+            "v17_0_1",
+            "v30_0_12",
+        )
+    ]
+    ctx = _make_context(main=main, releases=releases)
+
+    payload = json.loads(SwitcherJsonRenderer().render(ctx).decode("utf-8"))
+    versions = [e["version"] for e in payload]
+    assert versions == [
+        "__main",
+        "v30_0_12",
+        "v30_0_12_rc3",
+        "v30_0_11",
+        "v17_0_1",
+        "v17_0",
+        "13-0",
+    ]
+
+
+def test_switcher_keeps_semver_prerelease_with_its_final() -> None:
+    """A semver prerelease keeps its final's key in the switcher.
+
+    ``v1.2.3-rc1`` must not be read as an EUPS candidate, so it ties
+    with ``v1.2.3`` and keeps the grouped list's order.
+    """
+    releases = [
+        _edition(slug=s, title=s, kind=EditionKind.release)
+        for s in ("v1.2.3-rc1", "v1.2.3", "v1.10.0")
+    ]
+    ctx = _make_context(releases=releases)
+
+    payload = json.loads(SwitcherJsonRenderer().render(ctx).decode("utf-8"))
+    versions = [e["version"] for e in payload]
+    assert versions == ["v1.10.0", "v1.2.3-rc1", "v1.2.3"]
+
+
 def test_switcher_empty_project_yields_empty_array() -> None:
     ctx = _make_context()
     payload = json.loads(SwitcherJsonRenderer().render(ctx).decode("utf-8"))

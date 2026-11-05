@@ -21,6 +21,7 @@ from docverse_server.domain.dashboard_context import (
     EditionsContext,
     OrgContext,
     ProjectContext,
+    eups_release_sort_key,
     version_sort_key,
 )
 from docverse_server.domain.edition import Edition
@@ -87,9 +88,11 @@ def _release_sort_key(
     The slug is read as semver first (``v1.2.3``), then as an EUPS
     release tag (``v30_0_12``, two-component ``v17_0``, legacy ``13-0``),
     so both kinds of project list their releases newest version first and
-    the two grammars share one ``(major, minor, patch)`` space. The last
-    two components rank a final release above its candidates: an EUPS
-    ``rcN`` sorts below its final and by its number. A semver prerelease
+    the two grammars share one ``(major, minor, patch)`` space. The EUPS
+    grammar's dotted two-component form also covers lsst_doc slugs, so
+    ``v1.10`` sorts above ``v1.2``. The last two components rank a final
+    release above its candidates: an EUPS ``rcN`` sorts below its final
+    and by its number (see `eups_release_sort_key`). A semver prerelease
     keeps its final's key, as it always has, so semver-slugged projects
     order exactly as they did before EUPS slugs were understood. Slugs
     that neither grammar parses sort last.
@@ -99,13 +102,7 @@ def _release_sort_key(
         return (semver.major, semver.minor, semver.patch, 1, 0)
     eups = EupsReleaseVersion.parse(edition.slug)
     if eups is not None:
-        return (
-            eups.major,
-            eups.minor,
-            eups.patch,
-            int(eups.is_final),
-            eups.rc or 0,
-        )
+        return eups_release_sort_key(eups)
     return _UNPARSEABLE_RELEASE_KEY
 
 
