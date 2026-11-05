@@ -931,6 +931,142 @@ async def test_track_build_eups_daily(
     assert d2[0].action == "skipped"
 
 
+async def _setup_eups_release_main(
+    db_session: AsyncSession,
+    service: EditionTrackingService,
+    *,
+    org_slug: str,
+) -> tuple[Project, Build]:
+    """Seed ``__main`` on a ``main`` build, then switch it to eups_release.
+
+    This is the pipelines rollout: ``__main`` has been tracking the
+    ``main`` branch, and an operator PATCHes its ``tracking_mode`` to
+    ``eups_release``. Returns the project and the ``main`` build.
+    """
+    _org, project = await _setup(db_session, org_slug=org_slug)
+    edition_store = EditionStore(session=db_session, logger=_logger())
+    await edition_store.create_internal(
+        project_id=project.id,
+        slug=DEFAULT_EDITION_SLUG,
+        title="Main",
+        kind=EditionKind.main,
+        tracking_mode=TrackingMode.git_ref,
+        tracking_params={"git_ref": "main"},
+    )
+    main_build = await _create_build(db_session, project.id, git_ref="main")
+    await service.track_build(main_build)
+    switched = await edition_store.update(
+        project_id=project.id,
+        slug=DEFAULT_EDITION_SLUG,
+        data=EditionUpdate(tracking_mode=TrackingMode.eups_release),
+    )
+    assert switched is not None
+    assert switched.current_build_id == main_build.id
+    return project, main_build
+
+
+async def _main_build_id(db_session: AsyncSession, project_id: int) -> int:
+    edition_store = EditionStore(session=db_session, logger=_logger())
+    edition = await edition_store.get_by_slug(
+        project_id=project_id, slug=DEFAULT_EDITION_SLUG
+    )
+    assert edition is not None
+    assert edition.current_build_id is not None
+    return edition.current_build_id
+
+
+def _main_actions(result: EditionTrackingResult) -> list[str]:
+    return [
+        o.action for o in result.outcomes if o.slug == DEFAULT_EDITION_SLUG
+    ]
+
+
+@pytest.mark.asyncio
+async def test_track_build_eups_release_replaces_a_branch_build(
+    db_session: AsyncSession,
+) -> None:
+    """The first final release replaces ``__main``'s ``main`` build.
+
+    The release build is dated *before* the ``main`` build it replaces,
+    so only the version guard — not the date guard — can let it in.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, main_build = await _setup_eups_release_main(
+            db_session, service, org_slug="eups-rel-replace-org"
+        )
+        release = await _create_build(
+            db_session, project.id, git_ref="v30_0_11"
+        )
+        await db_session.execute(
+            update(SqlBuild)
+            .where(SqlBuild.id == release.id)
+            .values(date_created=datetime(2026, 1, 1, tzinfo=UTC))
+        )
+        result = await service.track_build(release)
+        current = await _main_build_id(db_session, project.id)
+        await db_session.commit()
+
+    assert _main_actions(result) == ["updated"]
+    assert current == release.id
+    assert current != main_build.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_eups_release_advances_and_never_goes_back(
+    db_session: AsyncSession,
+) -> None:
+    """``__main`` advances to a newer release and skips an older one."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, _main = await _setup_eups_release_main(
+            db_session, service, org_slug="eups-rel-advance-org"
+        )
+        v30_0_11 = await _create_build(
+            db_session, project.id, git_ref="v30_0_11"
+        )
+        await service.track_build(v30_0_11)
+        v30_0_12 = await _create_build(
+            db_session, project.id, git_ref="v30_0_12"
+        )
+        advanced = await service.track_build(v30_0_12)
+        late_v30_0_11 = await _create_build(
+            db_session, project.id, git_ref="v30_0_11"
+        )
+        skipped = await service.track_build(late_v30_0_11)
+        current = await _main_build_id(db_session, project.id)
+        await db_session.commit()
+
+    assert _main_actions(advanced) == ["updated"]
+    assert _main_actions(skipped) == ["skipped"]
+    assert current == v30_0_12.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_eups_release_ignores_release_candidates(
+    db_session: AsyncSession,
+) -> None:
+    """A release candidate never moves an ``eups_release`` edition."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, _main = await _setup_eups_release_main(
+            db_session, service, org_slug="eups-rel-rc-org"
+        )
+        v30_0_11 = await _create_build(
+            db_session, project.id, git_ref="v30_0_11"
+        )
+        await service.track_build(v30_0_11)
+        rc = await _create_build(
+            db_session, project.id, git_ref="v30_0_12_rc3"
+        )
+        result = await service.track_build(rc)
+        current = await _main_build_id(db_session, project.id)
+        await db_session.commit()
+
+    assert _main_actions(result) == []
+    assert current == v30_0_11.id
+
+
 @pytest.mark.asyncio
 async def test_track_build_lsst_doc(
     db_session: AsyncSession,
