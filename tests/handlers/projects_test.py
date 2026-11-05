@@ -1923,6 +1923,7 @@ async def test_patch_project_version_slug_rules(
         {"type": "semver"},
         {"type": "lsst_doc"},
         {"type": "eups_major"},
+        {"type": "eups_release"},
         {"type": "eups_weekly"},
     ]
     response = await client.patch(

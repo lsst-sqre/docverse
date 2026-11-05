@@ -93,6 +93,32 @@ class TestDeriveEditionKind:
         assert derivation.source == KindDerivationSource.rule
         assert derivation.detail == "semver"
 
+    def test_git_refs_final_eups_release_is_a_release(self) -> None:
+        """LTD pipelines' per-release editions import as releases.
+
+        No project rule is needed: the built-in ``eups_release`` rule
+        classifies the final EUPS tag Jenkins passes as the git ref.
+        """
+        edition = _edition(
+            slug="v30_0_12", mode="git_refs", tracked_refs=["v30_0_12"]
+        )
+        derivation = derive_edition_kind(edition, git_ref="v30_0_12")
+        assert derivation.kind == EditionKind.release
+        assert derivation.source == KindDerivationSource.rule
+        assert derivation.detail == "eups_release"
+
+    def test_git_refs_eups_release_candidate_is_a_draft(self) -> None:
+        """A release candidate matches no built-in rule and stays a draft."""
+        edition = _edition(
+            slug="v30_0_12_rc3",
+            mode="git_refs",
+            tracked_refs=["v30_0_12_rc3"],
+        )
+        derivation = derive_edition_kind(edition, git_ref="v30_0_12_rc3")
+        assert derivation.kind == EditionKind.draft
+        assert derivation.source == KindDerivationSource.fallback
+        assert derivation.detail is None
+
     def test_main_edition_is_main(self) -> None:
         edition = _edition(slug="main", tracked_refs=["main"])
         derivation = derive_edition_kind(edition, git_ref="main")
