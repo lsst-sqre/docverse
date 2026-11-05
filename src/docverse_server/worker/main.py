@@ -90,6 +90,7 @@ from .functions import (
     purgatory_cleanup_dispatcher,
     purgatory_cleanup_reaper,
 )
+from .functions.build_processing import probe_staging_spool
 from .functions.project_github_resolve import PROJECT_GITHUB_RESOLVE_MAX_TRIES
 from .queues import KEEPER_SYNC_QUEUE_NAME, MAINTENANCE_QUEUE_NAME
 
@@ -914,12 +915,24 @@ async def _startup(
 
 
 async def startup_default(ctx: dict[str, Any]) -> None:
-    """on_startup for the default Docverse arq queue."""
+    """on_startup for the default Docverse arq queue.
+
+    ``build_processing`` runs only on this pool, so only this pool
+    probes the temporary directory its jobs spool staging tarballs to
+    (:func:`probe_staging_spool`). A worker that cannot write one fails
+    here, before it takes a job, rather than failing every upload it is
+    handed. The probe runs after :func:`_startup` so its failure is
+    logged and reported like any other startup error; arq still runs
+    :func:`shutdown` to release what ``_startup`` opened.
+    """
     await _startup(
         ctx,
         component="worker",
         queue_name=config.arq_queue_name,
         max_jobs=config.arq_max_jobs,
+    )
+    structlog.get_logger("docverse_server.worker").info(
+        "Staging spool directory", directory=probe_staging_spool()
     )
 
 

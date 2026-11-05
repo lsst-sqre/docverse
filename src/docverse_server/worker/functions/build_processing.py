@@ -74,6 +74,46 @@ from docverse_server.worker.functions._cancellation import (
 #: "Worker memory and disk" in ``docs/build-processing.md``.
 _STAGING_TARBALL_PREFIX = "docverse-staging-"
 
+
+def probe_staging_spool() -> str:
+    """Check that a staging tarball can be spooled to a temporary file.
+
+    The default worker pool calls this once at startup. Every
+    ``build_processing`` job spools its staging tarball to a
+    :func:`tempfile.TemporaryFile` (#878), so a worker without a
+    writable temporary directory, such as the Phalanx chart's read-only
+    root filesystem with no ``/tmp`` volume, would accept each upload
+    and then fail it. Opening and closing one such file here makes that
+    misconfiguration stop the worker at startup instead.
+
+    Returns
+    -------
+    str
+        The directory staging tarballs are spooled to.
+
+    Raises
+    ------
+    RuntimeError
+        If no temporary file can be created there, chained from the
+        ``OSError`` that says why.
+    """
+    try:
+        directory = tempfile.gettempdir()
+        with tempfile.TemporaryFile(
+            prefix=_STAGING_TARBALL_PREFIX, dir=directory
+        ):
+            pass
+    except OSError as exc:
+        msg = (
+            "build_processing cannot spool staging tarballs to a temporary"
+            f" file ({exc}). Mount a writable, disk-backed volume at /tmp"
+            " or point TMPDIR at one; see 'Worker memory and disk' in"
+            " docs/build-processing.md."
+        )
+        raise RuntimeError(msg) from exc
+    return directory
+
+
 #: Statuses a *retirement* can leave on a build the worker is uploading
 #: for. A DELETE cancels it, the stranded-build sweep fails it, a
 #: supersession retires it — every one of them a deliberate decision by

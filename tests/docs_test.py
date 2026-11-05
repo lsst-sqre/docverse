@@ -2956,9 +2956,10 @@ def test_build_processing_worker_memory_documented() -> None:
     memory, so the section gives that bound, names the Phalanx
     ``workerResources`` value that sets the worker's memory limit, and
     says the worker needs a writable, disk-backed temporary directory,
-    which a read-only root filesystem does not give it. The timeout's
-    sizing section points at it, since a measured upload is also where
-    the memory peak is read off.
+    which a read-only root filesystem does not give it, naming the
+    startup line the default pool logs once it has checked one. The
+    timeout's sizing section points at it, since a measured upload is
+    also where the memory peak is read off.
     """
     section = _build_section("Worker memory and disk")
     assert not _uncoded(
@@ -2970,6 +2971,7 @@ def test_build_processing_worker_memory_documented() -> None:
             "emptyDir",
             "medium: Memory",
             "tarball_size_bytes",
+            "Staging spool directory",
         },
         section,
     )

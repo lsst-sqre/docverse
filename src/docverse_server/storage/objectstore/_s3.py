@@ -240,8 +240,9 @@ class S3ObjectStore:
         Copies the body :data:`_DOWNLOAD_CHUNK_BYTES` at a time, so the
         store holds one chunk of it, never the whole object. Retries are
         botocore's, which cover the ``GetObject`` request but not a body
-        that fails partway; a caller that sees one raise downloads again
-        into a fresh file.
+        that fails partway. That raises with ``fileobj`` holding the part
+        already written, so a caller that retries must truncate the file,
+        or open a fresh one, before downloading again.
         """
         client = self._get_client()
         response = await client.get_object(Bucket=self._bucket, Key=key)

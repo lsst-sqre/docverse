@@ -1,6 +1,6 @@
 ### Backwards-incompatible changes
 
-- The worker now needs a writable, disk-backed temporary directory (Python's `TMPDIR`, else `/tmp`): `build_processing` spools each build's staging tarball to a temporary file there instead of holding it in memory. A deployment that runs the worker with a read-only root filesystem, as the Phalanx chart does, must mount an `emptyDir` volume at `/tmp` (not `medium: Memory`, which would count the tarball against the memory limit again) before upgrading, or every `build_processing` job fails as it creates the file. The volume needs room for the largest tarball for each `build_processing` job that can run at once.
+- The worker now needs a writable, disk-backed temporary directory (Python's `TMPDIR`, else `/tmp`): `build_processing` spools each build's staging tarball to a temporary file there instead of holding it in memory. A deployment that runs the worker with a read-only root filesystem, as the Phalanx chart does, must mount an `emptyDir` volume at `/tmp` (not `medium: Memory`, which would count the tarball against the memory limit again) before upgrading, or the default-pool worker, which runs `build_processing`, fails at startup: it now checks that it can create the file there before it takes any job. The volume needs room for the largest tarball for each `build_processing` job that can run at once.
 
 ### Bug fixes
 

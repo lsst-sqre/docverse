@@ -121,9 +121,12 @@ Size the worker for the largest build the deployment takes:
 The worker's memory limit is the Phalanx `workerResources` value
 (`workerResources.limits.memory`). The Phalanx chart runs the worker
 with a read-only root filesystem, so the worker needs a writable
-`emptyDir` volume mounted at `/tmp`, or `TMPDIR` pointed at one; without
-one, every `build_processing` job fails as it creates its temporary
-file. Keep that volume disk-backed: an `emptyDir` with
+`emptyDir` volume mounted at `/tmp`, or `TMPDIR` pointed at one. The
+default-pool worker, which runs `build_processing`, checks at startup
+that it can create its temporary file there and logs the directory as
+`Staging spool directory`; without a writable one it fails to start,
+rather than failing every upload it is handed. Keep that volume
+disk-backed: an `emptyDir` with
 `medium: Memory` is a tmpfs, whose contents count against the memory
 limit and so would put the whole tarball back in memory. The volume
 counts against the pod's ephemeral storage, which has to hold the
