@@ -5736,14 +5736,14 @@ async def test_sync_imports_ticket_branch_edition_as_draft(
         (
             "eups_daily_release",
             "d_2026_08_10",
-            EditionKind.draft,
+            EditionKind.release,
             TrackingMode.eups_daily_release,
         ),
     ],
     ids=[
         "lsst-doc-version-release",
         "lsst-doc-branch-draft",
-        "eups-daily-draft",
+        "eups-daily-release",
     ],
 )
 async def test_sync_imports_version_mode_editions_by_mode(
@@ -5761,8 +5761,8 @@ async def test_sync_imports_version_mode_editions_by_mode(
     Docverse's tracking mode still comes straight from LTD's, but the
     *kind* does not: a ``lsst_doc`` edition on ``v1.2`` is a release and
     the same mode on a ticket branch is a draft. ``eups_daily_release``
-    is the one mode that decides alone, and it decides ``draft`` so
-    dailies keep ageing out.
+    decides alone — it only ever matches a daily tag — and decides
+    ``release``.
     """
     async with db_session.begin():
         org_id = await _seed_org(
@@ -5805,6 +5805,69 @@ async def test_sync_imports_version_mode_editions_by_mode(
         assert edition is not None
         assert edition.kind == expected_kind
         assert edition.tracking_mode == expected_tracking_mode
+
+
+def _weekly_build_payload(git_ref: str) -> dict:  # type: ignore[type-arg]
+    """Build LTD's ``/builds/43`` payload on an EUPS tag."""
+    payload = _load("build.json")
+    payload["self_url"] = f"{LTD_BASE}/builds/43"
+    payload["bucket_root_dir"] = "pipelines/builds/43"
+    payload["git_refs"] = [git_ref]
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_sync_imports_the_ltd_weekly_meta_edition_as_release(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """LTD pipelines' ``weekly`` edition imports as a release.
+
+    The fixture mirrors the real edition: slug ``weekly``, mode
+    ``eups_weekly_release``, ``tracked_refs: null``, on a ``w_*`` build.
+    Its slug matches no version rule, so only the mode can certify it;
+    before the mode pin it imported as a ``draft`` and aged out under
+    ``draft_inactivity``.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug="ks-weekly-meta")
+
+    _seed_two_editions_main_and_draft(
+        mock_discovery,
+        draft_payload=_load("edition_weekly_eups_weekly_release.json"),
+        draft_build_payload=_weekly_build_payload("w_2026_45"),
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/42/index.html": b"<html>main</html>",
+        "pipelines/builds/43/index.html": b"<html>w_2026_45</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    project_store = ProjectStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    edition_store = EditionStore(
+        session=db_session, logger=structlog.get_logger("test")
+    )
+    async with db_session.begin():
+        project = await project_store.get_by_slug(
+            org_id=org_id, slug="pipelines"
+        )
+        assert project is not None
+        edition = await edition_store.get_by_slug(
+            project_id=project.id, slug="weekly"
+        )
+    assert edition is not None
+    assert edition.kind == EditionKind.release
+    assert edition.kind_source == EditionKindSource.derived
+    assert edition.tracking_mode == TrackingMode.eups_weekly_release
 
 
 # ---------------------------------------------------------------------------
@@ -5937,6 +6000,79 @@ async def test_resync_promotes_draft_edition_to_release(
         edition = await edition_store.get_by_id(edition_id)
     assert edition is not None
     assert edition.kind == EditionKind.release
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("slug", "ltd_mode", "git_ref"),
+    [
+        ("weekly", "eups_weekly_release", "w_2026_45"),
+        ("daily", "eups_daily_release", "d_2026_11_04"),
+    ],
+)
+async def test_resync_promotes_the_weekly_and_daily_meta_editions(
+    *,
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    slug: str,
+    ltd_mode: str,
+    git_ref: str,
+) -> None:
+    """Prod's ``weekly`` / ``daily`` drafts heal to ``release`` on re-sync.
+
+    Both were imported as ``derived`` drafts — ``daily`` by the old
+    ``eups_daily_release`` -> ``draft`` pin, ``weekly`` by the rule
+    chain's fallback — so the next poll converges them without any
+    operator action.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, slug=f"ks-resync-{slug}-meta")
+    logger = structlog.get_logger("test")
+    async with db_session.begin():
+        project = await ProjectStore(session=db_session, logger=logger).create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="pipelines",
+                title="LSST Science Pipelines",
+                source_url="https://example.com/lsst/pipelines",
+            ),
+        )
+        seeded = await EditionStore(
+            session=db_session, logger=logger
+        ).create_internal(
+            project_id=project.id,
+            slug=slug,
+            title=slug,
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode(ltd_mode),
+        )
+
+    edition_payload = _load("edition_weekly_eups_weekly_release.json")
+    edition_payload["slug"] = slug
+    edition_payload["mode"] = ltd_mode
+    _seed_ltd_one_edition(mock_discovery, edition_payload=edition_payload)
+    mock_discovery.get(f"{LTD_BASE}/builds/43").mock(
+        return_value=httpx.Response(200, json=_weekly_build_payload(git_ref))
+    )
+
+    object_store = MockObjectStore()
+    source_objects = {
+        "pipelines/builds/43/index.html": b"<html>meta</html>",
+    }
+    service = _build_service(
+        db_session, http_client, object_store, source_objects
+    )
+
+    await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    async with db_session.begin():
+        edition = await EditionStore(
+            session=db_session, logger=logger
+        ).get_by_id(seeded.id)
+    assert edition is not None
+    assert edition.kind == EditionKind.release
+    assert edition.kind_source == EditionKindSource.derived
 
 
 @pytest.mark.asyncio

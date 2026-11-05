@@ -136,19 +136,17 @@ class TestDeriveEditionKind:
         assert derivation.source == KindDerivationSource.fallback
         assert derivation.detail is None
 
-    @pytest.mark.parametrize(
-        "ltd_mode",
-        ["lsst_doc", "eups_major_release", "eups_weekly_release"],
-    )
+    @pytest.mark.parametrize("ltd_mode", ["lsst_doc", "eups_major_release"])
     def test_version_modes_are_confirmed_by_the_ref(
         self, ltd_mode: str
     ) -> None:
-        """A version mode narrows; the ref has to confirm the release.
+        """A narrowing version mode needs the ref to confirm the release.
 
-        LTD's version modes only describe which grammar an edition
-        *prefers* — ``lsst_doc`` explicitly publishes ``main`` builds
-        until a version tag exists — so the mode alone cannot certify a
-        release. A ticket-shaped ref under any of them stays ``draft``.
+        ``lsst_doc`` and ``eups_major_release`` only describe which
+        grammar an edition *prefers* — ``lsst_doc`` explicitly publishes
+        ``main`` builds until a version tag exists — so the mode alone
+        cannot certify a release. A ticket-shaped ref under either stays
+        ``draft``.
         """
         edition = _edition(
             slug="u-jsick-feature",
@@ -164,7 +162,6 @@ class TestDeriveEditionKind:
         [
             ("lsst_doc", "v1.2", "lsst_doc"),
             ("eups_major_release", "v27_0", "eups_major"),
-            ("eups_weekly_release", "w_2026_10", "eups_weekly"),
         ],
     )
     def test_version_modes_confirmed_by_the_slug(
@@ -181,17 +178,29 @@ class TestDeriveEditionKind:
         assert derivation.source == KindDerivationSource.rule
         assert derivation.detail == expected_rule
 
-    def test_eups_daily_release_is_always_a_draft(self) -> None:
-        """Dailies stay drafts so they keep ageing out under lifecycle."""
-        edition = _edition(
-            slug="d_2026_08_10",
-            mode="eups_daily_release",
-            tracked_refs=None,
-        )
+    @pytest.mark.parametrize(
+        ("slug", "ltd_mode"),
+        [
+            ("weekly", "eups_weekly_release"),
+            ("daily", "eups_daily_release"),
+        ],
+    )
+    def test_weekly_and_daily_modes_are_releases(
+        self, slug: str, ltd_mode: str
+    ) -> None:
+        """LTD pipelines' ``weekly`` / ``daily`` meta editions are releases.
+
+        These modes only ever match a weekly or daily EUPS tag, so the
+        mode alone certifies that the edition is on a release. The meta
+        edition's own slug (``weekly``) matches no version rule, which
+        is why the mode has to decide: under the rule chain it fell to
+        the ``draft`` fallback and aged out under ``draft_inactivity``.
+        """
+        edition = _edition(slug=slug, mode=ltd_mode, tracked_refs=None)
         derivation = derive_edition_kind(edition)
-        assert derivation.kind == EditionKind.draft
+        assert derivation.kind == EditionKind.release
         assert derivation.source == KindDerivationSource.ltd_mode
-        assert derivation.detail == "eups_daily_release"
+        assert derivation.detail == ltd_mode
 
     def test_branch_tracking_lsst_doc_fixture_is_a_draft(self) -> None:
         """The captured mis-moded LTD edition imports as a draft.

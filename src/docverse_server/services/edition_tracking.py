@@ -78,6 +78,58 @@ def _derivation_governs(
     )
 
 
+#: Tracking modes whose matcher only ever accepts a release ref — a final
+#: EUPS release, a weekly tag, or a daily tag. An edition in one of them
+#: can never point at a branch or a release candidate, so the mode alone
+#: certifies it as a ``release``, whatever the build's own ref derives:
+#: a daily tag derives ``draft``, yet the ``daily`` edition following it
+#: is a release. ``lsst_doc`` is absent because it falls back to the
+#: default branch until a version tag exists; ``eups_major_release`` is
+#: left out by PRD #864, so its kind stays whatever it was created with.
+_RELEASE_TRACKING_MODES = frozenset(
+    {
+        TrackingMode.eups_release,
+        TrackingMode.eups_weekly_release,
+        TrackingMode.eups_daily_release,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _KindTarget:
+    """The kind tracking converges an edition on, and what decided it.
+
+    ``matched_rule_type`` is the slug-rewrite rule behind a ref
+    derivation, or ``None`` when the edition's tracking mode decided.
+    """
+
+    kind: EditionKind
+    matched_rule_type: str | None
+
+
+def _kind_target(
+    edition: Edition, derivation: SlugDerivationResult
+) -> _KindTarget | None:
+    """Return the kind *edition* should carry, or ``None`` if none governs.
+
+    A release-only tracking mode (see ``_RELEASE_TRACKING_MODES``)
+    certifies ``release`` on its own; otherwise the ref derivation
+    governs exactly the editions :func:`_derivation_governs` admits. The
+    default edition's ``main`` kind belongs to the project, so neither
+    rewrites it.
+    """
+    if edition.kind is EditionKind.main:
+        return None
+    if edition.tracking_mode in _RELEASE_TRACKING_MODES:
+        return _KindTarget(kind=EditionKind.release, matched_rule_type=None)
+    if _derivation_governs(edition, derivation):
+        return _KindTarget(
+            kind=derivation.edition_kind,
+            matched_rule_type=derivation.matched_rule_type,
+        )
+    return None
+
+
 # Tracking modes that use version comparison instead of date-based guards.
 _VERSION_MODES = frozenset(
     {
@@ -361,6 +413,13 @@ class EditionTrackingService:
         stranded. Convergence — not a re-asserting PATCH — is the
         supported way to undo an automatic kind.
 
+        An edition in a release-only tracking mode (``eups_release``,
+        ``eups_weekly_release``, ``eups_daily_release``) converges on
+        ``release`` instead, whatever the build's ref derives: its
+        matcher only ever accepts a release ref, so the mode certifies
+        the kind. That is how the ``weekly`` / ``daily`` meta editions,
+        whose own slugs match no version rule, stop being drafts.
+
         Returns the list with converged rows replaced by their
         post-write state, so downstream steps see the kind that is in
         the database.
@@ -384,18 +443,24 @@ class EditionTrackingService:
         org_id: int,
         project_id: int,
     ) -> Edition:
-        """Write *derivation*'s kind to *edition* when it governs it."""
-        if not _derivation_governs(edition, derivation):
+        """Write the kind that governs *edition* when it differs.
+
+        The target comes from :func:`_kind_target`: ``release`` for a
+        release-only tracking mode, else *derivation*'s kind when it
+        governs the edition. A ``declared`` kind is never rewritten.
+        """
+        target = _kind_target(edition, derivation)
+        if target is None:
             return edition
         if edition.kind_source is EditionKindSource.declared:
             return edition
-        if edition.kind is derivation.edition_kind:
+        if edition.kind is target.kind:
             return edition
         async with self._edition_update_lock(
             org_id=org_id, project_id=project_id, edition_id=edition.id
         ):
             await self._deps.edition_store.update_kind(
-                edition_id=edition.id, kind=derivation.edition_kind
+                edition_id=edition.id, kind=target.kind
             )
         self._deps.logger.info(
             "Converged edition kind",
@@ -403,11 +468,12 @@ class EditionTrackingService:
             edition_id=edition.id,
             project_id=project_id,
             previous_kind=edition.kind.value,
-            edition_kind=derivation.edition_kind.value,
+            edition_kind=target.kind.value,
             kind_trigger="build_upload",
-            matched_rule_type=derivation.matched_rule_type,
+            tracking_mode=edition.tracking_mode.value,
+            matched_rule_type=target.matched_rule_type,
         )
-        return edition.model_copy(update={"kind": derivation.edition_kind})
+        return edition.model_copy(update={"kind": target.kind})
 
     async def _update_editions(
         self,

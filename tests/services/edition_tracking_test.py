@@ -2038,6 +2038,173 @@ async def test_track_build_promotes_a_draft_eups_release_edition(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("slug", "tracking_mode", "git_ref"),
+    [
+        ("weekly", TrackingMode.eups_weekly_release, "w_2026_45"),
+        ("daily", TrackingMode.eups_daily_release, "d_2026_11_04"),
+    ],
+)
+async def test_track_build_converges_a_weekly_or_daily_draft_to_release(
+    *,
+    db_session: AsyncSession,
+    slug: str,
+    tracking_mode: TrackingMode,
+    git_ref: str,
+) -> None:
+    """A derived ``weekly`` / ``daily`` draft converges to release.
+
+    These modes only ever match a weekly or daily tag, so the mode
+    certifies the edition as a release whatever the build's own ref
+    derives — a daily tag derives ``draft``, yet the ``daily`` edition
+    following it is a release. This is prod's ``rubin/pipelines``
+    ``weekly`` / ``daily``, imported as ``derived`` drafts.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session, org_slug=f"{slug}-meta-heal-org"
+        )
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        stale = await edition_store.create_internal(
+            project_id=project.id,
+            slug=slug,
+            title=slug,
+            kind=EditionKind.draft,
+            tracking_mode=tracking_mode,
+        )
+        build = await _create_build(db_session, project.id, git_ref=git_ref)
+
+        with capture_logs() as logs:
+            await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        healed = await edition_store.get_by_id(stale.id)
+        assert healed is not None
+        assert healed.kind == EditionKind.release
+        assert healed.kind_source == EditionKindSource.derived
+        assert healed.current_build_id == build.id
+        await db_session.commit()
+
+    events = [
+        e
+        for e in logs
+        if e["event"] == "Converged edition kind" and e["edition_slug"] == slug
+    ]
+    assert len(events) == 1
+    assert events[0]["previous_kind"] == "draft"
+    assert events[0]["edition_kind"] == "release"
+    assert events[0]["kind_trigger"] == "build_upload"
+    assert events[0]["tracking_mode"] == tracking_mode.value
+
+
+@pytest.mark.asyncio
+async def test_track_build_keeps_a_declared_weekly_draft(
+    db_session: AsyncSession,
+) -> None:
+    """An operator's ``draft`` on ``weekly`` survives the mode's release.
+
+    POSTing the edition stamps ``kind_source`` ``declared``, and the
+    mode certification never overrides an operator. The pointer still
+    advances: kind and tracking are independent.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="weekly-decl-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        declared = await edition_store.create(
+            project_id=project.id,
+            data=EditionCreate(
+                slug="weekly",
+                title="Weekly release",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.eups_weekly_release,
+            ),
+        )
+        build = await _create_build(
+            db_session, project.id, git_ref="w_2026_45"
+        )
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        held = await edition_store.get_by_id(declared.id)
+        assert held is not None
+        assert held.kind == EditionKind.draft
+        assert held.kind_source == EditionKindSource.declared
+        assert held.current_build_id == build.id
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_converges_an_eups_release_draft_on_first_build(
+    db_session: AsyncSession,
+) -> None:
+    """An ``eups_release`` edition created as draft heals on its first build.
+
+    Its matcher only accepts final releases, so the first build it takes
+    certifies it — no wait for an operator PATCH.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="eups-rel-heal-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        created = await edition_store.create_internal(
+            project_id=project.id,
+            slug="stable",
+            title="Stable",
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.eups_release,
+        )
+        build = await _create_build(db_session, project.id, git_ref="v30_0_11")
+        await service.track_build(build)
+        await db_session.commit()
+
+    async with db_session.begin():
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        healed = await edition_store.get_by_id(created.id)
+        assert healed is not None
+        assert healed.kind == EditionKind.release
+        assert healed.current_build_id == build.id
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_track_build_leaves_main_kind_in_a_release_mode(
+    db_session: AsyncSession,
+) -> None:
+    """``__main`` tracking ``eups_release`` keeps its structural kind."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, _main = await _setup_eups_release_main(
+            db_session, service, org_slug="eups-rel-main-kind-org"
+        )
+        release = await _create_build(
+            db_session, project.id, git_ref="v30_0_11"
+        )
+        with capture_logs() as logs:
+            result = await service.track_build(release)
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        main_edition = await edition_store.get_by_slug(
+            project_id=project.id, slug=DEFAULT_EDITION_SLUG
+        )
+        await db_session.commit()
+
+    assert _main_actions(result) == ["updated"]
+    assert main_edition is not None
+    assert main_edition.kind == EditionKind.main
+    assert not [
+        e
+        for e in logs
+        if e["event"] == "Converged edition kind"
+        and e["edition_slug"] == DEFAULT_EDITION_SLUG
+    ]
+
+
+@pytest.mark.asyncio
 async def test_track_build_demotes_when_the_rules_change(
     db_session: AsyncSession,
 ) -> None:
