@@ -184,7 +184,9 @@ class DashboardPublisher:
         dashboard_context = replace(context, assets=dashboard_assets)
 
         html_renderer = DashboardHtmlRenderer(template_source=template_source)
-        switcher_renderer = SwitcherJsonRenderer()
+        switcher_renderer = SwitcherJsonRenderer(
+            template_source=template_source
+        )
         error_renderer = ErrorPageRenderer(template_source=template_source)
         edition_renderer = EditionJsonRenderer()
 

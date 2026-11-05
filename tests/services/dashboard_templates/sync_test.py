@@ -367,6 +367,54 @@ async def test_sync_invalid_template_toml_marks_failed_and_keeps_prior_content(
 
 
 @pytest.mark.asyncio
+async def test_sync_empty_switcher_template_marks_failed(
+    db_session: AsyncSession,
+    mock_github: GitHubMock,
+) -> None:
+    """A ``[switcher] template`` naming no file fails the sync, not builds.
+
+    The TOML parses, but an empty template name would break every
+    ``dashboard_build`` from the Jinja loader, so the sync records the
+    key and the value in ``last_sync_error`` and stores nothing.
+    """
+    async with db_session.begin():
+        binding_id = await _seed_binding(
+            db_session, org_slug="sync-empty-switcher"
+        )
+        await db_session.commit()
+
+    mock_github.seed_installation("acme", "templates", installation_id=42)
+    mock_github.seed_tree(
+        "acme",
+        "templates",
+        "main",
+        files={
+            "template.toml": _VALID_TEMPLATE_TOML
+            + b'\n[switcher]\ntemplate = ""\n',
+            "dashboard.html.jinja": b"<html>dash</html>",
+        },
+    )
+
+    async with httpx.AsyncClient() as http_client:
+        syncer = _make_syncer(
+            db_session, http_client=http_client, mock_github=mock_github
+        )
+        async with db_session.begin():
+            result = await syncer.sync(binding_id)
+            await db_session.commit()
+
+    expected = (
+        "Invalid template.toml: [switcher] template must be a non-empty "
+        "string, got ''"
+    )
+    assert result.status is DashboardSyncStatus.failed
+    assert result.error == expected
+    assert result.github_template_id is None
+    assert result.binding.last_sync_status == "failed"
+    assert result.binding.last_sync_error == expected
+
+
+@pytest.mark.asyncio
 async def test_sync_missing_template_toml_marks_failed(
     db_session: AsyncSession,
     mock_github: GitHubMock,

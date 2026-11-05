@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import json
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, fields
@@ -65,6 +66,7 @@ from docverse_server.config import (
     config,
 )
 from docverse_server.diagnostics.memory import MemorySample
+from docverse_server.domain.dashboard_context import DashboardContext
 from docverse_server.domain.edition import EditionDeleteReason
 from docverse_server.domain.edition_reconcile import ReconcileReason, _Skip
 from docverse_server.domain.lifecycle import REF_DELETED_RULE_TYPE
@@ -90,6 +92,11 @@ from docverse_server.metrics import (
     WebhookOutcome,
 )
 from docverse_server.sentry import DocverseSentryComponent
+from docverse_server.services.dashboard.renderers import (
+    SWITCHER_BOOLEAN_KEYS,
+    SWITCHER_STRING_KEYS,
+    InvalidSwitcherJsonError,
+)
 from docverse_server.services.default_branch import DefaultBranchTrigger
 from docverse_server.services.edition_reconcile import (
     EditionReconcileOutcome,
@@ -115,6 +122,12 @@ from docverse_server.storage._http_retry import (
     backoff_for_attempt,
 )
 from docverse_server.storage.build_store import BuildStore
+from docverse_server.storage.dashboard_templates.template_source import (
+    DashboardTemplateConfig,
+    Switcher404Config,
+    SwitcherConfig,
+    _parse_assets,
+)
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import (
     KeeperSyncState,
@@ -3147,3 +3160,77 @@ def test_build_processing_worker_memory_documented() -> None:
     )
     assert "cap \N{MULTIPLICATION SIGN} largest file" in section
     assert "(#worker-memory-and-disk)" in _build_section("Sizing the timeout")
+
+
+_TEMPLATES_PAGE = "dashboard-templates.md"
+"""Reference page for dashboard template sets and ``template.toml``."""
+
+_TEMPLATE_TOML_TABLES: dict[str, type] = {
+    "dashboard": DashboardTemplateConfig,
+    "error_404": Switcher404Config,
+    "switcher": SwitcherConfig,
+}
+"""Each ``template.toml`` table and the config dataclass it parses into."""
+
+
+def _templates_section(heading: str) -> str:
+    """Return one ``## heading`` section of the dashboard-templates page."""
+    return _section(_read(_TEMPLATES_PAGE), heading)
+
+
+def _toml_default(default: object) -> str:
+    """Return the Default cell the keys table gives a config default."""
+    if default is None:
+        return "unset"
+    value = list(default) if isinstance(default, tuple) else default
+    return f"`{json.dumps(value)}`"
+
+
+def test_docs_index_links_the_dashboard_templates_page() -> None:
+    """The index's Reference section points at the template-set page."""
+    assert _TEMPLATES_PAGE in _section(_read("index.md"), "Reference")
+
+
+def test_dashboard_templates_page_tables_every_template_toml_key() -> None:
+    """Every key the ``template.toml`` parser reads has a row and default.
+
+    The rows are read off the config dataclasses, so a key added to the
+    parser — like ``[switcher] template`` — is a row the page must gain.
+    An asset key sits in its table's ``.assets`` subtable.
+    """
+    section = _templates_section("`template.toml`")
+    rows = {(cells[0], cells[1]): cells for cells in _code_rows(section)}
+    asset_keys = set(_parse_assets({}))
+    expected: dict[tuple[str, str], object] = {}
+    for table, config_class in _TEMPLATE_TOML_TABLES.items():
+        for field in fields(config_class):
+            name = f"{table}.assets" if field.name in asset_keys else table
+            expected[(f"`[{name}]`", f"`{field.name}`")] = field.default
+    assert set(rows) == set(expected)
+    for key, default in expected.items():
+        assert _toml_default(default) in rows[key][2], key
+
+
+def test_dashboard_templates_page_names_every_template_variable() -> None:
+    """Every variable a template-set Jinja file renders with is named."""
+    section = _templates_section("Template variables")
+    assert not _uncoded(
+        (field.name for field in fields(DashboardContext)), section
+    )
+
+
+def test_dashboard_templates_switcher_contract_documented() -> None:
+    """The switcher-template section states the schema and the failure."""
+    section = _templates_section("Switcher templates")
+    assert not _uncoded(
+        {
+            *SWITCHER_STRING_KEYS,
+            *SWITCHER_BOOLEAN_KEYS,
+            InvalidSwitcherJsonError.__name__,
+            "include_kinds",
+            "tojson",
+            "dashboard_build",
+            "__switcher.json",
+        },
+        section,
+    )
