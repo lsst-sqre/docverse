@@ -34,6 +34,7 @@ from docverse_server.storage.dashboard_templates.template_source import (
     Switcher404Config,
     SwitcherConfig,
 )
+from tests.support.dashboard_templates import DEMO_SWITCHER_JINJA
 
 
 class _FakeTemplateSource:
@@ -383,22 +384,6 @@ def test_edition_json_falls_back_to_project_url_when_main_missing() -> None:
     assert payload["canonical_url"] == ctx.project.published_url
 
 
-_DEMO_SWITCHER_JINJA = """\
-[
-  {"name": {{ editions.main.title | tojson }},
-   "version": {{ editions.main.slug | tojson }},
-   "url": {{ editions.main.published_url | tojson }},
-   "preferred": true}
-  {%- for release in editions.releases[:3] %},
-  {"name": {{ (release.title ~ " of " ~ project.title ~ " (" ~ org.title ~ ")")
-              | tojson }},
-   "version": {{ release.slug | tojson }},
-   "url": {{ release.published_url | tojson }}}
-  {%- endfor %}
-]
-"""
-
-
 def _switcher_template_source(
     template_text: str, *, template_name: str = "switcher.json.jinja"
 ) -> _FakeTemplateSource:
@@ -424,7 +409,7 @@ def test_switcher_template_renders_with_dashboard_context() -> None:
     ]
     draft = _edition(slug="tickets-1", title="t1", kind=EditionKind.draft)
     ctx = _make_context(main=main, releases=releases, drafts=[draft])
-    source = _switcher_template_source(_DEMO_SWITCHER_JINJA)
+    source = _switcher_template_source(DEMO_SWITCHER_JINJA)
 
     rendered = SwitcherJsonRenderer(template_source=source).render(
         ctx, switcher_config=source.load_config().switcher
