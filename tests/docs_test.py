@@ -375,18 +375,22 @@ _BUILD_PAGE = "build-processing.md"
 """Operations page for the ``build_processing`` time budget (PRD #864)."""
 
 _BUILD_PROCESSING_PHALANX_VALUES: dict[str, str | None] = {
-    "build_processing_job_timeout_seconds": None,
+    "build_processing_job_timeout_seconds": (
+        "config.buildProcessing.jobTimeoutSeconds"
+    ),
     "build_processing_reaper_threshold_seconds": (
         "config.reaperThresholds.buildProcessingSeconds"
     ),
 }
 """The build-processing settings, each with its Phalanx value.
 
-``None`` for the timeout, which the chart does not render yet (#873):
-the docs row must then say so (see :data:`_NOT_RENDERED_BY_CHART`).
-When the chart renders it, replace ``None`` with its values key and the
-row's placeholder with the same key, in one change; the settings-table
-test fails if only one of the two moves.
+Both are rendered by the Phalanx chart (lsst-sqre/phalanx#7311 added
+the timeout's key). A setting the chart does not render yet maps to
+``None``, and its docs row must then say so (see
+:data:`_NOT_RENDERED_BY_CHART`); when the chart picks it up, replace
+``None`` with its values key and the row's placeholder with the same
+key, in one change, since the settings-table test fails if only one of
+the two moves.
 """
 
 _NOT_RENDERED_BY_CHART = "Not rendered by the chart yet"

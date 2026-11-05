@@ -13,7 +13,7 @@ and they move together.
 
 | Setting | Environment variable | Default | Phalanx value |
 | --- | --- | --- | --- |
-| `build_processing_job_timeout_seconds` | `DOCVERSE_BUILD_PROCESSING_JOB_TIMEOUT_SECONDS` | `300` | Not rendered by the chart yet (#873) |
+| `build_processing_job_timeout_seconds` | `DOCVERSE_BUILD_PROCESSING_JOB_TIMEOUT_SECONDS` | `300` | `config.buildProcessing.jobTimeoutSeconds` |
 | `build_processing_reaper_threshold_seconds` | `DOCVERSE_BUILD_PROCESSING_REAPER_THRESHOLD_SECONDS` | `28800` | `config.reaperThresholds.buildProcessingSeconds` |
 
 - **The job timeout** wraps `build_processing` on the default pool's
