@@ -1,0 +1,16 @@
+{
+  "self_url": "https://keeper.lsst.codes/editions/2",
+  "product_url": "https://keeper.lsst.codes/products/pipelines",
+  "build_url": "https://keeper.lsst.codes/builds/43",
+  "published_url": "https://pipelines.lsst.io/v/weekly",
+  "slug": "weekly",
+  "title": "Weekly release",
+  "date_created": "2018-01-12T21:30:00.000000+00:00",
+  "date_rebuilt": "2026-11-04T08:10:00.000000+00:00",
+  "date_ended": null,
+  "surrogate_key": "ed2weeklysurrogate1234ed2weekly12",
+  "pending_rebuild": false,
+  "tracked_refs": null,
+  "mode": "eups_weekly_release",
+  "queue_url": null
+}
