@@ -56,6 +56,7 @@ from docverse.models.keeper_sync import (
 )
 from docverse_server.config import (
     BUILD_PROCESSING_REAPER_MARGIN_SECONDS,
+    DASHBOARD_BUILD_REAPER_MARGIN_SECONDS,
     KEEPER_SYNC_REAPER_MARGIN_SECONDS,
     KEEPER_SYNC_SLICE_MARGIN_SECONDS,
     Configuration,
@@ -395,6 +396,33 @@ the two moves.
 
 _NOT_RENDERED_BY_CHART = "Not rendered by the chart yet"
 """Phalanx-value cell text for a setting the chart does not render."""
+
+_DASHBOARD_PAGE = "dashboard-build.md"
+"""Operations page for the ``dashboard_build`` time budget (#863)."""
+
+_DASHBOARD_BUILD_PHALANX_VALUES: dict[str, str] = {
+    "dashboard_build_job_timeout_seconds": (
+        "config.dashboardBuild.jobTimeoutSeconds"
+    ),
+    "dashboard_build_reaper_threshold_seconds": (
+        "config.reaperThresholds.dashboardBuildSeconds"
+    ),
+}
+"""The dashboard-build settings, each with its Phalanx value.
+
+The reaper threshold's key is rendered by the chart today; the
+timeout's key lands with the Phalanx change for #873, so it is also in
+:data:`_DASHBOARD_BUILD_UNRENDERED` and its docs row both says the
+chart does not render it yet and names the key it will have. When the
+chart picks it up, drop it from that set and replace the row's
+placeholder with the bare key, in one change, since the settings-table
+test fails if only one of the two moves.
+"""
+
+_DASHBOARD_BUILD_UNRENDERED = frozenset(
+    {"dashboard_build_job_timeout_seconds"}
+)
+"""Dashboard-build settings whose Phalanx key the chart does not render yet."""
 
 _WORKER_POOLS = (
     (WorkerSettings, "default"),
@@ -2946,6 +2974,148 @@ def test_build_processing_upload_transport_documented() -> None:
     assert f"{connect:g} s connect window" in section
     assert f"{_TRANSPORT_PAGE}#the-copy-client" in section
     assert "(#upload-transport)" in _build_section("Settings")
+
+
+def _dashboard_section(heading: str) -> str:
+    """Return one ``## heading`` section of the dashboard-build page."""
+    return _section(_read(_DASHBOARD_PAGE), heading)
+
+
+def test_docs_index_links_the_dashboard_build_page() -> None:
+    """The index's Operations section points at the dashboard-build page."""
+    assert _DASHBOARD_PAGE in _section(_read("index.md"), "Operations")
+
+
+def test_dashboard_build_settings_documented_side_by_side() -> None:
+    """The settings table is the timeout and the reaper threshold, together.
+
+    Each row names the setting's environment variable, its stock value
+    and its Phalanx value; a key the chart does not render yet is still
+    named, behind the not-rendered placeholder.
+    """
+    section = _dashboard_section("Settings")
+    env_prefix = Configuration.model_config.get("env_prefix", "")
+    rows = {cells[0].strip("`"): cells for cells in _code_rows(section)}
+    assert set(rows) == set(_DASHBOARD_BUILD_PHALANX_VALUES)
+    assert set(rows) >= _DASHBOARD_BUILD_UNRENDERED
+    for name, phalanx_value in _DASHBOARD_BUILD_PHALANX_VALUES.items():
+        cells = rows[name]
+        assert cells[1] == f"`{env_prefix}{name}`".upper(), name
+        default = Configuration.model_fields[name].default
+        assert _documented_default(default) in cells[2], name
+        if name in _DASHBOARD_BUILD_UNRENDERED:
+            assert cells[3].startswith(_NOT_RENDERED_BY_CHART), name
+            assert f"`{phalanx_value}`" in cells[3], name
+        else:
+            assert cells[3] == f"`{phalanx_value}`", name
+
+
+def _dashboard_build_reaper_minutes() -> set[int]:
+    """Return the minutes ``dashboard_build_reaper`` is scheduled at."""
+    for cron_job in MaintenanceWorkerSettings.cron_jobs:
+        coroutine = inspect.unwrap(cron_job.coroutine)
+        if coroutine.__name__ == "dashboard_build_reaper":
+            assert isinstance(cron_job.minute, set)
+            return cron_job.minute
+    msg = "the maintenance pool schedules no dashboard_build_reaper"
+    raise AssertionError(msg)
+
+
+def test_dashboard_build_reaper_floor_documented() -> None:
+    """The floor section names the margin and works it at stock values.
+
+    The margin is one full ``dashboard_build_reaper`` cron gap, read off
+    the maintenance pool's schedule, so moving the reaper's cadence is a
+    change the margin and the page have to carry. The floor at the stock
+    timeout and the largest timeout the stock threshold admits are read
+    off :class:`Configuration`.
+    """
+    section = _dashboard_section("The reaper floor")
+    minutes = sorted(_dashboard_build_reaper_minutes())
+    gaps = {
+        (later - earlier) % 60
+        for earlier, later in zip(
+            minutes, [*minutes[1:], minutes[0]], strict=True
+        )
+    }
+    assert gaps == {DASHBOARD_BUILD_REAPER_MARGIN_SECONDS // 60}
+    stock = Configuration()
+    timeout = stock.dashboard_build_job_timeout_seconds
+    threshold = stock.dashboard_build_reaper_threshold_seconds
+    assert not _uncoded(
+        {
+            "DASHBOARD_BUILD_REAPER_MARGIN_SECONDS",
+            "BUILD_PROCESSING_REAPER_MARGIN_SECONDS",
+            "dashboard_build_job_timeout_seconds",
+            "dashboard_build_reaper_threshold_seconds",
+        },
+        section,
+    )
+    assert f"({DASHBOARD_BUILD_REAPER_MARGIN_SECONDS})" in section
+    assert f"`{timeout + DASHBOARD_BUILD_REAPER_MARGIN_SECONDS}`" in section
+    assert f"`{threshold - DASHBOARD_BUILD_REAPER_MARGIN_SECONDS}`" in section
+    minute_spec = ", ".join(str(minute) for minute in minutes)
+    assert f"`minute={{{minute_spec}}}`" in _dashboard_section("Settings")
+
+
+def test_dashboard_build_cancellation_documented() -> None:
+    """The page says what a timeout records and links the shared payload."""
+    section = _dashboard_section("When the timeout fires")
+    assert not _uncoded(
+        {
+            "job_timeout",
+            "worker_shutdown",
+            "timeout_seconds",
+            "dashboard_build_job_timeout_seconds",
+            "dashboard_build_reaper",
+        },
+        section,
+    )
+    assert f"{_BUDGET_PAGE}#cancellation" in section
+
+
+def test_dashboard_build_upload_transport_documented() -> None:
+    """The page gives the upload order and the shared cap and client (#863).
+
+    ``dashboard_build`` lands its three project-level files first, in
+    order, then fans its edition files out over the copy client under
+    the worker-wide upload cap it shares with ``build_processing``. The
+    section names the three files, the setting, its environment variable
+    and stock value, and the copy client's connect window, read off the
+    code, and links both pages' accounts of the transport; the timeout
+    bullet points at it.
+    """
+    section = _dashboard_section("Upload order and transport")
+    name = "keeper_sync_upload_concurrency"
+    env_prefix = Configuration.model_config.get("env_prefix", "")
+    assert not _uncoded(
+        {
+            name,
+            f"{env_prefix}{name}".upper(),
+            "keeper_sync_upload_max_attempts",
+            "build_processing",
+        },
+        section,
+    )
+    default = Configuration.model_fields[name].default
+    assert _documented_default(default) in section
+    connect = COPY_HTTP_TIMEOUT.connect
+    assert connect is not None
+    assert f"{connect:g} s connect window" in section
+    assert f"{_BUILD_PAGE}#upload-transport" in section
+    assert f"{_TRANSPORT_PAGE}#the-copy-client" in section
+    assert "(#upload-order-and-transport)" in _dashboard_section("Settings")
+    lead = _read(_DASHBOARD_PAGE).split("\n## ", 1)[0]
+    assert not _uncoded(
+        {"__dashboard.html", "__404.html", "__switcher.json"}, lead
+    )
+
+
+def test_build_processing_page_links_the_dashboard_transport() -> None:
+    """The build page's transport section says dashboards share the cap."""
+    section = _build_section("Upload transport")
+    assert not _uncoded({"dashboard_build"}, section)
+    assert f"{_DASHBOARD_PAGE}#upload-order-and-transport" in section
 
 
 def test_build_processing_worker_memory_documented() -> None:

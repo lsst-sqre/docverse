@@ -1,7 +1,10 @@
 """Dashboard build worker function.
 
-Renders one project's dashboard artifacts (HTML + switcher JSON in the
-MVP slice) and uploads them to the project's object store.
+Renders one project's dashboard artifacts — the dashboard HTML, the 404
+page, the switcher JSON, and one metadata JSON per live edition — and
+uploads them to the project's object store. The edition files upload
+concurrently over the worker's copy client, under the process-wide
+upload cap ``keeper_sync_upload_concurrency`` (#863).
 """
 
 from __future__ import annotations
@@ -15,11 +18,11 @@ import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 
+from docverse_server.config import config
 from docverse_server.exceptions import NotFoundError
 from docverse_server.metrics import DashboardBuiltEvent
 from docverse_server.services.lock_service import LockKey
 from docverse_server.worker.functions._cancellation import (
-    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
     cancellation_recorded,
     record_cancellation,
 )
@@ -46,8 +49,9 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     Raises
     ------
     asyncio.CancelledError
-        When arq cancels the job — its default per-job timeout, or a
-        worker shutdown — after
+        When arq cancels the job — its per-job timeout,
+        ``dashboard_build_job_timeout_seconds``, or a worker shutdown —
+        after
         :func:`~docverse_server.worker.functions._cancellation.record_cancellation`
         has failed the row.
     """
@@ -87,11 +91,13 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             # From here on the job holds an ``in_progress`` row, which
             # arq's timeout or a worker shutdown would otherwise strand
             # for ``dashboard_build_reaper``: their ``CancelledError``
-            # bypasses the ``except Exception`` below (PRD #765).
+            # bypasses the ``except Exception`` below (PRD #765). The
+            # reason is read against the timeout ``WorkerSettings`` gives
+            # arq for this function (#863).
             async with record_cancellation(
                 ctx,
                 queue_job_id=queue_job_id,
-                timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+                timeout_seconds=config.dashboard_build_job_timeout_seconds,
                 logger=logger,
             ):
                 try:
@@ -115,8 +121,12 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                             project_id=project_id,
                             rendered_at=rendered_at,
                         )
-                        object_store = (
-                            await factory.create_objectstore_for_org(
+                        # The keeper-sync copier's transport, as for
+                        # ``build_processing``: presigned PUTs over the
+                        # worker's copy client, each holding the
+                        # process-wide upload limiter (#863, #877).
+                        object_store = await (
+                            factory.create_build_upload_objectstore_for_org(
                                 org_id=org_id, service_label=service_label
                             )
                         )
@@ -142,6 +152,9 @@ async def dashboard_build(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                             context=context,
                             object_store=object_store,
                             resolved=resolved,
+                            upload_concurrency=(
+                                config.keeper_sync_upload_concurrency
+                            ),
                         )
                 except Exception as exc:
                     sentry_sdk.capture_exception(exc)

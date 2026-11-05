@@ -1312,26 +1312,32 @@ class Factory:
     async def create_build_upload_objectstore_for_org(
         self, *, org_id: int, service_label: str
     ) -> ObjectStore:
-        """Resolve the store ``build_processing`` unpacks a build into.
+        """Resolve the store a default-pool job fans its uploads out into.
 
-        The same store :meth:`create_objectstore_for_org` resolves, on
-        the keeper-sync copier's transport: its presigned PUTs go over
+        ``build_processing`` unpacks a build into it, and
+        ``dashboard_build`` uploads a project's dashboard artifacts to
+        it. The same store :meth:`create_objectstore_for_org` resolves,
+        on the keeper-sync copier's transport: its presigned PUTs go over
         :attr:`copy_http_client` and each one holds
-        :attr:`keeper_sync_upload_limiter`, so build processing uploads
-        under the same size of cap on PUTs in flight, over the same kind
-        of pool sized to that cap, as keeper-sync copies do. The limiter
-        is per worker process, and ``build_processing`` runs on the
-        default pool while keeper-sync runs on the sync pool, so the two
-        never share one limiter; concurrent ``build_processing`` jobs on
-        one default-pool worker split its slots. Over the shared client
-        (5 s connect timeout, 20 connections kept alive) a pipelines
-        build's first burst of presigned PUTs all timed out connecting to
-        R2 (#877).
+        :attr:`keeper_sync_upload_limiter`, so these jobs upload under
+        the same size of cap on PUTs in flight, over the same kind of
+        pool sized to that cap, as keeper-sync copies do. The limiter is
+        per worker process, and these jobs run on the default pool while
+        keeper-sync runs on the sync pool, so the two never share one
+        limiter; concurrent ``build_processing`` and ``dashboard_build``
+        jobs on one default-pool worker split its slots. Over the shared
+        client (5 s connect timeout, 20 connections kept alive) a
+        pipelines build's first burst of presigned PUTs all timed out
+        connecting to R2 (#877), and one dashboard PUT at a time was too
+        slow for a project of a thousand editions (#863).
 
         It keeps the shared retry budget rather than the keeper-sync one:
         ``build_processing`` uploads inside the transaction that then
         completes the build, and the keeper-sync budget's longer waits
-        are for callers that hold none.
+        are for callers that hold none. ``dashboard_build`` holds no
+        transaction while it uploads, but takes the store as it is: its
+        uploads run under the job's arq timeout rather than a slice
+        budget, so the shorter waits suit it too.
 
         Without a copy client the store PUTs over the shared client, and
         without either it uploads through aiobotocore, as a directly

@@ -25,6 +25,7 @@ from .services.cdn_purge_coalescer import DEFAULT_PURGE_MIN_INTERVAL_SECONDS
 
 __all__ = [
     "BUILD_PROCESSING_REAPER_MARGIN_SECONDS",
+    "DASHBOARD_BUILD_REAPER_MARGIN_SECONDS",
     "EDITION_RECONCILE_REAPER_MARGIN_SECONDS",
     "KEEPER_SYNC_REAPER_MARGIN_SECONDS",
     "KEEPER_SYNC_SLICE_MARGIN_SECONDS",
@@ -103,6 +104,30 @@ Unlike those two thresholds, this one keeps its literal 8 h default
 rather than deriving from the timeout; the margin is the floor
 :meth:`Configuration._check_build_processing_reaper_threshold` holds an
 explicit value or a raised timeout to.
+"""
+
+
+DASHBOARD_BUILD_REAPER_MARGIN_SECONDS = 900
+"""Least gap between the dashboard-build job timeout and its reaper
+threshold, in seconds.
+
+arq cancels a ``dashboard_build`` job at
+``dashboard_build_job_timeout_seconds`` and the cancel fails its
+``queue_jobs`` row, so a row still ``in_progress`` past that point is one
+whose worker died without running the cancel.
+``dashboard_build_reaper_threshold_seconds`` must clear the timeout by at
+least this much: reaping earlier would free the project's rebuild slot
+(``idx_queue_jobs_dashboard_build_active_uq``) while arq is still
+running the render, so a second one could start uploading over it.
+
+Like the keeper-sync, ``edition_reconcile`` and ``build_processing``
+margins, it is sized at one full cron gap of its own reaper, which for
+``dashboard_build_reaper`` (``cron(minute={3, 18, 33, 48})``) is 15 min
+rather than their 30. That is also why it is not
+:data:`BUILD_PROCESSING_REAPER_MARGIN_SECONDS`: the dashboard reaper
+threshold is 1800 s on every deployment, and a 1800 s margin would leave
+no room for any timeout under it, where this one admits the 900 s
+default exactly.
 """
 
 
@@ -413,6 +438,29 @@ class Configuration(BaseSettings):
         ),
     )
 
+    dashboard_build_job_timeout_seconds: int = Field(
+        900,
+        ge=1,
+        title="Dashboard_build per-job timeout, in seconds",
+        description=(
+            "Wraps ``dashboard_build`` on ``WorkerSettings``: arq cancels"
+            " a job that runs past this. One job renders a project's"
+            " dashboard, 404 page and version switcher and one metadata"
+            " JSON per live edition, and uploads each of them, so its"
+            " wall clock grows with the number of editions: a project of"
+            " a thousand editions is the case to size it for. The job ran"
+            " under arq's implicit 300 s default before this setting, and"
+            " uploaded its edition files one at a time, so the largest"
+            " projects were cancelled on every rebuild (#863). A cancelled"
+            " job fails its ``queue_jobs`` row, recording this value as"
+            " the timeout it was read against. It must sit at least"
+            " ``DASHBOARD_BUILD_REAPER_MARGIN_SECONDS`` below"
+            " ``dashboard_build_reaper_threshold_seconds``, or"
+            " configuration fails at startup: the reaper must never fail"
+            " a job arq is still running."
+        ),
+    )
+
     keeper_sync_job_timeout_seconds: int = Field(
         3600,
         title="Keeper-sync per-job timeout, in seconds",
@@ -554,7 +602,8 @@ class Configuration(BaseSettings):
         title="Concurrent build-content presigned uploads per worker process",
         description=(
             "Process-wide bound on concurrent presigned PUTs across every"
-            " running keeper-sync job and ``build_processing`` job, and the"
+            " running keeper-sync, ``build_processing`` and"
+            " ``dashboard_build`` job, and the"
             " size of a worker's two build-copy connection pools: the"
             " upload client opens at most this many connections to R2 plus"
             " 10 and keeps every one of them alive between uploads, and"
@@ -562,7 +611,9 @@ class Configuration(BaseSettings):
             " at most this many connections to S3. Each"
             " ``build_processing`` job also fans its own uploads out this"
             " wide, and so holds at most this many unpacked files in"
-            " memory at once. On the sync worker, ``keeper_sync_max_jobs`` x"
+            " memory at once, and each ``dashboard_build`` job its"
+            " per-edition JSON uploads, so a dashboard rebuild's wall"
+            " clock follows it. On the sync worker, ``keeper_sync_max_jobs`` x"
             " ``keeper_sync_copy_concurrency`` remains the memory bound"
             " (the object bodies copiers buffer) and sizes no pool; a"
             " value above that product never throttles a copy."
@@ -717,9 +768,15 @@ class Configuration(BaseSettings):
             " operator's next ``POST /dashboard/rebuild`` no longer"
             " returns 409. Mirrors"
             " ``lifecycle_reaper_threshold_seconds`` so the operator"
-            " knob shape is identical across reapers; the"
-            " env-overridable default lets non-prod environments drive"
-            " the threshold down to seconds for fast verification."
+            " knob shape is identical across reapers. It must be at"
+            " least ``dashboard_build_job_timeout_seconds`` +"
+            " ``DASHBOARD_BUILD_REAPER_MARGIN_SECONDS`` (1800 s at the"
+            " stock 900 s timeout, so the default sits on the floor), or"
+            " configuration fails at startup: arq has not cancelled the"
+            " job until its timeout, so a lower threshold would free the"
+            " rebuild slot under a render still uploading. Non-prod"
+            " environments that want the reaper to fire quickly drive"
+            " the timeout down alongside it."
         ),
     )
 
@@ -1249,6 +1306,39 @@ class Configuration(BaseSettings):
                 " until its timeout elapses, so reaping before then would"
                 " fail a build that is still being unpacked. Raise the"
                 " threshold alongside the timeout."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_dashboard_build_reaper_threshold(self) -> Configuration:
+        """Refuse a dashboard reaper threshold the job timeout can reach.
+
+        ``dashboard_build_reaper`` exists to fail rows whose worker died
+        without arq's cancel running. A threshold less than
+        ``dashboard_build_job_timeout_seconds`` plus
+        :data:`DASHBOARD_BUILD_REAPER_MARGIN_SECONDS` could instead reap
+        a render that is still uploading, freeing the project's rebuild
+        slot for a second render to start over it. The stock pair (900 s
+        and 1800 s) sits exactly on the floor, so raising the timeout
+        without raising the threshold is the mistake this catches.
+        """
+        floor = (
+            self.dashboard_build_job_timeout_seconds
+            + DASHBOARD_BUILD_REAPER_MARGIN_SECONDS
+        )
+        threshold = self.dashboard_build_reaper_threshold_seconds
+        if threshold < floor:
+            raise ValueError(
+                f"dashboard_build_reaper_threshold_seconds ({threshold})"
+                " must be at least dashboard_build_job_timeout_seconds"
+                f" ({self.dashboard_build_job_timeout_seconds}) plus"
+                " DASHBOARD_BUILD_REAPER_MARGIN_SECONDS"
+                f" ({DASHBOARD_BUILD_REAPER_MARGIN_SECONDS}), so"
+                f" {floor}: arq has not cancelled a dashboard_build job"
+                " until its timeout elapses, so reaping before then would"
+                " free the project's rebuild slot under a render that is"
+                " still uploading. Raise the threshold alongside the"
+                " timeout."
             )
         return self
 

@@ -908,8 +908,8 @@ async def test_other_stores_get_no_upload_limiter(
     """Only the build-content stores upload under the limiter.
 
     The limiter caps a worker's presigned PUTs of build content to R2 so
-    a backfill or a large build's unpack cannot exhaust the node's NAT
-    ports; API build uploads and dashboard renders call
+    a backfill, a large build's unpack or a large dashboard render cannot
+    exhaust the node's NAT ports; API build uploads call
     ``create_objectstore_for_org`` directly and must keep uploading
     unbounded, even on a factory that holds the worker's limiter.
     """

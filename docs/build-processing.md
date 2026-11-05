@@ -143,7 +143,10 @@ also fans its own uploads out no wider than the cap. The cap is per
 worker process: every job in the process that uploads build content
 shares it, so concurrent `build_processing` jobs on one default-pool
 worker split its slots, as concurrent keeper-sync jobs on the sync
-worker do. The copy client keeps a connection alive for every slot and
+worker do. `dashboard_build` jobs upload their edition files over the
+same client under the same cap, so they split its slots with
+`build_processing` too (see
+[Dashboard build time budget](dashboard-build.md#upload-order-and-transport)). The copy client keeps a connection alive for every slot and
 gives each attempt a 10 s connect window, so a large build reuses its
 connections to R2 instead of re-dialling them through the burst.
 [The copy client](keeper-sync-transport.md#the-copy-client), on the

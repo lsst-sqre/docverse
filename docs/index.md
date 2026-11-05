@@ -66,6 +66,13 @@ that back each of them up.
   what a timed-out job records, how to size the timeout from a
   measured upload, and how much memory and temporary disk the worker
   needs to unpack one.
+- [Dashboard build time budget](dashboard-build.md) — how long one
+  `dashboard_build` job may render and upload a project's dashboard:
+  its job timeout and reaper threshold side by side, the floor that
+  keeps the reaper threshold above the timeout, what a timed-out job
+  records and leaves behind, the order its files land in, and how its
+  edition uploads share the copy client and the worker-wide upload cap
+  with `build_processing`.
 - [GitHub integration](github-integration.md) — what each GitHub App
   webhook delivery does (`push`, `delete`, `repository` renamed,
   transferred and edited, `organization` renamed, and the

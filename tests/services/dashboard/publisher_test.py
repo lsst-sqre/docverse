@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -17,6 +18,7 @@ from docverse.models import (
     ProjectCreate,
     TrackingMode,
 )
+from docverse_server.domain.dashboard_context import DashboardContext
 from docverse_server.services.dashboard.publisher import DashboardPublisher
 from docverse_server.services.dashboard_templates.resolver import (
     ResolvedTemplate,
@@ -37,6 +39,9 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 
 _HASH = "sha256:" + "a" * 64
+
+_UPLOAD_CONCURRENCY = 4
+"""Upload window for tests that do not exercise the fan-out itself."""
 
 
 def _logger() -> structlog.stdlib.BoundLogger:
@@ -134,6 +139,7 @@ async def test_publisher_uploads_dashboard_and_switcher(
             org_id=org.id,
             project_id=project.id,
             object_store_provider=_provider,
+            upload_concurrency=_UPLOAD_CONCURRENCY,
         )
 
     # 3 top-level artifacts (dashboard, switcher, 404) + 2 per-edition JSON
@@ -226,6 +232,7 @@ async def test_publisher_writes_per_edition_json_files(
             org_id=org.id,
             project_id=project.id,
             object_store_provider=_provider,
+            upload_concurrency=_UPLOAD_CONCURRENCY,
         )
 
     main_obj = mock_store.objects["per-ed-proj/__editions/__main.json"]
@@ -282,6 +289,7 @@ async def test_publisher_handles_empty_project(
             org_id=org.id,
             project_id=project.id,
             object_store_provider=_provider,
+            upload_concurrency=_UPLOAD_CONCURRENCY,
         )
 
     assert "empty-pub-proj/__dashboard.html" in mock_store.objects
@@ -457,6 +465,7 @@ async def test_publisher_render_and_upload_uses_provided_resolved_template(
             context=context,
             object_store=mock_store,
             resolved=resolved,
+            upload_concurrency=_UPLOAD_CONCURRENCY,
         )
 
     html_obj = mock_store.objects["render-provided-proj/__dashboard.html"]
@@ -505,6 +514,7 @@ async def test_publisher_logs_builtin_template_origin(
                 org_id=org.id,
                 project_id=project.id,
                 object_store_provider=_provider,
+                upload_concurrency=_UPLOAD_CONCURRENCY,
             )
 
     upload_events = [
@@ -595,6 +605,7 @@ async def test_publisher_logs_github_template_origin(
                 org_id=org.id,
                 project_id=project.id,
                 object_store_provider=_provider,
+                upload_concurrency=_UPLOAD_CONCURRENCY,
             )
 
     upload_events = [
@@ -604,3 +615,282 @@ async def test_publisher_logs_github_template_origin(
     ]
     assert len(upload_events) == 1
     assert upload_events[0]["template_origin"] == "org_default"
+
+
+# ── Edition upload fan-out (#863) ──────────────────────────────────────────
+
+_FAN_OUT_CAP = 3
+"""Upload window the fan-out tests run ``render_and_upload`` under."""
+
+_FAN_OUT_DRAFTS = _FAN_OUT_CAP * 4
+"""Draft editions the fan-out tests seed: several windows' worth."""
+
+
+async def _seed_fan_out_project(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+    *,
+    slug: str,
+) -> tuple[DashboardPublisher, DashboardContext, ResolvedTemplate]:
+    """Seed a project with more editions than the upload window.
+
+    Returns a publisher with the rendered context and resolved template
+    for the project, ready for :meth:`DashboardPublisher.render_and_upload`.
+    The project has ``__main`` plus :data:`_FAN_OUT_DRAFTS` drafts.
+    """
+    logger = _logger()
+    edition_store = EditionStore(session=db_session, logger=logger)
+    async with db_session.begin():
+        org = await OrganizationStore(
+            session=db_session, logger=logger
+        ).create(
+            OrganizationCreate(
+                slug=f"{slug}-org",
+                title="Fan-out Org",
+                base_domain=f"{slug}.example.com",
+            )
+        )
+        project = await ProjectStore(session=db_session, logger=logger).create(
+            org_id=org.id,
+            data=ProjectCreate(
+                slug=slug,
+                title="Fan-out Project",
+                source_url=f"https://example.com/example/{slug}",
+            ),
+        )
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug="__main",
+            title="Latest",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        for index in range(_FAN_OUT_DRAFTS):
+            await edition_store.create_internal(
+                project_id=project.id,
+                slug=f"draft-{index:02d}",
+                title=f"draft-{index:02d}",
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": f"tickets/draft-{index:02d}"},
+            )
+        await db_session.commit()
+
+    publisher = _make_publisher(db_session, discovery_client)
+    async with db_session.begin():
+        context = await publisher.build_context(
+            org_id=org.id, project_id=project.id
+        )
+        resolved = await publisher.resolve_template(
+            org_id=org.id, project_id=project.id
+        )
+    return publisher, context, resolved
+
+
+def _fixed_keys(slug: str) -> list[str]:
+    """Return the three project-level artifacts in the order they land."""
+    return [
+        f"{slug}/__dashboard.html",
+        f"{slug}/__404.html",
+        f"{slug}/__switcher.json",
+    ]
+
+
+class _UploadTimelineStore(MockObjectStore):
+    """``MockObjectStore`` that records when each upload starts and lands.
+
+    Each upload stays in flight across a real ``await``, so uploads the
+    caller did not hold back overlap, and pile up in :attr:`peak`.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeline: list[tuple[str, str]] = []
+        self._in_flight = 0
+        self.peak = 0
+
+    async def upload_object(
+        self, *, key: str, data: bytes, content_type: str
+    ) -> int:
+        """Store the object, recording its start and end on the timeline."""
+        self.timeline.append(("start", key))
+        self._in_flight += 1
+        self.peak = max(self.peak, self._in_flight)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().upload_object(
+                key=key, data=data, content_type=content_type
+            )
+        finally:
+            self._in_flight -= 1
+            self.timeline.append(("end", key))
+
+
+@pytest.mark.asyncio
+async def test_render_and_upload_lands_project_artifacts_first(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """The landing page, 404 and switcher land, in order, before editions.
+
+    The edition JSONs now fan out concurrently, but a reader must never
+    see a project's edition files ahead of the pages that link them, so
+    the three project-level artifacts still go one at a time, in order,
+    and the first edition upload starts only after the switcher landed.
+    """
+    slug = "fan-order"
+    publisher, context, resolved = await _seed_fan_out_project(
+        db_session, discovery_client, slug=slug
+    )
+    store = _UploadTimelineStore()
+
+    async with store:
+        await publisher.render_and_upload(
+            context=context,
+            object_store=store,
+            resolved=resolved,
+            upload_concurrency=_FAN_OUT_CAP,
+        )
+
+    fixed = _fixed_keys(slug)
+    assert store.timeline[: 2 * len(fixed)] == [
+        (step, key) for key in fixed for step in ("start", "end")
+    ]
+    rest = store.timeline[2 * len(fixed) :]
+    assert len(rest) == 2 * (_FAN_OUT_DRAFTS + 1)
+    assert all(key.startswith(f"{slug}/__editions/") for _, key in rest)
+
+
+@pytest.mark.asyncio
+async def test_render_and_upload_fans_editions_out_to_the_window(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """Edition JSONs upload concurrently, never more than the window.
+
+    One PUT at a time cost ``ts-xml`` (1,200 editions) about 2 s each
+    and arq cancelled every rebuild at 300 s (#863). The editions now go
+    up ``upload_concurrency`` at a time: with several windows' worth of
+    editions, the store sees exactly that many in flight at its peak.
+    """
+    publisher, context, resolved = await _seed_fan_out_project(
+        db_session, discovery_client, slug="fan-window"
+    )
+    store = _UploadTimelineStore()
+
+    async with store:
+        await publisher.render_and_upload(
+            context=context,
+            object_store=store,
+            resolved=resolved,
+            upload_concurrency=_FAN_OUT_CAP,
+        )
+
+    assert store.peak == _FAN_OUT_CAP
+
+
+@pytest.mark.asyncio
+async def test_render_and_upload_counts_every_artifact(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """Concurrent edition uploads report the same progress as sequential ones.
+
+    ``object_count`` is every artifact uploaded and ``total_size_bytes``
+    their summed size, exactly what the one-at-a-time loop reported, so
+    the job's progress and ``dashboard_built`` metric read the same.
+    """
+    slug = "fan-counts"
+    publisher, context, resolved = await _seed_fan_out_project(
+        db_session, discovery_client, slug=slug
+    )
+    store = _UploadTimelineStore()
+
+    async with store:
+        progress = await publisher.render_and_upload(
+            context=context,
+            object_store=store,
+            resolved=resolved,
+            upload_concurrency=_FAN_OUT_CAP,
+        )
+
+    assert set(store.objects) == {
+        *_fixed_keys(slug),
+        f"{slug}/__editions/__main.json",
+        *(
+            f"{slug}/__editions/draft-{index:02d}.json"
+            for index in range(_FAN_OUT_DRAFTS)
+        ),
+    }
+    assert progress.object_count == len(store.objects)
+    assert progress.total_size_bytes == sum(
+        len(stored.data) for stored in store.objects.values()
+    )
+
+
+class _FirstEditionFailsStore(MockObjectStore):
+    """``MockObjectStore`` whose first edition upload fails.
+
+    The project-level artifacts land. Every edition upload after the
+    first hangs until it is cancelled, and counts the cancellation, so a
+    test can tell an upload torn down with the render from one orphaned
+    to run on after it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempted: list[str] = []
+        self.cancelled = 0
+
+    async def upload_object(
+        self, *, key: str, data: bytes, content_type: str
+    ) -> int:
+        """Fail the first edition, hang every later one until cancelled."""
+        if "/__editions/" not in key:
+            return await super().upload_object(
+                key=key, data=data, content_type=content_type
+            )
+        self.attempted.append(key)
+        if len(self.attempted) == 1:
+            # Long enough for the rest of the window to start uploading.
+            await asyncio.sleep(0.01)
+            msg = "Object store went away"
+            raise RuntimeError(msg)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        msg = "unreachable: the upload hangs until it is cancelled"
+        raise AssertionError(msg)
+
+
+@pytest.mark.asyncio
+async def test_render_and_upload_edition_failure_cancels_the_rest(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """The first failed edition upload stops the rest and raises as itself.
+
+    No further edition upload starts, the ones already in flight are
+    cancelled rather than left running after the job has failed, and the
+    store's own error comes out — not an exception group — so the
+    worker's ``except Exception`` records it and Sentry sees the fault.
+    """
+    publisher, context, resolved = await _seed_fan_out_project(
+        db_session, discovery_client, slug="fan-fails"
+    )
+    store = _FirstEditionFailsStore()
+
+    with pytest.raises(RuntimeError, match=r"^Object store went away$"):
+        async with store:
+            await publisher.render_and_upload(
+                context=context,
+                object_store=store,
+                resolved=resolved,
+                upload_concurrency=_FAN_OUT_CAP,
+            )
+
+    assert 1 < len(store.attempted) <= _FAN_OUT_CAP
+    assert store.cancelled == len(store.attempted) - 1

@@ -214,8 +214,9 @@ COPY_HTTP_TIMEOUT = httpx.Timeout(
 """Timeouts of the HTTP client that carries build-content copies.
 
 The copy client PUTs every object a keeper-sync ``BuildContentCopier``
-writes to R2 through a presigned URL, and every file ``build_processing``
-unpacks into the object store (#877), and nothing else. Each timeout is
+writes to R2 through a presigned URL, every file ``build_processing``
+unpacks into the object store (#877), and every artifact
+``dashboard_build`` renders (#863), and nothing else. Each timeout is
 wider than the shared client's flat 5 s for its own reason:
 
 - ``connect`` (10 s) gives each upload attempt room to reach R2 through
@@ -297,8 +298,9 @@ def copy_http_limits(*, upload_concurrency: int) -> httpx.Limits:
 def create_copy_http_client(*, upload_concurrency: int) -> httpx.AsyncClient:
     """Build the worker's dedicated HTTP client for build-content copies.
 
-    Presigned PUTs of build content, whether a keeper-sync copy or a
-    ``build_processing`` unpack, go over this client so that an upload
+    Presigned PUTs of build content, whether a keeper-sync copy, a
+    ``build_processing`` unpack or a ``dashboard_build`` render, go over
+    this client so that an upload
     burst neither queues behind nor starves the discovery,
     GitHub, Cloudflare KV and purge calls on the shared client, or the
     LTD API calls on :func:`create_ltd_http_client`'s. The shared
@@ -414,8 +416,9 @@ def initialize_worker_http_clients(
     ``ctx["ltd_http_client"]`` the connection-capped LTD Keeper client
     from :func:`create_ltd_http_client`. Every pool opens all three,
     since the pools share :func:`_startup`, but only keeper-sync jobs
-    and crons copy or call LTD, and ``build_processing`` on the default
-    pool is the only other job that uploads over the copy client.
+    and crons copy or call LTD, and ``build_processing`` and
+    ``dashboard_build`` on the default pool are the only other jobs that
+    upload over the copy client.
     Neither dedicated client opens a connection until one of those
     uses it.
 
@@ -670,7 +673,8 @@ class WorkerFactoryBuilder:
         # ``purge_coalescer``: the cap on presigned PUTs (and so on the
         # copy client's connections to R2) only holds if every concurrent
         # ``keeper_sync_project`` job's copier, and every
-        # ``build_processing`` job's store, shares this one semaphore.
+        # ``build_processing`` and ``dashboard_build`` job's store,
+        # shares this one semaphore.
         # A per-job limiter would multiply the cap by ``max_jobs``.
         self._keeper_sync_upload_limiter = keeper_sync_upload_limiter
         # Process-lifetime and owned by ``shutdown``, like
@@ -1021,7 +1025,19 @@ class WorkerSettings:
             instrument_arq_task(build_processing),
             timeout=config.build_processing_job_timeout_seconds,
         ),
-        instrument_arq_task(dashboard_build),
+        # ``dashboard_build`` runs as long as uploading one metadata file
+        # per edition takes, which grows with the project: ``ts-xml``'s
+        # 1,200 editions ran past arq's implicit 300 s default on every
+        # rebuild (#863). It carries an explicit, operator-movable
+        # budget for the same reason as ``build_processing``, and its
+        # reaper threshold is validated to clear it
+        # (``Configuration._check_dashboard_build_reaper_threshold``).
+        # ``max_tries`` is left unset for the reason given for
+        # ``publish_edition`` below.
+        func(
+            instrument_arq_task(dashboard_build),
+            timeout=config.dashboard_build_job_timeout_seconds,
+        ),
         instrument_arq_task(dashboard_sync),
         instrument_arq_task(ping),
         # ``publish_edition`` is the only default-pool job that

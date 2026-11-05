@@ -9,11 +9,12 @@ from typing import Any
 
 import httpx
 import pytest
+import sentry_sdk
 import structlog
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
 from safir.testing.sentry import capture_events_fixture, sentry_init_fixture
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from structlog.testing import capture_logs
 
@@ -24,7 +25,9 @@ from docverse.models import (
     TrackingMode,
 )
 from docverse_server.config import Configuration
+from docverse_server.config import config as runtime_config
 from docverse_server.dbschema.organization import SqlOrganization
+from docverse_server.dbschema.queue_job import SqlQueueJob
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.queue import JobKind, JobStatus
 from docverse_server.factory import Factory
@@ -45,12 +48,10 @@ from docverse_server.storage.queue_job_store import (
     LATE_DELIVERY_IN_PROGRESS_MESSAGE,
     QueueJobStore,
 )
-from docverse_server.worker.functions._cancellation import (
-    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
-)
 from docverse_server.worker.functions.dashboard_build import dashboard_build
 from tests.support.arq_cancel import HangUntilCancelled, cancel_when_reached
 from tests.support.lock_service_spy import install_recording_lock_service
+from tests.support.objectstore import seed_minio_service
 from tests.worker.conftest import make_worker_ctx
 
 
@@ -101,11 +102,19 @@ async def _setup_org_and_project(
 def _mock_create_objectstore(
     mock_store: MockObjectStore,
 ) -> Any:
+    """Return a patched create_objectstore_for_org that returns
+    the given mock store.
+
+    Accepts and ignores the upload-transport keywords
+    ``create_build_upload_objectstore_for_org`` passes through.
+    """
+
     async def _create(
         self: Factory,
         *,
         org_id: int,
         service_label: str,
+        **kwargs: object,
     ) -> MockObjectStore:
         # Mimic the real helper's DB access so callers that invoke it
         # outside an explicit ``session.begin()`` block trigger autobegin
@@ -215,6 +224,7 @@ async def test_dashboard_build_marks_failed_on_render_exception(
         *,
         org_id: int,
         service_label: str,
+        **kwargs: object,
     ) -> MockObjectStore:
         msg = "Simulated objectstore resolution failure"
         raise RuntimeError(msg)
@@ -339,6 +349,7 @@ async def test_dashboard_build_publishes_dashboard_built_on_failure(
         *,
         org_id: int,
         service_label: str,
+        **kwargs: object,
     ) -> MockObjectStore:
         msg = "Simulated objectstore resolution failure"
         raise RuntimeError(msg)
@@ -768,21 +779,52 @@ async def test_dashboard_build_uses_github_template_when_bound(
     assert "<main>" not in html_text
 
 
+_CONFIGURED_DASHBOARD_TIMEOUT_SECONDS = 1200
+"""A ``dashboard_build_job_timeout_seconds`` other than its 900 s default.
+
+The cancel tests run under it so the payload's ``timeout_seconds`` can
+only match if the job read the setting, not arq's default or the stock
+value.
+"""
+
+
+@pytest.mark.parametrize(
+    ("started_ago", "expected_reason"),
+    [
+        pytest.param(None, "worker_shutdown", id="worker_shutdown"),
+        pytest.param(
+            timedelta(seconds=_CONFIGURED_DASHBOARD_TIMEOUT_SECONDS)
+            + timedelta(minutes=1),
+            "job_timeout",
+            id="job_timeout",
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_dashboard_build_cancel_fails_the_row(
+    *,
     app: None,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
+    started_ago: timedelta | None,
+    expected_reason: str,
 ) -> None:
     """An arq cancel mid-build fails the row instead of stranding it.
 
-    The job is cancelled while it resolves the org's object store, as a
-    rolling deploy's SIGTERM would catch it. Left ``in_progress``, the
-    row would hold the project's active-dashboard-build slot until
-    ``dashboard_build_reaper`` noticed; instead it fails with a
-    ``CancelledError`` payload read against arq's default job timeout,
-    which ``dashboard_build`` runs under, and the cancel re-raises.
+    The job is cancelled while it resolves the org's object store, as its
+    arq timeout or a rolling deploy's SIGTERM would catch it. Left
+    ``in_progress``, the row would hold the project's
+    active-dashboard-build slot until ``dashboard_build_reaper``
+    noticed; instead it fails with a ``CancelledError`` payload whose
+    ``reason`` and ``timeout_seconds`` are read against the configured
+    ``dashboard_build_job_timeout_seconds`` arq enforces on it (#863),
+    and the cancel re-raises.
     """
+    monkeypatch.setattr(
+        runtime_config,
+        "dashboard_build_job_timeout_seconds",
+        _CONFIGURED_DASHBOARD_TIMEOUT_SECONDS,
+    )
     async with db_session.begin():
         org, project = await _setup_org_and_project(db_session)
         queue_job = await QueueJobStore(
@@ -807,8 +849,19 @@ async def test_dashboard_build_cancel_fails_the_row(
         "queue_job_public_id": serialize_base32_id(queue_job.public_id),
     }
 
+    async def _backdate() -> None:
+        if started_ago is None:
+            return
+        async for session in db_session_dependency():
+            async with session.begin():
+                await session.execute(
+                    update(SqlQueueJob)
+                    .where(SqlQueueJob.id == queue_job.id)
+                    .values(date_started=func.now() - started_ago)
+                )
+
     task = asyncio.create_task(dashboard_build(ctx, payload))
-    await cancel_when_reached(task, hang.reached)
+    await cancel_when_reached(task, hang.reached, before_cancel=_backdate)
     await ctx["http_client"].aclose()
 
     async for session in db_session_dependency():
@@ -820,7 +873,185 @@ async def test_dashboard_build_cancel_fails_the_row(
             assert job.status == JobStatus.failed
             assert job.errors is not None
             assert job.errors["type"] == "CancelledError"
-            assert job.errors["reason"] == "worker_shutdown"
+            assert job.errors["reason"] == expected_reason
             assert job.errors["timeout_seconds"] == (
-                ARQ_DEFAULT_JOB_TIMEOUT_SECONDS
+                _CONFIGURED_DASHBOARD_TIMEOUT_SECONDS
             )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_uploads_on_the_copy_transport(
+    app: None,
+    db_session: AsyncSession,
+) -> None:
+    """Dashboard PUTs go over the copy client, one limiter slot each.
+
+    ``dashboard_build`` fans its edition JSONs out (#863), so it uploads
+    through the store ``build_processing`` uses (#877): every PUT goes
+    over the worker's copy client and holds a slot of its process-wide
+    upload limiter. A single-slot limiter holds the whole dashboard to
+    one PUT at a time even though the job alone would run the editions
+    together, and none of the PUTs reach the shared client. The org
+    resolves a real ``S3ObjectStore``.
+    """
+    logger = _logger()
+    job_id = "test-arq-dash-copy-transport"
+    drafts = [f"draft-{index}" for index in range(4)]
+    puts: list[str] = []
+    in_flight = 0
+    peak = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, peak
+        if request.method == "PUT":
+            puts.append(request.url.path)
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+        return httpx.Response(200)
+
+    copy_http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    )
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        copy_http_client=copy_http_client,
+        keeper_sync_upload_limiter=asyncio.Semaphore(1),
+        job_id=job_id,
+    )
+    factory = ctx["factory_builder"](session=db_session, logger=logger)
+    org_id = await seed_minio_service(db_session, factory)
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlOrganization)
+            .where(SqlOrganization.id == org_id)
+            .values(publishing_store_label="minio")
+        )
+        org = await OrganizationStore(
+            session=db_session, logger=logger
+        ).get_by_id(org_id)
+        assert org is not None
+        project = await ProjectStore(session=db_session, logger=logger).create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="dash-proj",
+                title="Dash Project",
+                source_url="https://example.com/example/dash",
+            ),
+        )
+        edition_store = EditionStore(session=db_session, logger=logger)
+        for slug in drafts:
+            await edition_store.create_internal(
+                project_id=project.id,
+                slug=slug,
+                title=slug,
+                kind=EditionKind.draft,
+                tracking_mode=TrackingMode.git_ref,
+                tracking_params={"git_ref": f"tickets/{slug}"},
+            )
+        queue_job = await QueueJobStore(
+            session=db_session, logger=logger
+        ).create(
+            kind=JobKind.dashboard_build,
+            org_id=org_id,
+            project_id=project.id,
+            backend_job_id=job_id,
+        )
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+    }
+
+    result = await dashboard_build(ctx, payload)
+    await ctx["http_client"].aclose()
+    await copy_http_client.aclose()
+
+    assert result == "completed"
+    assert sorted(puts) == sorted(
+        [
+            "/docs/dash-proj/__dashboard.html",
+            "/docs/dash-proj/__404.html",
+            "/docs/dash-proj/__switcher.json",
+            *(f"/docs/dash-proj/__editions/{slug}.json" for slug in drafts),
+        ]
+    )
+    assert peak == 1
+
+
+class _EditionUploadFailsStore(MockObjectStore):
+    """``MockObjectStore`` whose every edition upload fails."""
+
+    async def upload_object(
+        self, *, key: str, data: bytes, content_type: str
+    ) -> int:
+        """Store project-level artifacts; refuse edition JSONs."""
+        if "/__editions/" in key:
+            msg = "Object store went away"
+            raise RuntimeError(msg)
+        return await super().upload_object(
+            key=key, data=data, content_type=content_type
+        )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_build_edition_upload_failure_fails_the_job(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed edition PUT fails the row with the store's own error.
+
+    The edition uploads run in a task group (#863), but the row's
+    ``errors`` and the Sentry event carry the ``RuntimeError`` the store
+    raised, not the exception group around it, as the sequential loop
+    reported it.
+    """
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        queue_job = await QueueJobStore(
+            session=db_session, logger=_logger()
+        ).create(
+            kind=JobKind.dashboard_build,
+            org_id=org.id,
+            project_id=project.id,
+            backend_job_id="test-arq-dash-edition-fails",
+        )
+    monkeypatch.setattr(
+        Factory,
+        "create_objectstore_for_org",
+        _mock_create_objectstore(_EditionUploadFailsStore()),
+    )
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(), job_id="test-arq-dash-edition-fails"
+    )
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "queue_job_id": queue_job.id,
+        "queue_job_public_id": serialize_base32_id(queue_job.public_id),
+    }
+
+    result = await dashboard_build(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "failed"
+    assert [type(exc) for exc in captured] == [RuntimeError]
+    async for session in db_session_dependency():
+        async with session.begin():
+            job = await QueueJobStore(session=session, logger=_logger()).get(
+                queue_job.id
+            )
+            assert job is not None
+            assert job.status == JobStatus.failed
+            assert job.errors is not None
+            assert job.errors["type"] == "RuntimeError"
+            assert job.errors["message"] == "Object store went away"
