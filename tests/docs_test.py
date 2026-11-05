@@ -2916,3 +2916,33 @@ def test_build_processing_cancellation_documented() -> None:
         section,
     )
     assert f"{_BUDGET_PAGE}#cancellation" in section
+
+
+def test_build_processing_upload_transport_documented() -> None:
+    """The page says build uploads share the keeper-sync cap and client.
+
+    ``build_processing`` PUTs over the copy client under the worker-wide
+    upload cap (#877), so its unpack time follows
+    ``keeper_sync_upload_concurrency``. The section names the setting,
+    its environment variable and stock value, and the copy client's
+    connect window, read off the code, and links the transport page's
+    account of both; the timeout bullet points at it.
+    """
+    section = _build_section("Upload transport")
+    name = "keeper_sync_upload_concurrency"
+    env_prefix = Configuration.model_config.get("env_prefix", "")
+    assert not _uncoded(
+        {
+            name,
+            f"{env_prefix}{name}".upper(),
+            "keeper_sync_upload_max_attempts",
+        },
+        section,
+    )
+    default = Configuration.model_fields[name].default
+    assert _documented_default(default) in section
+    connect = COPY_HTTP_TIMEOUT.connect
+    assert connect is not None
+    assert f"{connect:g} s connect window" in section
+    assert f"{_TRANSPORT_PAGE}#the-copy-client" in section
+    assert "(#upload-transport)" in _build_section("Settings")

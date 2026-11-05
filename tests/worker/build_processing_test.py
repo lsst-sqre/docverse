@@ -71,7 +71,7 @@ from docverse_server.storage.edition_build_history_store import (
 )
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.keeper_sync import TombstoneReason
-from docverse_server.storage.objectstore import MockObjectStore
+from docverse_server.storage.objectstore import MockObjectStore, S3ObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_backend import ArqQueueBackend
@@ -87,6 +87,7 @@ from tests.support.arq_testing import (
     queue_names,
 )
 from tests.support.lock_service_spy import install_recording_lock_service
+from tests.support.objectstore import seed_minio_service
 from tests.support.rowlocks import backend_pid, wait_until_blocked_or_finished
 from tests.worker.conftest import make_worker_ctx
 
@@ -178,6 +179,9 @@ def _mock_create_objectstore(
 ) -> Any:
     """Return a patched create_objectstore_for_org that returns
     the given mock store.
+
+    Accepts and ignores the upload-transport keywords
+    ``create_build_upload_objectstore_for_org`` passes through.
     """
 
     async def _create(
@@ -185,6 +189,7 @@ def _mock_create_objectstore(
         *,
         org_id: int,
         service_label: str,
+        **kwargs: object,
     ) -> MockObjectStore:
         return mock_store
 
@@ -565,15 +570,17 @@ async def _process_staged_tarball(
     files: dict[str, bytes],
     job_id: str,
     events: DocverseEvents | None = None,
+    store: MockObjectStore | None = None,
 ) -> tuple[Build, MockObjectStore, list[MutableMapping[str, Any]]]:
     """Stage ``files`` as a build's tarball and run ``build_processing``.
 
     Asserts the job completes, then returns the build row as the worker
-    left it, the object store it wrote to, and the log events captured
-    while it ran.
+    left it, the object store it wrote to (``store`` when given, a fresh
+    ``MockObjectStore`` otherwise), and the log events captured while it
+    ran.
     """
     logger = _logger()
-    mock_store = MockObjectStore()
+    mock_store = store if store is not None else MockObjectStore()
 
     async with db_session.begin():
         org, project = await _setup_org_and_project(db_session)
@@ -775,6 +782,169 @@ async def test_build_processing_reports_excluded_members(
     assert event.object_count == len(_SURVIVING_MEMBERS)
     assert event.excluded_object_count == len(_EXCLUDED_MEMBERS)
     assert event.excluded_bytes == excluded_bytes
+
+
+@pytest.mark.asyncio
+async def test_build_processing_uploads_on_the_copy_transport(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Build processing PUTs over the copy client, one limiter slot each.
+
+    A pipelines daily's first 50 presigned PUTs all timed out connecting
+    to R2 over the shared client (#877). The job now uploads through the
+    store the keeper-sync copier uses: every PUT goes over the worker's
+    copy client and holds a slot of its process-wide upload limiter, so
+    a single-slot limiter holds the whole build to one PUT at a time even
+    though the job alone would run them all together. The org resolves a
+    real ``S3ObjectStore``; only its aiobotocore download and delete of
+    the staging tarball are served from memory.
+    """
+    logger = _logger()
+    job_id = "test-arq-copy-transport"
+    files = {
+        "index.html": b"<html>index</html>",
+        "a/page.html": b"<html>a</html>",
+        "b/page.html": b"<html>b</html>",
+    }
+    puts: list[str] = []
+    in_flight = 0
+    peak = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, peak
+        if request.method == "PUT":
+            puts.append(request.url.path)
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+        return httpx.Response(200)
+
+    copy_http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    )
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        copy_http_client=copy_http_client,
+        keeper_sync_upload_limiter=asyncio.Semaphore(1),
+        job_id=job_id,
+    )
+    factory = ctx["factory_builder"](session=db_session, logger=logger)
+    org_id = await seed_minio_service(db_session, factory)
+    async with db_session.begin():
+        await db_session.execute(
+            update(SqlOrganization)
+            .where(SqlOrganization.id == org_id)
+            .values(publishing_store_label="minio")
+        )
+        org = await OrganizationStore(
+            session=db_session, logger=logger
+        ).get_by_id(org_id)
+        assert org is not None
+        project = await ProjectStore(session=db_session, logger=logger).create(
+            org_id=org_id,
+            data=ProjectCreate(
+                slug="worker-test-proj",
+                title="Worker Test Project",
+                source_url="https://example.com/example/repo",
+            ),
+        )
+        build = await _create_build_in_processing(db_session, project.id)
+        await QueueJobStore(session=db_session, logger=logger).create(
+            kind=JobKind.build_processing,
+            org_id=org_id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id=job_id,
+        )
+
+    staged = {build.staging_key: _make_tarball(files)}
+
+    async def _download(self: S3ObjectStore, *, key: str) -> bytes:
+        return staged[key]
+
+    async def _delete(self: S3ObjectStore, *, key: str) -> None:
+        del staged[key]
+
+    monkeypatch.setattr(S3ObjectStore, "download_object", _download)
+    monkeypatch.setattr(S3ObjectStore, "delete_object", _delete)
+    payload: dict[str, Any] = {
+        "org_id": org_id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+    await copy_http_client.aclose()
+
+    assert result == "completed"
+    assert sorted(puts) == sorted(
+        f"/docs/{build.storage_prefix}{name}" for name in files
+    )
+    assert peak == 1
+
+
+class _PeakTrackingStore(MockObjectStore):
+    """``MockObjectStore`` that records its most concurrent uploads.
+
+    Each upload stays in flight across a real ``await``, so uploads the
+    caller did not hold back pile up in :attr:`peak`. Like the
+    aiobotocore fallback, it takes no slot of the worker's upload
+    limiter, so only the caller's own fan-out bounds it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_flight = 0
+        self.peak = 0
+
+    async def upload_object(
+        self, *, key: str, data: bytes, content_type: str
+    ) -> int:
+        """Store the object, counting it in flight while it is."""
+        self._in_flight += 1
+        self.peak = max(self.peak, self._in_flight)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().upload_object(
+                key=key, data=data, content_type=content_type
+            )
+        finally:
+            self._in_flight -= 1
+
+
+@pytest.mark.asyncio
+async def test_build_processing_fans_out_to_the_upload_cap(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The job's own upload fan-out is ``keeper_sync_upload_concurrency``.
+
+    The limiter only bounds presigned PUTs, so the job keeps a bound of
+    its own for a store that does not take a slot, the aiobotocore
+    fallback among them. It is the shared cap rather than a private one,
+    so no store this job writes to sees more uploads at once than a
+    worker's presigned PUTs are allowed.
+    """
+    monkeypatch.setattr(runtime_config, "keeper_sync_upload_concurrency", 2)
+    store = _PeakTrackingStore()
+
+    build, _, _ = await _process_staged_tarball(
+        db_session,
+        monkeypatch,
+        files={f"page-{index}.html": b"<html></html>" for index in range(6)},
+        job_id="test-arq-upload-fan-out",
+        store=store,
+    )
+
+    assert build.object_count == 6
+    assert store.peak == 2
 
 
 @pytest.mark.asyncio

@@ -551,18 +551,20 @@ class Configuration(BaseSettings):
     keeper_sync_upload_concurrency: int = Field(
         32,
         ge=1,
-        title="Concurrent keeper-sync presigned uploads per worker process",
+        title="Concurrent build-content presigned uploads per worker process",
         description=(
             "Process-wide bound on concurrent presigned PUTs across every"
-            " running keeper-sync job, and the size of the sync worker's"
-            " two build-copy connection pools: the upload client opens at"
-            " most this many connections to R2 plus 10 and keeps every one"
-            " of them alive between uploads, and the one LTD S3 source"
-            " every copier downloads through holds at most this many"
-            " connections to S3. ``keeper_sync_max_jobs`` x"
+            " running keeper-sync job and ``build_processing`` job, and the"
+            " size of a worker's two build-copy connection pools: the"
+            " upload client opens at most this many connections to R2 plus"
+            " 10 and keeps every one of them alive between uploads, and"
+            " the one LTD S3 source every copier downloads through holds"
+            " at most this many connections to S3. Each"
+            " ``build_processing`` job also fans its own uploads out this"
+            " wide. On the sync worker, ``keeper_sync_max_jobs`` x"
             " ``keeper_sync_copy_concurrency`` remains the memory bound"
             " (the object bodies copiers buffer) and sizes no pool; a"
-            " value above that product never throttles an upload."
+            " value above that product never throttles a copy."
         ),
     )
 

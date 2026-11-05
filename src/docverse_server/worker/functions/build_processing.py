@@ -67,9 +67,6 @@ from docverse_server.worker.functions._cancellation import (
     record_cancellation,
 )
 
-#: Maximum number of concurrent upload tasks.
-_UPLOAD_CONCURRENCY = 50
-
 #: Statuses a *retirement* can leave on a build the worker is uploading
 #: for. A DELETE cancels it, the stranded-build sweep fails it, a
 #: supersession retires it — every one of them a deliberate decision by
@@ -605,7 +602,10 @@ async def _process_build_locked(
             msg = f"No object store service configured for org {org_id}"
             raise RuntimeError(msg)
 
-        object_store = await factory.create_objectstore_for_org(
+        # The keeper-sync copier's transport: presigned PUTs over the
+        # worker's copy client, each holding the process-wide upload
+        # limiter (#877).
+        object_store = await factory.create_build_upload_objectstore_for_org(
             org_id=org_id, service_label=service_label
         )
 
@@ -1714,7 +1714,15 @@ async def _process_build(
     tarball_data = await object_store.download_object(key=build.staging_key)
 
     build_prefix = build.storage_prefix
-    semaphore = asyncio.Semaphore(_UPLOAD_CONCURRENCY)
+    # The job's own fan-out, at the worker-wide upload cap. On the
+    # presigned path the store from
+    # ``create_build_upload_objectstore_for_org`` holds the process-wide
+    # limiter of that size around each PUT, and that limiter is what
+    # caps PUTs across jobs. This bound covers the rest: a store that
+    # takes no slot (the aiobotocore fallback, which manages its own
+    # pool), and one job queueing its whole build on the shared limiter
+    # ahead of every other upload in the process.
+    semaphore = asyncio.Semaphore(config.keeper_sync_upload_concurrency)
 
     async def _upload_file(name: str, data: bytes) -> int:
         async with semaphore:

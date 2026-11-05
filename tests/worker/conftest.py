@@ -51,6 +51,7 @@ verify_worker_isolation(
 def make_worker_ctx(
     *,
     http_client: httpx.AsyncClient,
+    copy_http_client: httpx.AsyncClient | None = None,
     arq_queue: MockArqQueue | None = None,
     job_id: str | None = None,
     encryptor: CredentialEncryptor | None = None,
@@ -60,6 +61,7 @@ def make_worker_ctx(
     github_webhook_secret: SecretStr | None = None,
     events: DocverseEvents | None = None,
     cdn_purge_enabled: bool = False,
+    keeper_sync_upload_limiter: asyncio.Semaphore | None = None,
     ltd_s3_source: LtdS3Source | None = None,
     aiobotocore_session: AioSession | None = None,
     objectstore_cache: ObjectStoreCache | None = None,
@@ -83,7 +85,13 @@ def make_worker_ctx(
     constructed factories do. ``objectstore_cache`` is the same: given,
     it is recorded in ctx for ``shutdown`` and every per-job factory
     borrows org store clients from it; left out, each store opens and
-    closes a client of its own.
+    closes a client of its own. ``copy_http_client`` and
+    ``keeper_sync_upload_limiter`` are the build-content upload transport
+    ``_startup`` creates: given, the client is recorded in ctx for
+    ``shutdown`` and every per-job factory's copier destinations and
+    build-upload stores PUT over it under that limiter; left out, those
+    stores PUT over ``http_client`` under a fresh limiter sized by
+    ``keeper_sync_upload_concurrency``.
     """
     if encryptor is None:
         encryptor = CredentialEncryptor(
@@ -93,9 +101,14 @@ def make_worker_ctx(
         discovery = DiscoveryClient(http_client)
     if arq_queue is None:
         arq_queue = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    if keeper_sync_upload_limiter is None:
+        keeper_sync_upload_limiter = asyncio.Semaphore(
+            _config.keeper_sync_upload_concurrency
+        )
     builder = WorkerFactoryBuilder(
         encryptor=encryptor,
         http_client=http_client,
+        copy_http_client=copy_http_client,
         arq_queue=arq_queue,
         discovery=discovery,
         github_app_id=github_app_id,
@@ -111,9 +124,7 @@ def make_worker_ctx(
         keeper_sync_copy_retry_delay_seconds=(
             _config.keeper_sync_copy_retry_delay_seconds
         ),
-        keeper_sync_upload_limiter=asyncio.Semaphore(
-            _config.keeper_sync_upload_concurrency
-        ),
+        keeper_sync_upload_limiter=keeper_sync_upload_limiter,
         ltd_s3_source=ltd_s3_source,
         aiobotocore_session=aiobotocore_session,
         objectstore_cache=objectstore_cache,
@@ -123,6 +134,8 @@ def make_worker_ctx(
         "http_client": http_client,
         "arq_queue": arq_queue,
     }
+    if copy_http_client is not None:
+        ctx["copy_http_client"] = copy_http_client
     if objectstore_cache is not None:
         ctx["objectstore_cache"] = objectstore_cache
     if job_id is not None:

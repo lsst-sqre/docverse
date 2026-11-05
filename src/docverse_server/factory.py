@@ -196,8 +196,9 @@ class Factory:
         self._credential_encryptor = credential_encryptor
         self._superadmin_usernames = superadmin_usernames or []
         self._http_client = http_client
-        # The client a keeper-sync copier's destination store PUTs
-        # presigned uploads over, and no other store or client this
+        # The client a keeper-sync copier's destination store and the
+        # build-upload store (``create_build_upload_objectstore_for_org``)
+        # PUT presigned uploads over, and no other store or client this
         # factory builds. Falls back to the shared client so directly
         # constructed factories (tests, scripts) behave exactly as
         # before; the arq worker threads its dedicated copy client
@@ -250,14 +251,14 @@ class Factory:
         self._keeper_sync_copy_retry_delay_seconds = (
             keeper_sync_copy_retry_delay_seconds
         )
-        # The semaphore a keeper-sync copier's destination store holds
-        # around each presigned PUT, and no other store this factory
-        # builds. ``None`` (no bound) keeps directly constructed factories
-        # (tests, scripts) behaving exactly as before; the arq worker
-        # threads its one process-wide semaphore, sized by
-        # ``Config.keeper_sync_upload_concurrency``, through
-        # ``WorkerFactoryBuilder`` so every concurrent job's copies share
-        # the same cap.
+        # The semaphore a keeper-sync copier's destination store and the
+        # build-upload store hold around each presigned PUT, and no other
+        # store this factory builds. ``None`` (no bound) keeps directly
+        # constructed factories (tests, scripts) behaving exactly as
+        # before; the arq worker threads its one process-wide semaphore,
+        # sized by ``Config.keeper_sync_upload_concurrency``, through
+        # ``WorkerFactoryBuilder`` so every concurrent job's copies and
+        # build uploads share the same cap.
         self._keeper_sync_upload_limiter = keeper_sync_upload_limiter
         # The open LTD source every keeper-sync copier this factory builds
         # reads from, and which none of them closes: its owner opened it
@@ -311,7 +312,7 @@ class Factory:
 
     @property
     def copy_http_client(self) -> httpx.AsyncClient | None:
-        """Client a keeper-sync copier's destination store PUTs over.
+        """Client the copier's destination and build-upload store PUT over.
 
         The worker's dedicated copy client when one was given, otherwise
         the shared client (``None`` when neither was).
@@ -349,10 +350,11 @@ class Factory:
 
     @property
     def keeper_sync_upload_limiter(self) -> asyncio.Semaphore | None:
-        """Semaphore bounding a keeper-sync copier's in-flight PUTs.
+        """Semaphore bounding build-content stores' in-flight PUTs.
 
-        The worker's process-wide limiter when one was given, otherwise
-        ``None`` (uploads unbounded).
+        Held by a keeper-sync copier's destination and by the
+        build-upload store. The worker's process-wide limiter when one
+        was given, otherwise ``None`` (uploads unbounded).
         """
         return self._keeper_sync_upload_limiter
 
@@ -1228,11 +1230,13 @@ class Factory:
         upload_http_client
             Client the store PUTs presigned uploads over. Defaults to
             the factory's shared client, which every caller but the
-            keeper-sync copier keeps.
+            keeper-sync copier and
+            :meth:`create_build_upload_objectstore_for_org` keeps.
         upload_limiter
             Semaphore the store holds around each presigned PUT.
             Defaults to ``None`` (no bound), which every caller but the
-            keeper-sync copier keeps.
+            keeper-sync copier and
+            :meth:`create_build_upload_objectstore_for_org` keeps.
 
         Returns
         -------
@@ -1305,6 +1309,51 @@ class Factory:
             build,
         )
 
+    async def create_build_upload_objectstore_for_org(
+        self, *, org_id: int, service_label: str
+    ) -> ObjectStore:
+        """Resolve the store ``build_processing`` unpacks a build into.
+
+        The same store :meth:`create_objectstore_for_org` resolves, on
+        the keeper-sync copier's transport: its presigned PUTs go over
+        :attr:`copy_http_client` and each one holds
+        :attr:`keeper_sync_upload_limiter`, so build processing and
+        keeper-sync copies in one worker process share one cap on PUTs
+        in flight, over a pool sized to that cap. Over the shared client
+        (5 s connect timeout, 20 connections kept alive) a pipelines
+        build's first burst of presigned PUTs all timed out connecting to
+        R2 (#877).
+
+        It keeps the shared retry budget rather than the keeper-sync one:
+        ``build_processing`` uploads inside the transaction that then
+        completes the build, and the keeper-sync budget's longer waits
+        are for callers that hold none.
+
+        Without a copy client the store PUTs over the shared client, and
+        without either it uploads through aiobotocore, as a directly
+        constructed factory's stores do. Without a limiter its PUTs are
+        unbounded.
+
+        Parameters
+        ----------
+        org_id
+            Organization ID.
+        service_label
+            Service label to use (the org's resolved staging store).
+
+        Returns
+        -------
+        ObjectStore
+            An unopened ObjectStore. Caller must use as async context
+            manager.
+        """
+        return await self.create_objectstore_for_org(
+            org_id=org_id,
+            service_label=service_label,
+            upload_http_client=self._copy_http_client,
+            upload_limiter=self._keeper_sync_upload_limiter,
+        )
+
     def create_ltd_client(
         self, *, base_url: str = "https://keeper.lsst.codes"
     ) -> LtdClient:
@@ -1370,12 +1419,13 @@ class Factory:
         the ``keeper_sync_upload_*`` retry budget rather than the shared
         one: a build copy holds no transaction or lock while an upload
         backs off, so it can ride out an R2 connect outage that the
-        shared budget gives up inside (PRD #685). It is likewise the
-        only store that PUTs over :attr:`copy_http_client`, the worker's
+        shared budget gives up inside (PRD #685). Like the store from
+        :meth:`create_build_upload_objectstore_for_org`, and unlike any
+        other, it PUTs over :attr:`copy_http_client`, the worker's
         client sized from its upload cap, rather than the shared client,
-        and the only store that holds :attr:`keeper_sync_upload_limiter`
-        around each PUT, so every copier in the worker process shares
-        one cap on presigned PUTs in flight.
+        and holds :attr:`keeper_sync_upload_limiter` around each PUT, so
+        every copier and build upload in the worker process shares one
+        cap on presigned PUTs in flight.
         """
 
         @asynccontextmanager

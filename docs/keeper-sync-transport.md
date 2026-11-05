@@ -75,9 +75,14 @@ The layers, innermost first:
 | Build-level retry | `KeeperSyncService.sync_build` | A transport outage on either end of the copy: an R2 outage that outlasts one object's whole budget, or the LTD bucket timing out or dropping a connection during a download. One re-run of the copy | `keeper_sync_copy_retry_delay_seconds` |
 | Later syncs | The tier crons, `POST .../refresh`, a backfill run | Anything longer (see [When both retries fail](#when-both-retries-fail)) | None |
 
-Only the keeper-sync worker's copy path uses the first three. The API
-process, and every other object store a worker opens, keep the shared
-retry defaults and the shared HTTP client, and upload without a cap.
+Only the keeper-sync worker's copy path uses the first three. The one
+other user of the second layer is `build_processing`, which uploads
+over the copy client under the same cap but keeps the shared retry
+budget (see
+[Build processing upload transport](build-processing.md#upload-transport)).
+The API process, and every other object store a worker opens, keep the
+shared retry defaults and the shared HTTP client, and upload without a
+cap.
 
 The first two layers are on the R2 side only. The per-object budget
 applies to uploads, and LTD downloads go through aiobotocore rather
@@ -114,8 +119,10 @@ covers both ends.
   configurable.
 - `keeper_sync_upload_concurrency` bounds the presigned PUTs in flight
   at once across every keeper-sync job in the worker process (see
-  [The worker-wide upload cap](#the-worker-wide-upload-cap)). It also
-  sizes both of the sync worker's copy pools: the copy client's
+  [The worker-wide upload cap](#the-worker-wide-upload-cap)), and
+  across every `build_processing` job in the default worker (see
+  [Build processing upload transport](build-processing.md#upload-transport)).
+  It also sizes both of the sync worker's copy pools: the copy client's
   connections to R2 (see [Connection pool](#connection-pool)) and the
   shared LTD source's connections to S3 (see
   [The LTD source client](#the-ltd-source-client)). Lowering it slows a
@@ -201,8 +208,9 @@ failed this way.
 
 ## The copy client
 
-Presigned PUTs of copied objects go over a dedicated
-`httpx.AsyncClient`, and nothing else does. Every worker process opens
+Presigned PUTs of copied objects, and of the files `build_processing`
+unpacks from an upload, go over a dedicated `httpx.AsyncClient`, and
+nothing else does. Every worker process opens
 it at startup next to the shared client and the LTD API client
 (`ctx["copy_http_client"]` next to `ctx["http_client"]` and
 `ctx["ltd_http_client"]`), and `shutdown` closes all three. The shared
@@ -228,7 +236,8 @@ Each worker process builds one `asyncio.Semaphore` of
 `keeper_sync_upload_concurrency` slots at startup.
 `WorkerFactoryBuilder` holds it and hands it to every job's `Factory`,
 which passes it to the destination store of each keeper-sync copier
-and of nothing else. Every concurrent `keeper_sync_project` job's
+and to the store each `build_processing` job unpacks into, and to
+nothing else. Every concurrent `keeper_sync_project` job's
 copier therefore shares the one semaphore: at the defaults, ten jobs of
 eight transfers each have up to 80 objects in flight, and at most 32 of
 them are PUTting to R2 at any moment. The rest are downloading from
@@ -256,11 +265,11 @@ per-object budget, but it is wall-clock time. `elapsed_seconds` on the
 under a saturated cap it can run past the ride-out arithmetic above.
 No log line or metric reports a slot wait on its own.
 
-Only the keeper-sync copier's store takes a slot. The API process,
-build processing, dashboard builds and every other store a worker
-opens upload without a cap. Within that store only the presigned path
-honours it; the aiobotocore fallback, which production does not take,
-manages its own pool.
+Only the keeper-sync copier's store and `build_processing`'s store take
+a slot. The API process, dashboard builds and every other store a
+worker opens upload without a cap. Within those stores only the
+presigned path honours it; the aiobotocore fallback, which production
+does not take, manages its own pool.
 
 ### Timeouts
 
@@ -306,8 +315,9 @@ configuration: they bound transport behaviour an operator has no reason
 to tune, while the retry budget on top of them is configurable. The
 pool follows `keeper_sync_upload_concurrency` automatically. Every
 worker pool opens a copy client sized from that setting, because the
-pools share one startup, but only keeper-sync jobs copy and the client
-opens no connection until a copy uses it.
+pools share one startup, but only keeper-sync jobs on the sync pool and
+`build_processing` on the default pool upload over it, and the client
+opens no connection until one of them does.
 
 ### The LTD source client
 

@@ -90,11 +90,12 @@ class S3ObjectStore:
         once. Each attempt holds one slot for its PUT alone: signing the
         URL happens before the slot is taken, and the backoff between
         attempts happens after it is released, so a retrying object never
-        idles a slot another upload could use. The keeper-sync worker
-        shares one semaphore, sized by
+        idles a slot another upload could use. A worker process shares
+        one semaphore, sized by
         ``Config.keeper_sync_upload_concurrency``, across every copier's
-        store so the whole process never opens more upload connections
-        than that cap. ``None`` (the default) leaves uploads unbounded.
+        store and every ``build_processing`` job's store so the whole
+        process never opens more upload connections than that cap.
+        ``None`` (the default) leaves uploads unbounded.
         Only the presigned path honours it; the aiobotocore fallback
         manages its own connection pool.
     session
