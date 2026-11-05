@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Protocol, Self, runtime_checkable
+from typing import IO, Protocol, Self, runtime_checkable
 
 __all__ = ["ObjectEntry", "ObjectStore", "require_nonblank_prefix"]
 
@@ -224,6 +224,33 @@ class ObjectStore(Protocol):
         -------
         bytes
             The object contents.
+        """
+        ...
+
+    async def download_object_to_file(
+        self, *, key: str, fileobj: IO[bytes]
+    ) -> int:
+        """Download an object into a binary file, a chunk at a time.
+
+        The streaming sibling of :meth:`download_object`, for objects
+        too large to hold in memory: ``build_processing`` spools a
+        build's staging tarball, about 100 MB for a pipelines weekly,
+        to a temporary file this way rather than into a ``bytes``
+        object (#878). The body is written from ``fileobj``'s current
+        position, and the file is left positioned after the last byte
+        written; the caller rewinds it before reading it back.
+
+        Parameters
+        ----------
+        key
+            Object store key.
+        fileobj
+            Binary file, open for writing, to write the object into.
+
+        Returns
+        -------
+        int
+            Number of bytes written.
         """
         ...
 

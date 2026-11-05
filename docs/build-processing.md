@@ -82,7 +82,52 @@ to about twice that wall clock. Its `phase` moves through `unpacking`,
 same `keeper_sync_upload_concurrency` as the target's, since the upload
 cap sets how fast `unpacking` goes (see
 [Upload transport](#upload-transport)). Check the result against
-[the reaper floor](#the-reaper-floor) before setting it.
+[the reaper floor](#the-reaper-floor) before setting it. The same upload
+is where to read the worker's memory and disk needs off (see
+[Worker memory and disk](#worker-memory-and-disk)).
+
+## Worker memory and disk
+
+`build_processing` never holds a whole build in memory. It streams the
+staging tarball into a temporary file, then reads the tarball back from
+that file one member at a time: it takes a slot of its upload window
+before it reads a member's bytes, uploads the member at once, and drops
+the bytes when the upload lands. The window is
+`keeper_sync_upload_concurrency` members wide (see
+[Upload transport](#upload-transport)), so one job holds at most that
+many files in memory however many the build has. Before this the job
+held the whole tarball and every extracted file at once, and a
+pipelines weekly (8,598 files, 390 MB, a 94 MB tarball) was OOM-killed
+at the worker's 1Gi limit 40 s into its unpack.
+
+Size the worker for the largest build the deployment takes:
+
+- **Memory:** peak ≈ baseline + cap × largest file, per
+  `build_processing` job running at once, where the cap is
+  `keeper_sync_upload_concurrency` and the baseline is the worker's
+  idle footprint plus the `publish_edition` and `dashboard_build` jobs
+  that share the default pool with the unpack. The tarball adds
+  nothing here: it is on disk. Writing it fills the page cache, which
+  can show in the pod's memory graphs, but the kernel reclaims those
+  pages before it would OOM-kill the worker.
+- **Disk:** peak ≈ the tarball, per `build_processing` job running at
+  once; the extracted files never touch disk. The job logs the size it
+  spooled as `tarball_size_bytes` on its `Upload complete` line. The
+  file is created in Python's temporary directory (`TMPDIR`, else
+  `/tmp`) without a name, so closing it when the job completes, fails,
+  or is cancelled frees the space, and so does the kernel when the
+  process dies.
+
+The worker's memory limit is the Phalanx `workerResources` value
+(`workerResources.limits.memory`). The Phalanx chart runs the worker
+with a read-only root filesystem, so the worker needs a writable
+`emptyDir` volume mounted at `/tmp`, or `TMPDIR` pointed at one; without
+one, every `build_processing` job fails as it creates its temporary
+file. Keep that volume disk-backed: an `emptyDir` with
+`medium: Memory` is a tmpfs, whose contents count against the memory
+limit and so would put the whole tarball back in memory. The volume
+counts against the pod's ephemeral storage, which has to hold the
+largest tarball for every `build_processing` job that can run at once.
 
 ## Upload transport
 

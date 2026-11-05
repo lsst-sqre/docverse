@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from contextlib import nullcontext
 from time import monotonic
 from types import TracebackType
-from typing import Self
+from typing import IO, Self
 
 import httpx
 import structlog
@@ -38,6 +38,12 @@ _UPLOAD_URL_EXPIRES_SECONDS = 900
 #: tunable, and a prefix delete simply issues as many requests as the
 #: listing needs.
 _DELETE_BATCH_SIZE = 1000
+
+#: Bytes read off a ``GetObject`` body per write by
+#: ``download_object_to_file``. Large enough that a ~100 MB staging
+#: tarball is a hundred writes rather than aiobotocore's default 1 KiB
+#: chunks, small enough to be noise next to the worker's memory limit.
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class S3ObjectStore:
@@ -225,6 +231,26 @@ class S3ObjectStore:
         async with response["Body"] as stream:
             data: bytes = await stream.read()
         return data
+
+    async def download_object_to_file(
+        self, *, key: str, fileobj: IO[bytes]
+    ) -> int:
+        """Stream an object from S3 into ``fileobj``.
+
+        Copies the body :data:`_DOWNLOAD_CHUNK_BYTES` at a time, so the
+        store holds one chunk of it, never the whole object. Retries are
+        botocore's, which cover the ``GetObject`` request but not a body
+        that fails partway; a caller that sees one raise downloads again
+        into a fresh file.
+        """
+        client = self._get_client()
+        response = await client.get_object(Bucket=self._bucket, Key=key)
+        written = 0
+        async with response["Body"] as stream:
+            async for chunk in stream.iter_chunks(_DOWNLOAD_CHUNK_BYTES):
+                fileobj.write(chunk)
+                written += len(chunk)
+        return written
 
     async def delete_object(self, *, key: str) -> None:
         """Delete an object from S3."""

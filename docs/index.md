@@ -63,8 +63,9 @@ that back each of them up.
   `build_processing` job may unpack an upload: its job timeout and
   reaper threshold side by side, the floor that keeps the reaper
   threshold above the timeout and the startup error when it does not,
-  what a timed-out job records, and how to size the timeout from a
-  measured upload.
+  what a timed-out job records, how to size the timeout from a
+  measured upload, and how much memory and temporary disk the worker
+  needs to unpack one.
 - [GitHub integration](github-integration.md) — what each GitHub App
   webhook delivery does (`push`, `delete`, `repository` renamed,
   transferred and edited, `organization` renamed, and the

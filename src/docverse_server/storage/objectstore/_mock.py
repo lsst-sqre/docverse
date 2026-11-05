@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Self
+from typing import IO, Self
 from urllib.parse import quote
 
 import structlog
@@ -81,6 +81,14 @@ class MockObjectStore:
             msg = f"Object {key!r} not found"
             raise KeyError(msg)
         return obj.data
+
+    async def download_object_to_file(
+        self, *, key: str, fileobj: IO[bytes]
+    ) -> int:
+        """Write an in-memory object into ``fileobj``."""
+        data = await self.download_object(key=key)
+        fileobj.write(data)
+        return len(data)
 
     async def delete_object(self, *, key: str) -> None:
         """Delete an object from the in-memory store."""

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from docverse_server.storage.objectstore import MockObjectStore, ObjectEntry
@@ -34,6 +36,33 @@ async def test_download_missing_raises() -> None:
     store = MockObjectStore()
     with pytest.raises(KeyError):
         await store.download_object(key="nonexistent")
+
+
+@pytest.mark.asyncio
+async def test_download_object_to_file_writes_the_object() -> None:
+    """The streaming download writes the object's bytes and counts them."""
+    store = MockObjectStore()
+    await store.upload_object(
+        key="staging/build.tar.gz", data=b"tarball", content_type="x"
+    )
+    target = io.BytesIO()
+
+    written = await store.download_object_to_file(
+        key="staging/build.tar.gz", fileobj=target
+    )
+
+    assert written == len(b"tarball")
+    assert target.getvalue() == b"tarball"
+
+
+@pytest.mark.asyncio
+async def test_download_object_to_file_missing_raises() -> None:
+    """A missing key raises as ``download_object`` does, writing nothing."""
+    store = MockObjectStore()
+    target = io.BytesIO()
+    with pytest.raises(KeyError):
+        await store.download_object_to_file(key="nonexistent", fileobj=target)
+    assert target.getvalue() == b""
 
 
 @pytest.mark.asyncio

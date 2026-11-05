@@ -12,6 +12,7 @@ that counts its opens and closes.
 from __future__ import annotations
 
 import asyncio
+import io
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Self
@@ -278,6 +279,14 @@ async def test_handle_borrows_the_shared_store_while_entered() -> None:
             ObjectEntry(key="proj/a.html", size=1)
         ]
         assert await second.download_object(key="proj/a.html") == b"a"
+        target = io.BytesIO()
+        assert (
+            await second.download_object_to_file(
+                key="proj/a.html", fileobj=target
+            )
+            == 1
+        )
+        assert target.getvalue() == b"a"
         assert await second.delete_prefix(prefix="proj/") == 1
 
     (store,) = builds.stores

@@ -2946,3 +2946,32 @@ def test_build_processing_upload_transport_documented() -> None:
     assert f"{connect:g} s connect window" in section
     assert f"{_TRANSPORT_PAGE}#the-copy-client" in section
     assert "(#upload-transport)" in _build_section("Settings")
+
+
+def test_build_processing_worker_memory_documented() -> None:
+    """The page sizes the worker's memory and disk for an unpack (#878).
+
+    ``build_processing`` spools the staging tarball to a temporary file
+    and holds at most ``keeper_sync_upload_concurrency`` members in
+    memory, so the section gives that bound, names the Phalanx
+    ``workerResources`` value that sets the worker's memory limit, and
+    says the worker needs a writable, disk-backed temporary directory,
+    which a read-only root filesystem does not give it. The timeout's
+    sizing section points at it, since a measured upload is also where
+    the memory peak is read off.
+    """
+    section = _build_section("Worker memory and disk")
+    assert not _uncoded(
+        {
+            "keeper_sync_upload_concurrency",
+            "workerResources",
+            "TMPDIR",
+            "/tmp",  # noqa: S108 - the path the page names, not one used
+            "emptyDir",
+            "medium: Memory",
+            "tarball_size_bytes",
+        },
+        section,
+    )
+    assert "cap \N{MULTIPLICATION SIGN} largest file" in section
+    assert "(#worker-memory-and-disk)" in _build_section("Sizing the timeout")

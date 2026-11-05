@@ -16,8 +16,9 @@ store issues.
 from __future__ import annotations
 
 import asyncio
+import io
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
-from typing import Any, cast
+from typing import Any, Self, cast
 
 import httpx
 import pytest
@@ -1003,3 +1004,79 @@ async def test_open_creates_the_client_from_an_injected_session(
 
     assert create_calls == ["s3"]
     assert sessions == []
+
+
+class _StubBody:
+    """Stand-in for an aiobotocore streaming body, served in chunks.
+
+    Offers only the async context manager and ``iter_chunks``, so a store
+    that read the whole body in one ``read()`` would fail here rather
+    than buffer it. Records the chunk size it was asked for and whether
+    it was closed.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.chunk_sizes: list[int] = []
+        self.closed = False
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        self.closed = True
+
+    async def iter_chunks(self, chunk_size: int) -> AsyncIterator[bytes]:
+        self.chunk_sizes.append(chunk_size)
+        for start in range(0, len(self._data), chunk_size):
+            yield self._data[start : start + chunk_size]
+
+
+class _StubGetObjectClient:
+    """Stand-in for the aiobotocore S3 client's ``get_object``."""
+
+    def __init__(self, body: _StubBody) -> None:
+        self.body = body
+        self.get_calls: list[dict[str, Any]] = []
+
+    async def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        self.get_calls.append(kwargs)
+        return {"Body": self.body}
+
+
+@pytest.mark.asyncio
+async def test_download_object_to_file_streams_the_body_in_chunks() -> None:
+    """The staging tarball reaches the file a chunk at a time (#878).
+
+    ``download_object`` reads the whole body into one ``bytes``, which
+    for a pipelines weekly's tarball is about 100 MB of worker memory
+    before unpacking even starts. The streaming download copies the
+    body into the caller's file in bounded chunks instead, and closes
+    the body when it is done.
+    """
+    data = bytes(range(256)) * 20_000
+    body = _StubBody(data)
+    client = _StubGetObjectClient(body)
+    store = S3ObjectStore(
+        endpoint_url="https://account.r2.cloudflarestorage.com",
+        bucket="docs",
+        access_key_id="key-id",
+        secret_access_key="secret-key",
+        region="auto",
+        logger=structlog.get_logger("test"),
+    )
+    store._client = cast("AioBaseClient", client)
+    target = io.BytesIO()
+
+    written = await store.download_object_to_file(
+        key="__staging/build.tar.gz", fileobj=target
+    )
+
+    assert written == len(data)
+    assert target.getvalue() == data
+    assert client.get_calls == [
+        {"Bucket": "docs", "Key": "__staging/build.tar.gz"}
+    ]
+    (chunk_size,) = body.chunk_sizes
+    assert 0 < chunk_size < len(data)
+    assert body.closed

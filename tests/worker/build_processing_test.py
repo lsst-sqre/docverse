@@ -6,12 +6,14 @@ import asyncio
 import hashlib
 import io
 import tarfile
+import tempfile
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import IO, Any
 
 import httpx
 import pytest
@@ -862,13 +864,15 @@ async def test_build_processing_uploads_on_the_copy_transport(
 
     staged = {build.staging_key: _make_tarball(files)}
 
-    async def _download(self: S3ObjectStore, *, key: str) -> bytes:
-        return staged[key]
+    async def _download(
+        self: S3ObjectStore, *, key: str, fileobj: IO[bytes]
+    ) -> int:
+        return fileobj.write(staged[key])
 
     async def _delete(self: S3ObjectStore, *, key: str) -> None:
         del staged[key]
 
-    monkeypatch.setattr(S3ObjectStore, "download_object", _download)
+    monkeypatch.setattr(S3ObjectStore, "download_object_to_file", _download)
     monkeypatch.setattr(S3ObjectStore, "delete_object", _delete)
     payload: dict[str, Any] = {
         "org_id": org_id,
@@ -945,6 +949,340 @@ async def test_build_processing_fans_out_to_the_upload_cap(
 
     assert build.object_count == 6
     assert store.peak == 2
+
+
+class _MemberWindow:
+    """Counts tarball members whose bytes are in memory at once.
+
+    A member enters the window when the worker opens it out of the
+    tarball (:func:`_count_member_reads`) and leaves once its upload has
+    landed (:class:`_WindowedStore`): between the two its bytes are
+    live in the worker, whether queued for an upload slot or in flight.
+    """
+
+    def __init__(self) -> None:
+        self.live = 0
+        self.peak = 0
+        self.opened = 0
+
+    def enter(self) -> None:
+        """Count one member's bytes as read out of the tarball."""
+        self.opened += 1
+        self.live += 1
+        self.peak = max(self.peak, self.live)
+
+    def leave(self) -> None:
+        """Count one member's bytes as uploaded and dropped."""
+        self.live -= 1
+
+
+def _count_member_reads(
+    monkeypatch: pytest.MonkeyPatch, window: _MemberWindow
+) -> None:
+    """Enter every member the worker opens out of a tarball in ``window``."""
+    extractfile = tarfile.TarFile.extractfile
+
+    def _extractfile(
+        self: tarfile.TarFile, member: str | tarfile.TarInfo
+    ) -> IO[bytes] | None:
+        window.enter()
+        return extractfile(self, member)
+
+    monkeypatch.setattr(tarfile.TarFile, "extractfile", _extractfile)
+
+
+class _WindowedStore(MockObjectStore):
+    """``MockObjectStore`` that drops each uploaded member from a window.
+
+    Every upload stays in flight across a real ``await``, so a worker
+    that reads ahead of its uploads has time to. The test's own staging
+    upload, under ``__staging/``, is not a member and is not counted.
+    """
+
+    def __init__(self, window: _MemberWindow) -> None:
+        super().__init__()
+        self._window = window
+
+    async def upload_object(
+        self, *, key: str, data: bytes, content_type: str
+    ) -> int:
+        """Store the object, then let its member leave the window."""
+        if key.startswith("__staging/"):
+            return await super().upload_object(
+                key=key, data=data, content_type=content_type
+            )
+        await asyncio.sleep(0.001)
+        attempts = await super().upload_object(
+            key=key, data=data, content_type=content_type
+        )
+        self._window.leave()
+        return attempts
+
+
+@pytest.mark.asyncio
+async def test_build_processing_holds_one_upload_window_of_members(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At most ``keeper_sync_upload_concurrency`` members are in memory.
+
+    A pipelines weekly (8,598 files, 390 MB) OOM-killed the worker at
+    1Gi because the job read every member into memory before its first
+    upload began (#878). The worker now takes an upload slot before it
+    reads a member's bytes and uploads each member as soon as it is
+    read, so a tarball many times the window never has more than the
+    window's worth of members live at once — and the build's inventory
+    and manifest hash come out exactly as when every member was read up
+    front.
+    """
+    cap = 3
+    monkeypatch.setattr(runtime_config, "keeper_sync_upload_concurrency", cap)
+    files = {
+        f"./dir-{index % 4}/page-{index:02d}.html": (
+            f"<html>{index}</html>".encode() * (index + 1)
+        )
+        for index in range(cap * 8)
+    }
+    window = _MemberWindow()
+    _count_member_reads(monkeypatch, window)
+
+    build, store, _ = await _process_staged_tarball(
+        db_session,
+        monkeypatch,
+        files=files,
+        job_id="test-arq-upload-window",
+        store=_WindowedStore(window),
+    )
+
+    assert build.status == BuildStatus.completed
+    assert build.object_count == len(files)
+    assert build.total_size_bytes == sum(len(data) for data in files.values())
+    assert build.content_hash == hash_manifest_pairs(
+        (name, hashlib.sha256(data).hexdigest())
+        for name, data in files.items()
+    )
+    assert {
+        key.removeprefix(build.storage_prefix): stored.data
+        for key, stored in store.objects.items()
+    } == {name.removeprefix("./"): data for name, data in files.items()}
+    assert window.opened == len(files)
+    assert window.live == 0
+    assert window.peak == cap
+
+
+def _record_temporary_files(
+    monkeypatch: pytest.MonkeyPatch, directory: Path
+) -> list[IO[bytes]]:
+    """Put :mod:`tempfile`'s files in ``directory`` and record them.
+
+    Returns the list every ``tempfile.TemporaryFile`` the worker opens
+    from here on is appended to, still open or not.
+    """
+    monkeypatch.setattr(tempfile, "tempdir", str(directory))
+    opened: list[IO[bytes]] = []
+    temporary_file = tempfile.TemporaryFile
+
+    def _recording_temporary_file(*args: Any, **kwargs: Any) -> IO[bytes]:
+        file: IO[bytes] = temporary_file(*args, **kwargs)
+        opened.append(file)
+        return file
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", _recording_temporary_file)
+    return opened
+
+
+class _SpoolWatchingStore(MockObjectStore):
+    """``MockObjectStore`` that checks the spooled tarball mid-upload.
+
+    Each member upload records whether every temporary file the worker
+    opened is still open, then lands, fails or hangs until cancelled,
+    per ``outcome``. The test's own staging upload passes straight
+    through.
+    """
+
+    def __init__(self, opened: list[IO[bytes]], outcome: str) -> None:
+        super().__init__()
+        self._opened = opened
+        self._outcome = outcome
+        self.spool_open_during_upload: list[bool] = []
+        self.hang = HangUntilCancelled()
+
+    async def upload_object(
+        self, *, key: str, data: bytes, content_type: str
+    ) -> int:
+        """Note the spool's state, then land, fail or hang."""
+        if not key.startswith("__staging/"):
+            self.spool_open_during_upload.append(
+                bool(self._opened)
+                and not any(file.closed for file in self._opened)
+            )
+            if self._outcome == "failed":
+                msg = "Object store went away"
+                raise RuntimeError(msg)
+            if self._outcome == "cancelled":
+                await self.hang()
+        return await super().upload_object(
+            key=key, data=data, content_type=content_type
+        )
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+@pytest.mark.asyncio
+async def test_build_processing_removes_the_spooled_tarball(
+    *,
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    """The tarball's temporary file goes, however the job ends (#878).
+
+    The staging tarball is spooled to a temporary file in the worker's
+    ephemeral storage rather than held in memory, so a file left behind
+    by a failed or cancelled job would fill the pod's disk instead. The
+    file is open while members upload and closed — which removes it —
+    once the job has completed, failed on an upload error, or been
+    cancelled mid-upload as arq's timeout would.
+    """
+    job_id = f"test-arq-spool-{outcome}"
+    opened = _record_temporary_files(monkeypatch, tmp_path)
+    store = _SpoolWatchingStore(opened, outcome)
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(db_session, project.id)
+        await QueueJobStore(session=db_session, logger=_logger()).create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id=job_id,
+        )
+    await store.upload_object(
+        key=build.staging_key,
+        data=_make_tarball({"index.html": b"<html>spooled</html>"}),
+        content_type="application/gzip",
+    )
+    monkeypatch.setattr(
+        Factory, "create_objectstore_for_org", _mock_create_objectstore(store)
+    )
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), job_id=job_id)
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    task = asyncio.create_task(build_processing(ctx, payload))
+    if outcome == "cancelled":
+        await cancel_when_reached(task, store.hang.reached)
+    else:
+        assert await task == outcome
+    await ctx["http_client"].aclose()
+
+    assert store.spool_open_during_upload == [True]
+    assert len(opened) == 1
+    assert opened[0].closed
+    assert list(tmp_path.iterdir()) == []
+
+
+class _FirstUploadFailsStore(MockObjectStore):
+    """``MockObjectStore`` whose first member upload fails.
+
+    Every later member upload hangs until it is cancelled, and counts
+    the cancellation, so a test can tell an upload torn down with the
+    job from one orphaned to run on after it. The test's own staging
+    upload passes straight through.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempted: list[str] = []
+        self.cancelled = 0
+
+    async def upload_object(
+        self, *, key: str, data: bytes, content_type: str
+    ) -> int:
+        """Fail the first member, hang every later one until cancelled."""
+        if key.startswith("__staging/"):
+            return await super().upload_object(
+                key=key, data=data, content_type=content_type
+            )
+        self.attempted.append(key)
+        if len(self.attempted) == 1:
+            # Long enough for the rest of the window to start uploading.
+            await asyncio.sleep(0.01)
+            msg = "Object store went away"
+            raise RuntimeError(msg)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        msg = "unreachable: the upload hangs until it is cancelled"
+        raise AssertionError(msg)
+
+
+@pytest.mark.asyncio
+async def test_build_processing_upload_error_stops_the_unpack(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first failed upload stops the unpack and its other uploads.
+
+    ``asyncio.gather`` raised the first error but left every other
+    upload running, orphaned, after the job had already failed. Now the
+    worker reads no further into the tarball, cancels the uploads still
+    in flight, and reports the store's own error rather than an
+    exception group, so Sentry sees the fault itself.
+    """
+    cap = 2
+    monkeypatch.setattr(runtime_config, "keeper_sync_upload_concurrency", cap)
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", captured.append)
+    job_id = "test-arq-upload-stops"
+    store = _FirstUploadFailsStore()
+    async with db_session.begin():
+        org, project = await _setup_org_and_project(db_session)
+        build = await _create_build_in_processing(db_session, project.id)
+        await QueueJobStore(session=db_session, logger=_logger()).create(
+            kind=JobKind.build_processing,
+            org_id=org.id,
+            project_id=project.id,
+            build_id=build.id,
+            backend_job_id=job_id,
+        )
+    files = {f"page-{index:02d}.html": b"<html></html>" for index in range(20)}
+    await store.upload_object(
+        key=build.staging_key,
+        data=_make_tarball(files),
+        content_type="application/gzip",
+    )
+    monkeypatch.setattr(
+        Factory, "create_objectstore_for_org", _mock_create_objectstore(store)
+    )
+    ctx = make_worker_ctx(http_client=httpx.AsyncClient(), job_id=job_id)
+    payload: dict[str, Any] = {
+        "org_id": org.id,
+        "org_slug": org.slug,
+        "project_slug": project.slug,
+        "build_id": build.id,
+        "build_public_id": serialize_base32_id(build.public_id),
+    }
+
+    result = await build_processing(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "failed"
+    assert len(captured) == 1
+    assert isinstance(captured[0], RuntimeError)
+    assert str(captured[0]) == "Object store went away"
+    assert 1 < len(store.attempted) <= cap
+    assert store.cancelled == len(store.attempted) - 1
 
 
 @pytest.mark.asyncio

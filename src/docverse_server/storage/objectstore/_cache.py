@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator, Callable, Hashable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Self
+from typing import IO, Any, Self
 
 import httpx
 import structlog
@@ -394,6 +394,14 @@ class _CachedObjectStore:
     async def download_object(self, *, key: str) -> bytes:
         """Download an object through the shared store."""
         return await self._require_store().download_object(key=key)
+
+    async def download_object_to_file(
+        self, *, key: str, fileobj: IO[bytes]
+    ) -> int:
+        """Stream an object into ``fileobj`` through the shared store."""
+        return await self._require_store().download_object_to_file(
+            key=key, fileobj=fileobj
+        )
 
     async def upload_object(
         self, *, key: str, data: bytes, content_type: str
