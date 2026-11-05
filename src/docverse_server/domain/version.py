@@ -20,6 +20,7 @@ from docverse.models import TrackingMode
 __all__ = [
     "EupsDailyVersion",
     "EupsMajorVersion",
+    "EupsReleaseVersion",
     "EupsWeeklyVersion",
     "LsstDocVersion",
     "SemverVersion",
@@ -136,11 +137,15 @@ def parse_stable_semver(git_ref: str | None) -> SemverVersion | None:
 
 
 # ---------------------------------------------------------------------------
-# EUPS Major  (e.g. v12_0, 12.0)
+# EUPS Major  (e.g. v12_0, 12.0, 13-0)
+#
+# Every EUPS grammar accepts ``-`` as a separator alongside ``_`` and ``.``
+# so legacy LTD edition slugs (``13-0``, ``w-2018-06``) parse and order
+# with the rest. Slug derivation keeps those refs verbatim.
 # ---------------------------------------------------------------------------
 
 _EUPS_MAJOR_RE = re.compile(
-    r"^v?(?P<major>0|[1-9]\d*)[_.](?P<minor>0|[1-9]\d*)$"
+    r"^v?(?P<major>0|[1-9]\d*)[-_.](?P<minor>0|[1-9]\d*)$"
 )
 
 
@@ -174,10 +179,93 @@ class EupsMajorVersion:
 
 
 # ---------------------------------------------------------------------------
-# EUPS Weekly  (e.g. w_2024_05, w.2024.05)
+# EUPS Release  (e.g. v30_0_12, v17_0, v30_0_12_rc3, 13-0)
 # ---------------------------------------------------------------------------
 
-_EUPS_WEEKLY_RE = re.compile(r"^w[_.](?P<year>\d{4})[_.](?P<week>\d{2})$")
+_EUPS_RELEASE_RE = re.compile(
+    r"^v?(?P<major>0|[1-9]\d*)[-_.](?P<minor>0|[1-9]\d*)"
+    r"(?:[-_.](?P<patch>0|[1-9]\d*))?"
+    r"(?:[-_.]rc(?P<rc>0|[1-9]\d*))?$"
+)
+
+
+@functools.total_ordering
+@dataclass(frozen=True, slots=True)
+class EupsReleaseVersion:
+    """A parsed EUPS release tag, final or release candidate.
+
+    The grammar is ``v?MAJOR<sep>MINOR[<sep>PATCH][<sep>rcN]`` where each
+    ``<sep>`` is ``_``, ``.`` or ``-``. Underscores are what the Rubin
+    release pipelines emit (``v30_0_12``, ``v30_0_12_rc3``); the dot and
+    hyphen forms exist so legacy edition slugs such as ``13-0`` order
+    among the rest. A two-component tag (``v17_0``, the stack's form
+    through 17.0) parses with a ``patch`` of ``0``, so ``v17_0`` sorts
+    below ``v17_0_1``.
+
+    A release candidate orders below the final release of the same
+    version and above every earlier version, and candidates order by
+    their number. `is_final` is what tracking consults: only final
+    releases advance an ``eups_release`` edition.
+    """
+
+    major: int
+    minor: int
+    patch: int = 0
+    rc: int | None = None
+    """Release-candidate number, or ``None`` for a final release."""
+
+    @classmethod
+    def parse(cls, git_ref: str) -> Self | None:
+        """Parse a git ref as an EUPS release tag.
+
+        Returns ``None`` if the ref does not match the grammar.
+        """
+        m = _EUPS_RELEASE_RE.match(git_ref)
+        if m is None:
+            return None
+        rc = m.group("rc")
+        return cls(
+            major=int(m.group("major")),
+            minor=int(m.group("minor")),
+            patch=int(m.group("patch") or "0"),
+            rc=int(rc) if rc is not None else None,
+        )
+
+    @property
+    def is_final(self) -> bool:
+        """Whether this is a final release rather than a candidate."""
+        return self.rc is None
+
+    def _sort_key(self) -> tuple[int, int, int, bool, int]:
+        # A final release (``is_final`` True) sorts above every candidate
+        # of the same version; candidates then order by their number.
+        return (
+            self.major,
+            self.minor,
+            self.patch,
+            self.is_final,
+            self.rc or 0,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, EupsReleaseVersion):
+            return NotImplemented
+        return self._sort_key() == other._sort_key()
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, EupsReleaseVersion):
+            return NotImplemented
+        return self._sort_key() < other._sort_key()
+
+    def __hash__(self) -> int:
+        return hash(self._sort_key())
+
+
+# ---------------------------------------------------------------------------
+# EUPS Weekly  (e.g. w_2024_05, w.2024.05, w-2018-06)
+# ---------------------------------------------------------------------------
+
+_EUPS_WEEKLY_RE = re.compile(r"^w[-_.](?P<year>\d{4})[-_.](?P<week>\d{2})$")
 
 
 @functools.total_ordering
@@ -210,11 +298,11 @@ class EupsWeeklyVersion:
 
 
 # ---------------------------------------------------------------------------
-# EUPS Daily  (e.g. d_2024_01_15, d.2024.01.15)
+# EUPS Daily  (e.g. d_2024_01_15, d.2024.01.15, d-2024-01-15)
 # ---------------------------------------------------------------------------
 
 _EUPS_DAILY_RE = re.compile(
-    r"^d[_.](?P<year>\d{4})[_.](?P<month>\d{2})[_.](?P<day>\d{2})$"
+    r"^d[-_.](?P<year>\d{4})[-_.](?P<month>\d{2})[-_.](?P<day>\d{2})$"
 )
 
 
@@ -319,6 +407,7 @@ class LsstDocVersion:
 VersionType = (
     SemverVersion
     | EupsMajorVersion
+    | EupsReleaseVersion
     | EupsWeeklyVersion
     | EupsDailyVersion
     | LsstDocVersion
@@ -340,6 +429,8 @@ def parse_version_for_mode(
         return SemverVersion.parse(git_ref)
     if mode == TrackingMode.eups_major_release:
         return EupsMajorVersion.parse(git_ref)
+    if mode == TrackingMode.eups_release:
+        return EupsReleaseVersion.parse(git_ref)
     if mode == TrackingMode.eups_weekly_release:
         return EupsWeeklyVersion.parse(git_ref)
     if mode == TrackingMode.eups_daily_release:

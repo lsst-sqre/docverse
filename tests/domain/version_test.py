@@ -8,6 +8,7 @@ from docverse.models import TrackingMode
 from docverse_server.domain.version import (
     EupsDailyVersion,
     EupsMajorVersion,
+    EupsReleaseVersion,
     EupsWeeklyVersion,
     LsstDocVersion,
     SemverVersion,
@@ -122,6 +123,8 @@ class TestEupsMajorVersion:
             ("12.0", EupsMajorVersion(12, 0)),
             ("v1_2", EupsMajorVersion(1, 2)),
             ("0.0", EupsMajorVersion(0, 0)),
+            ("13-0", EupsMajorVersion(13, 0)),  # legacy LTD slug
+            ("v16-0", EupsMajorVersion(16, 0)),
         ],
     )
     def test_parse_valid(self, ref: str, expected: EupsMajorVersion) -> None:
@@ -148,6 +151,89 @@ class TestEupsMajorVersion:
         assert EupsMajorVersion(12, 0) == EupsMajorVersion(12, 0)
 
 
+# ── EupsReleaseVersion ────────────────────────────────────────────────────
+
+
+class TestEupsReleaseVersion:
+    """Parsing and ordering for EUPS release tags (``v30_0_12``)."""
+
+    @pytest.mark.parametrize(
+        ("ref", "expected"),
+        [
+            ("v30_0_12", EupsReleaseVersion(30, 0, 12)),
+            ("v17_0_1", EupsReleaseVersion(17, 0, 1)),
+            ("v17_0", EupsReleaseVersion(17, 0, 0)),
+            ("v30.0.12", EupsReleaseVersion(30, 0, 12)),
+            ("13-0", EupsReleaseVersion(13, 0, 0)),
+            ("v16-0", EupsReleaseVersion(16, 0, 0)),
+            ("30_0_12", EupsReleaseVersion(30, 0, 12)),
+            ("v30_0_12_rc3", EupsReleaseVersion(30, 0, 12, rc=3)),
+            ("v15_0_rc1", EupsReleaseVersion(15, 0, 0, rc=1)),
+        ],
+    )
+    def test_parse_valid(self, ref: str, expected: EupsReleaseVersion) -> None:
+        assert EupsReleaseVersion.parse(ref) == expected
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "w_2026_45",  # weekly
+            "w-2018-06",
+            "d_2026_11_04",  # daily
+            "30",  # one component
+            "v30",
+            "v30_0_12_rc",  # rc without a number
+            "v30_0_12_beta1",
+            "v30_0_12_1",  # four numeric components
+            "main",
+            "tickets/DM-56964",
+            "v30_0_12-rc.3",
+        ],
+    )
+    def test_parse_invalid(self, ref: str) -> None:
+        assert EupsReleaseVersion.parse(ref) is None
+
+    def test_ordering(self) -> None:
+        """Two-component releases sort as patch 0 below later patches."""
+        v17_0 = EupsReleaseVersion.parse("v17_0")
+        v17_0_1 = EupsReleaseVersion.parse("v17_0_1")
+        v30_0_12 = EupsReleaseVersion.parse("v30_0_12")
+        assert v17_0 is not None
+        assert v17_0_1 is not None
+        assert v30_0_12 is not None
+        assert v17_0 < v17_0_1 < v30_0_12
+
+    def test_ordering_is_numeric(self) -> None:
+        assert EupsReleaseVersion(9, 0, 0) < EupsReleaseVersion(13, 0, 0)
+        assert EupsReleaseVersion(30, 0, 9) < EupsReleaseVersion(30, 0, 11)
+
+    def test_release_candidate_orders_below_final(self) -> None:
+        rc = EupsReleaseVersion.parse("v30_0_12_rc3")
+        final = EupsReleaseVersion.parse("v30_0_12")
+        previous = EupsReleaseVersion.parse("v30_0_11")
+        assert rc is not None
+        assert final is not None
+        assert previous is not None
+        assert previous < rc < final
+
+    def test_release_candidates_order_numerically(self) -> None:
+        assert EupsReleaseVersion(30, 0, 12, rc=9) < EupsReleaseVersion(
+            30, 0, 12, rc=10
+        )
+
+    def test_is_final(self) -> None:
+        final = EupsReleaseVersion.parse("v30_0_12")
+        rc = EupsReleaseVersion.parse("v30_0_12_rc3")
+        assert final is not None
+        assert rc is not None
+        assert final.is_final
+        assert not rc.is_final
+
+    def test_separators_do_not_affect_equality(self) -> None:
+        dotted = EupsReleaseVersion.parse("v30.0.12")
+        assert dotted == EupsReleaseVersion.parse("v30_0_12")
+
+
 # ── EupsWeeklyVersion ─────────────────────────────────────────────────────
 
 
@@ -158,6 +244,7 @@ class TestEupsWeeklyVersion:
             ("w_2024_05", EupsWeeklyVersion(2024, 5)),
             ("w.2024.05", EupsWeeklyVersion(2024, 5)),
             ("w_2023_52", EupsWeeklyVersion(2023, 52)),
+            ("w-2018-06", EupsWeeklyVersion(2018, 6)),  # legacy LTD slug
         ],
     )
     def test_parse_valid(self, ref: str, expected: EupsWeeklyVersion) -> None:
@@ -189,6 +276,7 @@ class TestEupsDailyVersion:
         [
             ("d_2024_01_15", EupsDailyVersion(2024, 1, 15)),
             ("d.2024.01.15", EupsDailyVersion(2024, 1, 15)),
+            ("d-2018-06-01", EupsDailyVersion(2018, 6, 1)),
         ],
     )
     def test_parse_valid(self, ref: str, expected: EupsDailyVersion) -> None:
@@ -284,6 +372,21 @@ class TestParseVersionForMode:
         v = parse_version_for_mode("v1.0", TrackingMode.lsst_doc)
         assert isinstance(v, LsstDocVersion)
 
+    def test_eups_release(self) -> None:
+        v = parse_version_for_mode("v30_0_12", TrackingMode.eups_release)
+        assert v == EupsReleaseVersion(30, 0, 12)
+
+    def test_eups_release_candidate(self) -> None:
+        """Candidates parse; matching, not parsing, keeps them out."""
+        v = parse_version_for_mode("v30_0_12_rc3", TrackingMode.eups_release)
+        assert v == EupsReleaseVersion(30, 0, 12, rc=3)
+
+    def test_eups_release_rejects_weekly(self) -> None:
+        assert (
+            parse_version_for_mode("w_2026_45", TrackingMode.eups_release)
+            is None
+        )
+
     def test_git_ref_returns_none(self) -> None:
         assert parse_version_for_mode("main", TrackingMode.git_ref) is None
 
@@ -350,6 +453,23 @@ class TestAcceptsVersionAdvance:
             current_build_id=7,
             current_build_git_ref="15.2.1",
             mode=TrackingMode.semver_major,
+        )
+
+    def test_eups_release_overtakes_a_branch_build(self) -> None:
+        """A ``main`` build on an ``eups_release`` edition is replaced."""
+        assert accepts_version_advance(
+            candidate=EupsReleaseVersion(30, 0, 11),
+            current_build_id=7,
+            current_build_git_ref="main",
+            mode=TrackingMode.eups_release,
+        )
+
+    def test_eups_release_refuses_an_older_release(self) -> None:
+        assert not accepts_version_advance(
+            candidate=EupsReleaseVersion(30, 0, 11),
+            current_build_id=7,
+            current_build_git_ref="v30_0_12",
+            mode=TrackingMode.eups_release,
         )
 
     def test_uses_the_mode_grammar(self) -> None:

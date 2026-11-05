@@ -85,6 +85,7 @@ _VERSION_MODES = frozenset(
         TrackingMode.semver_major,
         TrackingMode.semver_minor,
         TrackingMode.eups_major_release,
+        TrackingMode.eups_release,
         TrackingMode.eups_weekly_release,
         TrackingMode.eups_daily_release,
         TrackingMode.lsst_doc,

@@ -111,6 +111,7 @@ from docverse_server.domain.project import FALLBACK_DEFAULT_BRANCH
 from docverse_server.domain.version import (
     EupsDailyVersion,
     EupsMajorVersion,
+    EupsReleaseVersion,
     EupsWeeklyVersion,
     LsstDocVersion,
     SemverVersion,
@@ -1808,6 +1809,12 @@ class EditionStore:
 
         if mode == TrackingMode.eups_major_release:
             return EupsMajorVersion.parse(git_ref) is not None
+
+        if mode == TrackingMode.eups_release:
+            # Release candidates parse but never match, so one cannot
+            # displace the final release an edition is serving.
+            release = EupsReleaseVersion.parse(git_ref)
+            return release is not None and release.is_final
 
         if mode == TrackingMode.eups_weekly_release:
             return EupsWeeklyVersion.parse(git_ref) is not None

@@ -90,6 +90,24 @@ async def test_create_edition(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_edition_eups_release(client: AsyncClient) -> None:
+    """POST accepts the ``eups_release`` tracking mode."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions",
+        json={
+            "slug": "latest-release",
+            "title": "Latest release",
+            "kind": "release",
+            "tracking_mode": "eups_release",
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    assert response.json()["tracking_mode"] == "eups_release"
+
+
+@pytest.mark.asyncio
 async def test_list_editions(client: AsyncClient) -> None:
     await _setup(client)
     await client.post(
@@ -474,6 +492,23 @@ async def test_patch_default_edition_kind_blocked(
         headers={"X-Auth-Request-User": "testuser"},
     )
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_patch_default_edition_to_eups_release(
+    client: AsyncClient,
+) -> None:
+    """PATCH __main can switch it to follow the latest EUPS release."""
+    await _setup(client)
+    response = await client.patch(
+        "/docverse/orgs/ed-org/projects/ed-proj/editions/__main",
+        json={"tracking_mode": "eups_release", "title": "Latest release"},
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["tracking_mode"] == "eups_release"
+    assert data["title"] == "Latest release"
 
 
 @pytest.mark.asyncio
