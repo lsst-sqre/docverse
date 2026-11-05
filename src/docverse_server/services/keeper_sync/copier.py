@@ -49,7 +49,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import mimetypes
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 
 import structlog
@@ -62,6 +62,7 @@ from docverse_server.domain.content_hash import (
 from docverse_server.storage._http_retry import retry_budget_exhausted
 from docverse_server.storage.ltd import LtdSourceProtocol
 from docverse_server.storage.objectstore import ObjectStore
+from docverse_server.taskgroups import first_real_error
 
 __all__ = [
     "DEFAULT_COPY_CONCURRENCY",
@@ -372,7 +373,7 @@ class BuildContentCopier:
                 for _ in range(worker_count):
                     task_group.create_task(_worker())
         except BaseExceptionGroup as exc_group:
-            leaf = _first_real_error(exc_group)
+            leaf = first_real_error(exc_group)
             # Re-raising the leaf ``from`` its *own* ``__cause__`` (which
             # is often ``None``) suppresses the group as ``__context__``
             # — the only thing worth hiding here — while leaving any
@@ -519,39 +520,3 @@ def _reject_escaping_keys(
                 " relative path contains '..' segment"
             )
             raise RuntimeError(msg)
-
-
-def _iter_leaf_exceptions(
-    group: BaseExceptionGroup[BaseException],
-) -> Iterator[BaseException]:
-    """Yield every non-group leaf exception in ``group``, depth-first."""
-    for exc in group.exceptions:
-        if isinstance(exc, BaseExceptionGroup):
-            yield from _iter_leaf_exceptions(exc)
-        else:
-            yield exc
-
-
-def _first_real_error(
-    group: BaseExceptionGroup[BaseException],
-) -> BaseException:
-    """Return the first non-cancellation leaf exception in ``group``.
-
-    ``asyncio.TaskGroup`` reports failures as an exception group, but the
-    copier's callers (``sync_edition`` and the keeper-sync worker's
-    ``except Exception`` isolation blocks) expect the underlying error
-    itself — an S3 ``AccessDenied``, say — exactly as the old
-    ``asyncio.gather`` call raised it. So the group is flattened back
-    down to its first real failure. Cancellations are skipped: they are
-    the pool tearing down siblings, not the cause.
-
-    If two keys fail close enough together that both land before
-    cancellation does, only the first is raised. That matches the
-    ``gather`` contract this replaces, which likewise surfaced one
-    error; the group itself is returned only when *every* leaf is a
-    cancellation, which should not happen for a group the pool raised.
-    """
-    for exc in _iter_leaf_exceptions(group):
-        if not isinstance(exc, asyncio.CancelledError):
-            return exc
-    return group

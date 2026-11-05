@@ -90,6 +90,7 @@ from .functions import (
     purgatory_cleanup_dispatcher,
     purgatory_cleanup_reaper,
 )
+from .functions.build_processing import probe_staging_spool
 from .functions.project_github_resolve import PROJECT_GITHUB_RESOLVE_MAX_TRIES
 from .queues import KEEPER_SYNC_QUEUE_NAME, MAINTENANCE_QUEUE_NAME
 
@@ -213,7 +214,9 @@ COPY_HTTP_TIMEOUT = httpx.Timeout(
 """Timeouts of the HTTP client that carries build-content copies.
 
 The copy client PUTs every object a keeper-sync ``BuildContentCopier``
-writes to R2 through a presigned URL, and nothing else. Each timeout is
+writes to R2 through a presigned URL, every file ``build_processing``
+unpacks into the object store (#877), and every artifact
+``dashboard_build`` renders (#863), and nothing else. Each timeout is
 wider than the shared client's flat 5 s for its own reason:
 
 - ``connect`` (10 s) gives each upload attempt room to reach R2 through
@@ -295,8 +298,10 @@ def copy_http_limits(*, upload_concurrency: int) -> httpx.Limits:
 def create_copy_http_client(*, upload_concurrency: int) -> httpx.AsyncClient:
     """Build the worker's dedicated HTTP client for build-content copies.
 
-    Presigned PUTs of copied build content go over this client so that
-    a copy burst neither queues behind nor starves the discovery,
+    Presigned PUTs of build content, whether a keeper-sync copy, a
+    ``build_processing`` unpack or a ``dashboard_build`` render, go over
+    this client so that an upload
+    burst neither queues behind nor starves the discovery,
     GitHub, Cloudflare KV and purge calls on the shared client, or the
     LTD API calls on :func:`create_ltd_http_client`'s. The shared
     client keeps httpx's defaults; Cloudflare KV calls set their own
@@ -411,8 +416,11 @@ def initialize_worker_http_clients(
     ``ctx["ltd_http_client"]`` the connection-capped LTD Keeper client
     from :func:`create_ltd_http_client`. Every pool opens all three,
     since the pools share :func:`_startup`, but only keeper-sync jobs
-    and crons copy or call LTD, and neither dedicated client opens a
-    connection until one of those uses it.
+    and crons copy or call LTD, and ``build_processing`` and
+    ``dashboard_build`` on the default pool are the only other jobs that
+    upload over the copy client.
+    Neither dedicated client opens a connection until one of those
+    uses it.
 
     Split out of :func:`_startup`, like :func:`initialize_worker_db_pool`,
     so the clients a worker actually ships with are reachable without
@@ -664,7 +672,9 @@ class WorkerFactoryBuilder:
         # Required for the same reason, and process-lifetime like
         # ``purge_coalescer``: the cap on presigned PUTs (and so on the
         # copy client's connections to R2) only holds if every concurrent
-        # ``keeper_sync_project`` job's copier shares this one semaphore.
+        # ``keeper_sync_project`` job's copier, and every
+        # ``build_processing`` and ``dashboard_build`` job's store,
+        # shares this one semaphore.
         # A per-job limiter would multiply the cap by ``max_jobs``.
         self._keeper_sync_upload_limiter = keeper_sync_upload_limiter
         # Process-lifetime and owned by ``shutdown``, like
@@ -909,12 +919,24 @@ async def _startup(
 
 
 async def startup_default(ctx: dict[str, Any]) -> None:
-    """on_startup for the default Docverse arq queue."""
+    """on_startup for the default Docverse arq queue.
+
+    ``build_processing`` runs only on this pool, so only this pool
+    probes the temporary directory its jobs spool staging tarballs to
+    (:func:`probe_staging_spool`). A worker that cannot write one fails
+    here, before it takes a job, rather than failing every upload it is
+    handed. The probe runs after :func:`_startup` so its failure is
+    logged and reported like any other startup error; arq still runs
+    :func:`shutdown` to release what ``_startup`` opened.
+    """
     await _startup(
         ctx,
         component="worker",
         queue_name=config.arq_queue_name,
         max_jobs=config.arq_max_jobs,
+    )
+    structlog.get_logger("docverse_server.worker").info(
+        "Staging spool directory", directory=probe_staging_spool()
     )
 
 
@@ -990,8 +1012,32 @@ class WorkerSettings:
 
     max_jobs = config.arq_max_jobs
     functions = [
-        instrument_arq_task(build_processing),
-        instrument_arq_task(dashboard_build),
+        # ``build_processing`` runs as long as unpacking a build into
+        # the object store takes, which grows with the build: a large
+        # documentation site of thousands of files is what it has to be
+        # sized for. So it carries an explicit, operator-movable budget
+        # instead of arq's implicit 300 s default, which stays its stock
+        # value (PRD #864); its reaper threshold is validated to clear
+        # it (``Configuration._check_build_processing_reaper_threshold``).
+        # ``max_tries`` is left unset for the reason given for
+        # ``publish_edition`` below.
+        func(
+            instrument_arq_task(build_processing),
+            timeout=config.build_processing_job_timeout_seconds,
+        ),
+        # ``dashboard_build`` runs as long as uploading one metadata file
+        # per edition takes, which grows with the project: ``ts-xml``'s
+        # 1,200 editions ran past arq's implicit 300 s default on every
+        # rebuild (#863). It carries an explicit, operator-movable
+        # budget for the same reason as ``build_processing``, and its
+        # reaper threshold is validated to clear it
+        # (``Configuration._check_dashboard_build_reaper_threshold``).
+        # ``max_tries`` is left unset for the reason given for
+        # ``publish_edition`` below.
+        func(
+            instrument_arq_task(dashboard_build),
+            timeout=config.dashboard_build_job_timeout_seconds,
+        ),
         instrument_arq_task(dashboard_sync),
         instrument_arq_task(ping),
         # ``publish_edition`` is the only default-pool job that

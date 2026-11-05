@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from types import TracebackType
-from typing import Self
+from types import SimpleNamespace, TracebackType
+from typing import Any, Self
 from unittest.mock import Mock
 
 import httpx
@@ -628,15 +628,23 @@ async def test_copier_destination_uses_keeper_sync_upload_budget(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "create_store",
+    ["create_objectstore_for_org", "create_build_upload_objectstore_for_org"],
+)
 async def test_objectstore_for_org_keeps_the_shared_upload_budget(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
+    create_store: str,
 ) -> None:
-    """Every other store the factory builds keeps the shared budget.
+    """Every store but the copier's destination keeps the shared budget.
 
-    The API's build uploads, dashboard renders and build processing all
-    call ``create_objectstore_for_org`` directly, so the keeper-sync
-    budget — set on this factory too — must not leak into them.
+    The API's build uploads and dashboard renders call
+    ``create_objectstore_for_org`` directly, so the keeper-sync budget —
+    set on this factory too — must not leak into them. Build
+    processing's store shares the copier's transport but not its budget:
+    it uploads inside the transaction that completes the build, which
+    the keeper-sync budget's longer waits are not meant to hold open.
     """
     delays = _record_sleeps(monkeypatch)
     attempts: list[int] = []
@@ -656,7 +664,7 @@ async def test_objectstore_for_org_keeps_the_shared_upload_budget(
         )
         org_id = await seed_minio_service(db_session, factory)
         async with db_session.begin():
-            store = await factory.create_objectstore_for_org(
+            store = await getattr(factory, create_store)(
                 org_id=org_id, service_label="minio"
             )
         async with store:
@@ -784,9 +792,9 @@ async def test_objectstore_for_org_keeps_the_shared_client(
 ) -> None:
     """Every other store the factory builds uploads over the shared client.
 
-    Dashboard renders and build processing call
-    ``create_objectstore_for_org`` directly; the copy client is sized for
-    keeper-sync copies alone, so it must not leak into them.
+    Dashboard renders call ``create_objectstore_for_org`` directly; the
+    copy client is sized for build-content uploads (keeper-sync copies
+    and build processing) alone, so it must not leak into them.
     """
     shared_puts: list[str] = []
     copy_puts: list[str] = []
@@ -897,11 +905,11 @@ async def test_other_stores_get_no_upload_limiter(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only the keeper-sync copier's store uploads under the limiter.
+    """Only the build-content stores upload under the limiter.
 
-    The limiter caps the sync worker's presigned PUTs to R2 so a backfill
-    burst cannot exhaust the node's NAT ports; API build uploads,
-    dashboard renders and build processing call
+    The limiter caps a worker's presigned PUTs of build content to R2 so
+    a backfill, a large build's unpack or a large dashboard render cannot
+    exhaust the node's NAT ports; API build uploads call
     ``create_objectstore_for_org`` directly and must keep uploading
     unbounded, even on a factory that holds the worker's limiter.
     """
@@ -933,6 +941,164 @@ async def test_other_stores_get_no_upload_limiter(
     assert len(recorded) == 1
     assert "upload_limiter" in recorded[0]
     assert recorded[0]["upload_limiter"] is None
+
+
+@pytest.mark.asyncio
+async def test_build_upload_store_puts_over_the_copy_client(
+    db_session: AsyncSession,
+) -> None:
+    """Build processing's store PUTs over the worker's copy client.
+
+    ``build_processing`` unpacks a whole build at once, and over the
+    shared client (5 s connect timeout, 20 connections kept alive) the
+    first burst of a pipelines-sized build's presigned PUTs all timed
+    out connecting to R2 (#877). Its store PUTs over the copy client
+    instead, as a keeper-sync copier's destination does, and none of
+    its PUTs reach the shared client.
+    """
+    shared_puts: list[str] = []
+    copy_puts: list[str] = []
+    async with (
+        httpx.AsyncClient(
+            transport=_recording_transport(shared_puts)
+        ) as http_client,
+        httpx.AsyncClient(
+            transport=_recording_transport(copy_puts)
+        ) as copy_http_client,
+    ):
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            credential_encryptor=CredentialEncryptor(
+                current_key=Fernet.generate_key().decode()
+            ),
+            http_client=http_client,
+            copy_http_client=copy_http_client,
+            default_queue_name="docverse:queue",
+        )
+        org_id = await seed_minio_service(db_session, factory)
+        async with db_session.begin():
+            store = await factory.create_build_upload_objectstore_for_org(
+                org_id=org_id, service_label="minio"
+            )
+        async with store:
+            await store.upload_object(
+                key="proj/__builds/1/index.html",
+                data=b"<html></html>",
+                content_type="text/html",
+            )
+
+    assert copy_puts == ["/docs/proj/__builds/1/index.html"]
+    assert shared_puts == []
+
+
+@pytest.mark.asyncio
+async def test_build_upload_store_uploads_under_the_upload_limiter(
+    db_session: AsyncSession,
+) -> None:
+    """Build processing's store holds the worker's upload limiter per PUT.
+
+    ``build_processing`` fans its uploads out on its own, so the cap on
+    the copy client's connections only holds if every PUT it makes also
+    takes a slot of the process-wide limiter the keeper-sync copiers
+    take. A single-slot limiter must hold three concurrent uploads to
+    one PUT at a time. The handler holds each PUT open across a real
+    ``await`` so PUTs the limiter did not hold back pile up in the peak.
+    """
+    puts: list[str] = []
+    in_flight = 0
+    peak = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, peak
+        if request.method == "PUT":
+            puts.append(request.url.path)
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler)
+    ) as copy_http_client:
+        factory = Factory(
+            session=db_session,
+            logger=_logger(),
+            credential_encryptor=CredentialEncryptor(
+                current_key=Fernet.generate_key().decode()
+            ),
+            copy_http_client=copy_http_client,
+            default_queue_name="docverse:queue",
+            keeper_sync_upload_limiter=asyncio.Semaphore(1),
+        )
+        org_id = await seed_minio_service(db_session, factory)
+        async with db_session.begin():
+            store = await factory.create_build_upload_objectstore_for_org(
+                org_id=org_id, service_label="minio"
+            )
+        async with store:
+            await asyncio.gather(
+                *(
+                    store.upload_object(
+                        key=f"proj/__builds/1/page-{index}.html",
+                        data=b"<html></html>",
+                        content_type="text/html",
+                    )
+                    for index in range(3)
+                )
+            )
+
+    assert len(puts) == 3
+    assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_build_upload_store_falls_back_to_aiobotocore(
+    db_session: AsyncSession,
+) -> None:
+    """Without an HTTP client, build processing's store uses aiobotocore.
+
+    A directly constructed factory holds neither the copy client nor the
+    shared one, so the store it resolves for build processing has no
+    client to PUT a presigned URL over and must upload through its
+    aiobotocore client's ``put_object``, as every store such a factory
+    builds does. A ``before-call`` hook on the session answers the call
+    in place of the network, the way botocore's own ``Stubber`` does.
+    """
+    session = get_session()
+    put_paths: list[str] = []
+
+    def _answer_put(
+        *, params: dict[str, Any], **kwargs: Any
+    ) -> tuple[SimpleNamespace, dict[str, Any]]:
+        put_paths.append(params["url_path"])
+        return SimpleNamespace(status_code=200, headers={}), {}
+
+    session.register("before-call.s3.PutObject", _answer_put)
+    factory = Factory(
+        session=db_session,
+        logger=_logger(),
+        credential_encryptor=CredentialEncryptor(
+            current_key=Fernet.generate_key().decode()
+        ),
+        default_queue_name="docverse:queue",
+        aiobotocore_session=session,
+    )
+    org_id = await seed_minio_service(db_session, factory)
+    async with db_session.begin():
+        store = await factory.create_build_upload_objectstore_for_org(
+            org_id=org_id, service_label="minio"
+        )
+    async with store:
+        attempts = await store.upload_object(
+            key="proj/__builds/1/index.html",
+            data=b"<html></html>",
+            content_type="text/html",
+        )
+
+    assert attempts == 1
+    assert put_paths == ["/proj/__builds/1/index.html"]
 
 
 @pytest.mark.asyncio

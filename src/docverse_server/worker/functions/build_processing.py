@@ -9,16 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import mimetypes
 import tarfile
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum, auto
-from typing import Any
+from typing import IO, Any
 
 import sentry_sdk
 import structlog
@@ -33,6 +33,7 @@ from docverse.models import (
     PublishJobRef,
     RetiredBuildStatus,
 )
+from docverse_server.config import config
 from docverse_server.domain.api_urls import edition_url, job_url
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
@@ -60,15 +61,58 @@ from docverse_server.storage.build_store import BuildStore
 from docverse_server.storage.objectstore import ObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
+from docverse_server.taskgroups import first_real_error
 from docverse_server.worker.functions._cancellation import (
-    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
     RunFinaliser,
     cancellation_recorded,
     record_cancellation,
 )
 
-#: Maximum number of concurrent upload tasks.
-_UPLOAD_CONCURRENCY = 50
+#: Name prefix of the temporary file a build's staging tarball is spooled
+#: to while it is unpacked. The file is created in :mod:`tempfile`'s
+#: directory (``TMPDIR``, else ``/tmp``), which must be writable: see
+#: "Worker memory and disk" in ``docs/build-processing.md``.
+_STAGING_TARBALL_PREFIX = "docverse-staging-"
+
+
+def probe_staging_spool() -> str:
+    """Check that a staging tarball can be spooled to a temporary file.
+
+    The default worker pool calls this once at startup. Every
+    ``build_processing`` job spools its staging tarball to a
+    :func:`tempfile.TemporaryFile` (#878), so a worker without a
+    writable temporary directory, such as the Phalanx chart's read-only
+    root filesystem with no ``/tmp`` volume, would accept each upload
+    and then fail it. Opening and closing one such file here makes that
+    misconfiguration stop the worker at startup instead.
+
+    Returns
+    -------
+    str
+        The directory staging tarballs are spooled to.
+
+    Raises
+    ------
+    RuntimeError
+        If no temporary file can be created there, chained from the
+        ``OSError`` that says why.
+    """
+    try:
+        directory = tempfile.gettempdir()
+        with tempfile.TemporaryFile(
+            prefix=_STAGING_TARBALL_PREFIX, dir=directory
+        ):
+            pass
+    except OSError as exc:
+        msg = (
+            "build_processing cannot spool staging tarballs to a temporary"
+            f" file ({exc}). Mount a writable, disk-backed volume at /tmp"
+            " or point TMPDIR at one; see 'Worker memory and disk' in"
+            " docs/build-processing.md."
+        )
+        raise RuntimeError(msg) from exc
+    return directory
+
 
 #: Statuses a *retirement* can leave on a build the worker is uploading
 #: for. A DELETE cancels it, the stranded-build sweep fails it, a
@@ -605,7 +649,10 @@ async def _process_build_locked(
             msg = f"No object store service configured for org {org_id}"
             raise RuntimeError(msg)
 
-        object_store = await factory.create_objectstore_for_org(
+        # The keeper-sync copier's transport: presigned PUTs over the
+        # worker's copy client, each holding the process-wide upload
+        # limiter (#877).
+        object_store = await factory.create_build_upload_objectstore_for_org(
             org_id=org_id, service_label=service_label
         )
 
@@ -624,13 +671,15 @@ async def _process_build_locked(
     # job with a ``CancelledError`` that the ``except Exception`` below
     # never sees, so the helper fails both on that path, as that branch
     # does, instead of leaving them to ``build_processing_reaper``
-    # (PRD #765). A legacy delivery that resolved no row has nothing to
-    # record.
+    # (PRD #765). The reason is read against
+    # ``build_processing_job_timeout_seconds``, the timeout
+    # ``WorkerSettings`` registers the job with. A legacy delivery that
+    # resolved no row has nothing to record.
     cancellation: AbstractAsyncContextManager[None] = (
         record_cancellation(
             ctx,
             queue_job_id=queue_job_id,
-            timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+            timeout_seconds=config.build_processing_job_timeout_seconds,
             logger=logger,
             finalise_run=_build_failure_finaliser(
                 build_id=build_id,
@@ -1677,6 +1726,10 @@ async def _process_build(
 ) -> _UploadInventory | _MidUploadRetirement:
     """Download, unpack, and upload build files.
 
+    The staging tarball is spooled to a temporary file and unpacked from
+    there a member at a time by :func:`_upload_members`, so neither the
+    tarball nor the extracted tree is ever held in memory whole (#878).
+
     Each extracted file is hashed as it goes by, so the build's content
     identity is derived from the same bytes that were uploaded and
     lands on the row in the same statement that marks it ``completed``.
@@ -1706,57 +1759,30 @@ async def _process_build(
         "Downloading staging tarball",
         staging_key=build.staging_key,
     )
-    # TODO(DM-54426): Full tarball loaded
-    # into memory. Streaming the download would reduce peak memory
-    # usage for large documentation builds.
-    tarball_data = await object_store.download_object(key=build.staging_key)
+    # Spooled to a temporary file rather than held as ``bytes`` (#878):
+    # a pipelines weekly's ~100 MB tarball lands in the worker's
+    # ephemeral storage, not its memory. ``TemporaryFile`` is unlinked
+    # as it is created, so closing it reclaims the space whether the
+    # block exits cleanly, on an error or on arq's cancel — and so does
+    # the kernel when an OOM kill takes the whole process down.
+    with tempfile.TemporaryFile(prefix=_STAGING_TARBALL_PREFIX) as tarball:
+        tarball_size = await object_store.download_object_to_file(
+            key=build.staging_key, fileobj=tarball
+        )
+        tarball.seek(0)
+        members = await _upload_members(
+            tarball,
+            object_store=object_store,
+            build_prefix=build.storage_prefix,
+        )
 
-    build_prefix = build.storage_prefix
-    semaphore = asyncio.Semaphore(_UPLOAD_CONCURRENCY)
-
-    async def _upload_file(name: str, data: bytes) -> int:
-        async with semaphore:
-            key = f"{build_prefix}{name}"
-            content_type = (
-                mimetypes.guess_type(name)[0] or "application/octet-stream"
-            )
-            await object_store.upload_object(
-                key=key, data=data, content_type=content_type
-            )
-            return len(data)
-
-    tasks: list[asyncio.Task[int]] = []
-    manifest_entries: list[tuple[str, str]] = []
-    excluded_object_count = 0
-    excluded_bytes = 0
-    # TODO(DM-54426): All extracted files
-    # held in memory before uploads begin. Streaming extraction with
-    # concurrent upload would lower peak memory for large builds.
-    with tarfile.open(fileobj=io.BytesIO(tarball_data), mode="r:gz") as tar:
-        for member in tar.getmembers():
-            if not member.isfile():
-                continue
-            name = member.name.removeprefix("./")
-            if is_excluded_path(name):
-                excluded_object_count += 1
-                excluded_bytes += member.size
-                continue
-            f = tar.extractfile(member)
-            if f is None:
-                continue
-            file_data = f.read()
-            manifest_entries.append(
-                (name, hashlib.sha256(file_data).hexdigest())
-            )
-            task = asyncio.create_task(_upload_file(name, file_data))
-            tasks.append(task)
-
-    results = await asyncio.gather(*tasks)
-    object_count = len(results)
-    total_size = sum(results)
+    object_count = members.object_count
+    total_size = members.total_size_bytes
+    excluded_object_count = members.excluded_object_count
+    excluded_bytes = members.excluded_bytes
     # Empty input yields EMPTY_MANIFEST_HASH, matching what the copier
     # reports for an empty source prefix.
-    content_hash = hash_manifest_pairs(manifest_entries)
+    content_hash = hash_manifest_pairs(members.manifest_entries)
 
     if object_count == 0:
         logger.warning(
@@ -1772,6 +1798,7 @@ async def _process_build(
         content_hash=content_hash,
         excluded_object_count=excluded_object_count,
         excluded_bytes=excluded_bytes,
+        tarball_size_bytes=tarball_size,
     )
 
     # Nothing that retires a ``processing`` build takes the
@@ -1872,3 +1899,123 @@ async def _process_build(
         excluded_object_count=excluded_object_count,
         excluded_bytes=excluded_bytes,
     )
+
+
+@dataclass(slots=True)
+class _MemberUploads:
+    """What :func:`_upload_members` unpacked out of one tarball."""
+
+    manifest_entries: list[tuple[str, str]] = field(default_factory=list)
+    """``(name, sha256 hex)`` per uploaded member, in tarball order."""
+
+    object_count: int = 0
+    """Members uploaded under the build's prefix."""
+
+    total_size_bytes: int = 0
+    """Bytes of those members."""
+
+    excluded_object_count: int = 0
+    """Regular-file members skipped as excluded cache paths."""
+
+    excluded_bytes: int = 0
+    """Bytes of the excluded members, from their tar headers."""
+
+
+async def _upload_members(
+    tarball: IO[bytes],
+    *,
+    object_store: ObjectStore,
+    build_prefix: str,
+) -> _MemberUploads:
+    """Unpack a gzipped tarball into the store, one upload window at a time.
+
+    The tarball is read in stream mode, front to back, and each regular
+    member is uploaded under ``build_prefix`` as soon as it is read. A
+    slot of the job's upload window is taken *before* a member's bytes
+    are read and given back once its upload has landed, so no more than
+    ``keeper_sync_upload_concurrency`` members' bytes are in memory at
+    once, however many the tarball holds. Reading every member first and
+    uploading afterwards held the whole extracted tree, and OOM-killed
+    the worker on a pipelines weekly (#878).
+
+    The window is the job's own fan-out, sized from the setting every
+    pool's ``_startup`` also sizes the process-wide upload limiter from,
+    so in a worker the two match. On the presigned path the store from
+    ``create_build_upload_objectstore_for_org`` holds that limiter around
+    each PUT, and the limiter is what caps PUTs across jobs: a factory
+    given a limiter of another size (as tests inject) is capped by the
+    limiter, whatever this bound is. The window covers the rest: memory,
+    a store that takes no slot (the aiobotocore fallback, which manages
+    its own pool), and one job queueing its whole build on the shared
+    limiter ahead of every other upload in the process.
+
+    The uploads run in an :class:`asyncio.TaskGroup`, so the first one
+    to fail stops the unpack and cancels the others still in flight,
+    and its error is raised as itself rather than as an exception group
+    (:func:`~docverse_server.taskgroups.first_real_error`), as the
+    ``asyncio.gather`` this replaced raised it.
+
+    Parameters
+    ----------
+    tarball
+        The gzipped tarball, positioned at its start.
+    object_store
+        Store to upload into.
+    build_prefix
+        Key prefix every member is uploaded under.
+
+    Returns
+    -------
+    _MemberUploads
+        The manifest, counts and sizes of what was uploaded and what was
+        skipped as excluded.
+    """
+    members = _MemberUploads()
+    window = asyncio.Semaphore(config.keeper_sync_upload_concurrency)
+
+    async def _upload(name: str, data: bytes) -> None:
+        try:
+            await object_store.upload_object(
+                key=f"{build_prefix}{name}",
+                data=data,
+                content_type=(
+                    mimetypes.guess_type(name)[0] or "application/octet-stream"
+                ),
+            )
+        finally:
+            window.release()
+        members.object_count += 1
+        members.total_size_bytes += len(data)
+
+    try:
+        async with asyncio.TaskGroup() as uploads:
+            with tarfile.open(fileobj=tarball, mode="r|gz") as tar:
+                for member in tar:
+                    if not member.isfile():
+                        continue
+                    name = member.name.removeprefix("./")
+                    if is_excluded_path(name):
+                        members.excluded_object_count += 1
+                        members.excluded_bytes += member.size
+                        continue
+                    await window.acquire()
+                    member_file = tar.extractfile(member)
+                    if member_file is None:
+                        window.release()
+                        continue
+                    with member_file:
+                        data = member_file.read()
+                    members.manifest_entries.append(
+                        (name, hashlib.sha256(data).hexdigest())
+                    )
+                    uploads.create_task(_upload(name, data))
+                    # Leave the bytes to the upload alone, so they are
+                    # dropped the moment it lands rather than held here
+                    # while the next member waits for a slot.
+                    del data
+    except BaseExceptionGroup as group:
+        leaf = first_real_error(group)
+        # ``from`` the leaf's own cause: hides the group, keeps any chain
+        # the store built (see ``first_real_error``).
+        raise leaf from leaf.__cause__
+    return members

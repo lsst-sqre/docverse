@@ -30,6 +30,8 @@ import pytest
 from pydantic import ValidationError
 
 from docverse_server.config import (
+    BUILD_PROCESSING_REAPER_MARGIN_SECONDS,
+    DASHBOARD_BUILD_REAPER_MARGIN_SECONDS,
     EDITION_RECONCILE_REAPER_MARGIN_SECONDS,
     KEEPER_SYNC_REAPER_MARGIN_SECONDS,
     KEEPER_SYNC_SLICE_MARGIN_SECONDS,
@@ -525,13 +527,187 @@ def test_publish_edition_job_timeout_env_var_override(
     assert config.publish_edition_job_timeout_seconds == 45
 
 
+def test_build_processing_job_timeout_default() -> None:
+    """The build-processing budget keeps arq's own 300 s by default.
+
+    Declaring the timeout makes it visible and movable from the
+    environment without changing what a deployment that sets nothing
+    already runs under, so the default is pinned to the value arq
+    applied implicitly.
+    """
+    config = Configuration()
+    assert config.build_processing_job_timeout_seconds == 300
+
+
+def test_build_processing_job_timeout_env_var_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The build-processing budget is env-overridable under the prefix."""
+    monkeypatch.setenv("DOCVERSE_BUILD_PROCESSING_JOB_TIMEOUT_SECONDS", "1200")
+    config = Configuration()
+    assert config.build_processing_job_timeout_seconds == 1200
+
+
+@pytest.mark.parametrize(
+    ("timeout", "threshold"),
+    [
+        # A timeout raised past the stock 8 h threshold less the margin,
+        # with the threshold left at its default.
+        pytest.param("28000", None, id="raised-timeout"),
+        # A threshold lowered one second under the stock floor.
+        pytest.param(
+            None,
+            str(300 + BUILD_PROCESSING_REAPER_MARGIN_SECONDS - 1),
+            id="lowered-threshold",
+        ),
+    ],
+)
+def test_build_processing_reaper_threshold_must_clear_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: str | None,
+    threshold: str | None,
+) -> None:
+    """A reaper threshold under timeout + margin is refused, naming all three.
+
+    ``build_processing_reaper`` fails any row ``in_progress`` past its
+    threshold, so one the job timeout can reach would fail builds arq is
+    still unpacking. Raising the timeout without the threshold is the
+    way an operator walks into that, so the error names the timeout, the
+    threshold, and the margin between them.
+    """
+    if timeout is not None:
+        monkeypatch.setenv(
+            "DOCVERSE_BUILD_PROCESSING_JOB_TIMEOUT_SECONDS", timeout
+        )
+    if threshold is not None:
+        monkeypatch.setenv(
+            "DOCVERSE_BUILD_PROCESSING_REAPER_THRESHOLD_SECONDS", threshold
+        )
+    with pytest.raises(ValidationError) as excinfo:
+        Configuration()
+    message = str(excinfo.value)
+    assert "build_processing_reaper_threshold_seconds" in message
+    assert "build_processing_job_timeout_seconds" in message
+    assert "BUILD_PROCESSING_REAPER_MARGIN_SECONDS" in message
+
+
+def test_build_processing_reaper_threshold_floor_is_inclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A threshold exactly timeout + margin is accepted.
+
+    The margin already covers the cancellation write and the reaper's
+    cron gap, so the floor itself is a valid setting — the lowest a
+    non-prod environment can drive the threshold to watch the reaper.
+    """
+    monkeypatch.setenv("DOCVERSE_BUILD_PROCESSING_JOB_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv(
+        "DOCVERSE_BUILD_PROCESSING_REAPER_THRESHOLD_SECONDS",
+        str(60 + BUILD_PROCESSING_REAPER_MARGIN_SECONDS),
+    )
+    config = Configuration()
+    assert config.build_processing_reaper_threshold_seconds == (
+        60 + BUILD_PROCESSING_REAPER_MARGIN_SECONDS
+    )
+
+
+def test_dashboard_build_job_timeout_default() -> None:
+    """The dashboard budget is 15 min, three times arq's old 300 s.
+
+    ``dashboard_build`` ran under arq's implicit default, and projects
+    with a thousand editions were cancelled at it on every rebuild
+    (#863). With the edition uploads fanned out the largest finish in
+    about a minute and a half, so 900 s is generous headroom while still
+    clearing the stock 1800 s reaper threshold by the margin.
+    """
+    config = Configuration()
+    assert config.dashboard_build_job_timeout_seconds == 900
+
+
+def test_dashboard_build_job_timeout_env_var_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dashboard budget is env-overridable under the prefix."""
+    monkeypatch.setenv("DOCVERSE_DASHBOARD_BUILD_JOB_TIMEOUT_SECONDS", "600")
+    config = Configuration()
+    assert config.dashboard_build_job_timeout_seconds == 600
+
+
+@pytest.mark.parametrize(
+    ("timeout", "threshold"),
+    [
+        # A timeout raised one second past the stock 1800 s threshold
+        # less the margin, with the threshold left at its default.
+        pytest.param(
+            str(1800 - DASHBOARD_BUILD_REAPER_MARGIN_SECONDS + 1),
+            None,
+            id="raised-timeout",
+        ),
+        # A threshold lowered one second under the stock floor.
+        pytest.param(
+            None,
+            str(900 + DASHBOARD_BUILD_REAPER_MARGIN_SECONDS - 1),
+            id="lowered-threshold",
+        ),
+    ],
+)
+def test_dashboard_build_reaper_threshold_must_clear_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: str | None,
+    threshold: str | None,
+) -> None:
+    """A reaper threshold under timeout + margin is refused, naming all three.
+
+    ``dashboard_build_reaper`` fails any row ``in_progress`` past its
+    threshold and frees the project's rebuild slot, so one the job
+    timeout can reach would let a second render start while arq is still
+    running the first. The error names the timeout, the threshold, and
+    the margin between them.
+    """
+    if timeout is not None:
+        monkeypatch.setenv(
+            "DOCVERSE_DASHBOARD_BUILD_JOB_TIMEOUT_SECONDS", timeout
+        )
+    if threshold is not None:
+        monkeypatch.setenv(
+            "DOCVERSE_DASHBOARD_BUILD_REAPER_THRESHOLD_SECONDS", threshold
+        )
+    with pytest.raises(ValidationError) as excinfo:
+        Configuration()
+    message = str(excinfo.value)
+    assert "dashboard_build_reaper_threshold_seconds" in message
+    assert "dashboard_build_job_timeout_seconds" in message
+    assert "DASHBOARD_BUILD_REAPER_MARGIN_SECONDS" in message
+
+
+def test_dashboard_build_reaper_threshold_floor_is_inclusive() -> None:
+    """The stock pair sits exactly on the floor, and is accepted.
+
+    The margin is one full ``dashboard_build_reaper`` cron gap, which
+    already covers the cancellation write and scheduling slop, so a
+    threshold of exactly timeout + margin is valid: it is what the
+    stock 900 s timeout and the 1800 s threshold Phalanx sets on dev and
+    prod come to.
+    """
+    config = Configuration()
+    assert config.dashboard_build_reaper_threshold_seconds == (
+        config.dashboard_build_job_timeout_seconds
+        + DASHBOARD_BUILD_REAPER_MARGIN_SECONDS
+    )
+
+
 def test_other_reaper_thresholds_unchanged() -> None:
     """Keeper-sync and edition_reconcile derive; these five keep literals.
 
     The two derived thresholds each back a job whose own timeout bounds
     it (``keeper_sync_job_timeout_seconds`` and the shared
-    ``maintenance_job_timeout_seconds``). The five below backstop jobs
-    with no such pairing, so they stay flat literals.
+    ``maintenance_job_timeout_seconds``), so their defaults are computed
+    from it. The five below keep flat literal defaults instead.
+    ``build_processing_reaper_threshold_seconds`` is still paired with
+    ``build_processing_job_timeout_seconds``, but as a floor that
+    ``_check_build_processing_reaper_threshold`` enforces (timeout plus
+    ``BUILD_PROCESSING_REAPER_MARGIN_SECONDS``) rather than a
+    derivation: its 8 h default clears the stock floor by hours.
     """
     config = Configuration()
     assert config.lifecycle_reaper_threshold_seconds == 21600
