@@ -24,6 +24,7 @@ from safir.pydantic import EnvRedisDsn
 from .services.cdn_purge_coalescer import DEFAULT_PURGE_MIN_INTERVAL_SECONDS
 
 __all__ = [
+    "BUILD_PROCESSING_REAPER_MARGIN_SECONDS",
     "EDITION_RECONCILE_REAPER_MARGIN_SECONDS",
     "KEEPER_SYNC_REAPER_MARGIN_SECONDS",
     "KEEPER_SYNC_SLICE_MARGIN_SECONDS",
@@ -79,6 +80,29 @@ Reaping any earlier would fail a tick that is still running, which
 drops its row from ``idx_queue_jobs_edition_reconcile_active_uq`` and
 lets the next dispatcher tick mint a second reconciler for the same
 organization.
+"""
+
+
+BUILD_PROCESSING_REAPER_MARGIN_SECONDS = 1800
+"""Least gap between the build-processing job timeout and its reaper
+threshold, in seconds.
+
+arq cancels a ``build_processing`` job at
+``build_processing_job_timeout_seconds`` and the cancel fails its
+``queue_jobs`` row and its build, so a row still ``in_progress`` past
+that point is one whose worker died without running the cancel (an OOM
+kill). ``build_processing_reaper_threshold_seconds`` must clear the
+timeout by at least this much: reaping earlier would fail a build arq
+is still unpacking, and the reaper's stranded-build sweep would fail
+the build under it. Like the keeper-sync and ``edition_reconcile``
+margins, it is sized at one full ``build_processing_reaper`` cron gap
+(``cron(minute={12, 42})``, so 30 min), covering the cancellation write
+plus scheduling slop.
+
+Unlike those two thresholds, this one keeps its literal 8 h default
+rather than deriving from the timeout; the margin is the floor
+:meth:`Configuration._check_build_processing_reaper_threshold` holds an
+explicit value or a raised timeout to.
 """
 
 
@@ -361,6 +385,31 @@ class Configuration(BaseSettings):
             " commits its ``queue_jobs`` completion *before* the purge,"
             " so a timeout during the purge costs only the best-effort"
             " purge, never the record of a committed publish."
+        ),
+    )
+
+    build_processing_job_timeout_seconds: int = Field(
+        300,
+        ge=1,
+        title="Build_processing per-job timeout, in seconds",
+        description=(
+            "Wraps ``build_processing`` on ``WorkerSettings``: arq"
+            " cancels a job that runs past this. One job downloads the"
+            " uploaded tarball from the staging store, unpacks every"
+            " file into the organization's object store, registers the"
+            " build, and enqueues its edition publishes, so its wall"
+            " clock grows with the size of the build — a large"
+            " documentation site of thousands of files is the case to"
+            " size it for. The default is arq's own implicit 300 s,"
+            " which the job previously ran under without it being"
+            " visible or movable; raise it from a measured upload of"
+            " the largest build a deployment takes. A cancelled job"
+            " fails its ``queue_jobs`` row and its build, recording"
+            " this value as the timeout it was read against. It must"
+            " sit at least ``BUILD_PROCESSING_REAPER_MARGIN_SECONDS``"
+            " below ``build_processing_reaper_threshold_seconds``, or"
+            " configuration fails at startup: the reaper must never"
+            " fail a job arq is still running."
         ),
     )
 
@@ -718,9 +767,15 @@ class Configuration(BaseSettings):
             " build is never falsely reaped, short enough that a truly"
             " wedged job does not block the project indefinitely."
             " Mirrors ``lifecycle_reaper_threshold_seconds`` so the"
-            " operator knob shape is identical across reapers; the"
-            " env-overridable default lets non-prod environments drive"
-            " the threshold down to seconds for fast verification."
+            " operator knob shape is identical across reapers. It must"
+            " be at least ``build_processing_job_timeout_seconds`` +"
+            " ``BUILD_PROCESSING_REAPER_MARGIN_SECONDS`` (2100 s at the"
+            " stock 300 s timeout), or configuration fails at startup:"
+            " arq has not cancelled the job until its timeout, so a"
+            " lower threshold would reap a build still being unpacked."
+            " Raising the timeout past 27000 s therefore means raising"
+            " this with it. Non-prod environments that want the reaper"
+            " to fire quickly drive the timeout down alongside it."
         ),
     )
 
@@ -1157,6 +1212,40 @@ class Configuration(BaseSettings):
                 " that is still running. Lower"
                 " maintenance_job_timeout_seconds alongside it to"
                 " reconcile faster in a test environment."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_build_processing_reaper_threshold(self) -> Configuration:
+        """Refuse a build reaper threshold the job timeout can reach.
+
+        ``build_processing_reaper`` exists to fail rows whose worker died
+        without arq's cancel running. A threshold less than
+        ``build_processing_job_timeout_seconds`` plus
+        :data:`BUILD_PROCESSING_REAPER_MARGIN_SECONDS` could instead
+        reap a job that is still unpacking its build — failing its row,
+        and through the stranded-build sweep the build itself — while
+        the job carries on uploading. The stock pair (300 s and 8 h)
+        clears it by hours; raising the timeout past
+        ``threshold - margin`` without raising the threshold is the
+        mistake this catches.
+        """
+        floor = (
+            self.build_processing_job_timeout_seconds
+            + BUILD_PROCESSING_REAPER_MARGIN_SECONDS
+        )
+        threshold = self.build_processing_reaper_threshold_seconds
+        if threshold < floor:
+            raise ValueError(
+                f"build_processing_reaper_threshold_seconds ({threshold})"
+                " must be at least build_processing_job_timeout_seconds"
+                f" ({self.build_processing_job_timeout_seconds}) plus"
+                " BUILD_PROCESSING_REAPER_MARGIN_SECONDS"
+                f" ({BUILD_PROCESSING_REAPER_MARGIN_SECONDS}), so"
+                f" {floor}: arq has not cancelled a build_processing job"
+                " until its timeout elapses, so reaping before then would"
+                " fail a build that is still being unpacked. Raise the"
+                " threshold alongside the timeout."
             )
         return self
 

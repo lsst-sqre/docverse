@@ -33,6 +33,7 @@ from docverse.models import (
     PublishJobRef,
     RetiredBuildStatus,
 )
+from docverse_server.config import config
 from docverse_server.domain.api_urls import edition_url, job_url
 from docverse_server.domain.base32id import serialize_base32_id
 from docverse_server.domain.build import Build
@@ -61,7 +62,6 @@ from docverse_server.storage.objectstore import ObjectStore
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.queue_job_store import QueueJobStore
 from docverse_server.worker.functions._cancellation import (
-    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
     RunFinaliser,
     cancellation_recorded,
     record_cancellation,
@@ -624,13 +624,15 @@ async def _process_build_locked(
     # job with a ``CancelledError`` that the ``except Exception`` below
     # never sees, so the helper fails both on that path, as that branch
     # does, instead of leaving them to ``build_processing_reaper``
-    # (PRD #765). A legacy delivery that resolved no row has nothing to
-    # record.
+    # (PRD #765). The reason is read against
+    # ``build_processing_job_timeout_seconds``, the timeout
+    # ``WorkerSettings`` registers the job with. A legacy delivery that
+    # resolved no row has nothing to record.
     cancellation: AbstractAsyncContextManager[None] = (
         record_cancellation(
             ctx,
             queue_job_id=queue_job_id,
-            timeout_seconds=ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
+            timeout_seconds=config.build_processing_job_timeout_seconds,
             logger=logger,
             finalise_run=_build_failure_finaliser(
                 build_id=build_id,

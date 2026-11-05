@@ -76,8 +76,12 @@ async def build_processing_reaper(ctx: dict[str, Any]) -> str:
     see that module for the shared sweep mechanics. Threshold defaults
     to 8 h via ``config.build_processing_reaper_threshold_seconds``;
     non-prod can override with
-    ``DOCVERSE_BUILD_PROCESSING_REAPER_THRESHOLD_SECONDS``. The same
-    threshold bounds the stranded-build sweep passed as ``extra_sweep``.
+    ``DOCVERSE_BUILD_PROCESSING_REAPER_THRESHOLD_SECONDS``, down to the
+    floor of ``build_processing_job_timeout_seconds`` +
+    :data:`~docverse_server.config.BUILD_PROCESSING_REAPER_MARGIN_SECONDS`
+    that configuration enforces, so this never reaps a job arq is still
+    running. The same threshold bounds the stranded-build sweep passed
+    as ``extra_sweep``.
     """
     return await sweep_runless_kind(
         ctx,

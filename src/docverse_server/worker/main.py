@@ -990,7 +990,19 @@ class WorkerSettings:
 
     max_jobs = config.arq_max_jobs
     functions = [
-        instrument_arq_task(build_processing),
+        # ``build_processing`` runs as long as unpacking a build into
+        # the object store takes, which grows with the build: a large
+        # documentation site of thousands of files is what it has to be
+        # sized for. So it carries an explicit, operator-movable budget
+        # instead of arq's implicit 300 s default, which stays its stock
+        # value (PRD #864); its reaper threshold is validated to clear
+        # it (``Configuration._check_build_processing_reaper_threshold``).
+        # ``max_tries`` is left unset for the reason given for
+        # ``publish_edition`` below.
+        func(
+            instrument_arq_task(build_processing),
+            timeout=config.build_processing_job_timeout_seconds,
+        ),
         instrument_arq_task(dashboard_build),
         instrument_arq_task(dashboard_sync),
         instrument_arq_task(ping),

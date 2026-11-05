@@ -1,0 +1,8 @@
+### Backwards-incompatible changes
+
+- `build_processing_reaper_threshold_seconds` must now be at least `build_processing_job_timeout_seconds` plus `BUILD_PROCESSING_REAPER_MARGIN_SECONDS` (1800 s, one `build_processing_reaper` cron gap), and configuration fails at startup with an error naming all three values otherwise. Without the check, a timeout raised past the threshold, or a threshold lowered under the timeout, would let the reaper fail a build that arq is still unpacking. At stock settings the floor is 2100 s against the 8 h default threshold, so only a timeout raised past 27000 s, or a `DOCVERSE_BUILD_PROCESSING_REAPER_THRESHOLD_SECONDS` below the floor, trips it. A non-prod environment that set the threshold to seconds to watch the reaper fire must raise it to at least the timeout plus 1800 s, lowering the timeout to bring the floor down.
+
+### New features
+
+- `build_processing` now runs under an explicit, operator-movable arq timeout, `build_processing_job_timeout_seconds` (`DOCVERSE_BUILD_PROCESSING_JOB_TIMEOUT_SECONDS`), instead of arq's implicit 300 s default. The default stays 300 s, so a deployment that sets nothing behaves as before; raise it for a deployment whose largest builds take longer than that to unpack. A cancelled job's `queue_jobs` row now records the configured value as `timeout_seconds`, and its `reason` is read against it, so a raised timeout is reported as the value arq actually enforced rather than 300 s.
+- New operations page, `docs/build-processing.md`, documents the two settings side by side, the floor, what a timed-out job records, and how to size the timeout from a measured upload.

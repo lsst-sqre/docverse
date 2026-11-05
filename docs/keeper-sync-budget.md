@@ -455,7 +455,7 @@ tier's `tier_cron_timeout` instead (see
 
 | Function | Pool | Timeout | Helper | Also closes out |
 | --- | --- | --- | --- | --- |
-| `build_processing` | default | `ARQ_DEFAULT_JOB_TIMEOUT_SECONDS` | `record_cancellation` | Fails its build, if the build is not already terminal. |
+| `build_processing` | default | `build_processing_job_timeout_seconds` (see [Build processing](build-processing.md)) | `record_cancellation` | Fails its build, if the build is not already terminal. |
 | `dashboard_build` | default | `ARQ_DEFAULT_JOB_TIMEOUT_SECONDS` | `record_cancellation` | Nothing. |
 | `dashboard_sync` | default | `ARQ_DEFAULT_JOB_TIMEOUT_SECONDS` | `record_cancellation` | Marks its GitHub binding's last sync failed. |
 | `publish_edition` | default | `publish_edition_job_timeout_seconds` | `record_cancellation` | Rolls up its keeper-sync run, if it has one. |

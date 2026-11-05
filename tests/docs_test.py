@@ -55,6 +55,7 @@ from docverse.models.keeper_sync import (
     _MAX_SLUG_PATTERNS,
 )
 from docverse_server.config import (
+    BUILD_PROCESSING_REAPER_MARGIN_SECONDS,
     KEEPER_SYNC_REAPER_MARGIN_SECONDS,
     KEEPER_SYNC_SLICE_MARGIN_SECONDS,
     Configuration,
@@ -369,6 +370,20 @@ _PHALANX_REAPER_PIN_SECONDS = 21600
 
 _TIER_CRON_PREFIX = "keeper_sync_tier_"
 """Name prefix of the keeper-sync tier crons; the rest is the tier."""
+
+_BUILD_PAGE = "build-processing.md"
+"""Operations page for the ``build_processing`` time budget (PRD #864)."""
+
+_BUILD_PROCESSING_PHALANX_VALUES: dict[str, str | None] = {
+    "build_processing_job_timeout_seconds": None,
+    "build_processing_reaper_threshold_seconds": (
+        "config.reaperThresholds.buildProcessingSeconds"
+    ),
+}
+"""The build-processing settings, each with its Phalanx value.
+
+``None`` for the timeout, which the chart does not render yet (#873).
+"""
 
 _WORKER_POOLS = (
     (WorkerSettings, "default"),
@@ -2823,3 +2838,67 @@ def test_budget_reaper_cap_documented() -> None:
     assert not _uncoded(
         {"KEEPER_SYNC_REAPER_MARGIN_SECONDS", *calls[0].fields}, section
     )
+
+
+def _build_section(heading: str) -> str:
+    """Return one ``## heading`` section of the build-processing page."""
+    return _section(_read(_BUILD_PAGE), heading)
+
+
+def test_docs_index_links_the_build_processing_page() -> None:
+    """The index's Operations section points at the build-processing page."""
+    assert _BUILD_PAGE in _section(_read("index.md"), "Operations")
+
+
+def test_build_processing_settings_documented_side_by_side() -> None:
+    """The settings table is the timeout and the reaper threshold, together.
+
+    Each row names the setting's environment variable and its stock
+    value, and the threshold's row its Phalanx value. The two sit in one
+    table because neither can be moved far without the other.
+    """
+    section = _build_section("Settings")
+    env_prefix = Configuration.model_config.get("env_prefix", "")
+    rows = {cells[0].strip("`"): cells for cells in _code_rows(section)}
+    assert set(rows) == set(_BUILD_PROCESSING_PHALANX_VALUES)
+    for name, phalanx_value in _BUILD_PROCESSING_PHALANX_VALUES.items():
+        cells = rows[name]
+        assert cells[1] == f"`{env_prefix}{name}`".upper(), name
+        default = Configuration.model_fields[name].default
+        assert _documented_default(default) in cells[2], name
+        if phalanx_value is not None:
+            assert cells[3] == f"`{phalanx_value}`", name
+
+
+def test_build_processing_reaper_floor_documented() -> None:
+    """The floor section names the margin and works it at stock values.
+
+    The floor at the stock timeout and the largest timeout the stock
+    threshold admits are read off :class:`Configuration`, so a change to
+    either default or to the margin is a change the page has to carry.
+    """
+    section = _build_section("The reaper floor")
+    stock = Configuration()
+    timeout = stock.build_processing_job_timeout_seconds
+    threshold = stock.build_processing_reaper_threshold_seconds
+    assert not _uncoded(
+        {
+            "BUILD_PROCESSING_REAPER_MARGIN_SECONDS",
+            "build_processing_job_timeout_seconds",
+            "build_processing_reaper_threshold_seconds",
+        },
+        section,
+    )
+    assert f"({BUILD_PROCESSING_REAPER_MARGIN_SECONDS})" in section
+    assert f"`{timeout + BUILD_PROCESSING_REAPER_MARGIN_SECONDS}`" in section
+    assert f"`{threshold - BUILD_PROCESSING_REAPER_MARGIN_SECONDS}`" in section
+
+
+def test_build_processing_cancellation_documented() -> None:
+    """The page says what a timeout records and links the shared payload."""
+    section = _build_section("When the timeout fires")
+    assert not _uncoded(
+        {"job_timeout", "timeout_seconds", "build_processing_reaper"},
+        section,
+    )
+    assert f"{_BUDGET_PAGE}#cancellation" in section

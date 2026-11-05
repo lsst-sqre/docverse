@@ -112,12 +112,14 @@ arq's ``Worker`` defaults ``job_timeout`` to this, and none of the three
 ``WorkerSettings`` classes overrides it, so it is the timeout every
 function registered without its own ``func(..., timeout=...)`` — and
 every ``cron(...)`` job registered without a ``timeout``, which defaults
-to the worker's — runs under: ``build_processing``, ``dashboard_build``
-and ``dashboard_sync`` on the default pool, and
-``project_github_resolve``. Those functions pass it to
-:func:`record_cancellation` or :func:`record_handoff_cancellation` so
-the ``reason`` is inferred against the timeout arq actually enforces on
-them, not their pool's longest one. The keeper-sync tier crons carry a
+to the worker's — runs under: ``dashboard_build`` and
+``dashboard_sync`` on the default pool, and ``project_github_resolve``.
+Those functions pass it to :func:`record_cancellation` or
+:func:`record_handoff_cancellation` so the ``reason`` is inferred
+against the timeout arq actually enforces on them, not their pool's
+longest one. ``build_processing`` ran under it too until it gained
+``build_processing_job_timeout_seconds``, whose default is this same
+value; it passes that setting instead. The keeper-sync tier crons carry a
 timeout of their own, derived from each tier's cron interval by
 :func:`~docverse_server.services.keeper_sync.scheduler.tier_cron_timeout`
 and floored at this value, which the scheduler holds as

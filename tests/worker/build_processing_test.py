@@ -22,7 +22,7 @@ from rubin.repertoire import DiscoveryClient, register_mock_discovery
 from safir.arq import MockArqQueue
 from safir.dependencies.db_session import db_session_dependency
 from safir.metrics import MockEventPublisher
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from structlog.testing import capture_logs
 
@@ -37,6 +37,7 @@ from docverse.models import (
 )
 from docverse.models.queue_enums import PublishStatus
 from docverse_server.config import Configuration
+from docverse_server.config import config as runtime_config
 from docverse_server.dbschema.build import SqlBuild
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
@@ -75,9 +76,6 @@ from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_backend import ArqQueueBackend
 from docverse_server.storage.queue_job_store import QueueJobStore
-from docverse_server.worker.functions._cancellation import (
-    ARQ_DEFAULT_JOB_TIMEOUT_SECONDS,
-)
 from docverse_server.worker.functions.build_processing import build_processing
 from docverse_server.worker.functions.build_processing_reaper import (
     build_processing_reaper,
@@ -4716,22 +4714,52 @@ async def test_failed_staging_delete_still_completes_the_build(
             assert job.status == JobStatus.completed
 
 
+_CONFIGURED_BUILD_TIMEOUT_SECONDS = 1200
+"""A ``build_processing_job_timeout_seconds`` other than arq's 300 s.
+
+The cancel tests run under it so the payload's ``timeout_seconds`` can
+only match if the job read the setting, not arq's default.
+"""
+
+
+@pytest.mark.parametrize(
+    ("started_ago", "expected_reason"),
+    [
+        pytest.param(None, "worker_shutdown", id="worker_shutdown"),
+        pytest.param(
+            timedelta(seconds=_CONFIGURED_BUILD_TIMEOUT_SECONDS)
+            + timedelta(minutes=1),
+            "job_timeout",
+            id="job_timeout",
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_build_processing_cancel_fails_the_job_and_the_build(
+    *,
     app: None,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
+    started_ago: timedelta | None,
+    expected_reason: str,
 ) -> None:
     """An arq cancel mid-unpack fails the job and its build at once.
 
-    The job is cancelled while it downloads the staging tarball, as arq's
-    default job timeout or a rolling deploy's SIGTERM would catch a large
+    The job is cancelled while it downloads the staging tarball, as its
+    arq timeout or a rolling deploy's SIGTERM would catch a large
     upload. Neither row may be left for the reaper — the job
     ``in_progress``, the build ``processing`` — up to eight hours: the
-    job fails with a ``CancelledError`` payload read against the arq
-    default timeout ``build_processing`` runs under, and the build fails
-    with it, the two writes the ``except`` branch makes for an error.
+    job fails with a ``CancelledError`` payload whose ``reason`` and
+    ``timeout_seconds`` are read against the configured
+    ``build_processing_job_timeout_seconds`` arq enforces on it, and the
+    build fails with it, the two writes the ``except`` branch makes for
+    an error.
     """
+    monkeypatch.setattr(
+        runtime_config,
+        "build_processing_job_timeout_seconds",
+        _CONFIGURED_BUILD_TIMEOUT_SECONDS,
+    )
     async with db_session.begin():
         org, project = await _setup_org_and_project(db_session)
         build = await _create_build_in_processing(
@@ -4763,8 +4791,21 @@ async def test_build_processing_cancel_fails_the_job_and_the_build(
         "build_public_id": serialize_base32_id(build.public_id),
     }
 
+    async def _backdate() -> None:
+        if started_ago is None:
+            return
+        async for session in db_session_dependency():
+            async with session.begin():
+                await session.execute(
+                    update(SqlQueueJob)
+                    .where(
+                        SqlQueueJob.backend_job_id == "test-arq-build-cancel"
+                    )
+                    .values(date_started=func.now() - started_ago)
+                )
+
     task = asyncio.create_task(build_processing(ctx, payload))
-    await cancel_when_reached(task, hang.reached)
+    await cancel_when_reached(task, hang.reached, before_cancel=_backdate)
     await ctx["http_client"].aclose()
 
     async for session in db_session_dependency():
@@ -4776,9 +4817,9 @@ async def test_build_processing_cancel_fails_the_job_and_the_build(
             assert job.status == JobStatus.failed
             assert job.errors is not None
             assert job.errors["type"] == "CancelledError"
-            assert job.errors["reason"] == "worker_shutdown"
+            assert job.errors["reason"] == expected_reason
             assert job.errors["timeout_seconds"] == (
-                ARQ_DEFAULT_JOB_TIMEOUT_SECONDS
+                _CONFIGURED_BUILD_TIMEOUT_SECONDS
             )
             refreshed = await BuildStore(
                 session=session, logger=_logger()

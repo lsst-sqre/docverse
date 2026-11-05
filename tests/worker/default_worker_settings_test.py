@@ -5,6 +5,10 @@ sleeps: it queues on the process-wide CDN purge coalescer and can then
 sit in the purger's rate-limit backoff. Registered bare it inherited
 arq's 300 s default timeout, which is neither derived from those waits
 nor visible to an operator. These tests pin the explicit budget.
+
+``build_processing`` carries one too, for a different reason: it runs
+as long as unpacking a build takes, so its ceiling has to be one an
+operator can raise for a deployment whose largest builds outgrow 300 s.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from docverse_server.storage._http_retry import (
     DEFAULT_MAX_ATTEMPTS,
     MAX_BACKOFF_SECONDS,
 )
-from docverse_server.worker.functions import publish_edition
+from docverse_server.worker.functions import build_processing, publish_edition
 from docverse_server.worker.main import WorkerSettings
 
 _config = Configuration()
@@ -94,4 +98,23 @@ def test_publish_edition_keeps_arqs_retry_policy() -> None:
     unset keeps the worker-level default this job already had.
     """
     entry = _function_by_coroutine(publish_edition)
+    assert entry.max_tries is None
+
+
+def test_build_processing_declares_an_explicit_timeout() -> None:
+    """The build job carries the configured budget, not an implicit one.
+
+    ``build_processing`` runs as long as unpacking the build into the
+    object store takes, so its ceiling has to be one an operator can see
+    and raise for a deployment whose largest builds outgrow it.
+    """
+    entry = _function_by_coroutine(build_processing)
+    assert entry.timeout_s == float(
+        _config.build_processing_job_timeout_seconds
+    )
+
+
+def test_build_processing_keeps_arqs_retry_policy() -> None:
+    """Adding a timeout must not silently change the retry behaviour."""
+    entry = _function_by_coroutine(build_processing)
     assert entry.max_tries is None
