@@ -82,14 +82,15 @@ from tracking altogether.
 
 - **A live edition already holds the slug.** It is reused, never
   duplicated: a matched one is advanced once, and an unmatched one is
-  pointed at the build as the ref's edition.
+  pointed at the build as the ref's edition. Either way it already
+  existed, so it is reported as `updated`.
 - **A lifecycle rule deleted the edition.** It is revived in place,
   with its id and build history, and reported as created (see
   [A build for the ref revives the edition](github-integration.md#a-build-for-the-ref-revives-the-edition)).
 - **An operator deleted the edition.** The delete reserves the slug,
   so the ref gets no edition and tracking logs `Edition slug reserved
-  by manual delete; build not tracked` at warning level. The aliases
-  still advance.
+  by manual delete; edition not recreated` at warning level. The
+  aliases the build matched still advance as usual.
 
 ### Semver aggregates
 
@@ -108,7 +109,8 @@ tag's own edition.
   revived and points at the build. Revived editions are also listed in
   the result's `revived`, and the worker publishes an
   `edition_lifecycle` event with `action` `restore` for each.
-- `updated`: an existing edition advanced to the build.
+- `updated`: an existing edition advanced to the build, including an
+  unmatched one reused because it already held the derived slug.
 - `skipped`: the version or date guard kept the edition on its current
   build.
 

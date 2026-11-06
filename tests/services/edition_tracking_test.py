@@ -2869,7 +2869,7 @@ async def test_track_build_skips_manually_deleted_slug(
         entry
         for entry in logs
         if entry["event"]
-        == "Edition slug reserved by manual delete; build not tracked"
+        == "Edition slug reserved by manual delete; edition not recreated"
     ]
     assert len(reserved) == 1
     assert reserved[0]["log_level"] == "warning"
@@ -3101,7 +3101,7 @@ async def test_track_build_skips_manually_deleted_aggregate_slug(
         entry
         for entry in logs
         if entry["event"]
-        == "Edition slug reserved by manual delete; build not tracked"
+        == "Edition slug reserved by manual delete; edition not recreated"
     ]
     assert [entry["slug"] for entry in reserved] == ["2"]
     assert not [e for e in logs if e["event"] == _AGGREGATE_SLUG_HELD]
@@ -3529,6 +3529,50 @@ async def test_track_build_alias_holding_the_derived_slug_is_not_doubled(
     ]
 
 
+@pytest.mark.asyncio
+async def test_track_build_reused_unmatched_slug_holder_reports_updated(
+    db_session: AsyncSession,
+) -> None:
+    """An unmatched live edition holding the derived slug is reused.
+
+    A ``git_ref`` edition named ``v30_0_13`` that tracks another ref
+    does not match the ``v30_0_13`` build, so it does not own the ref,
+    and auto-creation finds it holding the slug. It becomes the ref's
+    edition and is pointed at the build, but it already existed, so its
+    outcome is ``updated``, not ``created``.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, _main = await _setup_eups_release_main(
+            db_session, service, org_slug="reuse-unmatched-slug-org"
+        )
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        holder = await edition_store.create_internal(
+            project_id=project.id,
+            slug="v30_0_13",
+            title="v30_0_13",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "release/v30_0_13"},
+        )
+        build = await _create_build(db_session, project.id, git_ref="v30_0_13")
+        result = await service.track_build(build)
+        reused = await _get_edition(db_session, project.id, "v30_0_13")
+        await db_session.commit()
+
+    assert _actions_by_slug(result) == {
+        DEFAULT_EDITION_SLUG: "updated",
+        "v30_0_13": "updated",
+    }
+    assert [o.edition_id for o in result.outcomes if o.slug == "v30_0_13"] == [
+        holder.id
+    ]
+    assert result.revived == []
+    assert reused is not None
+    assert reused.id == holder.id
+    assert reused.current_build_id == build.id
+
+
 async def _setup_alias_with_deleted_release(
     db_session: AsyncSession,
     service: EditionTrackingService,
@@ -3625,7 +3669,7 @@ async def test_track_build_alias_leaves_a_manually_deleted_per_ref_edition(
         entry["slug"]
         for entry in logs
         if entry["event"]
-        == "Edition slug reserved by manual delete; build not tracked"
+        == "Edition slug reserved by manual delete; edition not recreated"
     ] == ["v30_0_13"]
     async with db_session.begin():
         row = (

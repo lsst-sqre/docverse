@@ -18,7 +18,6 @@ from docverse.models import (
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import (
     Edition,
-    EnsuredEdition,
     ReservedSlug,
     SlugReservation,
 )
@@ -170,6 +169,22 @@ _VERSION_MODES = frozenset(
         TrackingMode.lsst_doc,
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _RefEdition:
+    """The edition auto-creation settles the build's ref on.
+
+    ``created`` is whether this tracking inserted or revived it, which
+    reports it ``created``. An edition that already held the derived
+    slug is reused instead, so it reports ``updated`` like any other
+    existing edition the build advances. ``revived`` is the revived
+    subset of ``created``.
+    """
+
+    edition: Edition
+    created: bool
+    revived: bool
 
 
 @dataclass(slots=True)
@@ -340,19 +355,20 @@ class EditionTrackingService:
         #    matches — ``__main`` in ``eups_release``, ``weekly``,
         #    ``latest`` — advance alongside it rather than absorbing the
         #    build, so every release, weekly, or daily keeps its own
-        #    ``/v/<slug>/`` edition. The new edition joins ``editions``
-        #    so steps 9 and 10 converge, point, and publish it.
+        #    ``/v/<slug>/`` edition. The ref's edition joins ``editions``
+        #    so steps 9 and 10 converge, point, and publish it; only one
+        #    this step inserted or revived reports ``created``.
         created_ids: set[int] = set()
         revived_ids: set[int] = set()
-        if not any(_owns_ref(e, derivation) for e in editions):
-            ensured = await self._auto_create_edition(
-                project_id=project.id, derivation=derivation
-            )
-            if ensured is not None:
-                editions.append(ensured.edition)
-                created_ids.add(ensured.edition.id)
-                if ensured.revived:
-                    revived_ids.add(ensured.edition.id)
+        ref_edition = await self._auto_create_edition(
+            editions, project_id=project.id, derivation=derivation
+        )
+        if ref_edition is not None:
+            editions.append(ref_edition.edition)
+            if ref_edition.created:
+                created_ids.add(ref_edition.edition.id)
+            if ref_edition.revived:
+                revived_ids.add(ref_edition.edition.id)
 
         # 8. Auto-create (or revive) semver_major / semver_minor editions
         autocreation = resolve_edition_autocreation(
@@ -782,23 +798,35 @@ class EditionTrackingService:
 
     async def _auto_create_edition(
         self,
+        matched: list[Edition],
         *,
         project_id: int,
         derivation: SlugDerivationResult,
-    ) -> EnsuredEdition | None:
-        """Auto-create an edition from a slug derivation result.
+    ) -> _RefEdition | None:
+        """Auto-create the edition a slug derivation names for the ref.
 
-        If an edition with the derived slug already exists (race guard),
-        the existing edition is returned instead. A slug held by a
+        Returns ``None`` without touching anything when one of the
+        *matched* editions already owns the ref (see ``_owns_ref``).
+
+        A live edition already holding the derived slug is reused, not
+        duplicated, and comes back with ``created`` false. That is an
+        expected path, not only a race with another worker: it is taken
+        whenever no matched edition owns the ref but an unmatched one
+        holds its slug — a ``git_ref`` edition named ``v30_0_13`` that
+        tracks another ref, say — and ``track_build`` then points that
+        edition at the build as the ref's own. A slug held by a
         lifecycle-deleted edition revives that edition through
         :meth:`~docverse_server.storage.edition_store.EditionStore.revive_or_create`.
 
-        Returns ``None`` when an operator deleted the edition holding
-        the slug: their delete reserves it, so the build is stored but
-        tracks no edition. That is a decision, not a fault, so it is
+        Also returns ``None`` when an operator deleted the edition
+        holding the slug: their delete reserves it, so the build gets no
+        edition at the slug, though the editions it matched still
+        advance as usual. That is a decision, not a fault, so it is
         logged at warning level rather than raised to Sentry.
         """
-        # Race guard: check if another worker already created it
+        if any(_owns_ref(e, derivation) for e in matched):
+            return None
+
         existing = await self._deps.edition_store.get_by_slug(
             project_id=project_id, slug=derivation.slug
         )
@@ -808,7 +836,7 @@ class EditionTrackingService:
                 slug=derivation.slug,
                 project_id=project_id,
             )
-            return EnsuredEdition(edition=existing, revived=False)
+            return _RefEdition(edition=existing, created=False, revived=False)
 
         ensured = await self._deps.edition_store.revive_or_create(
             project_id=project_id,
@@ -832,12 +860,18 @@ class EditionTrackingService:
                 tracking_mode=ensured.edition.tracking_mode,
                 project_id=project_id,
             )
-        return ensured
+        return _RefEdition(
+            edition=ensured.edition, created=True, revived=ensured.revived
+        )
 
     def _log_slug_reserved(self, *, slug: str, project_id: int) -> None:
-        """Warn that a manual delete keeps a build from tracking *slug*."""
+        """Warn that a manual delete keeps tracking from recreating *slug*.
+
+        The editions the build matched still advance as usual; only the
+        deleted edition at *slug* stays gone.
+        """
         self._deps.logger.warning(
-            "Edition slug reserved by manual delete; build not tracked",
+            "Edition slug reserved by manual delete; edition not recreated",
             slug=slug,
             project_id=project_id,
         )
