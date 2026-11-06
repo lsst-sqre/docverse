@@ -195,6 +195,57 @@ async def test_context_builder_groups_editions_by_kind(
 
 
 @pytest.mark.asyncio
+async def test_by_slug_maps_every_live_edition_to_its_grouped_object(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """``by_slug`` covers ``__main`` and every grouped edition by identity.
+
+    Template sets such as pipelines pick meta editions (``weekly``,
+    ``daily``) by slug, so the lookup must return the very objects the
+    grouped lists hold, ``__main`` included.
+    """
+    async with db_session.begin():
+        org, project = await _seed_org_and_project(
+            db_session, org_slug="bs-org", project_slug="bs-proj"
+        )
+        for slug, kind in (
+            ("__main", EditionKind.main),
+            ("weekly", EditionKind.release),
+            ("v30_0_12", EditionKind.release),
+            ("w_2026_45", EditionKind.release),
+            ("d_2026_11_04", EditionKind.draft),
+            ("tickets-DM-1", EditionKind.draft),
+            ("30", EditionKind.major),
+            ("30.0", EditionKind.minor),
+            ("staging", EditionKind.alternate),
+        ):
+            await _create_edition(
+                db_session, project.id, slug=slug, title=slug, kind=kind
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        builder = _make_builder(db_session, discovery_client)
+        ctx = await builder.build(org_id=org.id, project_id=project.id)
+
+    editions = ctx.editions
+    assert editions.main is not None
+    grouped = [
+        editions.main,
+        *editions.releases,
+        *editions.drafts,
+        *editions.major,
+        *editions.minor,
+        *editions.alternates,
+    ]
+    assert len(grouped) == 9
+    assert set(editions.by_slug) == {e.slug for e in grouped}
+    for edition in grouped:
+        assert editions.by_slug[edition.slug] is edition
+
+
+@pytest.mark.asyncio
 async def test_releases_sorted_semver_descending(
     db_session: AsyncSession,
     discovery_client: DiscoveryClient,
@@ -203,8 +254,9 @@ async def test_releases_sorted_semver_descending(
         org, project = await _seed_org_and_project(
             db_session, org_slug="rel-org", project_slug="rel-proj"
         )
-        # Insert out of order to prove the sort.
-        for slug in ("v1.0.0", "v10.0.0", "v2.5.3", "v2.5.10"):
+        # Insert out of order to prove the sort; ``latest`` parses as no
+        # version and so still sorts last.
+        for slug in ("latest", "v1.0.0", "v10.0.0", "v2.5.3", "v2.5.10"):
             await _create_edition(
                 db_session,
                 project.id,
@@ -223,6 +275,93 @@ async def test_releases_sorted_semver_descending(
         "v2.5.10",
         "v2.5.3",
         "v1.0.0",
+        "latest",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_releases_sorted_by_eups_release_version_descending(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """EUPS release slugs order by version, not by slug.
+
+    Slug order would put ``13-0`` first and ``v17_0`` before
+    ``v17_0_1``; the legacy hyphenated form and the two-component form
+    must interleave with the three-component tags by version, and a slug
+    no grammar parses still sorts last.
+    """
+    async with db_session.begin():
+        org, project = await _seed_org_and_project(
+            db_session, org_slug="eups-org", project_slug="eups-proj"
+        )
+        # Insert in slug order, which is also the store's list order.
+        for slug in (
+            "13-0",
+            "v17_0",
+            "v17_0_1",
+            "v30_0_11",
+            "v30_0_12",
+            "weekly",
+        ):
+            await _create_edition(
+                db_session,
+                project.id,
+                slug=slug,
+                title=slug,
+                kind=EditionKind.release,
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        builder = _make_builder(db_session, discovery_client)
+        ctx = await builder.build(org_id=org.id, project_id=project.id)
+
+    assert [e.slug for e in ctx.editions.releases] == [
+        "v30_0_12",
+        "v30_0_11",
+        "v17_0_1",
+        "v17_0",
+        "13-0",
+        "weekly",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_releases_sorted_by_two_component_version_descending(
+    db_session: AsyncSession,
+    discovery_client: DiscoveryClient,
+) -> None:
+    """lsst_doc ``vMAJOR.MINOR`` release slugs order numerically.
+
+    These slugs are not semver, so before EUPS slugs were understood
+    they all sorted as unparseable and kept slug order (``v1.10``,
+    ``v1.2``, ``v2.0``). The EUPS grammar's dotted two-component form
+    reads them, so they now list newest version first.
+    """
+    async with db_session.begin():
+        org, project = await _seed_org_and_project(
+            db_session, org_slug="lsstdoc-org", project_slug="lsstdoc-proj"
+        )
+        # Insert in slug order, which is also the store's list order.
+        for slug in ("v1.10", "v1.2", "v2.0"):
+            await _create_edition(
+                db_session,
+                project.id,
+                slug=slug,
+                title=slug,
+                kind=EditionKind.release,
+            )
+        await db_session.commit()
+
+    async with db_session.begin():
+        builder = _make_builder(db_session, discovery_client)
+        ctx = await builder.build(org_id=org.id, project_id=project.id)
+
+    assert [e.slug for e in ctx.editions.releases] == [
+        "v2.0",
+        "v1.10",
+        "v1.2",
     ]
 
 

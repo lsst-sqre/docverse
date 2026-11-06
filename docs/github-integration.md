@@ -105,8 +105,8 @@ gets as `main` unless its default-edition config says otherwise. Builds
 match editions by exact string. So when a repository's default branch is
 renamed (`master` → `main`), builds start arriving on the new name,
 `__main` never matches them, and edition tracking auto-creates a `main`
-draft for them instead. Nothing fails; the project root just stops
-updating.
+draft for them instead (see [Edition tracking](edition-tracking.md)).
+Nothing fails; the project root just stops updating.
 
 Docverse therefore records each bound project's default branch in
 `projects.github_default_branch`, shown read-only as
@@ -256,7 +256,10 @@ publishes a fresh `lsst_doc` edition, a `vX.Y` tag upgrades it, a
 default-branch build never displaces a published release, and
 successive default-branch builds pass the same date guard `main` builds
 always have. For a project whose default branch is `master`, a build on
-`main` is an ordinary branch.
+`main` is an ordinary branch. An `lsst_doc` edition is an alias rather
+than the branch's own edition, so each default-branch build also
+advances the branch's own draft edition, creating it on the first one
+(see [Edition tracking](edition-tracking.md#the-refs-own-edition)).
 
 The branch fallback only applies while the edition serves that same
 branch. An `lsst_doc` edition still serving a build of the *former*
@@ -768,10 +771,11 @@ editions it shows, the listing and those fetches shared by the
 project's refs, and at most 20 refs per project. A dormant project the
 push woke adds its `main` check, usually one more call per tick for the
 window, which a push to `main` itself shares. Editions that follow a
-ref by a version rule rather than by name (`lsst_doc` and the `eups`
-modes) are not looked up: a tag push to such a project is caught by the
-listing when LTD creates an edition for the tag, and otherwise on the
-project's ordinary cadence.
+ref by a version rule rather than by name (`lsst_doc`,
+`eups_major_release`, `eups_weekly_release`, `eups_daily_release` and
+`eups_release`) are not looked up: a tag push to such a project is
+caught by the listing when LTD creates an edition for the tag, and
+otherwise on the project's ordinary cadence.
 
 ### `tier_main` log lines
 
@@ -1102,7 +1106,7 @@ see [Tombstones](keeper-sync-scope.md#tombstones).
 | `Lifecycle tombstone kept: live refs unavailable` | info | — |
 | `Edition slug reserved by manual delete; LTD edition not imported` | warning | `ltd_edition_id`, `ltd_edition_slug`, `docverse_slug`, `edition_id`, `project_id`, `project` |
 | `Revived soft-deleted edition` | info | `edition_id`, `edition_slug`, `project_id`, `previous_delete_reason`, `tombstone_cleared` |
-| `Edition slug reserved by manual delete; build not tracked` | warning | `slug`, `project_id` |
+| `Edition slug reserved by manual delete; edition not recreated` | warning | `slug`, `project_id` |
 | `Semver aggregate slug held by a non-aggregate edition; leaving it untouched` | info | `project_id`, `edition_id`, `edition_slug`, `edition_kind`, `tracking_mode`, `edition_deleted` |
 | `Semver aggregate slug reserved by manual delete; aggregate not backfilled` | warning | `project_id`, `edition_id`, `edition_slug` |
 | `Restored edition` | info | `org`, `project`, `edition_id`, `edition_slug`, `republished` |
@@ -1133,9 +1137,12 @@ see [Tombstones](keeper-sync-scope.md#tombstones).
   holds an `N` or `N.M` slug. `edition_deleted` is true when that
   edition is soft-deleted and so stays deleted; `tracking_mode` is the
   holder's. A native build reports an operator's delete of an aggregate
-  with `Edition slug reserved by manual delete; build not tracked`, the
-  backfill with `Semver aggregate slug reserved by manual delete;
-  aggregate not backfilled`.
+  with `Edition slug reserved by manual delete; edition not
+  recreated`, the backfill with `Semver aggregate slug reserved by
+  manual delete; aggregate not backfilled`.
+- `Edition slug reserved by manual delete; edition not recreated` is
+  about the deleted edition at `slug` alone: the other editions the
+  build matched, such as an alias, still advance as usual.
 - `Restored edition` is the admin restore's; `republished` is whether
   it queued a publish of the edition's current build.
 - `Restored edition has no build to republish` and `Restored edition

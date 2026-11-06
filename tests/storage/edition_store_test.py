@@ -2653,6 +2653,45 @@ async def test_find_matching_eups_daily(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("git_ref", "matches"),
+    [
+        ("v30_0_12", True),
+        ("v17_0", True),  # two-component final release
+        ("v30_0_12_rc3", False),  # release candidate
+        ("w_2026_45", False),  # weekly
+        ("d_2026_11_04", False),  # daily
+        ("main", False),
+    ],
+)
+async def test_find_matching_eups_release(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+    git_ref: str,
+    *,
+    matches: bool,
+) -> None:
+    """eups_release matches final EUPS releases only."""
+    async with db_session.begin():
+        project_id = await _create_project(db_session)
+        await _create_edition_internal(
+            edition_store,
+            project_id,
+            slug="latest-release",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.eups_release,
+        )
+
+        matched = await edition_store.find_matching_editions(
+            project_id=project_id, git_ref=git_ref
+        )
+        assert [e.slug for e in matched] == (
+            ["latest-release"] if matches else []
+        )
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
 async def test_find_matching_lsst_doc_version(
     db_session: AsyncSession,
     edition_store: EditionStore,
