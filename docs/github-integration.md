@@ -105,8 +105,8 @@ gets as `main` unless its default-edition config says otherwise. Builds
 match editions by exact string. So when a repository's default branch is
 renamed (`master` → `main`), builds start arriving on the new name,
 `__main` never matches them, and edition tracking auto-creates a `main`
-draft for them instead. Nothing fails; the project root just stops
-updating.
+draft for them instead (see [Edition tracking](edition-tracking.md)).
+Nothing fails; the project root just stops updating.
 
 Docverse therefore records each bound project's default branch in
 `projects.github_default_branch`, shown read-only as
@@ -256,7 +256,10 @@ publishes a fresh `lsst_doc` edition, a `vX.Y` tag upgrades it, a
 default-branch build never displaces a published release, and
 successive default-branch builds pass the same date guard `main` builds
 always have. For a project whose default branch is `master`, a build on
-`main` is an ordinary branch.
+`main` is an ordinary branch. An `lsst_doc` edition is an alias rather
+than the branch's own edition, so each default-branch build also
+advances the branch's own draft edition, creating it on the first one
+(see [Edition tracking](edition-tracking.md#the-refs-own-edition)).
 
 The branch fallback only applies while the edition serves that same
 branch. An `lsst_doc` edition still serving a build of the *former*
