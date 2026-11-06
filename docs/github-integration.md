@@ -1106,7 +1106,7 @@ see [Tombstones](keeper-sync-scope.md#tombstones).
 | `Lifecycle tombstone kept: live refs unavailable` | info | — |
 | `Edition slug reserved by manual delete; LTD edition not imported` | warning | `ltd_edition_id`, `ltd_edition_slug`, `docverse_slug`, `edition_id`, `project_id`, `project` |
 | `Revived soft-deleted edition` | info | `edition_id`, `edition_slug`, `project_id`, `previous_delete_reason`, `tombstone_cleared` |
-| `Edition slug reserved by manual delete; build not tracked` | warning | `slug`, `project_id` |
+| `Edition slug reserved by manual delete; edition not recreated` | warning | `slug`, `project_id` |
 | `Semver aggregate slug held by a non-aggregate edition; leaving it untouched` | info | `project_id`, `edition_id`, `edition_slug`, `edition_kind`, `tracking_mode`, `edition_deleted` |
 | `Semver aggregate slug reserved by manual delete; aggregate not backfilled` | warning | `project_id`, `edition_id`, `edition_slug` |
 | `Restored edition` | info | `org`, `project`, `edition_id`, `edition_slug`, `republished` |
@@ -1137,9 +1137,12 @@ see [Tombstones](keeper-sync-scope.md#tombstones).
   holds an `N` or `N.M` slug. `edition_deleted` is true when that
   edition is soft-deleted and so stays deleted; `tracking_mode` is the
   holder's. A native build reports an operator's delete of an aggregate
-  with `Edition slug reserved by manual delete; build not tracked`, the
-  backfill with `Semver aggregate slug reserved by manual delete;
-  aggregate not backfilled`.
+  with `Edition slug reserved by manual delete; edition not
+  recreated`, the backfill with `Semver aggregate slug reserved by
+  manual delete; aggregate not backfilled`.
+- `Edition slug reserved by manual delete; edition not recreated` is
+  about the deleted edition at `slug` alone: the other editions the
+  build matched, such as an alias, still advance as usual.
 - `Restored edition` is the admin restore's; `republished` is whether
   it queued a publish of the edition's current build.
 - `Restored edition has no build to republish` and `Restored edition
