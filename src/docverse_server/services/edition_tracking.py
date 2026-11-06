@@ -130,6 +130,33 @@ def _kind_target(
     return None
 
 
+#: Tracking modes in which an edition follows one literal git ref. A
+#: match in one of them is the edition the build's ref already has, so
+#: it suppresses auto-creation: ``__main`` tracking ``main`` keeps a
+#: ``main`` build from spawning a ``main`` edition beside it. A match in
+#: any other mode is an *alias* — ``__main`` following the newest
+#: release, ``weekly`` the newest weekly — that stands for a whole
+#: family of refs and owns none of them.
+_LITERAL_REF_MODES = frozenset(
+    {TrackingMode.git_ref, TrackingMode.alternate_git_ref}
+)
+
+
+def _owns_ref(edition: Edition, derivation: SlugDerivationResult) -> bool:
+    """Report whether matched *edition* is the build's own ref edition.
+
+    It is when it tracks the literal ref (see ``_LITERAL_REF_MODES``) or
+    already holds the derived slug — compared case-insensitively, as
+    ``uq_editions_project_lower_slug`` does, so an alias edition that
+    happens to carry the ref's slug is advanced once rather than
+    returned again by auto-creation's existing-slug guard.
+    """
+    return (
+        edition.tracking_mode in _LITERAL_REF_MODES
+        or edition.slug.lower() == derivation.slug.lower()
+    )
+
+
 # Tracking modes that use version comparison instead of date-based guards.
 _VERSION_MODES = frozenset(
     {
@@ -181,9 +208,10 @@ class EditionTrackingDeps:
 class EditionTrackingService:
     """Orchestrate edition tracking when a build completes.
 
-    Derives an edition slug from the build's git ref, finds or
-    auto-creates matching editions, updates their pointers (with a
-    stale-build guard), and records build history.
+    Derives an edition slug from the build's git ref, finds matching
+    editions, auto-creates the ref's own edition when no match owns the
+    ref, updates their pointers (with a stale-build guard), and records
+    build history.
     """
 
     def __init__(self, deps: EditionTrackingDeps) -> None:
@@ -191,6 +219,22 @@ class EditionTrackingService:
 
     async def track_build(self, build: Build) -> EditionTrackingResult:
         """Evaluate tracking rules for a completed build.
+
+        The build advances every edition whose tracking matches its ref,
+        and the edition its ref derives (``/v/<slug>/``) is auto-created
+        — or revived, if lifecycle rules reaped it — unless a match
+        already owns that ref: one tracking the literal ref (``git_ref``
+        or ``alternate_git_ref``), or one already holding the derived
+        slug. Matches in every other mode are aliases for a family of
+        refs (``__main`` in ``eups_release``, ``weekly``, ``latest``,
+        the semver aggregates, an ``lsst_doc`` edition), so they advance
+        *beside* the per-ref edition rather than absorbing the build.
+        ``__main`` tracking ``main`` therefore keeps a ``main`` build
+        from spawning a ``main`` edition, while a ``v30_0_13`` build
+        both advances an ``eups_release`` ``__main`` and creates
+        ``v30_0_13``. A slug an operator deleted stays deleted. Stable
+        semver tags also auto-create their ``N`` / ``N.M`` aggregates,
+        as ``edition_autocreation.semver_aggregates`` allows.
 
         Parameters
         ----------
@@ -291,16 +335,21 @@ class EditionTrackingService:
         #    say whether this build reaches it.
         await self._lock_project_for_default_repoint(editions)
 
-        # 7. Auto-create (or revive) the git_ref edition if no match
-        #    from the slug path
+        # 7. Auto-create (or revive) the derived edition unless a match
+        #    already owns the build's ref (see ``_owns_ref``). Alias
+        #    matches — ``__main`` in ``eups_release``, ``weekly``,
+        #    ``latest`` — advance alongside it rather than absorbing the
+        #    build, so every release, weekly, or daily keeps its own
+        #    ``/v/<slug>/`` edition. The new edition joins ``editions``
+        #    so steps 9 and 10 converge, point, and publish it.
         created_ids: set[int] = set()
         revived_ids: set[int] = set()
-        if not editions:
+        if not any(_owns_ref(e, derivation) for e in editions):
             ensured = await self._auto_create_edition(
                 project_id=project.id, derivation=derivation
             )
             if ensured is not None:
-                editions = [ensured.edition]
+                editions.append(ensured.edition)
                 created_ids.add(ensured.edition.id)
                 if ensured.revived:
                     revived_ids.add(ensured.edition.id)

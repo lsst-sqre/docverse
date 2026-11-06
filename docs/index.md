@@ -17,6 +17,13 @@ absorb these pages unchanged. The design of the system as a whole is
   cardinality rule a new tag must follow, what `ltd_lag` measures, and
   example InfluxQL queries for sync lag, API request volume and
   latency, and GitHub webhook deliveries.
+- [Edition tracking](edition-tracking.md) — which editions a completed
+  build advances and which it creates: the tracking modes and what each
+  matches, the rule that gives every ref its own `/v/<slug>/` edition
+  unless a matched edition tracking that literal ref already owns it,
+  aliases such as `__main` in `eups_release`, `weekly` and `latest`
+  that advance beside it, and what happens to a slug that is already
+  live, lifecycle-deleted or reserved by an operator's delete.
 - [Dashboard template sets](dashboard-templates.md) — how a template
   set is bound and synced, every `template.toml` key and its default,
   the variables each Jinja file renders with, and switcher templates:

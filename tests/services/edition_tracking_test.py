@@ -28,7 +28,7 @@ from docverse_server.dbschema.edition import SqlEdition
 from docverse_server.dbschema.organization import SqlOrganization
 from docverse_server.dbschema.project import SqlProject
 from docverse_server.domain.build import Build
-from docverse_server.domain.edition import DEFAULT_EDITION_SLUG
+from docverse_server.domain.edition import DEFAULT_EDITION_SLUG, Edition
 from docverse_server.domain.edition_tracking import (
     EditionTrackingResult,
     RevivedEdition,
@@ -3164,3 +3164,477 @@ async def test_track_build_locks_project_before_reviving(
         and "FOR UPDATE" in s
     )
     assert project_lock < revive_lock, statements
+
+
+# ── Per-ref editions alongside alias matches ─────────────────────────────
+
+
+async def _get_edition(
+    db_session: AsyncSession, project_id: int, slug: str
+) -> Edition | None:
+    """Read the live edition holding *slug*, or ``None``."""
+    edition_store = EditionStore(session=db_session, logger=_logger())
+    return await edition_store.get_by_slug(project_id=project_id, slug=slug)
+
+
+def _actions_by_slug(result: EditionTrackingResult) -> dict[str, str]:
+    return {o.slug: o.action for o in result.outcomes}
+
+
+@pytest.mark.asyncio
+async def test_track_build_eups_release_main_also_creates_the_release(
+    db_session: AsyncSession,
+) -> None:
+    """A release advances ``__main`` *and* gets its own ``/v/`` edition.
+
+    ``__main`` in ``eups_release`` is an alias for the newest release,
+    not the edition that owns the ``v30_0_13`` ref, so the per-ref
+    edition LTD always created is auto-created beside it, with the kind
+    the built-in ``eups_release`` slug rule derives.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, _main = await _setup_eups_release_main(
+            db_session, service, org_slug="alias-eups-rel-org"
+        )
+        v30_0_12 = await _create_build(
+            db_session, project.id, git_ref="v30_0_12"
+        )
+        await service.track_build(v30_0_12)
+        v30_0_13 = await _create_build(
+            db_session, project.id, git_ref="v30_0_13"
+        )
+        result = await service.track_build(v30_0_13)
+        current = await _main_build_id(db_session, project.id)
+        per_ref = await _get_edition(db_session, project.id, "v30_0_13")
+        await db_session.commit()
+
+    assert result.derived_slug == "v30_0_13"
+    assert _actions_by_slug(result) == {
+        DEFAULT_EDITION_SLUG: "updated",
+        "v30_0_13": "created",
+    }
+    assert current == v30_0_13.id
+    assert per_ref is not None
+    assert per_ref.kind == EditionKind.release
+    assert per_ref.kind_source == EditionKindSource.derived
+    assert per_ref.tracking_mode == TrackingMode.git_ref
+    assert per_ref.tracking_params == {"git_ref": "v30_0_13"}
+    assert per_ref.current_build_id == v30_0_13.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_eups_release_main_leaves_rcs_to_a_draft(
+    db_session: AsyncSession,
+) -> None:
+    """A release candidate leaves ``__main`` and gets a draft edition."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        project, _main = await _setup_eups_release_main(
+            db_session, service, org_slug="alias-eups-rc-org"
+        )
+        v30_0_12 = await _create_build(
+            db_session, project.id, git_ref="v30_0_12"
+        )
+        await service.track_build(v30_0_12)
+        rc = await _create_build(
+            db_session, project.id, git_ref="v30_0_12_rc3"
+        )
+        result = await service.track_build(rc)
+        current = await _main_build_id(db_session, project.id)
+        per_ref = await _get_edition(db_session, project.id, "v30_0_12_rc3")
+        await db_session.commit()
+
+    assert _actions_by_slug(result) == {"v30_0_12_rc3": "created"}
+    assert current == v30_0_12.id
+    assert per_ref is not None
+    assert per_ref.kind == EditionKind.draft
+    assert per_ref.current_build_id == rc.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("alias_slug", "tracking_mode", "git_ref", "per_ref_kind"),
+    [
+        (
+            "weekly",
+            TrackingMode.eups_weekly_release,
+            "w_2026_46",
+            EditionKind.release,
+        ),
+        (
+            "daily",
+            TrackingMode.eups_daily_release,
+            "d_2026_11_05",
+            EditionKind.draft,
+        ),
+    ],
+)
+async def test_track_build_weekly_or_daily_alias_also_creates_the_tag(
+    *,
+    db_session: AsyncSession,
+    alias_slug: str,
+    tracking_mode: TrackingMode,
+    git_ref: str,
+    per_ref_kind: EditionKind,
+) -> None:
+    """A weekly or daily tag advances its meta edition and gets its own.
+
+    The per-tag edition takes the kind its ref derives: a weekly matches
+    the built-in ``eups_weekly`` rule, while dailies have no built-in
+    rule and stay drafts that age out.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(
+            db_session, org_slug=f"alias-{alias_slug}-org"
+        )
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug=alias_slug,
+            title=alias_slug,
+            kind=EditionKind.release,
+            tracking_mode=tracking_mode,
+        )
+        build = await _create_build(db_session, project.id, git_ref=git_ref)
+        result = await service.track_build(build)
+        alias = await _get_edition(db_session, project.id, alias_slug)
+        per_ref = await _get_edition(db_session, project.id, git_ref)
+        await db_session.commit()
+
+    assert _actions_by_slug(result) == {
+        alias_slug: "updated",
+        git_ref: "created",
+    }
+    assert alias is not None
+    assert alias.current_build_id == build.id
+    assert per_ref is not None
+    assert per_ref.kind == per_ref_kind
+    assert per_ref.tracking_mode == TrackingMode.git_ref
+    assert per_ref.current_build_id == build.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_semver_release_alias_also_creates_the_tag(
+    db_session: AsyncSession,
+) -> None:
+    """``v1.0.0`` gets its own edition beside ``latest`` and the aggregates.
+
+    The ``1`` / ``1.0`` aggregates already exist, so every match is an
+    alias and none of them suppresses the per-tag edition.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="alias-semver-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug="latest",
+            title="Latest Release",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.semver_release,
+        )
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug="1",
+            title="1",
+            kind=EditionKind.major,
+            tracking_mode=TrackingMode.semver_major,
+            tracking_params={"major_version": 1},
+        )
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug="1.0",
+            title="1.0",
+            kind=EditionKind.minor,
+            tracking_mode=TrackingMode.semver_minor,
+            tracking_params={"major_version": 1, "minor_version": 0},
+        )
+        build = await _create_build(db_session, project.id, git_ref="v1.0.0")
+        result = await service.track_build(build)
+        per_ref = await _get_edition(db_session, project.id, "v1.0.0")
+        await db_session.commit()
+
+    assert _actions_by_slug(result) == {
+        "latest": "updated",
+        "1": "updated",
+        "1.0": "updated",
+        "v1.0.0": "created",
+    }
+    assert per_ref is not None
+    assert per_ref.kind == EditionKind.release
+    assert per_ref.current_build_id == build.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_lsst_doc_alias_also_creates_the_tag(
+    db_session: AsyncSession,
+) -> None:
+    """A technote's ``v1.0`` advances ``current`` and gets its own edition."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="alias-lsstdoc-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug="current",
+            title="Current",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+        build = await _create_build(db_session, project.id, git_ref="v1.0")
+        result = await service.track_build(build)
+        per_ref = await _get_edition(db_session, project.id, "v1.0")
+        await db_session.commit()
+
+    assert _actions_by_slug(result) == {
+        "current": "updated",
+        "v1.0": "created",
+    }
+    assert per_ref is not None
+    assert per_ref.kind == EditionKind.release
+    assert per_ref.current_build_id == build.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_lsst_doc_main_also_creates_the_branch_draft(
+    db_session: AsyncSession,
+) -> None:
+    """An ``lsst_doc`` ``__main`` on its branch fallback is still an alias.
+
+    It follows the default branch only until a version tag lands, so it
+    does not own ``main``: the build gets a ``main`` draft too, as LTD
+    gave every technote whose ``__main`` was in ``lsst_doc`` mode.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="alias-lsstmain-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+        build = await _create_build(db_session, project.id, git_ref="main")
+        result = await service.track_build(build)
+        per_ref = await _get_edition(db_session, project.id, "main")
+        await db_session.commit()
+
+    assert _actions_by_slug(result) == {
+        DEFAULT_EDITION_SLUG: "updated",
+        "main": "created",
+    }
+    assert per_ref is not None
+    assert per_ref.kind == EditionKind.draft
+
+
+@pytest.mark.asyncio
+async def test_track_build_git_ref_main_owns_its_branch(
+    db_session: AsyncSession,
+) -> None:
+    """``__main`` tracking ``main`` keeps a ``main`` build from a twin.
+
+    A ``git_ref`` match tracks the literal ref, so it is the ref's own
+    edition and no ``main`` edition is created beside it.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="owns-main-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Main",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "main"},
+        )
+        build = await _create_build(db_session, project.id, git_ref="main")
+        result = await service.track_build(build)
+        twin = await _get_edition(db_session, project.id, "main")
+        await db_session.commit()
+
+    assert _actions_by_slug(result) == {DEFAULT_EDITION_SLUG: "updated"}
+    assert twin is None
+
+
+@pytest.mark.asyncio
+async def test_track_build_reuses_a_tracking_per_ref_edition(
+    db_session: AsyncSession,
+) -> None:
+    """An existing ``w_2026_46`` edition is advanced, not duplicated."""
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="reuse-weekly-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug="weekly",
+            title="Weekly",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.eups_weekly_release,
+        )
+        existing = await edition_store.create_internal(
+            project_id=project.id,
+            slug="w_2026_46",
+            title="w_2026_46",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.git_ref,
+            tracking_params={"git_ref": "w_2026_46"},
+        )
+        build = await _create_build(
+            db_session, project.id, git_ref="w_2026_46"
+        )
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert sorted((o.slug, o.action) for o in result.outcomes) == [
+        ("w_2026_46", "updated"),
+        ("weekly", "updated"),
+    ]
+    assert [
+        o.edition_id for o in result.outcomes if o.slug == "w_2026_46"
+    ] == [existing.id]
+
+
+@pytest.mark.asyncio
+async def test_track_build_alias_holding_the_derived_slug_is_not_doubled(
+    db_session: AsyncSession,
+) -> None:
+    """A matched alias already carrying the derived slug owns the ref.
+
+    Auto-creation would otherwise hand the same row back through its
+    existing-slug guard and the build would advance it twice.
+    """
+    service = _make_service(db_session)
+    async with db_session.begin():
+        _org, project = await _setup(db_session, org_slug="slug-owner-org")
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        owner = await edition_store.create_internal(
+            project_id=project.id,
+            slug="Main",
+            title="Main",
+            kind=EditionKind.release,
+            tracking_mode=TrackingMode.lsst_doc,
+        )
+        build = await _create_build(db_session, project.id, git_ref="main")
+        result = await service.track_build(build)
+        await db_session.commit()
+
+    assert [(o.edition_id, o.action) for o in result.outcomes] == [
+        (owner.id, "updated")
+    ]
+
+
+async def _setup_alias_with_deleted_release(
+    db_session: AsyncSession,
+    service: EditionTrackingService,
+    *,
+    org_slug: str,
+    reason: TombstoneReason,
+) -> tuple[Project, int]:
+    """Track ``v30_0_13`` under an ``eups_release`` ``__main``, then delete it.
+
+    Returns the project and the deleted per-ref edition's id.
+    """
+    async with db_session.begin():
+        org, project = await _setup(db_session, org_slug=org_slug)
+        edition_store = EditionStore(session=db_session, logger=_logger())
+        await edition_store.create_internal(
+            project_id=project.id,
+            slug=DEFAULT_EDITION_SLUG,
+            title="Latest release",
+            kind=EditionKind.main,
+            tracking_mode=TrackingMode.eups_release,
+        )
+        await db_session.commit()
+    edition_id = await _track_then_delete(
+        db_session,
+        service,
+        org=org,
+        project=project,
+        git_ref="v30_0_13",
+        slug="v30_0_13",
+        reason=reason,
+    )
+    return project, edition_id
+
+
+@pytest.mark.asyncio
+async def test_track_build_alias_revives_a_reaped_per_ref_edition(
+    db_session: AsyncSession,
+) -> None:
+    """A lifecycle-deleted per-ref edition comes back beside the alias."""
+    service = _make_service(db_session)
+    project, edition_id = await _setup_alias_with_deleted_release(
+        db_session,
+        service,
+        org_slug="alias-revive-org",
+        reason=TombstoneReason.lifecycle_delete,
+    )
+
+    async with db_session.begin():
+        build = await _create_build(db_session, project.id, git_ref="v30_0_13")
+        result = await service.track_build(build)
+        revived = await _get_edition(db_session, project.id, "v30_0_13")
+        await db_session.commit()
+
+    assert _actions_by_slug(result) == {
+        DEFAULT_EDITION_SLUG: "updated",
+        "v30_0_13": "created",
+    }
+    assert result.revived == [
+        RevivedEdition(
+            edition_id=edition_id, slug="v30_0_13", kind=EditionKind.release
+        )
+    ]
+    assert revived is not None
+    assert revived.id == edition_id
+    assert revived.current_build_id == build.id
+
+
+@pytest.mark.asyncio
+async def test_track_build_alias_leaves_a_manually_deleted_per_ref_edition(
+    db_session: AsyncSession,
+) -> None:
+    """An operator's delete keeps the per-ref slug gone; the alias moves."""
+    service = _make_service(db_session)
+    project, edition_id = await _setup_alias_with_deleted_release(
+        db_session,
+        service,
+        org_slug="alias-manual-org",
+        reason=TombstoneReason.manual_delete,
+    )
+
+    with capture_logs() as logs:
+        async with db_session.begin():
+            build = await _create_build(
+                db_session, project.id, git_ref="v30_0_13"
+            )
+            result = await service.track_build(build)
+            current = await _main_build_id(db_session, project.id)
+            await db_session.commit()
+
+    assert _actions_by_slug(result) == {DEFAULT_EDITION_SLUG: "updated"}
+    assert result.revived == []
+    assert current == build.id
+    assert [
+        entry["slug"]
+        for entry in logs
+        if entry["event"]
+        == "Edition slug reserved by manual delete; build not tracked"
+    ] == ["v30_0_13"]
+    async with db_session.begin():
+        row = (
+            await db_session.execute(
+                select(SqlEdition)
+                .where(SqlEdition.id == edition_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        await db_session.commit()
+    assert row.date_deleted is not None
+    assert row.current_build_id != build.id
