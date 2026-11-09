@@ -41,7 +41,10 @@
  *   responses.
  *
  * - `redirect` routes return a 301 with `Location` set to `route.to` on the
- *   request's origin, preserving the original query string.
+ *   request's origin, preserving the original query string. Every 301 this
+ *   module emits (redirect routes and the directory-index trailing-slash
+ *   canonicalisation) carries `CACHE_CONTROL_LONG`, since the target is a
+ *   pure function of the request URL.
  *
  * 404 handling: every 404-producing branch in this module routes through
  * `notFoundResponse(project, dashboardStore, ctx)`, which serves the
@@ -163,10 +166,24 @@ export async function resolve(
   }
 }
 
+/**
+ * Build a 301 to `to` on the request's origin, preserving the query string.
+ *
+ * Carries an explicit `Cache-Control` so the edge can cache the redirect
+ * and browsers don't fall back to heuristic (effectively permanent) caching
+ * of a header-less 301. The long profile is safe here: the target depends
+ * only on the request URL's shape, never on edition content.
+ */
 function resolveRedirect(to: string, request: Request): Response {
   const url = new URL(request.url);
   url.pathname = to;
-  return Response.redirect(url.toString(), 301);
+  return new Response(null, {
+    status: 301,
+    headers: {
+      "Location": url.toString(),
+      "Cache-Control": CACHE_CONTROL_LONG,
+    },
+  });
 }
 
 /**

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { resolve, notFoundCacheKey } from "../src/resolver";
+import { resolve, notFoundCacheKey, CACHE_CONTROL_LONG } from "../src/resolver";
 import type { DashboardStore } from "../src/dashboardStore";
 import type { Route } from "../src/router";
 
@@ -351,6 +351,7 @@ describe("resolve — edition routes", () => {
     expect(response.headers.get("Location")).toBe(
       "https://example.com/pipelines/api/core/",
     );
+    expect(response.headers.get("Cache-Control")).toBe(CACHE_CONTROL_LONG);
   });
 
   it("redirects edition root without trailing slash", async () => {
@@ -383,6 +384,7 @@ describe("resolve — edition routes", () => {
     expect(response.headers.get("Location")).toBe(
       "https://pipelines.lsst.io/v/weekly/?x=1",
     );
+    expect(response.headers.get("Cache-Control")).toBe(CACHE_CONTROL_LONG);
   });
 
   it("serves the edition root index.html when the request has a trailing slash", async () => {
@@ -1021,6 +1023,7 @@ describe("resolve — redirect routes", () => {
     expect(new URL(response.headers.get("Location") ?? "").pathname).toBe(
       "/v/",
     );
+    expect(response.headers.get("Cache-Control")).toBe(CACHE_CONTROL_LONG);
     // Edition / dashboard paths must not be touched for redirect dispatch.
     expect(kv.get).not.toHaveBeenCalled();
     expect(r2.get).not.toHaveBeenCalled();

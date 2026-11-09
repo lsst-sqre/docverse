@@ -142,6 +142,9 @@ describe("Worker integration — subdomain routing", () => {
     expect(response.headers.get("Location")).toBe(
       "https://pipelines.lsst.io/v/v1.0/",
     );
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=300, s-maxage=86400",
+    );
   });
 
   it("infers correct Content-Type for CSS", async () => {
@@ -462,6 +465,9 @@ describe("Worker integration — path-prefix routing", () => {
     expect(response.status).toBe(301);
     expect(response.headers.get("Location")).toBe(
       "https://docs.example.com/docs/pipelines/v/main/",
+    );
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=300, s-maxage=86400",
     );
   });
 
