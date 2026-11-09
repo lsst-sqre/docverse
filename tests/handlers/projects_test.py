@@ -1013,6 +1013,31 @@ async def test_create_project_custom_default_edition(
 
 
 @pytest.mark.asyncio
+async def test_create_project_eups_release_default_edition(
+    client: AsyncClient,
+) -> None:
+    """A project's default edition can be created in ``eups_release``."""
+    await _setup(client)
+    response = await client.post(
+        "/docverse/orgs/proj-org/projects",
+        json={
+            "slug": "eups-ed",
+            "title": "EUPS Ed",
+            "source_url": "https://example.com/example/eups-ed",
+            "default_edition": {
+                "tracking_mode": "eups_release",
+                "title": "Latest release",
+            },
+        },
+        headers={"X-Auth-Request-User": "testuser"},
+    )
+    assert response.status_code == 201
+    edition = response.json()["default_edition"]
+    assert edition["tracking_mode"] == "eups_release"
+    assert edition["title"] == "Latest release"
+
+
+@pytest.mark.asyncio
 async def test_get_project_includes_default_edition(
     client: AsyncClient,
 ) -> None:
@@ -1898,6 +1923,7 @@ async def test_patch_project_version_slug_rules(
         {"type": "semver"},
         {"type": "lsst_doc"},
         {"type": "eups_major"},
+        {"type": "eups_release"},
         {"type": "eups_weekly"},
     ]
     response = await client.patch(

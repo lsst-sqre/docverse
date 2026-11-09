@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 from docverse.models import EditionKind, TrackingMode
 from docverse_server.domain.version import (
     EupsMajorVersion,
+    EupsReleaseVersion,
     EupsWeeklyVersion,
     LsstDocVersion,
     parse_stable_semver,
@@ -29,6 +30,7 @@ __all__ = [
     "MAX_SLUG_LENGTH",
     "AnySlugRewriteRule",
     "EupsMajorRule",
+    "EupsReleaseRule",
     "EupsWeeklyRule",
     "IgnoreRule",
     "InvalidSlugError",
@@ -186,6 +188,23 @@ class EupsMajorRule(VersionRule):
         return EupsMajorVersion.parse(git_ref) is not None
 
 
+class EupsReleaseRule(VersionRule):
+    """Match final EUPS release refs (``v30_0_12``, ``v17_0_1``).
+
+    Release candidates such as ``v30_0_12_rc3`` deliberately do not
+    match, so they fall through to the draft fallback the way semver
+    prereleases do. A two-component tag (``v17_0``) also satisfies this
+    grammar, but `EupsMajorRule` precedes this rule among the built-ins
+    and claims it first.
+    """
+
+    type: Literal["eups_release"] = "eups_release"
+
+    def matches(self, git_ref: str) -> bool:
+        version = EupsReleaseVersion.parse(git_ref)
+        return version is not None and version.is_final
+
+
 class EupsWeeklyRule(VersionRule):
     """Match EUPS weekly release refs (``w_2026_10``)."""
 
@@ -202,6 +221,7 @@ AnySlugRewriteRule = (
     | SemverRule
     | LsstDocRule
     | EupsMajorRule
+    | EupsReleaseRule
     | EupsWeeklyRule
 )
 """Any concrete slug rewrite rule, as an undiscriminated union.
@@ -223,14 +243,15 @@ BUILTIN_SLUG_REWRITE_RULES: tuple[AnySlugRewriteRule, ...] = (
     SemverRule(),
     LsstDocRule(),
     EupsMajorRule(),
+    EupsReleaseRule(),
     EupsWeeklyRule(),
 )
 """Version-heuristic rules applied to every project.
 
 `derive_edition_slug` consults these *after* the org/project-configured
 rules and *before* the draft fallback, so an explicit user rule always
-wins. EUPS dailies and ticket branches match nothing here and therefore
-fall through to the draft fallback.
+wins. EUPS release candidates, EUPS dailies and ticket branches match
+nothing here and therefore fall through to the draft fallback.
 """
 
 

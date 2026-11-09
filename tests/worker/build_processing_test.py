@@ -5529,7 +5529,7 @@ async def test_build_processing_skips_manually_deleted_edition_quietly(
     assert captured == []
     assert any(
         entry["event"]
-        == "Edition slug reserved by manual delete; build not tracked"
+        == "Edition slug reserved by manual delete; edition not recreated"
         and entry["log_level"] == "warning"
         for entry in logs
     )

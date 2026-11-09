@@ -169,21 +169,27 @@ class TrackingDerivation:
 
 
 #: LTD version tracking modes that decide a Docverse kind on their own,
-#: with no ref inspection. Only ``eups_daily_release`` qualifies, and
-#: only because it is a *floor*: whatever ref a daily edition points at,
-#: it must stay ``draft`` so it keeps ageing out under the
-#: ``draft_inactivity`` lifecycle rule.
+#: with no ref inspection. ``eups_weekly_release`` and
+#: ``eups_daily_release`` qualify because their matchers only ever
+#: accept a weekly or daily EUPS tag: an edition in either mode can
+#: never point at a branch, so the mode alone certifies that it is on a
+#: release. That matters for the ``weekly`` / ``daily`` meta editions —
+#: their own slugs match no version rule, so under the rule chain they
+#: fell to the ``draft`` fallback and aged out under
+#: ``draft_inactivity``. The per-day ``d_YYYY_MM_DD`` editions are
+#: ``git_refs`` editions, not this mode, so they stay drafts.
 #:
-#: The other version modes (``lsst_doc``, ``eups_major_release``,
-#: ``eups_weekly_release``) deliberately do **not** appear here. They
-#: narrow which grammar an edition prefers, but they do not certify that
-#: the edition is currently on a release — LTD's own ``lsst_doc`` mode
-#: publishes ``main`` builds until a version tag exists, so a
-#: branch-tracking edition under any of them would have imported as
-#: ``release`` and become permanently exempt from lifecycle reaping.
-#: They fall through to the ref/slug confirmation below instead.
+#: ``lsst_doc`` and ``eups_major_release`` deliberately do **not**
+#: appear here. They narrow which grammar an edition prefers, but they
+#: do not certify that the edition is currently on a release — LTD's own
+#: ``lsst_doc`` mode publishes ``main`` builds until a version tag
+#: exists, so a branch-tracking edition under either would have
+#: imported as ``release`` and become permanently exempt from lifecycle
+#: reaping. They fall through to the ref/slug confirmation below
+#: instead.
 _MODE_KIND_TABLE: dict[LtdEditionMode, EditionKind] = {
-    LtdEditionMode.eups_daily_release: EditionKind.draft,
+    LtdEditionMode.eups_weekly_release: EditionKind.release,
+    LtdEditionMode.eups_daily_release: EditionKind.release,
 }
 
 
@@ -199,17 +205,17 @@ def derive_edition_kind(
 
     1. LTD's ``main`` edition maps onto Docverse's auto-created
        ``__main`` edition (``EditionKind.main``).
-    2. ``eups_daily_release`` pins ``draft`` outright — see
-       ``_MODE_KIND_TABLE``.
+    2. ``eups_weekly_release`` and ``eups_daily_release`` pin
+       ``release`` outright — see ``_MODE_KIND_TABLE``.
     3. Everything else runs the full slug-rewrite rule chain —
        org/project rules then the built-in version heuristics — against
        the tracked ref. Ignore rules do not participate: they gate
        auto-creation on the native path, and these editions already
        exist in LTD.
 
-    The version modes take arm 3 with the rest: the mode narrows, but
-    the ref (or, when LTD sends none, the version-shaped LTD slug) is
-    what confirms a release.
+    ``lsst_doc`` and ``eups_major_release`` take arm 3 with the rest:
+    the mode narrows, but the ref (or, when LTD sends none, the
+    version-shaped LTD slug) is what confirms a release.
 
     Parameters
     ----------
@@ -221,8 +227,9 @@ def derive_edition_kind(
         ``tracked_refs`` entry and finally to the LTD slug, so an
         edition with no ref at all still gets classified on its slug.
         LTD reports ``tracked_refs: null`` for every non-``git_refs``
-        mode, so version-mode editions land on that slug fallback — and
-        their slug is the version string (``v27_0``, ``w_2026_10``).
+        mode, so ``lsst_doc`` and ``eups_major_release`` editions land
+        on that slug fallback — and their slug is the version string
+        (``v1.2``, ``v27_0``).
     rules
         Ordered org/project-configured slug rewrite rules. The built-in
         version rules are always appended by the domain layer.

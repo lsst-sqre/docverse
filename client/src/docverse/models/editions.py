@@ -86,6 +86,11 @@ class TrackingMode(StrEnum):
       (``w_<year>_<week>``, e.g. ``w_2026_30``).
     - ``eups_daily_release`` — follow the highest EUPS daily tag
       (``d_<year>_<month>_<day>``, e.g. ``d_2026_07_29``).
+    - ``eups_release`` — follow the highest final EUPS release tag
+      (``v<major>_<minor>[_<patch>]``, e.g. ``v30_0_12`` or ``v17_0``).
+      Release candidates (``v30_0_12_rc3``) and weekly or daily tags
+      never advance it, and a build whose ref is not a release (such
+      as ``main``) is replaced by the first release that arrives.
     - ``semver_release`` — follow the highest semantic-version tag
       overall (e.g. ``v2.3.0``).
     - ``semver_major`` — follow the highest release within one major
@@ -101,6 +106,7 @@ class TrackingMode(StrEnum):
     eups_major_release = "eups_major_release"
     eups_weekly_release = "eups_weekly_release"
     eups_daily_release = "eups_daily_release"
+    eups_release = "eups_release"
     semver_release = "semver_release"
     semver_major = "semver_major"
     semver_minor = "semver_minor"

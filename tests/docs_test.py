@@ -287,7 +287,7 @@ _REVIVAL_LOG_LINES: dict[str, tuple[str, ...]] = {
     ),
     "docverse_server.storage.edition_store": ("Revived soft-deleted edition",),
     "docverse_server.services.edition_tracking": (
-        "Edition slug reserved by manual delete; build not tracked",
+        "Edition slug reserved by manual delete; edition not recreated",
         _AGGREGATE_SLUG_HELD,
     ),
     "docverse_server.services.edition": ("Restored edition",),

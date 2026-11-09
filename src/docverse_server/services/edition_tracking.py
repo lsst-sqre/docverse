@@ -18,7 +18,6 @@ from docverse.models import (
 from docverse_server.domain.build import Build
 from docverse_server.domain.edition import (
     Edition,
-    EnsuredEdition,
     ReservedSlug,
     SlugReservation,
 )
@@ -78,6 +77,85 @@ def _derivation_governs(
     )
 
 
+#: Tracking modes whose matcher only ever accepts a release ref — a final
+#: EUPS release, a weekly tag, or a daily tag. An edition in one of them
+#: can never point at a branch or a release candidate, so the mode alone
+#: certifies it as a ``release``, whatever the build's own ref derives:
+#: a daily tag derives ``draft``, yet the ``daily`` edition following it
+#: is a release. ``lsst_doc`` is absent because it falls back to the
+#: default branch until a version tag exists; ``eups_major_release`` is
+#: left out by PRD #864, so its kind stays whatever it was created with.
+_RELEASE_TRACKING_MODES = frozenset(
+    {
+        TrackingMode.eups_release,
+        TrackingMode.eups_weekly_release,
+        TrackingMode.eups_daily_release,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _KindTarget:
+    """The kind tracking converges an edition on, and what decided it.
+
+    ``matched_rule_type`` is the slug-rewrite rule behind a ref
+    derivation, or ``None`` when the edition's tracking mode decided.
+    """
+
+    kind: EditionKind
+    matched_rule_type: str | None
+
+
+def _kind_target(
+    edition: Edition, derivation: SlugDerivationResult
+) -> _KindTarget | None:
+    """Return the kind *edition* should carry, or ``None`` if none governs.
+
+    A release-only tracking mode (see ``_RELEASE_TRACKING_MODES``)
+    certifies ``release`` on its own; otherwise the ref derivation
+    governs exactly the editions :func:`_derivation_governs` admits. The
+    default edition's ``main`` kind belongs to the project, so neither
+    rewrites it.
+    """
+    if edition.kind is EditionKind.main:
+        return None
+    if edition.tracking_mode in _RELEASE_TRACKING_MODES:
+        return _KindTarget(kind=EditionKind.release, matched_rule_type=None)
+    if _derivation_governs(edition, derivation):
+        return _KindTarget(
+            kind=derivation.edition_kind,
+            matched_rule_type=derivation.matched_rule_type,
+        )
+    return None
+
+
+#: Tracking modes in which an edition follows one literal git ref. A
+#: match in one of them is the edition the build's ref already has, so
+#: it suppresses auto-creation: ``__main`` tracking ``main`` keeps a
+#: ``main`` build from spawning a ``main`` edition beside it. A match in
+#: any other mode is an *alias* — ``__main`` following the newest
+#: release, ``weekly`` the newest weekly — that stands for a whole
+#: family of refs and owns none of them.
+_LITERAL_REF_MODES = frozenset(
+    {TrackingMode.git_ref, TrackingMode.alternate_git_ref}
+)
+
+
+def _owns_ref(edition: Edition, derivation: SlugDerivationResult) -> bool:
+    """Report whether matched *edition* is the build's own ref edition.
+
+    It is when it tracks the literal ref (see ``_LITERAL_REF_MODES``) or
+    already holds the derived slug — compared case-insensitively, as
+    ``uq_editions_project_lower_slug`` does, so an alias edition that
+    happens to carry the ref's slug is advanced once rather than
+    returned again by auto-creation's existing-slug guard.
+    """
+    return (
+        edition.tracking_mode in _LITERAL_REF_MODES
+        or edition.slug.lower() == derivation.slug.lower()
+    )
+
+
 # Tracking modes that use version comparison instead of date-based guards.
 _VERSION_MODES = frozenset(
     {
@@ -85,11 +163,28 @@ _VERSION_MODES = frozenset(
         TrackingMode.semver_major,
         TrackingMode.semver_minor,
         TrackingMode.eups_major_release,
+        TrackingMode.eups_release,
         TrackingMode.eups_weekly_release,
         TrackingMode.eups_daily_release,
         TrackingMode.lsst_doc,
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _RefEdition:
+    """The edition auto-creation settles the build's ref on.
+
+    ``created`` is whether this tracking inserted or revived it, which
+    reports it ``created``. An edition that already held the derived
+    slug is reused instead, so it reports ``updated`` like any other
+    existing edition the build advances. ``revived`` is the revived
+    subset of ``created``.
+    """
+
+    edition: Edition
+    created: bool
+    revived: bool
 
 
 @dataclass(slots=True)
@@ -128,9 +223,10 @@ class EditionTrackingDeps:
 class EditionTrackingService:
     """Orchestrate edition tracking when a build completes.
 
-    Derives an edition slug from the build's git ref, finds or
-    auto-creates matching editions, updates their pointers (with a
-    stale-build guard), and records build history.
+    Derives an edition slug from the build's git ref, finds matching
+    editions, auto-creates the ref's own edition when no match owns the
+    ref, updates their pointers (with a stale-build guard), and records
+    build history.
     """
 
     def __init__(self, deps: EditionTrackingDeps) -> None:
@@ -138,6 +234,22 @@ class EditionTrackingService:
 
     async def track_build(self, build: Build) -> EditionTrackingResult:
         """Evaluate tracking rules for a completed build.
+
+        The build advances every edition whose tracking matches its ref,
+        and the edition its ref derives (``/v/<slug>/``) is auto-created
+        — or revived, if lifecycle rules reaped it — unless a match
+        already owns that ref: one tracking the literal ref (``git_ref``
+        or ``alternate_git_ref``), or one already holding the derived
+        slug. Matches in every other mode are aliases for a family of
+        refs (``__main`` in ``eups_release``, ``weekly``, ``latest``,
+        the semver aggregates, an ``lsst_doc`` edition), so they advance
+        *beside* the per-ref edition rather than absorbing the build.
+        ``__main`` tracking ``main`` therefore keeps a ``main`` build
+        from spawning a ``main`` edition, while a ``v30_0_13`` build
+        both advances an ``eups_release`` ``__main`` and creates
+        ``v30_0_13``. A slug an operator deleted stays deleted. Stable
+        semver tags also auto-create their ``N`` / ``N.M`` aggregates,
+        as ``edition_autocreation.semver_aggregates`` allows.
 
         Parameters
         ----------
@@ -238,19 +350,25 @@ class EditionTrackingService:
         #    say whether this build reaches it.
         await self._lock_project_for_default_repoint(editions)
 
-        # 7. Auto-create (or revive) the git_ref edition if no match
-        #    from the slug path
+        # 7. Auto-create (or revive) the derived edition unless a match
+        #    already owns the build's ref (see ``_owns_ref``). Alias
+        #    matches — ``__main`` in ``eups_release``, ``weekly``,
+        #    ``latest`` — advance alongside it rather than absorbing the
+        #    build, so every release, weekly, or daily keeps its own
+        #    ``/v/<slug>/`` edition. The ref's edition joins ``editions``
+        #    so steps 9 and 10 converge, point, and publish it; only one
+        #    this step inserted or revived reports ``created``.
         created_ids: set[int] = set()
         revived_ids: set[int] = set()
-        if not editions:
-            ensured = await self._auto_create_edition(
-                project_id=project.id, derivation=derivation
-            )
-            if ensured is not None:
-                editions = [ensured.edition]
-                created_ids.add(ensured.edition.id)
-                if ensured.revived:
-                    revived_ids.add(ensured.edition.id)
+        ref_edition = await self._auto_create_edition(
+            editions, project_id=project.id, derivation=derivation
+        )
+        if ref_edition is not None:
+            editions.append(ref_edition.edition)
+            if ref_edition.created:
+                created_ids.add(ref_edition.edition.id)
+            if ref_edition.revived:
+                revived_ids.add(ref_edition.edition.id)
 
         # 8. Auto-create (or revive) semver_major / semver_minor editions
         autocreation = resolve_edition_autocreation(
@@ -360,6 +478,13 @@ class EditionTrackingService:
         stranded. Convergence — not a re-asserting PATCH — is the
         supported way to undo an automatic kind.
 
+        An edition in a release-only tracking mode (``eups_release``,
+        ``eups_weekly_release``, ``eups_daily_release``) converges on
+        ``release`` instead, whatever the build's ref derives: its
+        matcher only ever accepts a release ref, so the mode certifies
+        the kind. That is how the ``weekly`` / ``daily`` meta editions,
+        whose own slugs match no version rule, stop being drafts.
+
         Returns the list with converged rows replaced by their
         post-write state, so downstream steps see the kind that is in
         the database.
@@ -383,18 +508,24 @@ class EditionTrackingService:
         org_id: int,
         project_id: int,
     ) -> Edition:
-        """Write *derivation*'s kind to *edition* when it governs it."""
-        if not _derivation_governs(edition, derivation):
+        """Write the kind that governs *edition* when it differs.
+
+        The target comes from :func:`_kind_target`: ``release`` for a
+        release-only tracking mode, else *derivation*'s kind when it
+        governs the edition. A ``declared`` kind is never rewritten.
+        """
+        target = _kind_target(edition, derivation)
+        if target is None:
             return edition
         if edition.kind_source is EditionKindSource.declared:
             return edition
-        if edition.kind is derivation.edition_kind:
+        if edition.kind is target.kind:
             return edition
         async with self._edition_update_lock(
             org_id=org_id, project_id=project_id, edition_id=edition.id
         ):
             await self._deps.edition_store.update_kind(
-                edition_id=edition.id, kind=derivation.edition_kind
+                edition_id=edition.id, kind=target.kind
             )
         self._deps.logger.info(
             "Converged edition kind",
@@ -402,11 +533,12 @@ class EditionTrackingService:
             edition_id=edition.id,
             project_id=project_id,
             previous_kind=edition.kind.value,
-            edition_kind=derivation.edition_kind.value,
+            edition_kind=target.kind.value,
             kind_trigger="build_upload",
-            matched_rule_type=derivation.matched_rule_type,
+            tracking_mode=edition.tracking_mode.value,
+            matched_rule_type=target.matched_rule_type,
         )
-        return edition.model_copy(update={"kind": derivation.edition_kind})
+        return edition.model_copy(update={"kind": target.kind})
 
     async def _update_editions(
         self,
@@ -666,23 +798,35 @@ class EditionTrackingService:
 
     async def _auto_create_edition(
         self,
+        matched: list[Edition],
         *,
         project_id: int,
         derivation: SlugDerivationResult,
-    ) -> EnsuredEdition | None:
-        """Auto-create an edition from a slug derivation result.
+    ) -> _RefEdition | None:
+        """Auto-create the edition a slug derivation names for the ref.
 
-        If an edition with the derived slug already exists (race guard),
-        the existing edition is returned instead. A slug held by a
+        Returns ``None`` without touching anything when one of the
+        *matched* editions already owns the ref (see ``_owns_ref``).
+
+        A live edition already holding the derived slug is reused, not
+        duplicated, and comes back with ``created`` false. That is an
+        expected path, not only a race with another worker: it is taken
+        whenever no matched edition owns the ref but an unmatched one
+        holds its slug — a ``git_ref`` edition named ``v30_0_13`` that
+        tracks another ref, say — and ``track_build`` then points that
+        edition at the build as the ref's own. A slug held by a
         lifecycle-deleted edition revives that edition through
         :meth:`~docverse_server.storage.edition_store.EditionStore.revive_or_create`.
 
-        Returns ``None`` when an operator deleted the edition holding
-        the slug: their delete reserves it, so the build is stored but
-        tracks no edition. That is a decision, not a fault, so it is
+        Also returns ``None`` when an operator deleted the edition
+        holding the slug: their delete reserves it, so the build gets no
+        edition at the slug, though the editions it matched still
+        advance as usual. That is a decision, not a fault, so it is
         logged at warning level rather than raised to Sentry.
         """
-        # Race guard: check if another worker already created it
+        if any(_owns_ref(e, derivation) for e in matched):
+            return None
+
         existing = await self._deps.edition_store.get_by_slug(
             project_id=project_id, slug=derivation.slug
         )
@@ -692,7 +836,7 @@ class EditionTrackingService:
                 slug=derivation.slug,
                 project_id=project_id,
             )
-            return EnsuredEdition(edition=existing, revived=False)
+            return _RefEdition(edition=existing, created=False, revived=False)
 
         ensured = await self._deps.edition_store.revive_or_create(
             project_id=project_id,
@@ -716,12 +860,18 @@ class EditionTrackingService:
                 tracking_mode=ensured.edition.tracking_mode,
                 project_id=project_id,
             )
-        return ensured
+        return _RefEdition(
+            edition=ensured.edition, created=True, revived=ensured.revived
+        )
 
     def _log_slug_reserved(self, *, slug: str, project_id: int) -> None:
-        """Warn that a manual delete keeps a build from tracking *slug*."""
+        """Warn that a manual delete keeps tracking from recreating *slug*.
+
+        The editions the build matched still advance as usual; only the
+        deleted edition at *slug* stays gone.
+        """
         self._deps.logger.warning(
-            "Edition slug reserved by manual delete; build not tracked",
+            "Edition slug reserved by manual delete; edition not recreated",
             slug=slug,
             project_id=project_id,
         )
