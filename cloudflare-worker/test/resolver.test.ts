@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { resolve, notFoundCacheKey } from "../src/resolver";
+import { resolve, notFoundCacheKey, CACHE_CONTROL_LONG } from "../src/resolver";
 import type { DashboardStore } from "../src/dashboardStore";
 import type { Route } from "../src/router";
 
@@ -351,6 +351,68 @@ describe("resolve — edition routes", () => {
     expect(response.headers.get("Location")).toBe(
       "https://example.com/pipelines/api/core/",
     );
+    expect(response.headers.get("Cache-Control")).toBe(CACHE_CONTROL_LONG);
+  });
+
+  it("redirects edition root without trailing slash", async () => {
+    // `/v/weekly` parses to an edition route with an empty path, exactly
+    // like `/v/weekly/`; only the request pathname tells them apart.
+    const rootRoute: Route = {
+      kind: "edition",
+      project: "pipelines",
+      edition: "weekly",
+      path: "",
+    };
+    const kv = createMockKV({
+      "pipelines/weekly": JSON.stringify({
+        build_id: "b123",
+        r2_prefix: "pipelines/__builds/b123/",
+      }),
+    });
+    const r2 = createMockR2({
+      "pipelines/__builds/b123/index.html": {
+        body: streamFromString("<html>weekly</html>"),
+        size: 19,
+      },
+    });
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://pipelines.lsst.io/v/weekly?x=1");
+
+    const response = await resolve(rootRoute, request, kv, r2, dashboardStore, ctx);
+
+    expect(response.status).toBe(301);
+    expect(response.headers.get("Location")).toBe(
+      "https://pipelines.lsst.io/v/weekly/?x=1",
+    );
+    expect(response.headers.get("Cache-Control")).toBe(CACHE_CONTROL_LONG);
+  });
+
+  it("serves the edition root index.html when the request has a trailing slash", async () => {
+    const rootRoute: Route = {
+      kind: "edition",
+      project: "pipelines",
+      edition: "weekly",
+      path: "",
+    };
+    const kv = createMockKV({
+      "pipelines/weekly": JSON.stringify({
+        build_id: "b123",
+        r2_prefix: "pipelines/__builds/b123/",
+      }),
+    });
+    const r2 = createMockR2({
+      "pipelines/__builds/b123/index.html": {
+        body: streamFromString("<html>weekly</html>"),
+        size: 19,
+      },
+    });
+    const dashboardStore = createMockDashboardStore();
+    const request = new Request("https://pipelines.lsst.io/v/weekly/");
+
+    const response = await resolve(rootRoute, request, kv, r2, dashboardStore, ctx);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("<html>weekly</html>");
   });
 
   it("serves index.html when path has trailing slash", async () => {
@@ -961,6 +1023,7 @@ describe("resolve — redirect routes", () => {
     expect(new URL(response.headers.get("Location") ?? "").pathname).toBe(
       "/v/",
     );
+    expect(response.headers.get("Cache-Control")).toBe(CACHE_CONTROL_LONG);
     // Edition / dashboard paths must not be touched for redirect dispatch.
     expect(kv.get).not.toHaveBeenCalled();
     expect(r2.get).not.toHaveBeenCalled();

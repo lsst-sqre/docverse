@@ -132,6 +132,21 @@ describe("Worker integration — subdomain routing", () => {
     );
   });
 
+  it("redirects /v/{edition} without trailing slash to /v/{edition}/", async () => {
+    const response = await SELF.fetch(
+      "https://pipelines.lsst.io/v/v1.0",
+      { redirect: "manual" },
+    );
+
+    expect(response.status).toBe(301);
+    expect(response.headers.get("Location")).toBe(
+      "https://pipelines.lsst.io/v/v1.0/",
+    );
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=300, s-maxage=86400",
+    );
+  });
+
   it("infers correct Content-Type for CSS", async () => {
     const response = await SELF.fetch(
       "https://pipelines.lsst.io/style.css",
@@ -427,6 +442,33 @@ describe("Worker integration — path-prefix routing", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html");
     expect(await response.text()).toBe("<html>root</html>");
+  });
+
+  it("redirects /docs/{project} without trailing slash", async () => {
+    const response = await fetchPathPrefix(
+      "https://docs.example.com/docs/pipelines",
+      { redirect: "manual" },
+    );
+
+    expect(response.status).toBe(301);
+    expect(response.headers.get("Location")).toBe(
+      "https://docs.example.com/docs/pipelines/",
+    );
+  });
+
+  it("redirects /docs/{project}/v/{edition} without trailing slash", async () => {
+    const response = await fetchPathPrefix(
+      "https://docs.example.com/docs/pipelines/v/main",
+      { redirect: "manual" },
+    );
+
+    expect(response.status).toBe(301);
+    expect(response.headers.get("Location")).toBe(
+      "https://docs.example.com/docs/pipelines/v/main/",
+    );
+    expect(response.headers.get("Cache-Control")).toBe(
+      "public, max-age=300, s-maxage=86400",
+    );
   });
 
   it("serves a page under __main", async () => {

@@ -7,7 +7,9 @@
  *   1. Look up `{project}/{edition}` in KV to get the build mapping.
  *   2. Construct the R2 object key as `{r2_prefix}{file_path}`.
  *   3. Try exact path, then `{path}/index.html` for directory index
- *      resolution.
+ *      resolution. When the index file is found but the request pathname
+ *      lacks a trailing slash (e.g. `/v/weekly` or `/api/core`), return a
+ *      301 to the slash-terminated URL so relative asset links resolve.
  *   4. Return the R2 object with `Content-Type` inferred from the file
  *      extension and `Cache-Control` derived from the KV value's
  *      `cache_profile` field: `CACHE_CONTROL_LONG` for `"long"`,
@@ -39,7 +41,10 @@
  *   responses.
  *
  * - `redirect` routes return a 301 with `Location` set to `route.to` on the
- *   request's origin, preserving the original query string.
+ *   request's origin, preserving the original query string. Every 301 this
+ *   module emits (redirect routes and the directory-index trailing-slash
+ *   canonicalisation) carries `CACHE_CONTROL_LONG`, since the target is a
+ *   pure function of the request URL.
  *
  * 404 handling: every 404-producing branch in this module routes through
  * `notFoundResponse(project, dashboardStore, ctx)`, which serves the
@@ -161,10 +166,24 @@ export async function resolve(
   }
 }
 
+/**
+ * Build a 301 to `to` on the request's origin, preserving the query string.
+ *
+ * Carries an explicit `Cache-Control` so the edge can cache the redirect
+ * and browsers don't fall back to heuristic (effectively permanent) caching
+ * of a header-less 301. The long profile is safe here: the target depends
+ * only on the request URL's shape, never on edition content.
+ */
 function resolveRedirect(to: string, request: Request): Response {
   const url = new URL(request.url);
   url.pathname = to;
-  return Response.redirect(url.toString(), 301);
+  return new Response(null, {
+    status: 301,
+    headers: {
+      "Location": url.toString(),
+      "Cache-Control": CACHE_CONTROL_LONG,
+    },
+  });
 }
 
 /**
@@ -252,11 +271,13 @@ async function resolveEdition(
       : `${r2Key}/index.html`;
     object = await r2.get(indexKey);
     if (object !== null) {
-      // Redirect to trailing slash so relative links resolve correctly
-      if (route.path !== "" && !route.path.endsWith("/")) {
-        const url = new URL(request.url);
-        url.pathname = `${url.pathname}/`;
-        return Response.redirect(url.toString(), 301);
+      // Redirect to trailing slash so relative links resolve correctly.
+      // Decide from the request pathname rather than `route.path`: the
+      // edition root has an empty `route.path` whether the request was
+      // `/v/weekly/` or `/v/weekly`, and only the latter needs the redirect.
+      const { pathname } = new URL(request.url);
+      if (!pathname.endsWith("/")) {
+        return resolveRedirect(`${pathname}/`, request);
       }
       resolvedPath = indexKey.slice(prefix.length);
     }
