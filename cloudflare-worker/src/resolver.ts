@@ -258,10 +258,9 @@ async function resolveEdition(
       // Decide from the request pathname rather than `route.path`: the
       // edition root has an empty `route.path` whether the request was
       // `/v/weekly/` or `/v/weekly`, and only the latter needs the redirect.
-      const url = new URL(request.url);
-      if (!url.pathname.endsWith("/")) {
-        url.pathname = `${url.pathname}/`;
-        return Response.redirect(url.toString(), 301);
+      const { pathname } = new URL(request.url);
+      if (!pathname.endsWith("/")) {
+        return resolveRedirect(`${pathname}/`, request);
       }
       resolvedPath = indexKey.slice(prefix.length);
     }
