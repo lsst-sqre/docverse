@@ -17,6 +17,11 @@ absorb these pages unchanged. The design of the system as a whole is
   cardinality rule a new tag must follow, what `ltd_lag` measures, and
   example InfluxQL queries for sync lag, API request volume and
   latency, and GitHub webhook deliveries.
+- [Dashboard template sets](dashboard-templates.md) — how a template
+  set is bound and synced, every `template.toml` key and its default,
+  the variables each Jinja file renders with, and switcher templates:
+  the `[switcher] template` key, the JSON schema its output must meet,
+  and what a dashboard build does when it does not.
 
 ## Operations
 

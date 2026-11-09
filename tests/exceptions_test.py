@@ -35,7 +35,13 @@ from docverse_server.exceptions import (
     KeeperSyncSystemicFailureError,
     UpstreamServiceError,
 )
+from docverse_server.services.dashboard.renderers import (
+    InvalidSwitcherJsonError,
+)
 from docverse_server.storage.cdncachepurger import CloudflareCachePurgeError
+from docverse_server.storage.dashboard_templates.template_source import (
+    InvalidTemplateConfigError,
+)
 from docverse_server.storage.editionpublisher import CloudflareKvReadError
 from docverse_server.storage.ltd import LtdSourceAccessDeniedError
 from docverse_server.storage.objectstore import ObjectStoreError
@@ -131,6 +137,22 @@ def _make_object_store_error() -> ObjectStoreError:
     )
 
 
+def _make_invalid_switcher_json() -> InvalidSwitcherJsonError:
+    return InvalidSwitcherJsonError(
+        template="switcher.json.jinja",
+        org_slug="rubin",
+        project_slug="pipelines",
+        reason="entry 2 has no 'url'",
+    )
+
+
+def _make_invalid_template_config() -> InvalidTemplateConfigError:
+    return InvalidTemplateConfigError(
+        key="[switcher] template",
+        reason="must be a non-empty string, got ''",
+    )
+
+
 _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
     ("InvalidJobStateError", _make_invalid_job_state),
     ("InvalidBuildStateError", _make_invalid_build_state),
@@ -149,6 +171,8 @@ _FACTORIES: list[tuple[str, Callable[[], DocverseSlackException]]] = [
     ("CloudflareKvReadError", _make_cloudflare_kv_read),
     ("LtdSourceAccessDeniedError", _make_ltd_source_access_denied),
     ("ObjectStoreError", _make_object_store_error),
+    ("InvalidSwitcherJsonError", _make_invalid_switcher_json),
+    ("InvalidTemplateConfigError", _make_invalid_template_config),
 ]
 
 

@@ -22,6 +22,7 @@ from docverse_server.storage.dashboard_templates.github import (
     GitHubTemplateKey,
 )
 from docverse_server.storage.dashboard_templates.template_source import (
+    InvalidTemplateConfigError,
     parse_template_toml,
 )
 from docverse_server.storage.github import GitHubAppClient, GitHubTreeFetcher
@@ -183,7 +184,11 @@ class DashboardTemplateSyncer:
 
         try:
             parse_template_toml(template_toml)
-        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        except (
+            tomllib.TOMLDecodeError,
+            UnicodeDecodeError,
+            InvalidTemplateConfigError,
+        ) as exc:
             return await self._record_failure(
                 binding=binding,
                 logger=logger,
