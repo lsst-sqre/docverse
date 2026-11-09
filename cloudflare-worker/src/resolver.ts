@@ -7,7 +7,9 @@
  *   1. Look up `{project}/{edition}` in KV to get the build mapping.
  *   2. Construct the R2 object key as `{r2_prefix}{file_path}`.
  *   3. Try exact path, then `{path}/index.html` for directory index
- *      resolution.
+ *      resolution. When the index file is found but the request pathname
+ *      lacks a trailing slash (e.g. `/v/weekly` or `/api/core`), return a
+ *      301 to the slash-terminated URL so relative asset links resolve.
  *   4. Return the R2 object with `Content-Type` inferred from the file
  *      extension and `Cache-Control` derived from the KV value's
  *      `cache_profile` field: `CACHE_CONTROL_LONG` for `"long"`,
@@ -252,9 +254,12 @@ async function resolveEdition(
       : `${r2Key}/index.html`;
     object = await r2.get(indexKey);
     if (object !== null) {
-      // Redirect to trailing slash so relative links resolve correctly
-      if (route.path !== "" && !route.path.endsWith("/")) {
-        const url = new URL(request.url);
+      // Redirect to trailing slash so relative links resolve correctly.
+      // Decide from the request pathname rather than `route.path`: the
+      // edition root has an empty `route.path` whether the request was
+      // `/v/weekly/` or `/v/weekly`, and only the latter needs the redirect.
+      const url = new URL(request.url);
+      if (!url.pathname.endsWith("/")) {
         url.pathname = `${url.pathname}/`;
         return Response.redirect(url.toString(), 301);
       }
