@@ -42,7 +42,14 @@ dev = [
     "asgi-lifespan",
     "coverage[toml]",
     "httpx",
-    "pytest",
+    # Temporary cap. pytest 9.2.0 no longer reads the private Item._nodeid
+    # attribute that pytest-xdist 3.8.0 writes to implement
+    # --dist=loadgroup, so the xdist_group mark is silently ignored and the
+    # paired pins in tests/session_lifespan_test.py land on different
+    # workers. Fixed on pytest-xdist's master branch but not yet released;
+    # drop this cap once a pytest-xdist newer than 3.8.0 is out. See
+    # https://github.com/pytest-dev/pytest-xdist/issues/1386
+    "pytest<9.2",
     "pytest-asyncio",
     # 2.4 is the first release whose debugger detection reads
     # sys.monitoring, which is how a debugger attaches on the Python this
