@@ -985,7 +985,7 @@ dev = [
     { name = "asgi-lifespan" },
     { name = "coverage", extras = ["toml"] },
     { name = "httpx" },
-    { name = "pytest" },
+    { name = "pytest", specifier = "<9.2" },
     { name = "pytest-asyncio" },
     { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "pytest-xdist" },
