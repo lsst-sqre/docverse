@@ -27,10 +27,7 @@ import structlog  # noqa: E402
 from asgi_lifespan import LifespanManager  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
-from rubin.repertoire import (  # noqa: E402
-    DiscoveryClient,
-    register_mock_discovery,
-)
+from rubin.repertoire import DiscoveryClient, register_mock_discovery  # noqa: E402
 from safir.arq import MockArqQueue  # noqa: E402
 from safir.database import create_database_engine  # noqa: E402
 from safir.dependencies.arq import arq_dependency  # noqa: E402
@@ -58,20 +55,12 @@ from docverse_server.domain.base32id import serialize_base32_id  # noqa: E402
 from docverse_server.main import app as docverse_app  # noqa: E402
 from docverse_server.metrics import build_event_manager  # noqa: E402
 from docverse_server.metrics.events import DocverseEvents  # noqa: E402
-from docverse_server.services.keeper_sync_run import (  # noqa: E402
-    KEEPER_SYNC_QUEUE_NAME,
-)
+from docverse_server.services.keeper_sync_run import KEEPER_SYNC_QUEUE_NAME  # noqa: E402
 from docverse_server.storage.build_store import BuildStore  # noqa: E402
-from docverse_server.storage.membership_store import (  # noqa: E402
-    OrgMembershipStore,
-)
-from docverse_server.storage.organization_store import (  # noqa: E402
-    OrganizationStore,
-)
+from docverse_server.storage.membership_store import OrgMembershipStore  # noqa: E402
+from docverse_server.storage.organization_store import OrganizationStore  # noqa: E402
 from docverse_server.storage.project_store import ProjectStore  # noqa: E402
-from docverse_server.storage.user_info_store import (  # noqa: E402
-    StubUserInfoStore,
-)
+from docverse_server.storage.user_info_store import StubUserInfoStore  # noqa: E402
 from docverse_server.worker.queues import MAINTENANCE_QUEUE_NAME  # noqa: E402
 
 from .support.arq_testing import register_queue  # noqa: E402
