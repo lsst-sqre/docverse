@@ -59,6 +59,7 @@ from docverse_server.storage.edition_build_history_store import (
 )
 from docverse_server.storage.edition_store import EditionStore
 from docverse_server.storage.editionpublisher import EditionPublisher
+from docverse_server.storage.keeper_sync.state_store import TombstoneReason
 from docverse_server.storage.organization_store import OrganizationStore
 from docverse_server.storage.project_store import ProjectStore
 from docverse_server.storage.queue_backend import ArqQueueBackend, EnqueuedJob
@@ -661,6 +662,75 @@ async def test_a_rival_publish_between_plan_and_apply_drops_the_republish(
             db_session, edition_id=seeded.alpha_edition_id
         )
         == 1
+    )
+    assert (
+        await _publish_status(db_session, edition_id=seeded.alpha_edition_id)
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_delete_between_plan_and_apply_drops_the_republish(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A republish planned for an edition since soft-deleted is dropped.
+
+    Issue #886: a branch deleted while the tick runs is soft-deleted by
+    the ``ref_deleted`` webhook after the plan's transaction has read it
+    as live. Enqueuing anyway marks a tombstone ``pending`` and hands
+    ``publish_edition`` a job for an edition it cannot resolve, so the
+    re-check reads ``date_deleted`` under the same row lock as the
+    current build and stands down, counting the edition as the
+    tombstone it now is.
+    """
+    async with db_session.begin():
+        seeded = await _seed_drift_with_a_spare_build(db_session, key="gone")
+
+    async def _delete_the_edition() -> None:
+        async with db_session.begin():
+            deleted = await EditionStore(
+                session=db_session, logger=_logger()
+            ).soft_delete(
+                org_id=seeded.org.id,
+                project_id=seeded.project_id,
+                slug="alpha",
+                reason=TombstoneReason.lifecycle_delete,
+            )
+            assert deleted is True
+
+    mock_arq = MockArqQueue(default_queue_name=_config.arq_queue_name)
+    queue_backend = ArqQueueBackend(
+        arq_queue=mock_arq, default_queue_name=_config.arq_queue_name
+    )
+    with sentry_init_fixture() as init:
+        init(environment="test")
+        sentry_events = capture_events_fixture(monkeypatch)()
+        async for session in db_session_dependency():
+            service = _interrupted_service(
+                session,
+                queue_backend=queue_backend,
+                interruption=_delete_the_edition,
+            )
+            outcome = await service.reconcile_org(seeded.org, limit=10)
+            break
+
+    assert outcome.tombstoned == 1
+    assert outcome.as_progress()["tombstoned"] == 1
+    assert outcome.superseded_skipped == 0
+    assert outcome.republish_failed == 0
+    assert not outcome.has_errors
+    assert sentry_events.errors == []
+    # The org's other drift is still repaired.
+    assert outcome.republished == 1
+    assert outcome.republished_editions == ["svc-gone-proj/beta"]
+    # Phase A wrote nothing at all for the deleted edition.
+    assert (
+        await _publish_job_count(
+            db_session, edition_id=seeded.alpha_edition_id
+        )
+        == 0
     )
     assert (
         await _publish_status(db_session, edition_id=seeded.alpha_edition_id)

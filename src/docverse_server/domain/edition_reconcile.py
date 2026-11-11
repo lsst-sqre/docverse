@@ -19,6 +19,7 @@ __all__ = [
     "EditionReconcilePlan",
     "EditionRepublish",
     "EditionUnpublish",
+    "LockedRepublishTarget",
     "ReconcileEdition",
     "ReconcileReason",
     "plan_edition_reconcile",
@@ -203,6 +204,23 @@ class EditionRepublish:
     build_id: int
     build_public_id: str
     reason: ReconcileReason
+
+
+@dataclass(frozen=True, slots=True)
+class LockedRepublishTarget:
+    """What a planned republish rests on, re-read under the edition's lock.
+
+    The answer to the apply-time re-check: the plan chose its pair in a
+    transaction that has closed, so the enqueue asks again, under a row
+    lock, whether the edition is still there and still points where the
+    plan said.
+    """
+
+    current_build_id: int | None
+    """The build the edition points at now, if any."""
+
+    deleted: bool
+    """Whether the edition or its project has been soft-deleted."""
 
 
 @dataclass(frozen=True, slots=True)

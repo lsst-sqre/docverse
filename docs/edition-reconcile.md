@@ -167,14 +167,15 @@ drifting faster than one tick can repair.
 The decision table above describes an instant that has passed by the
 time an action is applied. The plan's read transaction commits before
 the CDN read-back, and up to a whole cap's worth of other actions can
-run before any one republish reaches the queue. Two things can change
+run before any one republish reaches the queue. Three things can change
 in that window, so each republish is re-tested as the first statement
 of the transaction that enqueues it — inside
 `enqueue_publish_for_edition`'s Phase A, before it writes anything:
 
 | Re-check | Dropped when | Reported as |
 | --- | --- | --- |
-| `editions.current_build_id`, read `FOR UPDATE` | the edition no longer points at the build the plan chose | `superseded_skipped` |
+| `editions.date_deleted` and its project's, read `FOR UPDATE` of the edition | the edition or its project has been soft-deleted | `tombstoned` |
+| `editions.current_build_id`, from the same locked read | the edition no longer points at the build the plan chose | `superseded_skipped` |
 | a live `publish_edition` job for the pair (row 6's test, asked of one pair) | another driver enqueued the pair since the snapshot | `in_flight_skipped` |
 
 A dropped action writes nothing at all: the edition is not marked
@@ -182,17 +183,27 @@ A dropped action writes nothing at all: the edition is not marked
 created. It is logged at **info** with the edition and both build ids,
 and the tick carries on with the org's remaining actions.
 
-The lock is what makes the first check hold. Every repoint on
-`editions` — tracking, an API rollback, keeper-sync — goes through an
-`UPDATE` of that row, so it waits on the lock rather than slipping
-between the check and the queue insert, and the enqueue commits
-together with the current build it names. Without it the reconciler
+The first check covers a delete that lands mid-tick, most often the
+`ref_deleted` webhook for a branch removed as its pull request merges.
+The delete removes the edition's key as well as stamping the row, so
+the read-back that follows the plan's transaction finds no pointer for
+an edition the plan still holds as live and published — row 11's
+`pointer_missing`. Without the check the tick would mark the tombstone
+`pending` and enqueue a publish for an edition `publish_edition` can no
+longer resolve. The edition is counted `tombstoned`, which is what the
+next tick's plan would call it.
+
+The lock is what makes the first two checks hold. Every soft-delete and
+every repoint on `editions` — tracking, an API rollback, keeper-sync —
+goes through an `UPDATE` of that row, so it waits on the lock rather
+than slipping between the check and the queue insert, and the enqueue
+commits together with the state it rests on. Without it the reconciler
 could enqueue a publish of superseded content, and the `EDITION_UPDATE`
 advisory lock would not save it: that lock serializes publish jobs by
 pickup order, not enqueue order, so the stale job can win and leave the
 edge on the old build until the next tick notices.
 
-The second check is a point read, not a mutex. `queue_jobs` has no
+The last check is a point read, not a mutex. `queue_jobs` has no
 partial unique index for `publish_edition` and this loop deliberately
 does not add one — publish jobs for a pair are legitimately enqueued by
 several drivers, and the reconciler only needs to not be one more.
@@ -332,8 +343,9 @@ much of an environment's publish traffic is the system healing itself.
   publish"` with its `reason`, or `"Removed a stranded edition
   pointer"`), tagged `phase="reconcile"`.
 - So does each action the apply-time re-check dropped —
+  `"Skipped a republish for a soft-deleted edition"`,
   `"Skipped a superseded edition republish"` or
-  `"Skipped an in-flight edition republish"` — both carrying
+  `"Skipped an in-flight edition republish"` — all carrying
   `edition_id`, `planned_build_id`, and the `current_build_id` read
   under the lock.
 

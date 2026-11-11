@@ -106,7 +106,10 @@ from docverse_server.domain.edition import (
     ReservedSlug,
     SlugReservation,
 )
-from docverse_server.domain.edition_reconcile import ReconcileEdition
+from docverse_server.domain.edition_reconcile import (
+    LockedRepublishTarget,
+    ReconcileEdition,
+)
 from docverse_server.domain.project import FALLBACK_DEFAULT_BRANCH
 from docverse_server.domain.version import (
     EupsDailyVersion,
@@ -572,8 +575,10 @@ class EditionStore:
         edition_row, build_public_id, build_git_ref = row_tuple
         return self._validate(edition_row, build_public_id, build_git_ref)
 
-    async def lock_current_build_id(self, *, edition_id: int) -> int | None:
-        """Read an edition's current build under an exclusive row lock.
+    async def lock_republish_target(
+        self, *, edition_id: int
+    ) -> LockedRepublishTarget | None:
+        """Read what a republish rests on, under an exclusive row lock.
 
         The ``edition_reconcile`` loop's apply-time guard against acting
         on a stale plan (task #631). The loop chooses its
@@ -581,31 +586,48 @@ class EditionStore:
         long before any one of them is enqueued, so it asks this again
         as the first statement of the enqueue's own transaction: if
         tracking, a rollback, or keeper-sync has repointed the edition
-        meanwhile, the answer has changed and the planned action is
-        dropped.
+        meanwhile, or a delete has tombstoned it, the answer has changed
+        and the planned action is dropped.
 
         ``FOR UPDATE`` rather than a plain read because the answer has
-        to stay true for the rest of that transaction. Every repoint on
-        this table goes through an ``UPDATE`` of this row, which blocks
-        on the lock, so the enqueue and the current build it names
-        commit together instead of a repoint slipping between the check
-        and the queue insert. The lock is taken on ``editions`` — the
-        same row, in the same order, that
+        to stay true for the rest of that transaction. Every repoint and
+        every soft-delete on this table goes through an ``UPDATE`` of
+        this row, which blocks on the lock, so the enqueue and the state
+        it rests on commit together instead of a writer slipping between
+        the check and the queue insert. The lock is taken on
+        ``editions`` — the same row, in the same order, that
         :meth:`~docverse_server.storage.edition_build_history_store.EditionBuildHistoryStore.record`
         locks a moment later in the same transaction — so it introduces
         no new lock ordering.
 
-        Returns ``None`` both for an edition with no current build and
-        for an ``edition_id`` naming no row. Neither can equal the build
-        a caller planned against, which is the only question this
-        answers; the store does not own that referential check.
+        The project is joined for its own ``date_deleted`` and is not
+        locked (``FOR UPDATE OF editions``). A project delete tombstones
+        its editions in the same transaction, so it already waits on the
+        edition's lock; the project's stamp is read as well only because
+        that cascade shipped without a backfill, and a project deleted
+        before it still owns editions reading NULL (see
+        :meth:`list_org_editions_for_reconcile`).
+
+        Returns ``None`` for an ``edition_id`` naming no row.
         """
         result = await self._session.execute(
-            select(SqlEdition.current_build_id)
+            select(
+                SqlEdition.current_build_id,
+                SqlEdition.date_deleted,
+                SqlProject.date_deleted,
+            )
+            .join(SqlProject, SqlProject.id == SqlEdition.project_id)
             .where(SqlEdition.id == edition_id)
-            .with_for_update()
+            .with_for_update(of=SqlEdition)
         )
-        return result.scalar_one_or_none()
+        row = result.one_or_none()
+        if row is None:
+            return None
+        current_build_id, edition_deleted, project_deleted = row
+        return LockedRepublishTarget(
+            current_build_id=current_build_id,
+            deleted=edition_deleted is not None or project_deleted is not None,
+        )
 
     async def list_by_project_ids_and_kind(
         self, *, project_ids: list[int], kind: EditionKind
