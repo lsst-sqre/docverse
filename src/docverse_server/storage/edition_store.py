@@ -62,9 +62,9 @@ rows the transaction already holds, which costs nothing. There are two:
 
 A writer that needs only one of the three is unconstrained by this:
 :meth:`~docverse_server.services.build.BuildService.soft_delete` locks a
-build and reads editions without locking them, ``enqueue_publish`` locks
-only the edition, and the per-column writes on this store lock nothing
-else.
+build and reads editions without locking them, ``enqueue_publish`` and
+``publish_edition``'s pickup lock only the edition, and the per-column
+writes on this store lock nothing else.
 """
 
 from __future__ import annotations
@@ -535,7 +535,7 @@ class EditionStore:
         return len(result.scalars().all()) > 0
 
     async def get_by_slug(
-        self, *, project_id: int, slug: str
+        self, *, project_id: int, slug: str, for_update: bool = False
     ) -> Edition | None:
         """Fetch an edition by project_id and slug.
 
@@ -543,12 +543,27 @@ class EditionStore:
         creation-time casing, but any case from the caller resolves to
         the same row. The returned ``Edition.slug`` is always the
         canonical stored value, never the caller's input.
+
+        Parameters
+        ----------
+        for_update
+            When ``True``, take an exclusive lock on the edition row
+            (``FOR UPDATE OF editions``; the joined build is not
+            locked). ``publish_edition`` reads its edition this way at
+            pickup: a soft-delete still uncommitted when the read starts
+            is waited for, and because the statement re-tests
+            ``date_deleted IS NULL`` once the delete commits, the
+            edition then reads as missing rather than as the live row a
+            plain read would have returned (issue #886). The lock also
+            holds the answer for the rest of the caller's transaction.
         """
         stmt = self._base_query().where(
             SqlEdition.project_id == project_id,
             func.lower(SqlEdition.slug) == slug.lower(),
             SqlEdition.date_deleted.is_(None),
         )
+        if for_update:
+            stmt = stmt.with_for_update(of=SqlEdition)
         result = await self._session.execute(stmt)
         row_tuple = result.one_or_none()
         if row_tuple is None:

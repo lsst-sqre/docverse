@@ -239,6 +239,126 @@ async def test_get_by_id_excludes_soft_deleted(
     assert found is None
 
 
+async def _create_bare_edition(
+    edition_store: EditionStore, *, project_id: int, slug: str
+) -> Edition:
+    return await edition_store.create(
+        project_id=project_id,
+        data=EditionCreate(
+            slug=slug,
+            title=slug,
+            kind=EditionKind.draft,
+            tracking_mode=TrackingMode.git_ref,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_republish_target_reads_a_live_edition(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A live edition reports its current build and is not deleted."""
+    async with db_session.begin():
+        _, project_id = await _create_project_with_org(db_session)
+        edition = await _create_bare_edition(
+            edition_store, project_id=project_id, slug="live-ed"
+        )
+        build = await BuildStore(
+            session=db_session, logger=structlog.get_logger("docverse")
+        ).create(
+            project_id=project_id,
+            project_slug="ed-proj",
+            data=BuildCreate(git_ref="main", content_hash=_HASH),
+            uploader="testuser",
+        )
+        unpointed = await edition_store.lock_republish_target(
+            edition_id=edition.id
+        )
+        await db_session.execute(
+            update(SqlEdition)
+            .where(SqlEdition.id == edition.id)
+            .values(current_build_id=build.id)
+        )
+        pointed = await edition_store.lock_republish_target(
+            edition_id=edition.id
+        )
+        await db_session.commit()
+    assert unpointed is not None
+    assert unpointed.current_build_id is None
+    assert unpointed.deleted is False
+    assert pointed is not None
+    assert pointed.current_build_id == build.id
+    assert pointed.deleted is False
+
+
+@pytest.mark.asyncio
+async def test_lock_republish_target_reports_a_deleted_edition(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """The edition's own tombstone stamp reads as deleted (issue #886)."""
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        edition = await _create_bare_edition(
+            edition_store, project_id=project_id, slug="gone-ed"
+        )
+        await edition_store.soft_delete(
+            org_id=org_id,
+            project_id=project_id,
+            slug="gone-ed",
+            reason=TombstoneReason.lifecycle_delete,
+        )
+        target = await edition_store.lock_republish_target(
+            edition_id=edition.id
+        )
+        await db_session.commit()
+    assert target is not None
+    assert target.deleted is True
+
+
+@pytest.mark.asyncio
+async def test_lock_republish_target_reports_a_deleted_project(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    """A deleted project's stamp counts even when the edition's is NULL.
+
+    The project soft-delete cascade shipped without a backfill, so a
+    project deleted before it still owns editions whose own
+    ``date_deleted`` reads NULL. Stamping only the project row here
+    reproduces that shape.
+    """
+    async with db_session.begin():
+        _, project_id = await _create_project_with_org(db_session)
+        edition = await _create_bare_edition(
+            edition_store, project_id=project_id, slug="orphan-ed"
+        )
+        await db_session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project_id)
+            .values(date_deleted=datetime.now(tz=UTC))
+        )
+        target = await edition_store.lock_republish_target(
+            edition_id=edition.id
+        )
+        await db_session.commit()
+    assert target is not None
+    assert target.deleted is True
+
+
+@pytest.mark.asyncio
+async def test_lock_republish_target_missing_returns_none(
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+) -> None:
+    async with db_session.begin():
+        await _create_project(db_session)
+        target = await edition_store.lock_republish_target(edition_id=999999)
+        await db_session.commit()
+    assert target is None
+
+
 @pytest.mark.asyncio
 async def test_list_by_project(
     db_session: AsyncSession,
@@ -1638,6 +1758,86 @@ async def test_set_current_build_does_not_deadlock_with_project_delete(
         ).scalar_one()
         assert row.current_build_id is None
         assert row.date_deleted is not None
+
+
+@pytest.mark.asyncio
+async def test_get_by_slug_for_update_waits_for_an_open_delete(
+    app: FastAPI,
+    db_session: AsyncSession,
+    edition_store: EditionStore,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A locked read sees a delete that was uncommitted when it started.
+
+    Issue #886, the pickup half. ``publish_edition`` reads its edition
+    while the ``ref_deleted`` webhook's soft-delete may still be open. A
+    plain read returns the live row and the job goes on to publish a
+    tombstone; the ``FOR UPDATE`` read parks on the delete's row lock
+    and, once it commits, re-tests ``date_deleted IS NULL`` and finds
+    nothing.
+    """
+    logger = structlog.get_logger("docverse")
+    async with db_session.begin():
+        org_id, project_id = await _create_project_with_org(db_session)
+        await _create_bare_edition(
+            edition_store, project_id=project_id, slug="racing-ed"
+        )
+        await db_session.commit()
+
+    plain: list[Edition | None] = []
+    locked: list[Edition | None] = []
+
+    async with (
+        db_session_factory() as delete_session,
+        db_session_factory() as pickup_session,
+        db_session_factory() as probe,
+    ):
+        pickup_pid = await backend_pid(pickup_session)
+        pickup_store = EditionStore(session=pickup_session, logger=logger)
+
+        async def run_locked_read() -> None:
+            locked.append(
+                await pickup_store.get_by_slug(
+                    project_id=project_id, slug="racing-ed", for_update=True
+                )
+            )
+            await pickup_session.commit()
+
+        reading: asyncio.Task[None] | None = None
+        parked = False
+        try:
+            # The delete is flushed but not committed.
+            assert await EditionStore(
+                session=delete_session, logger=logger
+            ).soft_delete(
+                org_id=org_id,
+                project_id=project_id,
+                slug="racing-ed",
+                reason=TombstoneReason.lifecycle_delete,
+            )
+            # A plain read still sees the live row: the gap being closed.
+            plain.append(
+                await pickup_store.get_by_slug(
+                    project_id=project_id, slug="racing-ed"
+                )
+            )
+            reading = asyncio.ensure_future(run_locked_read())
+            parked = await wait_until_blocked_or_finished(
+                probe, pid=pickup_pid, task=reading
+            )
+            await delete_session.commit()
+            await reading
+        finally:
+            if reading is not None and not reading.done():
+                reading.cancel()
+                with suppress(asyncio.CancelledError):
+                    await reading
+            await delete_session.rollback()
+            await pickup_session.rollback()
+
+    assert plain[0] is not None
+    assert parked
+    assert locked == [None]
 
 
 @pytest.mark.asyncio

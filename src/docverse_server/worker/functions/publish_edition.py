@@ -226,6 +226,7 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
                     prepared = await _prepare_publish(
                         factory=factory,
                         payload=payload,
+                        project_id=project_id,
                         queue_job_store=queue_job_store,
                         edition_store=edition_store,
                         history_store=history_store,
@@ -378,6 +379,7 @@ async def _prepare_publish(
     *,
     factory: Factory,
     payload: dict[str, Any],
+    project_id: int,
     queue_job_store: QueueJobStore,
     edition_store: EditionStore,
     history_store: EditionBuildHistoryStore,
@@ -389,7 +391,9 @@ async def _prepare_publish(
     the ``publishing`` writes they gate see the same rows: a job is
     refused before it has left a trace of itself on any of them.
     """
-    resources = await _load_resources(factory=factory, payload=payload)
+    resources = await _load_resources(
+        factory=factory, payload=payload, project_id=project_id
+    )
     if resources is None:
         return _RefusedPublish(skip=_EDITION_DELETED)
     skip = _skip_reason(resources)
@@ -576,19 +580,31 @@ async def _load_resources(
     *,
     factory: Factory,
     payload: dict[str, Any],
+    project_id: int,
 ) -> _PublishResources | None:
-    """Load project, edition, build, and history entry for the job.
+    """Load the edition, build, and history entry for the job.
 
-    Returns ``None`` when the project or the edition the payload names
-    is gone: soft-deleted, or — for the edition — a slug that now
-    resolves to a different row than the ``edition_id`` the job was
-    enqueued for. Both are a delete that landed between the enqueue and
-    this pickup, most often the delete webhook for a branch removed as
-    its pull request merged, and the job is retired as a skip rather
-    than raised into Sentry with its queue row left ``in_progress`` for
-    ``publish_edition_reaper`` (issue #886). A missing build or history
-    row is not that race — neither is ever removed by a delete — so
-    those still raise.
+    Returns ``None`` when the edition the payload names is gone:
+    soft-deleted, or a slug that now resolves to a different row than
+    the ``edition_id`` the job was enqueued for. That is a delete that
+    landed between the enqueue and this pickup, most often the delete
+    webhook for a branch removed as its pull request merged, and the job
+    is retired as a skip rather than raised into Sentry with its queue
+    row left ``in_progress`` for ``publish_edition_reaper`` (issue
+    #886). A missing build or history row is not that race — neither is
+    ever removed by a delete — so those still raise.
+
+    The edition is read ``FOR UPDATE``. A plain read would return the
+    live row while a delete's transaction was still open, and the job
+    would go on to write a pointer for the tombstone that delete was
+    about to commit; the locked read waits for the delete and then sees
+    it. The lock is held to the end of the caller's transaction, so the
+    ``publishing`` writes commit against the row the guards read.
+
+    ``project_id`` is the id :func:`_resolve_project_id` resolved before
+    the lock, not a second lookup by slug. A project deleted since then
+    has tombstoned its editions in the same transaction, so it shows up
+    here as the missing edition it is.
 
     The history entry is the row named by the payload's ``history_id``
     when it carries one, and the pair's newest row otherwise. Either
@@ -598,18 +614,12 @@ async def _load_resources(
     is read here, under ``EDITION_UPDATE``, so its ``current_build_id``
     is as fresh as the pointer guard in :func:`_skip_reason` needs.
     """
-    project_store = factory.create_project_store()
     edition_store = factory.create_edition_store()
     build_store = factory.create_build_store()
     history_store = factory.create_edition_build_history_store()
 
-    project = await project_store.get_by_slug(
-        org_id=payload["org_id"], slug=payload["project_slug"]
-    )
-    if project is None:
-        return None
     edition = await edition_store.get_by_slug(
-        project_id=project.id, slug=payload["edition_slug"]
+        project_id=project_id, slug=payload["edition_slug"], for_update=True
     )
     if edition is None or edition.id != payload["edition_id"]:
         return None
