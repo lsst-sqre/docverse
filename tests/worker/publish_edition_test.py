@@ -1918,6 +1918,119 @@ async def test_publish_edition_deleted_build_skips(
             assert entries[0].publish_status == history_entry.publish_status
 
 
+@pytest.mark.parametrize(
+    ("gone", "message"),
+    [
+        ("edition", "Edition was deleted before publishing"),
+        ("edition_id", "Edition was deleted before publishing"),
+        ("project", "Project was deleted before publishing"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_publish_edition_deleted_target_skips(
+    app: None,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    gone: str,
+    message: str,
+) -> None:
+    """A job whose edition or project was deleted retires as a skip.
+
+    Issue #886: a delete landing between the enqueue and the pickup —
+    most often the ``ref_deleted`` webhook for a branch removed as its
+    pull request merged — left ``publish_edition`` unable to resolve the
+    edition its payload named. It raised ``NotFoundError`` into Sentry
+    and left the queue row ``in_progress`` for ``publish_edition_reaper``
+    to fail four hours later. The job now completes carrying
+    ``deleted_skipped``, like a job for a deleted build.
+
+    ``edition_id`` is the slug-reuse arm: the slug resolves, but to a
+    different row than the one the job was enqueued for.
+    """
+    logger = _logger()
+    mock_publisher = MockEditionPublisher()
+
+    async with db_session.begin():
+        (
+            org,
+            project,
+            edition,
+            build,
+            history_entry,
+            queue_job,
+        ) = await _setup_publish_scenario(
+            db_session,
+            org_slug=f"pub-gone-{gone.replace('_', '-')}-org",
+            cdn_service_label="cdn-prod",
+            backend_job_id=f"test-publish-arq-gone-{gone}",
+        )
+        if gone == "edition":
+            assert await EditionStore(
+                session=db_session, logger=logger
+            ).soft_delete(
+                org_id=org.id,
+                project_id=project.id,
+                slug=edition.slug,
+                reason=TombstoneReason.lifecycle_delete,
+            )
+        elif gone == "project":
+            assert await ProjectStore(
+                session=db_session, logger=logger
+            ).soft_delete(
+                org_id=org.id,
+                slug=project.slug,
+                reason=TombstoneReason.manual_delete,
+            )
+
+    monkeypatch.setattr(
+        Factory,
+        "create_edition_publisher_for_org",
+        _mock_create_edition_publisher(mock_publisher),
+    )
+
+    ctx = make_worker_ctx(
+        http_client=httpx.AsyncClient(),
+        job_id=f"test-publish-arq-gone-{gone}",
+    )
+    payload = _make_payload(
+        org=org,
+        project=project,
+        edition=edition,
+        build=build,
+        queue_job=queue_job,
+    )
+    if gone == "edition_id":
+        payload["edition_id"] = edition.id + 1_000_000
+
+    with sentry_init_fixture() as init:
+        init(environment="test")
+        sentry_events = capture_events_fixture(monkeypatch)()
+        result = await publish_edition(ctx, payload)
+    await ctx["http_client"].aclose()
+
+    assert result == "completed"
+    assert mock_publisher.calls == []
+    assert sentry_events.errors == []
+
+    async for session in db_session_dependency():
+        async with session.begin():
+            qjs = QueueJobStore(session=session, logger=logger)
+            job = await qjs.get(queue_job.id)
+            assert job is not None
+            assert job.status == JobStatus.completed
+            assert job.progress is not None
+            assert job.progress["deleted_skipped"] is True
+            assert job.progress["message"] == message
+
+            # The history row is left exactly where the enqueue put it.
+            hist_store = EditionBuildHistoryStore(
+                session=session, logger=logger
+            )
+            entries = await hist_store.list_by_edition(edition.id)
+            assert [entry.id for entry in entries] == [history_entry.id]
+            assert entries[0].publish_status == history_entry.publish_status
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("deleted", [True, False])
 async def test_publish_edition_purged_build_skips(

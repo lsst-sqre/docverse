@@ -83,6 +83,30 @@ class _PublishSkip:
     """The structlog event the retirement logs."""
 
 
+_PROJECT_DELETED = _PublishSkip(
+    message="Project was deleted before publishing",
+    progress_flag="deleted_skipped",
+    log_event="Deleted project skipped before publishing",
+)
+
+_EDITION_DELETED = _PublishSkip(
+    message="Edition was deleted before publishing",
+    progress_flag="deleted_skipped",
+    log_event="Deleted edition skipped before publishing",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _RefusedPublish:
+    """A job one of the pickup guards refused, and what it had loaded."""
+
+    skip: _PublishSkip
+    """Why the job publishes nothing."""
+
+    resources: _PublishResources | None = None
+    """The job's rows, or ``None`` when its edition could not be resolved."""
+
+
 @cancellation_recorded
 async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     """Sync one edition's current build to its organization's CDN.
@@ -105,7 +129,8 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     Returns
     -------
     str
-        ``"completed"`` on success — and equally when one of
+        ``"completed"`` on success — and equally when the job's
+        project or edition was deleted before pickup or one of
         :func:`_skip_reason`'s guards refused the job, a skip rather
         than a failure — ``"failed"`` if the publish attempt raised, or
         ``"skipped"`` for a row the late-delivery guard refuses.
@@ -148,10 +173,10 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
         # guard absorbs arrives alongside exactly such a delete:
         # ``lifecycle_eval`` soft-deletes the edition whose publish the
         # abandoned sweep just reaped. Resolving resources first would
-        # therefore raise ``NotFoundError`` into Sentry for a race the
-        # reaper is meant to swallow, so the guard runs before anything
-        # can fail to find a row — matching ``build_processing``'s
-        # guard-first pickup ordering.
+        # therefore retire the job as a deleted edition and complete a
+        # row the reaper has already failed, so the guard runs before
+        # anything can fail to find a row — matching
+        # ``build_processing``'s guard-first pickup ordering.
         async with session.begin():
             if await queue_job_store.start_if_queued(queue_job_id) is None:
                 return "skipped"
@@ -170,43 +195,54 @@ async def publish_edition(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
             logger=logger,
             finalise_run=_keeper_sync_run_finaliser(queue_job_id),
         ):
+            project_id = await _resolve_project_id(
+                session=session,
+                project_store=project_store,
+                payload=payload,
+            )
+            if project_id is None:
+                # No project, so no lock key to build and nothing a
+                # lock would protect: the job writes only its own row.
+                await _retire_skipped_publish(
+                    ctx=ctx,
+                    session=session,
+                    factory=factory,
+                    queue_job_store=queue_job_store,
+                    queue_job_id=queue_job_id,
+                    refused=_RefusedPublish(skip=_PROJECT_DELETED),
+                    logger=logger,
+                )
+                return "completed"
             lock_key = LockKey.for_edition_update(
                 org_id=payload["org_id"],
-                project_id=await _resolve_project_id(
-                    session=session,
-                    project_store=project_store,
-                    payload=payload,
-                ),
+                project_id=project_id,
                 edition_id=payload["edition_id"],
             )
             async with lock_service.acquire(lock_key):
                 async with session.begin():
-                    resources = await _load_resources(
-                        factory=factory, payload=payload
-                    )
                     # Every pickup guard, read under EDITION_UPDATE and
-                    # ahead of every write. See :func:`_skip_reason`.
-                    skip = _skip_reason(resources)
-                    if skip is None:
-                        await _mark_publishing(
-                            queue_job_store=queue_job_store,
-                            edition_store=edition_store,
-                            history_store=history_store,
-                            resources=resources,
-                            queue_job_id=queue_job_id,
-                        )
-                if skip is not None:
+                    # ahead of every write. See :func:`_load_resources`
+                    # and :func:`_skip_reason`.
+                    prepared = await _prepare_publish(
+                        factory=factory,
+                        payload=payload,
+                        queue_job_store=queue_job_store,
+                        edition_store=edition_store,
+                        history_store=history_store,
+                        queue_job_id=queue_job_id,
+                    )
+                if isinstance(prepared, _RefusedPublish):
                     await _retire_skipped_publish(
                         ctx=ctx,
                         session=session,
                         factory=factory,
                         queue_job_store=queue_job_store,
                         queue_job_id=queue_job_id,
-                        resources=resources,
-                        skip=skip,
+                        refused=prepared,
                         logger=logger,
                     )
                     return "completed"
+                resources = prepared
 
                 publishing_service = (
                     factory.create_edition_publishing_service()
@@ -319,24 +355,54 @@ async def _resolve_project_id(
     session: AsyncSession,
     project_store: ProjectStore,
     payload: dict[str, Any],
-) -> int:
+) -> int | None:
     """Resolve the payload's ``project_slug`` for the lock key, pre-lock.
 
     The ``EDITION_UPDATE`` lock key needs the project's id, but the arq
     payload carries ``project_slug`` rather than ``project_id``, so a
     small SELECT is required before the lock is acquired.
+
+    Returns ``None`` when the slug no longer resolves to a live project.
+    Every producer enqueues for a project it has just read, so the only
+    way to get here is a delete that landed between the enqueue and this
+    pickup, and the caller retires the job as a skip (issue #886).
     """
     async with session.begin():
         project = await project_store.get_by_slug(
             org_id=payload["org_id"], slug=payload["project_slug"]
         )
-        if project is None:
-            msg = (
-                f"Project {payload['project_slug']!r} not found "
-                f"for org {payload['org_id']}"
-            )
-            raise NotFoundError(msg)
-    return project.id
+    return project.id if project is not None else None
+
+
+async def _prepare_publish(
+    *,
+    factory: Factory,
+    payload: dict[str, Any],
+    queue_job_store: QueueJobStore,
+    edition_store: EditionStore,
+    history_store: EditionBuildHistoryStore,
+    queue_job_id: int,
+) -> _PublishResources | _RefusedPublish:
+    """Load the job's rows and either mark them publishing or refuse.
+
+    Runs in one transaction under ``EDITION_UPDATE``, so the guards and
+    the ``publishing`` writes they gate see the same rows: a job is
+    refused before it has left a trace of itself on any of them.
+    """
+    resources = await _load_resources(factory=factory, payload=payload)
+    if resources is None:
+        return _RefusedPublish(skip=_EDITION_DELETED)
+    skip = _skip_reason(resources)
+    if skip is not None:
+        return _RefusedPublish(skip=skip, resources=resources)
+    await _mark_publishing(
+        queue_job_store=queue_job_store,
+        edition_store=edition_store,
+        history_store=history_store,
+        resources=resources,
+        queue_job_id=queue_job_id,
+    )
+    return resources
 
 
 def _skip_reason(resources: _PublishResources) -> _PublishSkip | None:
@@ -439,16 +505,20 @@ async def _retire_skipped_publish(
     factory: Factory,
     queue_job_store: QueueJobStore,
     queue_job_id: int,
-    resources: _PublishResources,
-    skip: _PublishSkip,
+    refused: _RefusedPublish,
     logger: structlog.stdlib.BoundLogger,
 ) -> None:
-    """Retire a publish one of :func:`_skip_reason`'s guards refused.
+    """Retire a publish one of the pickup guards refused.
+
+    Covers :func:`_skip_reason`'s refusals and the two that come before
+    it has rows to read: a project or an edition deleted between the
+    enqueue and this pickup (issue #886).
 
     The publish-side twin of ``build_processing``'s
     ``_mark_deleted_skipped``, and it records the same thing: a flag on
     the ``progress`` of a job that completes rather than fails. No
-    refusal is an error — an operator asked for the delete, the sweep
+    refusal is an error — an operator or a branch-delete webhook asked
+    for the delete, the sweep
     reclaimed a deleted build as it is meant to, a duplicate delivery
     for a row another writer has already settled has nothing left to
     do, and a job for a build the edition has moved off would only
@@ -467,13 +537,18 @@ async def _retire_skipped_publish(
     terminal, so a run that was waiting on it must be allowed to
     finalise exactly as the success and failure paths allow it to.
     """
-    logger.info(
-        skip.log_event,
-        history_id=resources.history_entry.id,
-        history_publish_status=resources.history_entry.publish_status,
-        history_superseded=resources.history_superseded,
-        current_build_id=resources.edition.current_build_id,
-    )
+    skip = refused.skip
+    resources = refused.resources
+    if resources is None:
+        logger.info(skip.log_event)
+    else:
+        logger.info(
+            skip.log_event,
+            history_id=resources.history_entry.id,
+            history_publish_status=resources.history_entry.publish_status,
+            history_superseded=resources.history_superseded,
+            current_build_id=resources.edition.current_build_id,
+        )
     completion: KeeperSyncRunWithActivity | None = None
     async with session.begin():
         await queue_job_store.update_phase(
@@ -501,8 +576,19 @@ async def _load_resources(
     *,
     factory: Factory,
     payload: dict[str, Any],
-) -> _PublishResources:
+) -> _PublishResources | None:
     """Load project, edition, build, and history entry for the job.
+
+    Returns ``None`` when the project or the edition the payload names
+    is gone: soft-deleted, or — for the edition — a slug that now
+    resolves to a different row than the ``edition_id`` the job was
+    enqueued for. Both are a delete that landed between the enqueue and
+    this pickup, most often the delete webhook for a branch removed as
+    its pull request merged, and the job is retired as a skip rather
+    than raised into Sentry with its queue row left ``in_progress`` for
+    ``publish_edition_reaper`` (issue #886). A missing build or history
+    row is not that race — neither is ever removed by a delete — so
+    those still raise.
 
     The history entry is the row named by the payload's ``history_id``
     when it carries one, and the pair's newest row otherwise. Either
@@ -521,21 +607,12 @@ async def _load_resources(
         org_id=payload["org_id"], slug=payload["project_slug"]
     )
     if project is None:
-        msg = (
-            f"Project {payload['project_slug']!r} not found "
-            f"for org {payload['org_id']}"
-        )
-        raise NotFoundError(msg)
+        return None
     edition = await edition_store.get_by_slug(
         project_id=project.id, slug=payload["edition_slug"]
     )
     if edition is None or edition.id != payload["edition_id"]:
-        msg = (
-            f"Edition {payload['edition_slug']!r} "
-            f"(id={payload['edition_id']}) not found for project "
-            f"{payload['project_slug']!r}"
-        )
-        raise NotFoundError(msg)
+        return None
     build = await build_store.get_by_id(payload["build_id"])
     if build is None:
         msg = f"Build {payload['build_id']} not found"
