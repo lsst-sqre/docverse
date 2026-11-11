@@ -682,8 +682,8 @@ async def test_a_delete_between_plan_and_apply_drops_the_republish(
     as live. Enqueuing anyway marks a tombstone ``pending`` and hands
     ``publish_edition`` a job for an edition it cannot resolve, so the
     re-check reads ``date_deleted`` under the same row lock as the
-    current build and stands down, counting the edition as the
-    tombstone it now is.
+    current build and stands down, counting the drop in its own
+    ``deleted_skipped`` bucket.
     """
     async with db_session.begin():
         seeded = await _seed_drift_with_a_spare_build(db_session, key="gone")
@@ -716,8 +716,9 @@ async def test_a_delete_between_plan_and_apply_drops_the_republish(
             outcome = await service.reconcile_org(seeded.org, limit=10)
             break
 
-    assert outcome.tombstoned == 1
-    assert outcome.as_progress()["tombstoned"] == 1
+    assert outcome.deleted_skipped == 1
+    assert outcome.as_progress()["deleted_skipped"] == 1
+    assert outcome.tombstoned == 0
     assert outcome.superseded_skipped == 0
     assert outcome.republish_failed == 0
     assert not outcome.has_errors

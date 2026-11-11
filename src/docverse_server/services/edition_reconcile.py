@@ -113,21 +113,22 @@ class _ApplySkip(StrEnum):
     named to match it. ``in_flight`` feeds the very counter the
     planner's ``in_flight_skipped`` bucket feeds, because a pair skipped
     for a live publish is the same finding whichever of the two reads
-    noticed it, and ``tombstoned`` feeds the planner's ``tombstoned``
-    bucket on the same grounds: the edition is soft-deleted and nothing
-    is to be published for it. ``superseded`` has no plan-time sibling:
-    the planner cannot observe a repoint that happens after its own
-    transaction closed.
+    noticed it. ``deleted`` and ``superseded`` have no plan-time
+    sibling: the planner cannot observe a soft-delete or a repoint that
+    happens after its own transaction closed. ``deleted`` is kept out of
+    the planner's ``tombstoned`` bucket on purpose — that one is a
+    standing count of an org's settled tombstones, and folding a race
+    into it would hide how often the race fires.
     """
 
-    tombstoned = "tombstoned"
+    deleted = "deleted"
     superseded = "superseded"
     in_flight = "in_flight"
 
     @property
     def message(self) -> str:
         """The log line this skip is reported under."""
-        if self is _ApplySkip.tombstoned:
+        if self is _ApplySkip.deleted:
             return "Skipped a republish for a soft-deleted edition"
         if self is _ApplySkip.superseded:
             return "Skipped a superseded edition republish"
@@ -213,6 +214,20 @@ class EditionReconcileOutcome:
     per-job cap wants lowering rather than that anything is broken.
     """
 
+    deleted_skipped: int = 0
+    """Planned republishes whose edition was soft-deleted before the enqueue.
+
+    The other apply-time bucket with no planner counterpart (issue
+    #886): the edition, or its project, was deleted after the plan's
+    transaction read it as live — most often by the delete webhook for a
+    branch removed as its pull request merged. Kept apart from
+    :attr:`tombstoned`, which counts an org's settled tombstones and
+    would bury a handful of these in a stock of thousands. Nothing is
+    unpublished for such an edition this tick; if the delete left its
+    key behind, the next tick's plan reads it as a tombstone and removes
+    it.
+    """
+
     grace_skipped: int = 0
     """Pairs too young to tell apart from an enqueue in progress."""
 
@@ -223,15 +238,7 @@ class EditionReconcileOutcome:
     """Pointers at a soft-deleted or purged build."""
 
     tombstoned: int = 0
-    """Soft-deleted editions the edge already serves nothing for.
-
-    Counts both the tombstones the planner's snapshot saw and the
-    editions deleted between the plan and the enqueue of a republish
-    planned for them (issue #886). The second kind is the same finding
-    read later: the delete that tombstoned the edition also removed its
-    key, which is what made the pair look drifted, so there is nothing
-    to publish and nothing left to remove.
-    """
+    """Soft-deleted editions the edge already serves nothing for."""
 
     unpointed: int = 0
     """Live editions that have never had a current build."""
@@ -298,6 +305,7 @@ class EditionReconcileOutcome:
             "unpublish_failed": self.unpublish_failed,
             "in_flight_skipped": self.in_flight_skipped,
             "superseded_skipped": self.superseded_skipped,
+            "deleted_skipped": self.deleted_skipped,
             "grace_skipped": self.grace_skipped,
             "failed_left_alone": self.failed_left_alone,
             "retired_build_skipped": self.retired_build_skipped,
@@ -516,8 +524,8 @@ class EditionReconcileService:
                 precheck=_recheck,
             )
         except _StalePlanError as stale:
-            if stale.skip is _ApplySkip.tombstoned:
-                outcome.tombstoned += 1
+            if stale.skip is _ApplySkip.deleted:
+                outcome.deleted_skipped += 1
             elif stale.skip is _ApplySkip.superseded:
                 outcome.superseded_skipped += 1
             else:
@@ -601,15 +609,15 @@ class EditionReconcileService:
         it points at, an edition that has moved on is superseded
         whatever is in flight for the build it has left, and each is the
         more specific thing to tell an operator. An ``edition_id`` that
-        names no row at all is reported as a tombstone too: there is
-        nothing to publish for it either.
+        names no row at all is reported as deleted too: there is nothing
+        to publish for it either.
         """
         target = await self._edition_store.lock_republish_target(
             edition_id=action.edition_id
         )
         if target is None or target.deleted:
             raise _StalePlanError(
-                _ApplySkip.tombstoned,
+                _ApplySkip.deleted,
                 current_build_id=(
                     target.current_build_id if target is not None else None
                 ),

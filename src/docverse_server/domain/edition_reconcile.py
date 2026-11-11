@@ -75,7 +75,7 @@ class ReconcileEdition:
     a project deleted before it still owns editions reading NULL, and
     those editions are unpublishable: ``publish_edition`` resolves the
     project by slug through a lookup that filters tombstones, so a
-    republish raises before it can record a failure and the pair is
+    republish retires as a skip with the pair still unpublished and is
     re-driven on every subsequent tick. Carrying the stamp lets the
     planner treat the whole subtree as tombstoned instead.
     """
@@ -431,8 +431,9 @@ def _classify_edition(
     :attr:`~ReconcileEdition.tombstoned`, which covers the edition's own
     stamp *and* its project's: a live-looking edition under a deleted
     project cannot be republished (the publish job resolves the project
-    through a tombstone-filtering lookup and raises), so routing it
-    anywhere but here would re-drive an unsatisfiable job every tick.
+    through a tombstone-filtering lookup and retires as a skip), so
+    routing it anywhere but here would re-drive an unsatisfiable job
+    every tick.
     """
     if edition.tombstoned:
         if pointer is not None:

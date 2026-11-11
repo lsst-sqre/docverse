@@ -1204,6 +1204,7 @@ async def test_edition_reconcile_publishes_a_drifted_orgs_tally(
     assert tick.unpublished == 1
     assert tick.in_flight_skipped == 0
     assert tick.superseded_skipped == 0
+    assert tick.deleted_skipped == 0
     assert tick.failed_left_alone == 0
     assert tick.unexpected_pointers == 0
     assert tick.capped == 0

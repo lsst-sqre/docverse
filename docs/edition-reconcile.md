@@ -132,10 +132,10 @@ that tombstones a project's editions shipped without a backfill, so a
 project deleted before it still owns editions reading NULL. Left in the
 live legs those editions look like the plainest drift there is and earn
 a republish nothing can satisfy: `publish_edition` resolves the project
-by slug through a lookup that filters tombstones, so the job raises
-before it can mark the pair failed, the reaper fails the row an hour
-later, and the next tick re-drives the same pair — Sentry noise and a
-burnt action-cap slot, every tick, forever. Such an edition is therefore
+by slug through a lookup that filters tombstones, so the job retires
+as a `deleted_skipped` skip with the pair still unpublished, and the
+next tick re-drives the same pair — a wasted job and a burnt action-cap
+slot, every tick, forever. Such an edition is therefore
 unpublished if the edge still serves its key, and counted `tombstoned`
 otherwise.
 
@@ -174,7 +174,7 @@ of the transaction that enqueues it — inside
 
 | Re-check | Dropped when | Reported as |
 | --- | --- | --- |
-| `editions.date_deleted` and its project's, read `FOR UPDATE` of the edition | the edition or its project has been soft-deleted | `tombstoned` |
+| `editions.date_deleted` and its project's, read `FOR UPDATE` of the edition | the edition or its project has been soft-deleted | `deleted_skipped` |
 | `editions.current_build_id`, from the same locked read | the edition no longer points at the build the plan chose | `superseded_skipped` |
 | a live `publish_edition` job for the pair (row 6's test, asked of one pair) | another driver enqueued the pair since the snapshot | `in_flight_skipped` |
 
@@ -190,8 +190,10 @@ the read-back that follows the plan's transaction finds no pointer for
 an edition the plan still holds as live and published — row 11's
 `pointer_missing`. Without the check the tick would mark the tombstone
 `pending` and enqueue a publish for an edition `publish_edition` can no
-longer resolve. The edition is counted `tombstoned`, which is what the
-next tick's plan would call it.
+longer resolve. The drop is counted `deleted_skipped` rather than
+`tombstoned`, so it is not lost among the org's settled tombstones; the
+next tick's plan reads the edition as an ordinary tombstone, and removes
+its key if the delete left one behind.
 
 The lock is what makes the first two checks hold. Every soft-delete and
 every repoint on `editions` — tracking, an API rollback, keeper-sync —
@@ -207,6 +209,9 @@ The last check is a point read, not a mutex. `queue_jobs` has no
 partial unique index for `publish_edition` and this loop deliberately
 does not add one — publish jobs for a pair are legitimately enqueued by
 several drivers, and the reconciler only needs to not be one more.
+
+`deleted_skipped` above zero is normal wherever branches are deleted
+as their pull requests merge, and is not a failure either.
 
 `superseded_skipped` above zero is normal on a busy org and is not a
 failure: it means editions moved while the tick walked them. A steady
@@ -276,6 +281,7 @@ each carries the tally as `progress`:
   "unpublish_failed": 0,
   "in_flight_skipped": 0,
   "superseded_skipped": 0,
+  "deleted_skipped": 0,
   "grace_skipped": 1,
   "failed_left_alone": 2,
   "retired_build_skipped": 0,
@@ -319,7 +325,8 @@ event — including the ticks that found nothing, because a reconciler
 that goes quiet when it finds nothing is indistinguishable on a
 dashboard from one that stopped running. Its fields are
 `editions_scanned`, `pointers_read`, `republished`, `unpublished`,
-`in_flight_skipped`, `superseded_skipped`, `failed_left_alone`,
+`in_flight_skipped`, `superseded_skipped`, `deleted_skipped`,
+`failed_left_alone`,
 `unexpected_pointers`, `capped`, `cdn_checked`, and `elapsed`.
 
 `project` is always null: one tick spans every project in the org. The
