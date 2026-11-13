@@ -26,6 +26,7 @@ from docverse_server.metrics import (
     HttpMethod,
     HttpStatusClass,
     KeeperSyncPushCheckEvent,
+    KeeperSyncPushCheckOutcome,
 )
 
 
@@ -325,3 +326,45 @@ def test_keeper_sync_push_check_fields() -> None:
         assert not isinstance(fields[required], list)
     # Every union member must be one InfluxDB can store.
     KeeperSyncPushCheckEvent.validate_structure()
+
+
+def test_keeper_sync_push_check_outcome_appends_completed() -> None:
+    """``completed`` is the last symbol of the event's ``outcome`` enum.
+
+    Adding a symbol is the only change PRD #888 makes to the schema, and
+    appending it keeps every existing symbol's index, as the precedent
+    of ``github_webhook_received``'s ``malformed`` did. The field set
+    and order are unchanged.
+    """
+    fields = _avro_field_types(KeeperSyncPushCheckEvent)
+
+    outcome = fields["outcome"]
+    assert outcome["type"] == "enum"
+    assert outcome["symbols"] == [
+        "new_edition",
+        "rebuilt",
+        "unchanged",
+        "expired",
+        "not_found",
+        "error",
+        "completed",
+    ]
+
+
+def test_keeper_sync_push_check_completed_carries_no_enqueue() -> None:
+    """A ``completed`` visit is a window closing, not an enqueue.
+
+    It is published with ``enqueued`` false and no ``push_lag``, the
+    same shape as an ``expired`` one.
+    """
+    event = KeeperSyncPushCheckEvent(
+        organization="rubin",
+        project="dp2",
+        github_ref="tickets/DM-56325",
+        outcome=KeeperSyncPushCheckOutcome.completed,
+        enqueued=False,
+        push_lag=None,
+    )
+
+    assert event.outcome is KeeperSyncPushCheckOutcome.completed
+    assert event.model_dump(mode="json")["outcome"] == "completed"

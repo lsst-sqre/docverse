@@ -87,9 +87,11 @@ from docverse_server.services.keeper_sync.mappers import (
 )
 from docverse_server.services.keeper_sync.push_hints import (
     PushCheckOutcome,
+    closed_window_outcome,
     ltd_rebuilt_since_sync,
     prune_pushed_refs,
     read_pushed_refs,
+    read_pushed_refs_enqueued,
     settle_pushed_refs,
 )
 from docverse_server.services.keeper_sync.scheduler import (
@@ -3010,7 +3012,9 @@ async def _tier_main_for_org(
     each live ref is checked on every tick until its window passes, even
     after a visit has enqueued its sync, since LTD can rebuild it again
     for a later push's CI run or after creating its edition build-less;
-    an expired ref is pruned even once the project is dormant again. A
+    a ref whose window has passed is pruned even once the project is
+    dormant again, reported ``completed`` if it enqueued in its window
+    and ``expired`` if it never did. A
     ref whose sync keeps failing may therefore enqueue on every tick of
     its window; the project's active-job slot holds it to one sync at a
     time. The ``main`` check and the pushed refs
@@ -3490,14 +3494,17 @@ async def _visit_pushed_refs(
 ) -> list[_PushedRefCheck]:
     """Visit every ref stamped on a project and say what each found.
 
-    A ref whose window has passed is ``expired`` and costs no LTD call.
-    The live refs are checked oldest push first
-    (:meth:`_PushedRefChecker.check`); after an LTD failure the rest of
-    the project's live refs wait for the next tick unvisited, since the
-    failure has already ridden out the LTD client's retries and the
-    next call would most likely do the same.
+    A ref whose window has passed costs no LTD call: it is ``completed``
+    when ``tier_main`` enqueued its sync in that window, as recorded in
+    ``github_pushed_refs_enqueued``, and ``expired`` when it never did
+    (:func:`closed_window_outcome`). The live refs are checked oldest
+    push first (:meth:`_PushedRefChecker.check`); after an LTD failure
+    the rest of the project's live refs wait for the next tick
+    unvisited, since the failure has already ridden out the LTD client's
+    retries and the next call would most likely do the same.
     """
     stamped = read_pushed_refs(project_state)
+    enqueued = read_pushed_refs_enqueued(project_state)
     live = prune_pushed_refs(stamped, now=now, window=window)
     checks: list[_PushedRefCheck] = []
     for ref, pushed_at in sorted(
@@ -3506,7 +3513,9 @@ async def _visit_pushed_refs(
         if ref in live:
             outcome = await checker.check(ref)
         else:
-            outcome = PushCheckOutcome.expired
+            outcome = closed_window_outcome(
+                pushed_at=pushed_at, enqueued_at=enqueued.get(ref)
+            )
         checks.append(
             _PushedRefCheck(ref=ref, pushed_at=pushed_at, outcome=outcome)
         )
@@ -3532,22 +3541,30 @@ async def _settle_pushed_refs(
 
     Once the project's sync is enqueued (at ``enqueued_at``), every ref
     whose outcome called for it is reported as enqueued, with its lag
-    from its latest push to this enqueue; when the enqueue was skipped
-    (``enqueued_at`` is ``None``: an active job for the project already
-    holds its slot) none is. Either way each ref keeps its stamp until
-    its window passes, so the next tick checks it again: a ref may
+    from its latest push to this enqueue, and the enqueue is recorded
+    against it in ``github_pushed_refs_enqueued``; when the enqueue was
+    skipped (``enqueued_at`` is ``None``: an active job for the project
+    already holds its slot) none is. Either way each ref keeps its stamp
+    until its window passes, so the next tick checks it again: a ref may
     enqueue the project's sync more than once in its window, as LTD
     rebuilds it for each of several pushes, or first creates its edition
-    with no build and then rebuilds it. Only the expired refs are pruned,
-    so the row is written only when the visit found one: it is re-read
-    ``FOR UPDATE`` and settled by :func:`settle_pushed_refs`, so a push
-    stamped since the visit read the row keeps its stamp.
+    with no build and then rebuilds it. Only the refs whose window has
+    passed (``completed`` or ``expired``) are pruned, each with its
+    recorded enqueue, so the row is written only when the visit enqueued
+    or pruned a ref: it is re-read ``FOR UPDATE`` and settled by
+    :func:`settle_pushed_refs`, so a push stamped since the visit read
+    the row keeps its stamp.
 
     Each visited ref is then logged and published as one
     ``keeper_sync_push_check`` event (:func:`_publish_push_check`), after
     the write, so the event reports what the tick settled.
     """
-    if any(check.outcome is PushCheckOutcome.expired for check in checks):
+    enqueued_refs = {
+        check.ref: enqueued_at
+        for check in checks
+        if enqueued_at is not None and check.outcome.enqueues
+    }
+    if enqueued_refs or any(check.outcome.prunes for check in checks):
         async with session.begin():
             state = await state_store.get(
                 org_id=org.id,
@@ -3561,7 +3578,7 @@ async def _settle_pushed_refs(
                     resource_type=ResourceType.project,
                     ltd_slug=ltd_slug,
                     annotations=settle_pushed_refs(
-                        state, now=now, window=window
+                        state, enqueued=enqueued_refs, now=now, window=window
                     ),
                 )
     for check in checks:

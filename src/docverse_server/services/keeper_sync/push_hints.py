@@ -28,7 +28,12 @@ one shape, and so the rules can be unit-tested on in-memory
   CI run of several pushes, or create its edition before the first
   upload lands and rebuild it after. ``tier_main`` settles the map after
   each visit, pruning only the refs whose window has passed
-  (:func:`settle_pushed_refs`), each reported as ``expired``.
+  (:func:`settle_pushed_refs`);
+- ``tier_main`` records each ref's last enqueue beside its stamp, in the
+  ``github_pushed_refs_enqueued`` annotation, which is pruned with the
+  stamp and capped like it. A ref whose window has passed is reported
+  as ``completed`` when it enqueued in that window and as ``expired``
+  when it never did (:func:`closed_window_outcome`).
 
 Nothing here does I/O: the callers read and write the row.
 """
@@ -44,12 +49,15 @@ from docverse_server.storage.keeper_sync import KeeperSyncState
 
 __all__ = [
     "ANNOTATION_GITHUB_PUSHED_REFS",
+    "ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED",
     "PUSHED_REFS_CAP",
     "PushCheckOutcome",
+    "closed_window_outcome",
     "is_in_push_window",
     "ltd_rebuilt_since_sync",
     "prune_pushed_refs",
     "read_pushed_refs",
+    "read_pushed_refs_enqueued",
     "settle_pushed_refs",
     "stamp_pushed_ref",
 ]
@@ -61,16 +69,28 @@ __all__ = [
 #: ``tier_main`` through :func:`settle_pushed_refs`.
 ANNOTATION_GITHUB_PUSHED_REFS = "github_pushed_refs"
 
+#: ``keeper_sync_state.annotations`` key on a project-resource state row
+#: recording, for each stamped ref, the ISO-8601 time of the last sync
+#: ``tier_main`` enqueued for it. Written and pruned with the ref's stamp
+#: by :func:`settle_pushed_refs`, and read when the ref's window passes
+#: to tell a push that produced a sync (``completed``) from one that
+#: never did (``expired``). A row without the key has never enqueued.
+ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED = "github_pushed_refs_enqueued"
+
 
 class PushCheckOutcome(StrEnum):
     """What ``tier_main``'s visit to one stamped ref found.
 
     Logged as ``outcome`` on each visit. :attr:`new_edition` and
     :attr:`rebuilt` are the outcomes that enqueue the project's sync
-    (:attr:`enqueues`). Every outcome but :attr:`expired` leaves the
-    ref's stamp for the next tick, including one whose sync was
-    enqueued: the ref is checked on every tick until its window passes,
-    and a later rebuild inside the window enqueues the sync again.
+    (:attr:`enqueues`). Every outcome but :attr:`completed` and
+    :attr:`expired` leaves the ref's stamp for the next tick, including
+    one whose sync was enqueued: the ref is checked on every tick until
+    its window passes, and a later rebuild inside the window enqueues
+    the sync again. Once the window has passed the ref is pruned
+    (:attr:`prunes`), as :attr:`completed` when it enqueued in that
+    window and :attr:`expired` when it never did
+    (:func:`closed_window_outcome`).
     """
 
     new_edition = "new_edition"
@@ -86,8 +106,13 @@ class PushCheckOutcome(StrEnum):
     """The edition tracking the ref is as keeper-sync last synced it: the
     push's CI has not uploaded yet."""
 
+    completed = "completed"
+    """The ref's window passed after it enqueued the project's sync at
+    least once in that window; its stamp is pruned."""
+
     expired = "expired"
-    """The ref's window passed; its stamp is pruned."""
+    """The ref's window passed without it enqueueing the project's sync:
+    the push never produced a sync. Its stamp is pruned."""
 
     not_found = "not_found"
     """No synced edition tracks the ref, and LTD lists no edition
@@ -101,6 +126,11 @@ class PushCheckOutcome(StrEnum):
     def enqueues(self) -> bool:
         """Whether this outcome calls for the project's sync."""
         return self in {PushCheckOutcome.new_edition, PushCheckOutcome.rebuilt}
+
+    @property
+    def prunes(self) -> bool:
+        """Whether the ref's window has passed, so its stamp is pruned."""
+        return self in {PushCheckOutcome.completed, PushCheckOutcome.expired}
 
 
 #: Most refs one project's push hints hold. A stamp that would leave
@@ -131,17 +161,33 @@ def read_pushed_refs(state: KeeperSyncState | None) -> dict[str, datetime]:
         Every well-formed stamp, keyed by normalized ref. Includes refs
         whose window has passed; see :func:`prune_pushed_refs`.
     """
-    if state is None or state.annotations is None:
-        return {}
-    raw = state.annotations.get(ANNOTATION_GITHUB_PUSHED_REFS)
-    if not isinstance(raw, Mapping):
-        return {}
-    refs: dict[str, datetime] = {}
-    for ref, value in raw.items():
-        pushed_at = _parse_push_time(value)
-        if isinstance(ref, str) and ref and pushed_at is not None:
-            refs[ref] = pushed_at
-    return refs
+    return _read_ref_times(state, ANNOTATION_GITHUB_PUSHED_REFS)
+
+
+def read_pushed_refs_enqueued(
+    state: KeeperSyncState | None,
+) -> dict[str, datetime]:
+    """Return when ``tier_main`` last enqueued each stamped ref's sync.
+
+    Read as defensively as :func:`read_pushed_refs`: a missing or
+    non-object map reads as empty, so a row written before the map
+    existed reads as no ref ever enqueued, and a malformed entry is
+    skipped rather than raised on.
+
+    Parameters
+    ----------
+    state
+        The project's ``keeper_sync_state`` row, or ``None`` when the
+        project has none.
+
+    Returns
+    -------
+    dict of str to datetime
+        Every well-formed entry of
+        :data:`ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED`, keyed by
+        normalized ref.
+    """
+    return _read_ref_times(state, ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED)
 
 
 def prune_pushed_refs(
@@ -178,12 +224,13 @@ def stamp_pushed_ref(
     for it. The map is capped at :data:`PUSHED_REFS_CAP`, keeping the
     most recent pushes. Refs whose window has passed are left in place
     for ``tier_main``, which prunes each one on its next visit and
-    reports it as ``expired`` (:func:`settle_pushed_refs`): pruning them
-    here would drop that report whenever another ref of the repository
-    is pushed first. They are the oldest pushes, so the cap drops them
-    before any live ref. Every other annotation key on the row is
-    carried over unchanged, so the caller can write the result back
-    whole.
+    reports it as ``completed`` or ``expired``
+    (:func:`settle_pushed_refs`): pruning them here would drop that
+    report whenever another ref of the repository is pushed first. They
+    are the oldest pushes, so the cap drops them before any live ref.
+    Every other annotation key on the row, ``tier_main``'s
+    :data:`ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED` included, is carried
+    over unchanged, so the caller can write the result back whole.
 
     Parameters
     ----------
@@ -202,16 +249,10 @@ def stamp_pushed_ref(
     """
     refs = read_pushed_refs(state)
     refs[ref] = now
-    newest = sorted(
-        refs.items(), key=lambda item: (item[1], item[0]), reverse=True
-    )[:PUSHED_REFS_CAP]
     prior = state.annotations or {}
     return {
         **prior,
-        ANNOTATION_GITHUB_PUSHED_REFS: {
-            stamped_ref: pushed_at.isoformat()
-            for stamped_ref, pushed_at in newest
-        },
+        ANNOTATION_GITHUB_PUSHED_REFS: _as_iso(_newest(refs)),
     }
 
 
@@ -238,6 +279,7 @@ def is_in_push_window(
 def settle_pushed_refs(
     state: KeeperSyncState,
     *,
+    enqueued: Mapping[str, datetime],
     now: datetime,
     window: timedelta,
 ) -> dict[str, Any]:
@@ -249,13 +291,24 @@ def settle_pushed_refs(
     read are pruned: a ref keeps its stamp until then whatever its visit
     found, including a visit that enqueued its sync, so a later LTD
     rebuild of the ref inside the window is caught too. A newer push to a
-    ref is judged by its newer stamp, which restarts the window. Every
-    other annotation key on the row is carried over unchanged.
+    ref is judged by its newer stamp, which restarts the window.
+
+    The enqueues the visit made are recorded in
+    :data:`ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED`, each overwriting the
+    ref's earlier entry. The map is pruned with the stamps, so it keeps
+    an entry only for a ref still stamped once the expired refs are gone
+    (a ref the push processor's cap dropped loses its entry here too),
+    and is capped at :data:`PUSHED_REFS_CAP`, keeping the latest
+    enqueues. Every other annotation key on the row is carried over
+    unchanged.
 
     Parameters
     ----------
     state
         The project's ``keeper_sync_state`` row, freshly read.
+    enqueued
+        The refs whose sync the visit enqueued, each with the time of
+        that enqueue; empty when it enqueued none.
     now
         The time of the visit.
     window
@@ -265,16 +318,52 @@ def settle_pushed_refs(
     -------
     dict of str to Any
         The row's annotations to write back, with
-        :data:`ANNOTATION_GITHUB_PUSHED_REFS` replaced.
+        :data:`ANNOTATION_GITHUB_PUSHED_REFS` and
+        :data:`ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED` replaced.
     """
     kept = prune_pushed_refs(read_pushed_refs(state), now=now, window=window)
+    enqueue_times = {
+        ref: enqueued_at
+        for ref, enqueued_at in {
+            **read_pushed_refs_enqueued(state),
+            **enqueued,
+        }.items()
+        if ref in kept
+    }
     prior = state.annotations or {}
     return {
         **prior,
-        ANNOTATION_GITHUB_PUSHED_REFS: {
-            ref: pushed_at.isoformat() for ref, pushed_at in kept.items()
-        },
+        ANNOTATION_GITHUB_PUSHED_REFS: _as_iso(kept),
+        ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: _as_iso(
+            _newest(enqueue_times)
+        ),
     }
+
+
+def closed_window_outcome(
+    *, pushed_at: datetime, enqueued_at: datetime | None
+) -> PushCheckOutcome:
+    """Return how a ref whose window has passed is reported.
+
+    :attr:`~PushCheckOutcome.completed` when ``tier_main`` enqueued the
+    ref's sync in the window of the push its stamp records, that is at
+    or after that push, and :attr:`~PushCheckOutcome.expired` otherwise.
+    An enqueue from before the push was made for an earlier push's
+    window, which a later push to the ref restarted, so it does not
+    count for this one.
+
+    Parameters
+    ----------
+    pushed_at
+        The ref's push time, from its stamp.
+    enqueued_at
+        The ref's last enqueue, from
+        :data:`ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED`, or ``None`` when
+        none is recorded.
+    """
+    if enqueued_at is not None and enqueued_at >= pushed_at:
+        return PushCheckOutcome.completed
+    return PushCheckOutcome.expired
 
 
 def ltd_rebuilt_since_sync(
@@ -313,8 +402,46 @@ def ltd_rebuilt_since_sync(
     return ltd_date_rebuilt > reference
 
 
+def _newest(times: Mapping[str, datetime]) -> dict[str, datetime]:
+    """Return the :data:`PUSHED_REFS_CAP` latest entries, latest first.
+
+    Ties on time are broken by ref, so the cut is deterministic.
+    """
+    return dict(
+        sorted(
+            times.items(), key=lambda item: (item[1], item[0]), reverse=True
+        )[:PUSHED_REFS_CAP]
+    )
+
+
+def _as_iso(times: Mapping[str, datetime]) -> dict[str, str]:
+    """Return a ref-to-time map as it is stored: ISO-8601 strings."""
+    return {ref: at.isoformat() for ref, at in times.items()}
+
+
+def _read_ref_times(
+    state: KeeperSyncState | None, key: str
+) -> dict[str, datetime]:
+    """Return the ref-to-time map under annotation ``key``, read defensively.
+
+    A missing or non-object map reads as empty, and an entry whose ref is
+    not a non-empty string or whose time does not parse is skipped.
+    """
+    if state is None or state.annotations is None:
+        return {}
+    raw = state.annotations.get(key)
+    if not isinstance(raw, Mapping):
+        return {}
+    times: dict[str, datetime] = {}
+    for ref, value in raw.items():
+        parsed = _parse_push_time(value)
+        if isinstance(ref, str) and ref and parsed is not None:
+            times[ref] = parsed
+    return times
+
+
 def _parse_push_time(value: object) -> datetime | None:
-    """Return a stamp's push time as an aware datetime, or ``None``."""
+    """Return a map entry's time as an aware datetime, or ``None``."""
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, str):

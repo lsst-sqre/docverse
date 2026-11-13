@@ -609,8 +609,8 @@ Every stamp writes the whole map back:
   its time, so the window restarts from the latest push.
 - **Expired refs are left for `tier_main`.** A stamp drops no ref
   whose window has passed: `tier_main` prunes each one on its next
-  visit and reports it as `expired`, so a push to another ref of a busy
-  repository cannot drop that report first.
+  visit and reports it as `completed` or `expired`, so a push to
+  another ref of a busy repository cannot drop that report first.
 - **The map is capped.** It holds at most 20 refs; a stamp that would
   leave more drops the oldest pushes first, expired ones before any
   live one, so a repository that pushes many tags at once cannot grow
@@ -625,6 +625,31 @@ The stamp needs only the payload: the keeper-sync step never calls
 GitHub, not even the compare API the dashboard-template step falls back
 to for a truncated push.
 
+Beside the stamps, `tier_main` keeps a second map on the same row,
+`github_pushed_refs_enqueued`: each stamped ref, keyed the same way, to
+the ISO-8601 time of the last project sync it enqueued for that ref.
+The push processor never writes it, and a row without it reads as no
+ref ever enqueued, so there is nothing to migrate:
+
+```json
+{
+  "github_pushed_refs": {
+    "tickets/DM-56619": "2026-10-09T14:02:11.204518+00:00"
+  },
+  "github_pushed_refs_enqueued": {
+    "tickets/DM-56619": "2026-10-09T14:10:03.551207+00:00"
+  }
+}
+```
+
+An entry is written on every enqueue for the ref, overwriting the last,
+and is pruned with the ref's stamp; the map is capped at 20 refs like
+the stamps, keeping the latest enqueues. A malformed map or entry reads
+as empty rather than failing the tick. When the ref's window passes,
+the map is what tells a push that produced a sync (`completed`) from one
+that never did (`expired`): see
+[The `tier_main` check](#the-tier_main-check).
+
 ### The window
 
 A ref is inside the window while less than
@@ -634,9 +659,11 @@ and its upload to LTD. Throughout it, `tier_main` checks the ref on
 every tick, including after it has enqueued the ref's sync, so every
 LTD rebuild of the ref inside the window is synced on the fast path.
 Once the window closes the ref drops back to its project's ordinary
-cadence: `tier_main`'s next visit prunes it from the map with the
-outcome `expired`. Raising the window keeps a slow CI on the fast path
-longer, at the price of more LTD polling per push.
+cadence: `tier_main`'s next visit prunes it from both maps with the
+outcome `completed` when it enqueued the project's sync at least once
+in the window, and `expired` when it never did. Raising the window
+keeps a slow CI on the fast path longer, at the price of more LTD
+polling per push.
 
 ### A push counts as hot
 
@@ -683,8 +710,12 @@ runs too; the visit itself runs whatever the check's dormancy gate
 decided, so a ref whose window has passed is pruned even from a project
 that is dormant again.
 
-Refs whose window has passed come first. Each is `expired`, costs no LTD
-call, and is pruned. Then each live ref, oldest push first:
+Refs whose window has passed come first. Each costs no LTD call and is
+pruned. It is `completed` when `github_pushed_refs_enqueued` records an
+enqueue for it at or after the push its stamp holds, so a sync was
+enqueued in this window, and `expired` otherwise: an enqueue made before
+a later push to the same ref restarted its window does not count for
+that push. Then each live ref, oldest push first:
 
 1. **Find the edition the ref feeds.** The Docverse editions of the
    project that track the ref (`git_ref` tracking mode, any kind: the
@@ -740,7 +771,8 @@ call, and is pruned. Then each live ref, oldest push first:
 | `unchanged` | The ref's edition is as keeper-sync last synced or tombstoned it | Kept |
 | `not_found` | No edition keeper-sync has seen tracks the ref, and LTD lists nothing new that tracks it | Kept |
 | `error` | LTD failed to answer | Kept |
-| `expired` | The ref's window passed | Pruned |
+| `completed` | The ref's window passed after it enqueued the project's sync at least once in that window | Pruned, with its enqueue |
+| `expired` | The ref's window passed without it enqueueing the project's sync: the push never produced a sync | Pruned, with any enqueue on record |
 
 A `rebuilt` or `new_edition` ref enqueues the project's whole
 `keeper_sync_project`, with the tier label `main`, through the same
@@ -754,8 +786,13 @@ rebuild of the same ref, such as the upload of a later push's CI run
 after an earlier run's upload was synced, or the first upload to an
 edition LTD created, and keeper-sync synced, before any build had
 landed: the synced edition reads `unchanged` until LTD rebuilds it, and
-`rebuilt` after. When the slot was taken, the refs that called for the
-job are simply checked again next tick.
+`rebuilt` after. Each enqueue is recorded against every ref that called
+for it, in `github_pushed_refs_enqueued`. When the slot was taken, the
+refs that called for the job record nothing and are simply checked
+again next tick.
+
+`completed` does not enqueue anything: the window has closed, and any
+rebuild after it waits for the project's ordinary cadence.
 
 An LTD failure, after the client's own retries, is logged as
 `Tier-main: failed to check pushed ref` and sent to Sentry, as the
@@ -764,11 +801,14 @@ remaining live refs wait for the next tick rather than spend more LTD
 calls on an LTD that is failing. When the `main` check itself failed on
 LTD, the project's refs wait for the next tick too.
 
-The visit writes the map back only when it pruned a ref, reading the
-row `FOR UPDATE` first: a ref pushed again while the tick ran keeps its
-newer stamp, which restarts its window. The three tier crons' own writes to the row, which
+The visit writes the maps back only when it pruned a ref or enqueued a
+ref's sync, reading the row `FOR UPDATE` first: a ref pushed again while
+the tick ran keeps its newer stamp, which restarts its window, and an
+enqueue entry is kept only for a ref still stamped. The three tier
+crons' own writes to the row, which
 record when they polled the project, read it `FOR UPDATE` for the same
-reason, so none of them can write back a map that predates a stamp.
+reason, so none of them can write back a map that predates a stamp or
+an enqueue.
 
 The check's cost is bounded: at most two LTD calls per stamped ref per
 tick (its edition, then the edition of the lifecycle tombstone its name
@@ -822,7 +862,8 @@ catalog](metrics.md#keeper_sync_push_check).
 `keeper_sync_push_hot_path_enabled` (default `true`) is the hot path's
 switch. Off, a push logs
 `Keeper-sync push hot path is disabled, not stamping` and stamps
-nothing, `tier_main` neither checks nor prunes stamps, making exactly
+nothing, `tier_main` neither checks nor prunes stamps nor records
+enqueues, making exactly
 the LTD calls it made before the hot path existed, and keeper-sync polls
 every project on its ordinary cadence: a stamp makes no project hot,
 on any tier or on the status endpoint. The dashboard-template work a
@@ -877,7 +918,8 @@ redelivery's time.
   }
   ```
 
-- **The row.** The same response shows the raw stamp in
+- **The row.** The same response shows the raw stamps, and the
+  enqueues recorded beside them in `github_pushed_refs_enqueued`, in
   `project_state.annotations`.
 - **The tick.** `tier_main`'s lines say what each visit found and when
   a push's sync was enqueued: see

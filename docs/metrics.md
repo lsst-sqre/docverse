@@ -605,21 +605,22 @@ best-effort: a failed publish is logged and never stops the tick.
 | `unchanged` | The ref's edition is as keeper-sync last synced it | `false`, null |
 | `not_found` | No synced edition tracks the ref, and LTD lists nothing new that tracks it | `false`, null |
 | `error` | LTD failed to answer; the stamp is kept for the next tick | `false`, null |
-| `expired` | The ref's window passed without a sync; the stamp is pruned | `false`, null |
+| `completed` | The ref's window passed after it enqueued the project's sync at least once in that window; the stamp is pruned | `false`, null |
+| `expired` | The ref's window passed without it enqueueing the project's sync: the push never produced a sync; the stamp is pruned | `false`, null |
 
 A `rebuilt` or `new_edition` ref is not enqueued when a sync of the
 project already holds its slot: it then reports `enqueued` false with no
 `push_lag`, keeps its stamp, and is checked again on the next tick.
 Counting `outcome` over a day says how often a push is caught
-(`rebuilt`, `new_edition`) against how often its window closes on
-nothing (`expired`).
+(`rebuilt`, `new_edition`), and how its window ends: with a sync
+(`completed`) or on nothing (`expired`).
 
 | Field | Type | Stored as | Meaning |
 | --- | --- | --- | --- |
 | `organization` | string | tag | Organization slug. |
 | `project` | string or null | tag | Project slug, which is also its LTD product slug; always set on this event. |
 | `github_ref` | string | field | The pushed branch or tag, normalized: `main` or `v1.2.0`, not `refs/heads/main`. A field, not a tag; see the [cardinality rule](#cardinality-rule). |
-| `outcome` | enum | tag | What the visit found: `new_edition`, `rebuilt`, `unchanged`, `expired`, `not_found`, or `error`. |
+| `outcome` | enum | tag | What the visit found: `new_edition`, `rebuilt`, `unchanged`, `expired`, `not_found`, `error`, or `completed`. |
 | `enqueued` | boolean | field | Whether the visit enqueued the project's `keeper_sync_project` for this ref, and so cleared its stamp. |
 | `push_lag` | duration or null | field | Time from the push, as Docverse stamped it on receiving the delivery, to the enqueue this visit made: the repository's CI run, its upload to LTD, and the wait for the tick. Set exactly when `enqueued` is true. |
 

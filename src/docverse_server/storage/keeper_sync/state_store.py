@@ -124,6 +124,15 @@ class KeeperSyncState(BaseModel):
         Docverse stamped it, written by the keeper-sync push processor.
         Its rules (overwrite, window pruning, the cap) live in
         :mod:`docverse_server.services.keeper_sync.push_hints`.
+
+        ``github_pushed_refs_enqueued`` — a map from each stamped ref to
+        the ISO-8601 time of the last project sync ``tier_main``
+        enqueued for it, written by ``tier_main`` when it settles a
+        visit and pruned with the ref's stamp. Read when the ref's
+        window passes to report it ``completed`` (it enqueued in that
+        window) rather than ``expired``. A missing or malformed map
+        reads as no ref ever enqueued. Its rules live beside the
+        stamps' in :mod:`docverse_server.services.keeper_sync.push_hints`.
     Edition-resource rows
         ``ltd_mode`` / ``ltd_tracked_refs`` — the LTD-side edition
         mode / refs preserved for reversibility (used by the ``manual``

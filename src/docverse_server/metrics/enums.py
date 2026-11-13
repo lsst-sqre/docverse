@@ -478,13 +478,22 @@ class KeeperSyncPushCheckOutcome(StrEnum):
     """The ref's edition is as keeper-sync last synced it."""
 
     expired = "expired"
-    """The ref's window passed; its stamp is pruned."""
+    """The ref's window passed without it enqueueing the project's sync;
+    its stamp is pruned."""
 
     not_found = "not_found"
     """No synced edition tracks the ref, and LTD lists nothing new."""
 
     error = "error"
     """LTD failed to answer; the stamp is kept for the next tick."""
+
+    completed = "completed"
+    """The ref's window passed after it enqueued the project's sync at
+    least once in that window; its stamp is pruned (PRD #888).
+
+    Appended after :attr:`error` so every earlier symbol keeps its index
+    in the Avro enum.
+    """
 
     @classmethod
     def from_domain(

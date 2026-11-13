@@ -4,9 +4,10 @@ Pure-function tests with no DB or HTTP, on in-memory
 ``KeeperSyncState`` rows like ``scheduler_test.py``. The push processor
 writes what :func:`stamp_pushed_ref` returns onto a project's state row,
 and ``tier_main`` what :func:`settle_pushed_refs` returns, so these
-tests pin the shape of the ``github_pushed_refs`` annotation as well as
-the stamp, prune, cap, window, and settle rules, and the rebuild check
-``tier_main`` runs on each pushed ref's edition.
+tests pin the shape of the ``github_pushed_refs`` and
+``github_pushed_refs_enqueued`` annotations as well as the stamp, prune,
+cap, window, and settle rules, how a closed window is reported, and the
+rebuild check ``tier_main`` runs on each pushed ref's edition.
 """
 
 from __future__ import annotations
@@ -16,11 +17,15 @@ from typing import Any
 
 from docverse_server.services.keeper_sync.push_hints import (
     ANNOTATION_GITHUB_PUSHED_REFS,
+    ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED,
     PUSHED_REFS_CAP,
+    PushCheckOutcome,
+    closed_window_outcome,
     is_in_push_window,
     ltd_rebuilt_since_sync,
     prune_pushed_refs,
     read_pushed_refs,
+    read_pushed_refs_enqueued,
     settle_pushed_refs,
     stamp_pushed_ref,
 )
@@ -174,6 +179,29 @@ def test_stamp_preserves_other_annotation_keys() -> None:
     )
 
 
+def test_stamp_carries_the_enqueue_map_over() -> None:
+    """A push leaves ``tier_main``'s enqueue record as it found it.
+
+    The enqueue map is ``tier_main``'s to write and prune; a repeated
+    push restarts the ref's window, and the enqueue on record, now older
+    than the push, no longer counts for it (see
+    :func:`closed_window_outcome`).
+    """
+    enqueues = {"main": (_NOW - timedelta(minutes=5)).isoformat()}
+    state = _project_state(
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS: {
+                "main": (_NOW - timedelta(minutes=20)).isoformat()
+            },
+            ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: enqueues,
+        }
+    )
+
+    merged = stamp_pushed_ref(state, ref="main", now=_NOW)
+
+    assert merged[ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED] == enqueues
+
+
 def test_stamp_replaces_a_malformed_map() -> None:
     """A map that is not an object, or bad entries in it, are discarded."""
     not_a_map = _project_state(
@@ -219,6 +247,51 @@ def test_read_pushed_refs_without_a_row_or_map_is_empty() -> None:
     assert read_pushed_refs(None) == {}
     assert read_pushed_refs(_project_state()) == {}
     assert read_pushed_refs(_project_state(annotations={"x": 1})) == {}
+
+
+def test_read_pushed_refs_enqueued_parses_times() -> None:
+    """The enqueue map reads back as aware datetimes, like the stamps."""
+    enqueued = _NOW - timedelta(minutes=2)
+    state = _project_state(
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
+                "main": enqueued.isoformat(),
+                "naive": "2026-10-09T11:00:00",
+            }
+        }
+    )
+
+    assert read_pushed_refs_enqueued(state) == {
+        "main": enqueued,
+        "naive": datetime(2026, 10, 9, 11, 0, tzinfo=UTC),
+    }
+
+
+def test_read_pushed_refs_enqueued_is_defensive() -> None:
+    """A missing or malformed enqueue map reads as never enqueued.
+
+    Rows written before the map existed carry no key, and the map
+    round-trips through JSONB, so a non-object map or a bad entry is
+    skipped rather than raised on.
+    """
+    assert read_pushed_refs_enqueued(None) == {}
+    assert read_pushed_refs_enqueued(_project_state()) == {}
+    assert read_pushed_refs_enqueued(_project_state(annotations={})) == {}
+    not_a_map = _project_state(
+        annotations={ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: ["main"]}
+    )
+    assert read_pushed_refs_enqueued(not_a_map) == {}
+    bad_entries = _project_state(
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
+                "garbled": "not a time",
+                "number": 12,
+                "": _NOW.isoformat(),
+                "main": _NOW.isoformat(),
+            }
+        }
+    )
+    assert read_pushed_refs_enqueued(bad_entries) == {"main": _NOW}
 
 
 def test_prune_pushed_refs_keeps_only_the_window() -> None:
@@ -272,8 +345,12 @@ def test_settle_keeps_an_enqueued_ref_until_its_window_passes() -> None:
         }
     )
 
-    inside = settle_pushed_refs(state, now=_NOW, window=_WINDOW)
-    after = settle_pushed_refs(state, now=pushed + _WINDOW, window=_WINDOW)
+    inside = settle_pushed_refs(
+        state, enqueued={"tickets/DM-1": _NOW}, now=_NOW, window=_WINDOW
+    )
+    after = settle_pushed_refs(
+        state, enqueued={}, now=pushed + _WINDOW, window=_WINDOW
+    )
 
     assert inside[ANNOTATION_GITHUB_PUSHED_REFS] == {
         "tickets/DM-1": pushed.isoformat()
@@ -295,7 +372,7 @@ def test_settle_judges_a_ref_by_its_fresh_stamp() -> None:
         }
     )
 
-    settled = settle_pushed_refs(state, now=_NOW, window=_WINDOW)
+    settled = settle_pushed_refs(state, enqueued={}, now=_NOW, window=_WINDOW)
 
     assert settled[ANNOTATION_GITHUB_PUSHED_REFS] == {
         "tickets/DM-1": again.isoformat()
@@ -313,9 +390,121 @@ def test_settle_prunes_expired_refs() -> None:
         }
     )
 
-    settled = settle_pushed_refs(state, now=_NOW, window=_WINDOW)
+    settled = settle_pushed_refs(state, enqueued={}, now=_NOW, window=_WINDOW)
 
     assert set(settled[ANNOTATION_GITHUB_PUSHED_REFS]) == {"live"}
+
+
+def test_settle_records_each_enqueued_ref() -> None:
+    """A ref whose sync the visit enqueued records that enqueue's time.
+
+    Written as an ISO-8601 string beside the ref's stamp, overwriting an
+    earlier enqueue of the same ref, so the map holds the ref's last
+    enqueue; a ref the visit did not enqueue keeps what it had.
+    """
+    pushed = _NOW - timedelta(minutes=20)
+    earlier = _NOW - timedelta(minutes=10)
+    enqueued_at = _NOW + timedelta(seconds=2)
+    state = _project_state(
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS: {
+                "tickets/DM-1": pushed.isoformat(),
+                "tickets/DM-2": pushed.isoformat(),
+                "tickets/DM-3": pushed.isoformat(),
+            },
+            ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
+                "tickets/DM-1": earlier.isoformat(),
+                "tickets/DM-3": earlier.isoformat(),
+            },
+        }
+    )
+
+    settled = settle_pushed_refs(
+        state,
+        enqueued={"tickets/DM-1": enqueued_at, "tickets/DM-2": enqueued_at},
+        now=_NOW,
+        window=_WINDOW,
+    )
+
+    assert settled[ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED] == {
+        "tickets/DM-1": enqueued_at.isoformat(),
+        "tickets/DM-2": enqueued_at.isoformat(),
+        "tickets/DM-3": earlier.isoformat(),
+    }
+    assert settled[ANNOTATION_GITHUB_PUSHED_REFS] == {
+        "tickets/DM-1": pushed.isoformat(),
+        "tickets/DM-2": pushed.isoformat(),
+        "tickets/DM-3": pushed.isoformat(),
+    }
+
+
+def test_settle_prunes_an_enqueue_with_its_stamp() -> None:
+    """A ref's enqueue goes when its stamp does.
+
+    The expired ref's enqueue is pruned with its stamp, and an enqueue
+    for a ref with no stamp left on the row (the push processor's cap
+    dropped it) is dropped too, so the map only ever describes refs
+    still stamped.
+    """
+    expired = _NOW - _WINDOW
+    live = _NOW - timedelta(minutes=5)
+    state = _project_state(
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS: {
+                "expired": expired.isoformat(),
+                "live": live.isoformat(),
+            },
+            ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
+                "expired": (expired + timedelta(minutes=5)).isoformat(),
+                "live": (live + timedelta(minutes=1)).isoformat(),
+                "unstamped": live.isoformat(),
+            },
+        }
+    )
+
+    settled = settle_pushed_refs(state, enqueued={}, now=_NOW, window=_WINDOW)
+
+    assert settled[ANNOTATION_GITHUB_PUSHED_REFS] == {"live": live.isoformat()}
+    assert settled[ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED] == {
+        "live": (live + timedelta(minutes=1)).isoformat()
+    }
+
+
+def test_settle_caps_the_enqueue_map_keeping_the_latest() -> None:
+    """The enqueue map holds at most the cap's worth of refs.
+
+    The push processor caps the stamps, but a row can carry more (a
+    hand-edited one, say); the enqueue map keeps the latest enqueues.
+    """
+    count = PUSHED_REFS_CAP + 5
+    pushed = _NOW - timedelta(minutes=50)
+    state = _project_state(
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS: {
+                f"ref-{index:02d}": pushed.isoformat()
+                for index in range(count)
+            },
+            ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
+                f"ref-{index:02d}": (
+                    pushed + timedelta(minutes=index)
+                ).isoformat()
+                for index in range(count - 1)
+            },
+        }
+    )
+
+    settled = settle_pushed_refs(
+        state,
+        enqueued={f"ref-{count - 1:02d}": _NOW},
+        now=_NOW,
+        window=_WINDOW,
+    )
+
+    enqueues = settled[ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED]
+    assert len(enqueues) == PUSHED_REFS_CAP
+    assert enqueues[f"ref-{count - 1:02d}"] == _NOW.isoformat()
+    assert "ref-04" not in enqueues
+    assert "ref-05" in enqueues
 
 
 def test_settle_preserves_other_annotation_keys() -> None:
@@ -329,12 +518,66 @@ def test_settle_preserves_other_annotation_keys() -> None:
         }
     )
 
-    settled = settle_pushed_refs(state, now=_NOW, window=_WINDOW)
+    settled = settle_pushed_refs(state, enqueued={}, now=_NOW, window=_WINDOW)
 
     assert settled == {
         "date_main_last_polled": "2026-10-09T11:55:00+00:00",
         ANNOTATION_GITHUB_PUSHED_REFS: {},
+        ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {},
     }
+
+
+def test_closed_window_with_an_enqueue_is_completed() -> None:
+    """A ref that enqueued its sync in its window ends ``completed``.
+
+    The enqueue counts when it came at or after the push the stamp
+    records, so it was made for that push's window.
+    """
+    pushed = _NOW - _WINDOW - timedelta(minutes=5)
+
+    for enqueued_at in (pushed, pushed + timedelta(minutes=12)):
+        outcome = closed_window_outcome(
+            pushed_at=pushed, enqueued_at=enqueued_at
+        )
+        assert outcome is PushCheckOutcome.completed
+
+
+def test_closed_window_without_an_enqueue_is_expired() -> None:
+    """A ref that never enqueued in its window ends ``expired``."""
+    pushed = _NOW - _WINDOW - timedelta(minutes=5)
+
+    outcome = closed_window_outcome(pushed_at=pushed, enqueued_at=None)
+
+    assert outcome is PushCheckOutcome.expired
+
+
+def test_closed_window_ignores_an_enqueue_before_the_push() -> None:
+    """An enqueue from an earlier push's window does not count.
+
+    A ref synced for one push, then pushed again (the stamp restarting
+    its window) with no sync since, still ends ``expired``: the enqueue
+    on record predates the push the stamp now holds.
+    """
+    pushed = _NOW - _WINDOW - timedelta(minutes=5)
+
+    outcome = closed_window_outcome(
+        pushed_at=pushed, enqueued_at=pushed - timedelta(seconds=1)
+    )
+
+    assert outcome is PushCheckOutcome.expired
+
+
+def test_completed_neither_enqueues_nor_keeps_the_stamp() -> None:
+    """``completed`` ends a window like ``expired``: no sync, stamp pruned."""
+    assert not PushCheckOutcome.completed.enqueues
+    assert PushCheckOutcome.completed.prunes
+    assert PushCheckOutcome.expired.prunes
+    assert not any(
+        outcome.prunes
+        for outcome in PushCheckOutcome
+        if outcome
+        not in {PushCheckOutcome.completed, PushCheckOutcome.expired}
+    )
 
 
 def test_ltd_rebuilt_since_sync_compares_with_the_rebuild_seen() -> None:

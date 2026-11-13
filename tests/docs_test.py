@@ -110,6 +110,7 @@ from docverse_server.services.keeper_sync import (
 )
 from docverse_server.services.keeper_sync.push_hints import (
     ANNOTATION_GITHUB_PUSHED_REFS,
+    ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED,
     PUSHED_REFS_CAP,
     PushCheckOutcome,
 )
@@ -2018,7 +2019,8 @@ def test_github_manual_fallback_documented() -> None:
 def test_github_push_hot_path_names_its_contract() -> None:
     """The hot-path section names the stamp, its knobs, and every skip.
 
-    The annotation key is what an operator reads off a state row, the
+    The annotation keys (the stamps, and the enqueues ``tier_main``
+    records beside them) are what an operator reads off a state row, the
     two settings are how the path is tuned or switched off, and the skip
     reasons are what the processor's log says when a push stamps nothing.
     """
@@ -2032,6 +2034,7 @@ def test_github_push_hot_path_names_its_contract() -> None:
     assert "projects_stamped" in GitHubWebhookReceivedEvent.model_fields
     names = {
         ANNOTATION_GITHUB_PUSHED_REFS,
+        ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED,
         "projects_stamped",
         *knobs,
         *(reason.value for reason in KeeperSyncPushSkip),
