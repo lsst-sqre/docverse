@@ -715,6 +715,7 @@ explains each counter against the loop's decision table.
 | `unpublished` | integer | field | Stranded CDN keys the tick deleted. |
 | `in_flight_skipped` | integer | field | Pairs a live `publish_edition` job still held. |
 | `superseded_skipped` | integer | field | Planned republishes the edition had moved off before the enqueue. |
+| `deleted_skipped` | integer | field | Planned republishes whose edition was soft-deleted before the enqueue. |
 | `failed_left_alone` | integer | field | Pairs reading `failed`; reported, never re-driven. |
 | `unexpected_pointers` | integer | field | Keys for editions with no build to publish; reported, not acted on. |
 | `capped` | integer | field | Actions the per-job cap left for the next tick. |

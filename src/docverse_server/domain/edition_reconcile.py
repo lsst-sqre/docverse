@@ -19,6 +19,7 @@ __all__ = [
     "EditionReconcilePlan",
     "EditionRepublish",
     "EditionUnpublish",
+    "LockedRepublishTarget",
     "ReconcileEdition",
     "ReconcileReason",
     "plan_edition_reconcile",
@@ -74,7 +75,7 @@ class ReconcileEdition:
     a project deleted before it still owns editions reading NULL, and
     those editions are unpublishable: ``publish_edition`` resolves the
     project by slug through a lookup that filters tombstones, so a
-    republish raises before it can record a failure and the pair is
+    republish retires as a skip with the pair still unpublished and is
     re-driven on every subsequent tick. Carrying the stamp lets the
     planner treat the whole subtree as tombstoned instead.
     """
@@ -203,6 +204,23 @@ class EditionRepublish:
     build_id: int
     build_public_id: str
     reason: ReconcileReason
+
+
+@dataclass(frozen=True, slots=True)
+class LockedRepublishTarget:
+    """What a planned republish rests on, re-read under the edition's lock.
+
+    The answer to the apply-time re-check: the plan chose its pair in a
+    transaction that has closed, so the enqueue asks again, under a row
+    lock, whether the edition is still there and still points where the
+    plan said.
+    """
+
+    current_build_id: int | None
+    """The build the edition points at now, if any."""
+
+    deleted: bool
+    """Whether the edition or its project has been soft-deleted."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,8 +431,9 @@ def _classify_edition(
     :attr:`~ReconcileEdition.tombstoned`, which covers the edition's own
     stamp *and* its project's: a live-looking edition under a deleted
     project cannot be republished (the publish job resolves the project
-    through a tombstone-filtering lookup and raises), so routing it
-    anywhere but here would re-drive an unsatisfiable job every tick.
+    through a tombstone-filtering lookup and retires as a skip), so
+    routing it anywhere but here would re-drive an unsatisfiable job
+    every tick.
     """
     if edition.tombstoned:
         if pointer is not None:

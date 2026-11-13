@@ -268,6 +268,14 @@ class EditionReconcileCompletedEvent(DocverseEventBase):
     them — a reason to lower the per-job cap, not a failure.
     """
 
+    deleted_skipped: int
+    """Planned republishes whose edition was deleted before the enqueue.
+
+    Soft-deletes that landed after the plan was made, most often the
+    delete webhook for a branch removed as its pull request merged. Not
+    a failure: the tick stood down instead of publishing a tombstone.
+    """
+
     failed_left_alone: int
     """Pairs reading ``failed``; reported for operators, never re-driven."""
 

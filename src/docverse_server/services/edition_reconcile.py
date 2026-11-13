@@ -18,8 +18,8 @@ Each enqueue re-tests its pair first, inside the enqueue's own
 transaction, because the plan describes an instant that has passed:
 the read transaction closed before the CDN read-back, and up to a
 whole cap's worth of other actions may have run since. An edition
-repointed in that window, or a pair another driver has meanwhile
-enqueued, is dropped rather than re-driven — see
+soft-deleted or repointed in that window, or a pair another driver has
+meanwhile enqueued, is dropped rather than re-driven — see
 :meth:`EditionReconcileService._recheck_republish`.
 
 An unpublish has no such path to defer to; nothing enqueues a key
@@ -113,17 +113,23 @@ class _ApplySkip(StrEnum):
     named to match it. ``in_flight`` feeds the very counter the
     planner's ``in_flight_skipped`` bucket feeds, because a pair skipped
     for a live publish is the same finding whichever of the two reads
-    noticed it. ``superseded`` has no plan-time sibling: the planner
-    cannot observe a repoint that happens after its own transaction
-    closed.
+    noticed it. ``deleted`` and ``superseded`` have no plan-time
+    sibling: the planner cannot observe a soft-delete or a repoint that
+    happens after its own transaction closed. ``deleted`` is kept out of
+    the planner's ``tombstoned`` bucket on purpose — that one is a
+    standing count of an org's settled tombstones, and folding a race
+    into it would hide how often the race fires.
     """
 
+    deleted = "deleted"
     superseded = "superseded"
     in_flight = "in_flight"
 
     @property
     def message(self) -> str:
         """The log line this skip is reported under."""
+        if self is _ApplySkip.deleted:
+            return "Skipped a republish for a soft-deleted edition"
         if self is _ApplySkip.superseded:
             return "Skipped a superseded edition republish"
         return "Skipped an in-flight edition republish"
@@ -146,7 +152,7 @@ class _StalePlanError(Exception):
     ) -> None:
         super().__init__(f"Republish dropped at apply time: {skip.value}")
         self.skip = skip
-        """Which of the two apply-time races dropped the action."""
+        """Which of the apply-time races dropped the action."""
 
         self.current_build_id = current_build_id
         """The build the edition actually pointed at under the lock."""
@@ -206,6 +212,20 @@ class EditionReconcileOutcome:
     a steady trickle here is an org whose editions are re-pointed faster
     than a tick takes to walk them, which is the read that says the
     per-job cap wants lowering rather than that anything is broken.
+    """
+
+    deleted_skipped: int = 0
+    """Planned republishes whose edition was soft-deleted before the enqueue.
+
+    The other apply-time bucket with no planner counterpart (issue
+    #886): the edition, or its project, was deleted after the plan's
+    transaction read it as live — most often by the delete webhook for a
+    branch removed as its pull request merged. Kept apart from
+    :attr:`tombstoned`, which counts an org's settled tombstones and
+    would bury a handful of these in a stock of thousands. Nothing is
+    unpublished for such an edition this tick; if the delete left its
+    key behind, the next tick's plan reads it as a tombstone and removes
+    it.
     """
 
     grace_skipped: int = 0
@@ -285,6 +305,7 @@ class EditionReconcileOutcome:
             "unpublish_failed": self.unpublish_failed,
             "in_flight_skipped": self.in_flight_skipped,
             "superseded_skipped": self.superseded_skipped,
+            "deleted_skipped": self.deleted_skipped,
             "grace_skipped": self.grace_skipped,
             "failed_left_alone": self.failed_left_alone,
             "retired_build_skipped": self.retired_build_skipped,
@@ -503,7 +524,9 @@ class EditionReconcileService:
                 precheck=_recheck,
             )
         except _StalePlanError as stale:
-            if stale.skip is _ApplySkip.superseded:
+            if stale.skip is _ApplySkip.deleted:
+                outcome.deleted_skipped += 1
+            elif stale.skip is _ApplySkip.superseded:
                 outcome.superseded_skipped += 1
             else:
                 outcome.in_flight_skipped += 1
@@ -551,11 +574,21 @@ class EditionReconcileService:
         Runs as the first statement of
         :func:`~docverse_server.services.publish_enqueue.enqueue_publish_for_edition`'s
         Phase A, and raises :exc:`_StalePlanError` to abort it with
-        nothing written. Both conditions it tests are races the plan
+        nothing written. The conditions it tests are all races the plan
         cannot close on its own, because the plan's transaction commits
         before the CDN read-back and before the first of up to ``limit``
         enqueues:
 
+        * The edition, or its project, may have been **soft-deleted** —
+          most often by the delete webhook for a branch removed as its
+          pull request merged. The delete also removes the CDN key, and
+          the read-back that follows the plan's transaction then finds
+          no pointer for an edition the snapshot still calls live, which
+          is precisely the ``pointer_missing`` drift. Enqueuing would
+          mark a tombstone ``pending`` and hand ``publish_edition`` a
+          job for an edition it can no longer resolve (issue #886). A
+          soft-delete is an ``UPDATE`` of the locked row, so one
+          arriving mid-transaction waits like a repoint does.
         * The edition may have been **repointed** — by tracking, by an
           API rollback, by keeper-sync — since the pair was chosen.
           Enqueuing the planned build then publishes superseded content,
@@ -572,13 +605,24 @@ class EditionReconcileService:
           would get two jobs, two KV writes, and two
           ``edition_published`` events.
 
-        Order matters: an edition that has moved on is superseded
-        whatever is in flight for the build it has left, and that is the
-        more specific thing to tell an operator.
+        Order matters: a deleted edition has nothing to publish whatever
+        it points at, an edition that has moved on is superseded
+        whatever is in flight for the build it has left, and each is the
+        more specific thing to tell an operator. An ``edition_id`` that
+        names no row at all is reported as deleted too: there is nothing
+        to publish for it either.
         """
-        current_build_id = await self._edition_store.lock_current_build_id(
+        target = await self._edition_store.lock_republish_target(
             edition_id=action.edition_id
         )
+        if target is None or target.deleted:
+            raise _StalePlanError(
+                _ApplySkip.deleted,
+                current_build_id=(
+                    target.current_build_id if target is not None else None
+                ),
+            )
+        current_build_id = target.current_build_id
         if current_build_id != action.build_id:
             raise _StalePlanError(
                 _ApplySkip.superseded, current_build_id=current_build_id

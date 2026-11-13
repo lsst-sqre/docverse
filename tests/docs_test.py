@@ -910,7 +910,7 @@ def test_metrics_event_fields_documented() -> None:
 
 
 def test_apply_time_skip_log_lines_documented() -> None:
-    """Both log lines the apply-time re-check emits are documented.
+    """Every log line the apply-time re-check emits is documented.
 
     They are the only record that a planned repair was dropped rather
     than applied — the counters say how many, the lines say which — so
