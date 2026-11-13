@@ -176,7 +176,7 @@ def test_keeper_sync_push_check_outcome_values() -> None:
     ``outcome`` is an InfluxDB tag, so on ``keeper_sync_push_check`` these
     values are what a query's ``GROUP BY`` and ``WHERE`` clauses quote. A
     new outcome is appended, so every existing symbol keeps its index in
-    the Avro enum.
+    the Avro enum: ``completed`` (PRD #888) comes after ``error``.
     """
     assert [member.value for member in KeeperSyncPushCheckOutcome] == [
         "new_edition",
@@ -185,6 +185,7 @@ def test_keeper_sync_push_check_outcome_values() -> None:
         "expired",
         "not_found",
         "error",
+        "completed",
     ]
 
 

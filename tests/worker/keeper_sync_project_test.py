@@ -374,8 +374,9 @@ async def test_keeper_sync_project_runs_service_and_enqueues_publish(
     assert publish_payload["edition_slug"] == "__main"
     assert publish_payload["project_slug"] == "pipelines"
     assert publish_payload["org_id"] == org_id
-    # A first import measures no sync lag: LTD's ``date_rebuilt`` dates a
-    # rebuild that happened before Docverse mirrored the edition.
+    # A backfill's first import measures no sync lag: the edition predates
+    # the project, so LTD's ``date_rebuilt`` dates a rebuild that happened
+    # before Docverse mirrored it.
     assert "ltd_date_rebuilt" not in publish_payload
 
     async for session in db_session_dependency():
@@ -1352,7 +1353,8 @@ async def test_keeper_sync_project_publishes_build_content_copied(
     assert event.build_retry_used is False
     assert event.succeeded is True
     assert event.duration_seconds >= 0
-    # The copy is ``main``'s first import, which measures no sync lag.
+    # The copy is ``main``'s first import, a backfill of an edition older
+    # than the project, which measures no sync lag.
     assert event.ltd_lag_seconds is None
 
 
@@ -2425,8 +2427,8 @@ async def test_keeper_sync_project_publishes_backfilled_aggregates(
         job.kwargs["payload"]["edition_slug"] for job in publish_jobs
     )
     assert publish_slugs == ["15", "15.2", "15.2.1", "__main"]
-    # A first import measures no sync lag, and the aggregates it moved
-    # report the release's (absent) lag.
+    # A backfill's first import measures no sync lag, and the aggregates
+    # it moved report the release's (absent) lag.
     assert [
         job.kwargs["payload"]["edition_slug"]
         for job in publish_jobs

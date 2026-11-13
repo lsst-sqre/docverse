@@ -192,7 +192,7 @@ def test_should_refresh_other_when_past_threshold() -> None:
 def test_should_not_refresh_other_when_within_threshold() -> None:
     """Just-synced editions don't get re-enqueued on every cron tick."""
     now = datetime(2026, 5, 7, 12, tzinfo=UTC)
-    state = _state(date_last_synced=now - timedelta(minutes=10))
+    state = _state(date_last_synced=now - timedelta(minutes=5))
     assert not should_refresh_other_edition(state=state, now=now)
 
 
@@ -219,7 +219,7 @@ def test_should_refresh_other_falls_back_to_the_tombstone_date() -> None:
     now = datetime(2026, 5, 7, 12, tzinfo=UTC)
     fresh = _state(
         docverse_id=None,
-        date_tombstoned=now - timedelta(minutes=10),
+        date_tombstoned=now - timedelta(minutes=5),
         tombstone_reason="lifecycle_preemptive",
     )
     old = _state(
@@ -231,23 +231,84 @@ def test_should_refresh_other_falls_back_to_the_tombstone_date() -> None:
     assert should_refresh_other_edition(state=old, now=now)
 
 
-def test_tier_other_refresh_threshold_matches_user_story() -> None:
-    """The threshold is one hour, per user story 10's branch SLO.
+def test_tier_other_refresh_threshold_is_ten_minutes() -> None:
+    """The threshold is 10 minutes (PRD #888, root cause 3; issue #895).
 
     Locking the constant here so a future change has to come back and
-    re-acknowledge the SLO it's drifting away from.
+    re-acknowledge the fallback latency it moves: about 1 h 10 min from
+    an edition's last sync to its ``tier_other`` refresh at the worst,
+    for an edition synced just under 10 minutes before a tick.
     """
-    assert timedelta(hours=1) == TIER_OTHER_REFRESH_THRESHOLD
+    assert timedelta(minutes=10) == TIER_OTHER_REFRESH_THRESHOLD
+
+
+def test_tier_other_refresh_threshold_is_below_the_cron_interval() -> None:
+    """The threshold sits strictly below ``tier_other``'s cron interval.
+
+    With the two equal, an edition synced any time after tick T is
+    still under one threshold old at the next tick and waits for the
+    one after, two intervals on. A threshold below the interval lets
+    an edition synced early enough in an interval refresh on the next
+    tick.
+    """
+    assert TIER_OTHER_REFRESH_THRESHOLD < TIER_OTHER_CRON_INTERVAL
+
+
+@pytest.mark.parametrize(
+    ("synced", "tick"),
+    [
+        pytest.param(
+            datetime(2026, 11, 12, 21, 35, tzinfo=UTC),
+            datetime(2026, 11, 12, 22, tzinfo=UTC),
+            id="dp2-2026-11-12",
+        ),
+        pytest.param(
+            datetime(2026, 11, 5, 4, 40, tzinfo=UTC),
+            datetime(2026, 11, 5, 5, tzinfo=UTC),
+            id="dp2-2026-11-05",
+        ),
+    ],
+)
+def test_should_refresh_other_on_the_tick_after_a_dp2_push_sync(
+    synced: datetime, tick: datetime
+) -> None:
+    """An edition a push sync stamped 20-25 minutes ago refreshes now.
+
+    A push hot-path sync re-stamps every edition of the project, so
+    prod ``rubin/dp2``'s branch editions were synced at 21:35 on
+    2026-11-12 and at 04:40 on 2026-11-05, before LTD rebuilt the
+    branch, and were 25 and 20 minutes old at the next ``tier_other``
+    tick. Under any threshold above 25 minutes, the old one-hour one
+    included, both waited a further hour, for the tick after (PRD #888,
+    root cause 3); at 10 minutes the next tick refreshes them.
+    """
+    state = _state(date_last_synced=synced)
+    assert should_refresh_other_edition(state=state, now=tick)
+
+
+def test_should_not_refresh_other_synced_5_minutes_before_the_tick() -> None:
+    """An edition synced 5 minutes before a tick waits for the next one.
+
+    It is under the threshold at 22:00 and refreshed at 23:00, 1 h 5 min
+    after its sync: the worst case the 10-minute threshold leaves.
+    """
+    tick = datetime(2026, 11, 12, 22, tzinfo=UTC)
+    state = _state(date_last_synced=tick - timedelta(minutes=5))
+    assert not should_refresh_other_edition(state=state, now=tick)
+    assert should_refresh_other_edition(
+        state=state, now=tick + TIER_OTHER_CRON_INTERVAL
+    )
 
 
 def test_should_refresh_other_respects_caller_threshold() -> None:
     """Callers may override the threshold (e.g. tests, follow-up tiers)."""
     now = datetime(2026, 5, 7, 12, tzinfo=UTC)
-    state = _state(date_last_synced=now - timedelta(minutes=30))
-    # Default threshold is 1h, so 30m old is fresh — but a 15m caller
+    state = _state(date_last_synced=now - timedelta(minutes=5))
+    # Default threshold is 10m, so 5m old is fresh — but a 3m caller
     # threshold flips that decision.
+    assert not should_refresh_other_edition(state=state, now=now)
     assert should_refresh_other_edition(
-        state=state, now=now, threshold=timedelta(minutes=15)
+        state=state, now=now, threshold=timedelta(minutes=3)
     )
 
 

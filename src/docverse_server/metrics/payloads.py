@@ -194,15 +194,18 @@ class EditionPublishedEvent(DocverseEventBase):
 
     The publish's success time minus the ``date_rebuilt`` LTD Keeper
     reported for the edition, set only when a keeper-sync visit imported
-    that rebuild of an edition Docverse already mirrored and enqueued
-    this publish. A semver aggregate (``15``, ``15.2``) the same visit
-    moved reports its release's lag, because that release's rebuild is
-    what moved it. A build-level copy retry happens inside the window
-    and counts toward it.
+    that rebuild and enqueued this publish, for an edition Docverse
+    already mirrored or one LTD created after the Docverse project (a
+    new branch's first import, including the wait for its first build).
+    A semver aggregate (``15``, ``15.2``) the same visit moved reports
+    its release's lag, because that release's rebuild is what moved it.
+    A build-level copy retry happens inside the window and counts
+    toward it.
 
-    ``None`` whenever there is no LTD rebuild to measure from: an
-    edition's first import, whose ``date_rebuilt`` predates Docverse
-    mirroring it; the build fan-out, rollback, and reconcile publishes;
+    ``None`` whenever there is no LTD rebuild to measure from: the first
+    import of an edition created before the Docverse project (a
+    backfill), whose ``date_rebuilt`` predates Docverse mirroring it;
+    the build fan-out, rollback, and reconcile publishes;
     keeper-sync's self-heal of an edition whose publish was lost;
     publish jobs enqueued before this field existed; and LTD editions
     that report no ``date_rebuilt``. Never clamped: clock skew between
@@ -359,12 +362,17 @@ class KeeperSyncPushCheckEvent(DocverseEventBase):
 
     A ``push`` stamps the pushed ref onto each LTD-synced project bound
     to the repository, and every five-minute ``keeper_sync_tier_main``
-    tick visits each stamped ref until LTD has rebuilt its edition or
-    its window passes (PRD #803). One event per ref per visit, published
-    once the visit's stamps are settled, so the stream counts how often
-    a push is caught (``rebuilt``, ``new_edition``) or missed
+    tick visits each stamped ref until its window passes (PRD #803),
+    including after a visit that enqueued the ref's sync (PRD #888), so
+    a ref LTD rebuilds more than once in its window is caught each time.
+    One event per ref per visit, published once the visit's stamps are
+    settled, so the stream counts how often a push is caught
+    (``rebuilt``, ``new_edition``) and how its window ends, with
+    ``tier_main`` having enqueued the ref's sync (``completed``) or not
     (``expired``), and ``push_lag`` times how long a contributor's push
-    takes to reach a sync.
+    takes to reach a sync. The closing outcomes report what ``tier_main``
+    did, not whether a given upload was synced: see
+    :func:`~docverse_server.services.keeper_sync.push_hints.closed_window_outcome`.
 
     ``project`` is the project's slug, which is also its LTD product
     slug. Never ``None``: the hot path is per project.
@@ -385,18 +393,23 @@ class KeeperSyncPushCheckEvent(DocverseEventBase):
     """Whether the visit enqueued the project's sync for this ref.
 
     ``True`` only for ``rebuilt`` and ``new_edition``, and not even then
-    when a sync for the project already held its slot; the ref then
-    keeps its stamp and is checked again next tick.
+    when a sync for the project already held its slot, or when the
+    ref's last enqueue was for the same LTD rebuild less than
+    :data:`~docverse_server.services.keeper_sync.push_hints.PUSHED_REF_REENQUEUE_BACKOFF`
+    before; the ref then keeps its stamp and is checked again next
+    tick. Always ``False`` on ``completed``, which reports a window
+    closing, not an enqueue.
     """
 
     push_lag: timedelta | None
-    """Time from the ref's push to the enqueue of the project's sync.
+    """Time from the ref's latest push to the enqueue of the project's sync.
 
-    The push time is when Docverse processed the ``push`` delivery, and
-    the enqueue is the one this visit made, so the lag spans the
-    repository's CI run, its upload to LTD, and the wait for the next
-    ``tier_main`` tick. Set exactly when ``enqueued`` is, and ``None``
-    for every other visit.
+    The push time is when Docverse processed the ref's latest ``push``
+    delivery, and the enqueue is the one this visit made, so the lag
+    spans the repository's CI run, its upload to LTD, and the wait for
+    the next ``tier_main`` tick. A ref that enqueues more than once in
+    its window measures each enqueue from its latest push. Set exactly
+    when ``enqueued`` is, and ``None`` for every other visit.
     """
 
 
@@ -480,9 +493,10 @@ class BuildContentCopiedEvent(DocverseEventBase):
     leaves the queue wait and the CDN publish. A float in seconds, like
     ``duration_seconds``, so the two read in the same unit.
 
-    ``None`` on the edition's first import, whose ``date_rebuilt``
-    predates Docverse mirroring it, and when LTD reports no
-    ``date_rebuilt`` for the edition. Never clamped: clock skew between
+    ``None`` on the first import of an edition created before the
+    Docverse project (a backfill), whose ``date_rebuilt`` predates
+    Docverse mirroring it, and when LTD reports no ``date_rebuilt`` for
+    the edition. Never clamped: clock skew between
     LTD and Docverse shows up as a negative value rather than hiding as
     zero.
     """
