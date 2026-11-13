@@ -1819,8 +1819,9 @@ async def _enqueue_publish_for_aggregates(
     the outcome reports it: the aggregate moved because that release was
     rebuilt, so its ``edition_published`` event reports the release's
     ``ltd_lag``. The service leaves it ``None`` wherever the visit
-    measured no lag — a first import, or a short-circuited build whose
-    rebuild an earlier visit imported — so those payloads leave it out,
+    measured no lag — a backfill's first import of an edition older
+    than the project, or a short-circuited build whose rebuild an
+    earlier visit imported — so those payloads leave it out,
     as the self-heal publishes do. See
     :attr:`EditionSyncOutcome.ltd_date_rebuilt`.
 

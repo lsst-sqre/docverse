@@ -406,10 +406,12 @@ class BuildCopyReport:
 
     Measured when the copy finished, successfully or not, so a
     build-level re-run falls inside it. Only a rebuild of an edition
-    Docverse already mirrors measures one (see
-    :func:`_measures_sync_lag`): ``None`` on the edition's first import,
-    and when LTD reports no ``date_rebuilt``. Not clamped: a rebuild
-    stamped ahead of Docverse's clock gives a negative value.
+    Docverse already mirrors, or the first import of an edition LTD
+    created after the Docverse project, measures one (see
+    :func:`_measures_sync_lag`): ``None`` on the first import of an
+    edition older than the project (a backfill), and when LTD reports
+    no ``date_rebuilt``. Not clamped: a rebuild stamped ahead of
+    Docverse's clock gives a negative value.
     """
 
 
@@ -706,32 +708,55 @@ def _date_rebuilt_marker_retracted(state: KeeperSyncState) -> bool:
 
 
 def _measures_sync_lag(
-    edition_state: KeeperSyncState | None, edition: Edition
+    edition_state: KeeperSyncState | None,
+    edition: Edition,
+    *,
+    ltd_edition: LtdEdition,
+    project: Project,
 ) -> bool:
     """Report whether importing LTD's build now measures a sync lag.
 
     ``now - date_rebuilt`` is how long Docverse took to follow LTD's
-    rebuild only when Docverse was already mirroring the edition when
-    LTD rebuilt it. Both halves of "already mirroring" are read before
-    this visit writes anything:
+    rebuild only when Docverse was already mirroring the project when
+    LTD rebuilt the edition. Two cases qualify, both judged on what this
+    visit read before writing anything:
 
-    * **An edition state row from an earlier visit.** It is keyed on
-      the LTD edition id, which survives rebuilds. The *build* row does
+    **A rebuild of an edition Docverse already mirrors.** Both halves of
+    "already mirrors" must hold:
+
+    * *An edition state row from an earlier visit.* It is keyed on the
+      LTD edition id, which survives rebuilds. The *build* row does
       not: LTD rebuilds an edition by pointing it at a newly uploaded
-      build, so every rebuild brings a build id no row has seen yet. A
-      first import has no edition row either — nor does an adopted
-      native edition's first keeper-sync import — and its
-      ``date_rebuilt`` is whenever LTD last rebuilt the edition: years
-      ago, on a backfill.
-    * **A current build on the Docverse edition.** A first import whose
-      copy failed still wrote the state row, so the next visit's retry
-      would otherwise pass for a rebuild. It never repointed the
-      edition, so the edition has no build yet.
+      build, so every rebuild brings a build id no row has seen yet.
+    * *A current build on the Docverse edition.* A first import whose
+      copy failed still wrote the state row, as does a visit to an
+      edition LTD registered before its first upload landed; neither
+      repointed the edition, so it has no build yet and the next
+      import is still the edition's first.
+
+    **A first import of an edition LTD created mid-mirror** (PRD #888):
+    no state row, or a state row without a current build — a retry of a
+    failed first copy, or the first build of an edition first seen
+    build-less. An adopted native edition's first keeper-sync import
+    has no state row either, so it is judged here too, whatever build
+    it already serves. It measures a lag only when the LTD edition's
+    ``date_created`` is later than the Docverse project's: LTD created
+    the edition while Docverse was mirroring the project, so its
+    ``date_rebuilt`` is a rebuild Docverse could have followed, and the
+    wait for a new branch's first build is part of the lag. An edition
+    created before the project's mirror began is a backfill whose
+    ``date_rebuilt`` is whenever LTD last rebuilt it — years ago,
+    perhaps — and measures nothing Docverse did.
+
+    Whether LTD reports a ``date_rebuilt`` at all is the caller's to
+    read: this decides only whether one would measure a lag.
 
     Takes *edition* as ``sync_edition`` holds it before ``sync_build``
     runs, when ``current_build_id`` is still the pre-visit pointer.
     """
-    return edition_state is not None and edition.current_build_id is not None
+    if edition_state is not None and edition.current_build_id is not None:
+        return True
+    return ltd_edition.date_created > project.date_created
 
 
 class TombstoneVerdict(StrEnum):
@@ -914,21 +939,23 @@ class EditionSyncOutcome:
     """LTD's ``date_rebuilt`` for the edition, when this visit measured lag.
 
     Set only when the visit imported a fresh build (``build_outcome``
-    not short-circuited) for an edition Docverse already mirrored — see
-    :func:`_measures_sync_lag` — so the time since it is how long LTD's
-    rebuild took to reach Docverse. The worker forwards it as-is into the
-    ``publish_edition`` payloads it enqueues from this outcome, the
-    edition's own and those of the semver aggregates its release moved,
-    and the ``edition_published`` event reports ``ltd_lag`` from it (PRD
-    #713); the copy's ``BuildCopyReport.ltd_lag_seconds`` is measured
-    from the same value.
+    not short-circuited) for an edition Docverse already mirrored, or
+    as the first import of an edition LTD created after the Docverse
+    project (PRD #888) — see :func:`_measures_sync_lag` — so the time
+    since it is how long LTD's rebuild took to reach Docverse. The
+    worker forwards it as-is into the ``publish_edition`` payloads it
+    enqueues from this outcome, the edition's own and those of the
+    semver aggregates its release moved, and the ``edition_published``
+    event reports ``ltd_lag`` from it (PRD #713); the copy's
+    ``BuildCopyReport.ltd_lag_seconds`` is measured from the same value.
 
-    ``None`` on a first import, whose ``date_rebuilt`` dates a rebuild
-    from before Docverse mirrored the edition (years old, on a
-    backfill); on a short-circuited build, whose rebuild an earlier visit
-    imported; on a tombstone short-circuit or a build-less edition; and
-    when LTD reports no ``date_rebuilt``. This field is the single
-    decision: consumers forward it without re-deriving freshness.
+    ``None`` on the first import of an edition created before the
+    project (a backfill), whose ``date_rebuilt`` dates a rebuild from
+    before Docverse mirrored it (years old, perhaps); on a
+    short-circuited build, whose rebuild an earlier visit imported; on
+    a tombstone short-circuit or a build-less edition; and when LTD
+    reports no ``date_rebuilt``. This field is the single decision:
+    consumers forward it without re-deriving freshness.
     """
 
     tombstone_verdict: TombstoneVerdict | None = None
@@ -2396,7 +2423,12 @@ class KeeperSyncService:
         # through ``sync_build`` and the outcome's below.
         ltd_lag_since = (
             ltd_edition.date_rebuilt
-            if _measures_sync_lag(edition_state, edition)
+            if _measures_sync_lag(
+                edition_state,
+                edition,
+                ltd_edition=ltd_edition,
+                project=project,
+            )
             else None
         )
         build_outcome: BuildSyncOutcome | None = None
@@ -3794,7 +3826,8 @@ class KeeperSyncService:
         ``ltd_lag_since`` is the LTD ``date_rebuilt`` a copy's
         :class:`BuildCopyReport` measures ``ltd_lag_seconds`` from, or
         ``None`` for no lag. ``sync_edition`` sets it only for a rebuild
-        of an edition Docverse already mirrors (see
+        of an edition Docverse already mirrors or the first import of an
+        edition LTD created after the project (see
         :func:`_measures_sync_lag`), so this method never decides it.
 
         The bucket prefix the content is read from is resolved once, by

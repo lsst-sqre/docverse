@@ -1101,18 +1101,20 @@ def _rebuild_ltd_main(
 
 
 @pytest.mark.asyncio
-async def test_first_import_measures_no_ltd_lag(
+async def test_backfill_first_import_measures_no_ltd_lag(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
 ) -> None:
-    """Importing an edition for the first time reports no sync lag.
+    """A project's backfill imports its editions without a sync lag.
 
-    LTD's ``date_rebuilt`` for an edition Docverse has never mirrored is
-    whenever LTD last rebuilt it — years ago, for a backfill — so the
-    time since it says how old the rebuild is, not how long Docverse
-    took to follow it. Neither the outcome, which the worker forwards
-    into the publish payload, nor the copy report carries it.
+    The sync that creates the Docverse project imports every edition LTD
+    already had, each created before the project was. LTD's
+    ``date_rebuilt`` for such an edition is whenever LTD last rebuilt it
+    — years ago, perhaps — so the time since it says how old the
+    rebuild is, not how long Docverse took to follow it. Neither the
+    outcome, which the worker forwards into the publish payload, nor
+    the copy report carries it.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session)
@@ -1233,23 +1235,39 @@ async def test_short_circuited_visit_measures_no_ltd_lag(
 
 
 @pytest.mark.asyncio
-async def test_retried_first_import_measures_no_ltd_lag(
+@pytest.mark.parametrize(
+    "created_after_project",
+    [timedelta(hours=1), -timedelta(days=1)],
+    ids=["new-edition", "backfill"],
+)
+async def test_retried_first_import_measures_ltd_lag_as_a_first_import(
     db_session: AsyncSession,
     http_client: httpx.AsyncClient,
     mock_discovery: respx.Router,
     monkeypatch: pytest.MonkeyPatch,
+    created_after_project: timedelta,
 ) -> None:
     """A first import that failed and is retried is still a first import.
 
     The failed visit recorded the edition's state row before its copy
     failed, so the row alone would pass the retry off as a rebuild of a
-    mirrored edition and report the age of LTD's old rebuild. The
-    edition never received a build, which is what keeps the retry from
-    measuring a lag, on the outcome and on the copy report alike.
+    mirrored edition. The edition never received a build, so the retry
+    follows the first-import rule instead, on the outcome and on the
+    copy report alike: it measures a lag for an edition LTD created
+    after the project, and none for a backfill, however recent its
+    ``date_rebuilt``.
     """
     async with db_session.begin():
         org_id = await _seed_org(db_session, slug="ks-lag-retried-import")
-    _seed_ltd(mock_discovery)
+    project_created = await _seed_mirrored_project(db_session, org_id=org_id)
+    date_rebuilt = datetime.now(tz=UTC) - timedelta(minutes=1)
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_branch_edition_payload(
+            date_created=project_created + created_after_project,
+            date_rebuilt=date_rebuilt,
+        ),
+    )
     reports, on_build_copied = _record_copy_reports()
     service = _build_service(
         db_session,
@@ -1262,7 +1280,7 @@ async def test_retried_first_import_measures_no_ltd_lag(
                 ]
             }
         ),
-        {"pipelines/builds/42/index.html": b"<html>v1</html>"},
+        {"pipelines/builds/43/index.html": b"<html>branch</html>"},
         on_build_copied=on_build_copied,
     )
     _record_copy_retry_sleeps(monkeypatch, db_session)
@@ -1276,8 +1294,194 @@ async def test_retried_first_import_measures_no_ltd_lag(
     [outcome] = result.edition_outcomes
     assert outcome.build_outcome is not None
     assert outcome.build_outcome.short_circuited is False
-    assert outcome.ltd_date_rebuilt is None
-    assert [report.ltd_lag_seconds for report in reports] == [None]
+    [report] = reports
+    if created_after_project < timedelta(0):
+        assert outcome.ltd_date_rebuilt is None
+        assert report.ltd_lag_seconds is None
+    else:
+        assert outcome.ltd_date_rebuilt == date_rebuilt
+        assert report.ltd_lag_seconds is not None
+        assert report.duration_seconds <= report.ltd_lag_seconds
+
+
+#: How long :func:`_seed_mirrored_project` says Docverse has mirrored
+#: ``pipelines``: wide enough that an LTD edition dated either side of
+#: the project never lands on the wrong side through a skew between the
+#: test's clock and the database's.
+_MIRRORED_FOR = timedelta(days=1)
+
+
+async def _seed_mirrored_project(
+    session: AsyncSession, *, org_id: int
+) -> datetime:
+    """Create ``pipelines`` as a project Docverse has mirrored for a day.
+
+    The project is created through :func:`_seed_project` (no ``__main``,
+    so it pairs with :func:`_seed_ltd_one_edition`) and its
+    ``date_created`` moved back by :data:`_MIRRORED_FOR`, so an LTD
+    edition can be dated before the mirror began (a backfill) or after
+    it (an edition LTD created while Docverse was mirroring the
+    project). Returns that ``date_created``.
+    """
+    project_id = await _seed_project(session, org_id=org_id)
+    date_created = datetime.now(tz=UTC) - _MIRRORED_FOR
+    async with session.begin():
+        await session.execute(
+            update(SqlProject)
+            .where(SqlProject.id == project_id)
+            .values(date_created=date_created)
+        )
+    return date_created
+
+
+def _branch_edition_payload(
+    *,
+    date_created: datetime,
+    date_rebuilt: datetime | None,
+    built: bool = True,
+) -> dict[str, object]:
+    """LTD's ``u/jsick/feature`` branch edition, dated by the caller.
+
+    The edition is ``/editions/2`` on build ``43``, as
+    :func:`_seed_ltd_one_edition` serves it. ``built=False`` gives the
+    edition LTD registers before its first upload lands: no
+    ``build_url`` yet.
+    """
+    edition = _load("edition_branch_git_refs.json")
+    edition["date_created"] = date_created.isoformat()
+    edition["date_rebuilt"] = (
+        None if date_rebuilt is None else date_rebuilt.isoformat()
+    )
+    if not built:
+        edition["build_url"] = None
+    return edition
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("created_after_project", "rebuilt_ago"),
+    [
+        (timedelta(hours=1), timedelta(minutes=1)),
+        (timedelta(hours=1), None),
+        (-timedelta(days=1), timedelta(minutes=1)),
+    ],
+    ids=["new-edition", "new-edition-never-rebuilt", "backfill"],
+)
+async def test_first_import_measures_ltd_lag_for_editions_newer_than_project(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+    created_after_project: timedelta,
+    rebuilt_ago: timedelta | None,
+) -> None:
+    """A first import measures lag when LTD created the edition mid-mirror.
+
+    An LTD edition created after the Docverse project was, and so while
+    Docverse was already mirroring the project, is a new branch whose
+    every rebuild Docverse could have followed: the time since its
+    ``date_rebuilt`` is how long its first import took to arrive. One
+    created before the project is a backfill, whose ``date_rebuilt``
+    dates a rebuild from before the mirror began — however recent it is,
+    it measures nothing Docverse did. An edition that reports no
+    ``date_rebuilt`` has nothing to measure from.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    project_created = await _seed_mirrored_project(db_session, org_id=org_id)
+    date_rebuilt = (
+        None if rebuilt_ago is None else datetime.now(tz=UTC) - rebuilt_ago
+    )
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_branch_edition_payload(
+            date_created=project_created + created_after_project,
+            date_rebuilt=date_rebuilt,
+        ),
+    )
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/43/index.html": b"<html>branch</html>"},
+        on_build_copied=on_build_copied,
+    )
+
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    finished = datetime.now(tz=UTC)
+
+    [outcome] = result.edition_outcomes
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is False
+    [report] = reports
+    if created_after_project < timedelta(0) or date_rebuilt is None:
+        assert outcome.ltd_date_rebuilt is None
+        assert report.ltd_lag_seconds is None
+    else:
+        assert outcome.ltd_date_rebuilt == date_rebuilt
+        assert report.ltd_lag_seconds is not None
+        assert report.duration_seconds <= report.ltd_lag_seconds
+        assert (
+            report.ltd_lag_seconds <= (finished - date_rebuilt).total_seconds()
+        )
+
+
+@pytest.mark.asyncio
+async def test_first_build_of_edition_first_seen_build_less_measures_ltd_lag(
+    db_session: AsyncSession,
+    http_client: httpx.AsyncClient,
+    mock_discovery: respx.Router,
+) -> None:
+    """A new branch first seen before its upload landed measures its lag.
+
+    LTD registers a branch's edition before the build upload finishes,
+    so a visit can find it with no ``build_url`` (PRD #888, root cause
+    1): that visit writes the edition and its state row and imports
+    nothing. The next visit, once LTD has rebuilt the edition onto its
+    first build, finds the state row but an edition with no build, so
+    it is still the edition's first import — of an edition LTD created
+    after the project, whose wait for that build is the lag to report.
+    """
+    async with db_session.begin():
+        org_id = await _seed_org(db_session)
+    project_created = await _seed_mirrored_project(db_session, org_id=org_id)
+    edition_created = project_created + timedelta(hours=1)
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_branch_edition_payload(
+            date_created=edition_created, date_rebuilt=None, built=False
+        ),
+    )
+    reports, on_build_copied = _record_copy_reports()
+    service = _build_service(
+        db_session,
+        http_client,
+        MockObjectStore(),
+        {"pipelines/builds/43/index.html": b"<html>branch</html>"},
+        on_build_copied=on_build_copied,
+    )
+    first = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+    [build_less] = first.edition_outcomes
+    assert build_less.build_outcome is None
+    assert build_less.ltd_date_rebuilt is None
+    assert reports == []
+
+    date_rebuilt = datetime.now(tz=UTC) - timedelta(minutes=1)
+    _seed_ltd_one_edition(
+        mock_discovery,
+        edition_payload=_branch_edition_payload(
+            date_created=edition_created, date_rebuilt=date_rebuilt
+        ),
+    )
+    result = await service.sync_project(org_id=org_id, ltd_slug="pipelines")
+
+    [outcome] = result.edition_outcomes
+    assert outcome.build_outcome is not None
+    assert outcome.build_outcome.short_circuited is False
+    assert outcome.ltd_date_rebuilt == date_rebuilt
+    [report] = reports
+    assert report.ltd_lag_seconds is not None
+    assert report.duration_seconds <= report.ltd_lag_seconds
 
 
 @pytest.mark.asyncio
