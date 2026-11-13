@@ -209,26 +209,48 @@ compare the two distributions over the same organization and window
 events.
 
 **When `ltd_lag` is set.** Only on a publish that a keeper-sync visit
-enqueued after importing a fresh LTD rebuild of an edition Docverse
-already mirrors, meaning an earlier visit imported the edition and it
-already served a build, so LTD rebuilt it while keeper-sync was
-watching. The job's payload then carries the rebuild's
-`ltd_date_rebuilt`, and `publish_edition` subtracts it at its success
-terminal. A semver aggregate edition (`15`, `15.2`) that the same visit
-moved reports its release's lag, because the release's rebuild is what
-moved it. A build-level copy retry happens inside the window and counts
-toward it. It is the rebuild-to-CDN delay for known editions, which is
-what a sync-lag dashboard means.
+enqueued after importing an LTD rebuild made while Docverse was
+mirroring the project. Two kinds of import qualify:
 
-**When it is null.** Whenever there is no fresh rebuild to measure
-from:
+- **A rebuild of an edition Docverse already mirrors**, meaning an
+  earlier visit imported the edition and it already served a build, so
+  LTD rebuilt it while keeper-sync was watching.
+- **The first import of an edition LTD created after the Docverse
+  project** (PRD #888): the LTD edition's `date_created` is later than
+  the Docverse project's `date_created`, which stands in for when
+  Docverse began mirroring the project. That is the edition a new
+  branch's first CI upload made LTD create, so its lag includes the
+  wait for that first build to reach Docverse. The rule covers every
+  import until the edition serves a build: a retry of a first import
+  whose copy failed, and the first build of an edition an earlier
+  visit imported before LTD had a build for it (LTD creates a branch's
+  edition when the build is registered, before the upload lands, so the
+  push hot path's `new_edition` check can catch it build-less). An
+  adopted native edition's first keeper-sync import is judged by the
+  same rule.
 
-- an edition's first import, including a retry of a first import whose
-  copy failed. Its `date_rebuilt` is whenever LTD last rebuilt the
-  edition, before Docverse mirrored it: years ago, for most of what a
-  backfill run imports. The time since then is the rebuild's age, not a
-  sync lag, and `build_content_copied`'s `ltd_lag_seconds` is null for
-  the same copy;
+The job's payload then carries the rebuild's `ltd_date_rebuilt`, and
+`publish_edition` subtracts it at its success terminal. A semver
+aggregate edition (`15`, `15.2`) that the same visit moved reports its
+release's lag, because the release's rebuild is what moved it. A
+build-level copy retry happens inside the window and counts toward it.
+It is the rebuild-to-CDN delay for every edition Docverse could have
+followed, which is what a sync-lag dashboard means. Before PRD #888 a
+new branch's first build was never measured, so a percentile taken
+across that change rises by the new branches it now counts, not because
+syncs got slower.
+
+**When it is null.** Whenever there is no rebuild Docverse could have
+followed to measure from:
+
+- the first import of an edition LTD created before the Docverse
+  project, or at the same instant (a backfill, as nearly every edition
+  of a project newly added to the sync scope is), including a retry of
+  such a first import whose copy failed. Its `date_rebuilt` is whenever
+  LTD last rebuilt the edition, before Docverse mirrored it: years ago,
+  for most of what a backfill imports. The time since then is the
+  rebuild's age, not a sync lag, and `build_content_copied`'s
+  `ltd_lag_seconds` is null for the same copy;
 - publishes from a client build's fan-out, a rollback, or the reconcile
   loop;
 - keeper-sync's self-heal publish of an edition or aggregate whose
@@ -247,15 +269,17 @@ tier crons that poll LTD between runs enqueue their publishes without a
 run, so those publishes read `trigger=build` although they carry an
 `ltd_lag`. Keeper-sync's self-heal publishes, conversely, can read
 `trigger=keeper_sync` with no lag, and so do a backfill run's first
-imports. The presence of `ltd_lag` is the marker of a publish that
-measured one, and an aggregate over `ltd_lag` already sees only those;
-adding `"trigger" = 'keeper_sync'` narrows it to the editions a backfill
-run found already mirrored and rebuilt since.
+imports of editions older than the project. The presence of `ltd_lag` is
+the marker of a publish that measured one, and an aggregate over
+`ltd_lag` already sees only those; adding `"trigger" = 'keeper_sync'`
+narrows it to the editions a backfill run found rebuilt, or created,
+since Docverse began mirroring the project.
 
-**Negative values are data.** Neither field is clamped. LTD's clock and
-Docverse's disagree by some amount, and a lag shorter than that skew
-comes out negative rather than as zero, which keeps the skew visible. A
-run of negative values is a clock problem, not a fast sync.
+**Negative values are data.** Neither field is clamped, on a rebuild or
+on a first import. LTD's clock and Docverse's disagree by some amount,
+and a lag shorter than that skew comes out negative rather than as
+zero, which keeps the skew visible. A run of negative values is a clock
+problem, not a fast sync.
 
 ## Event catalog
 
@@ -354,7 +378,7 @@ read these events across a sync campaign.
 | `exhausted_object_count` | integer | field | Objects whose upload ran out of its whole retry budget. |
 | `build_retry_used` | boolean | field | Whether the build-level retry re-ran the copy. |
 | `succeeded` | boolean | field | Whether the copy, after any build-level retry, stored every object. Not named `success`, so not a tag. |
-| `ltd_lag_seconds` | float or null | field | Seconds from LTD's `date_rebuilt` for the edition to the copy's end: the copy half of `ltd_lag`, set when the copy is a rebuild of an edition Docverse already mirrors. Null on the edition's first import and when LTD reports no `date_rebuilt`; negative under clock skew. See [Measuring lag behind LTD Keeper](#measuring-lag-behind-ltd-keeper). |
+| `ltd_lag_seconds` | float or null | field | Seconds from LTD's `date_rebuilt` for the edition to the copy's end: the copy half of `ltd_lag`, set when the copy is a rebuild of an edition Docverse already mirrors or the first import of an edition LTD created after the Docverse project. Null on the first import of an edition older than the project (a backfill) and when LTD reports no `date_rebuilt`; negative under clock skew. See [Measuring lag behind LTD Keeper](#measuring-lag-behind-ltd-keeper). |
 | `excluded_object_count` | integer or null | field | LTD keys the copy's last pass left behind as excluded cache paths (`.doctrees/`, `.buildinfo` and the rest of `docverse.excluded_paths`); never downloaded, so there is no byte total. Null when that pass failed before listing the prefix. |
 
 ### `edition_published`
@@ -371,7 +395,7 @@ from the `publish_edition` worker's success terminal only.
 | `edition_kind` | enum | tag | The edition's kind: `main`, `release`, `draft`, `major`, `minor`, or `alternate`. |
 | `trigger` | enum | tag | What drove the publish: `build` (a client build's fan-out, and keeper-sync's tier crons), `keeper_sync` (a keeper-sync run), `rollback`, or `reconcile` (the `edition_reconcile` loop re-driving a lost publish). |
 | `elapsed` | duration | field | Time the worker spent on the publish. |
-| `ltd_lag` | duration or null | field | Time from LTD's `date_rebuilt` for the edition to this publish's success, set when a keeper-sync visit imported a fresh rebuild of an edition Docverse already mirrors; null on the edition's first import. See [Measuring lag behind LTD Keeper](#measuring-lag-behind-ltd-keeper) for when else it is null and why not to filter on `trigger`. |
+| `ltd_lag` | duration or null | field | Time from LTD's `date_rebuilt` for the edition to this publish's success, set when a keeper-sync visit imported a fresh rebuild of an edition Docverse already mirrors, or the first build of an edition LTD created after the Docverse project; null on the first import of an edition older than the project (a backfill). See [Measuring lag behind LTD Keeper](#measuring-lag-behind-ltd-keeper) for when else it is null and why not to filter on `trigger`. |
 
 ### `dashboard_built`
 
@@ -590,13 +614,34 @@ Measurement: `lsst.square.metrics.events.docverse.keeper_sync_push_check`
 an LTD-synced project, on the [keeper-sync push hot
 path](github-integration.md#the-keeper-sync-push-hot-path) (PRD #803).
 Published once per stamped ref on every five-minute tick, after the
-tick has settled the project's stamps, until the ref's sync is enqueued
-or its window passes. A push whose CI uploads to LTD therefore reports
-`unchanged` or `not_found` on the ticks while the CI runs and then one
-`rebuilt` or `new_edition`, with the push lag; one whose CI never
-uploads ends with one `expired`. With `keeper_sync_push_hot_path_enabled`
-off, `tier_main` visits no stamps and publishes none. Publishing is
-best-effort: a failed publish is logged and never stops the tick.
+tick has settled the project's stamps, from the first tick after the
+push to the first tick after its window
+(`keeper_sync_push_window_seconds`, one hour by default) has passed. A
+repeated push to the ref restarts the window. Enqueueing the ref's sync
+does not end its visits (PRD #888): the ref keeps its stamp, the next
+ticks check it against what that sync imported, and a later LTD rebuild
+inside the window enqueues the sync again. So a ref can report
+`enqueued` true more than once in a window:
+
+- **A push whose CI uploads to LTD** reports `unchanged` or `not_found`
+  on the ticks while the CI runs, then `rebuilt` or `new_edition` with
+  the push lag, then `unchanged` until the window passes, and ends with
+  one `completed`.
+- **Several pushes to one ref** each restart the window, and LTD
+  rebuilds the edition for each CI run that uploads. Each rebuild the
+  ticks catch reports `rebuilt`, enqueued again, so the last push's
+  upload is synced on the fast path even after an earlier run's upload
+  was. The ref ends with one `completed`, a window after its last push.
+- **A new branch** can report `new_edition` before its first build has
+  landed, since LTD creates the edition when the CI registers the
+  build. The sync it enqueues imports the edition with no build, the
+  ticks after report `unchanged` until the upload lands, and then
+  `rebuilt`, enqueued again, imports the build.
+- **A push whose CI never uploads** ends with one `expired`.
+
+With `keeper_sync_push_hot_path_enabled` off, `tier_main` visits no
+stamps and publishes none. Publishing is best-effort: a failed publish
+is logged and never stops the tick.
 
 | Outcome | What the visit found | `enqueued` and `push_lag` |
 | --- | --- | --- |
@@ -608,12 +653,23 @@ best-effort: a failed publish is logged and never stops the tick.
 | `completed` | The ref's window passed after it enqueued the project's sync at least once in that window; the stamp is pruned | `false`, null |
 | `expired` | The ref's window passed without it enqueueing the project's sync: the push never produced a sync; the stamp is pruned | `false`, null |
 
+A window ends `completed` only on an enqueue made at or after the push
+its stamp records. An enqueue made for an earlier push, whose window a
+later push to the same ref restarted, does not count for the later
+one, so `expired` always means the latest push never produced a sync.
+The visit that reports `completed` or `expired` makes no LTD call and
+enqueues nothing: a rebuild after the window waits for the project's
+ordinary cadence.
+
 A `rebuilt` or `new_edition` ref is not enqueued when a sync of the
 project already holds its slot: it then reports `enqueued` false with no
-`push_lag`, keeps its stamp, and is checked again on the next tick.
-Counting `outcome` over a day says how often a push is caught
-(`rebuilt`, `new_edition`), and how its window ends: with a sync
-(`completed`) or on nothing (`expired`).
+`push_lag`, records no enqueue, and is checked again on the next tick.
+Counting `outcome` over a day says how often a visit catches a rebuild
+(`rebuilt`, `new_edition`), which can be several times for one push,
+and how each window ends: with a sync (`completed`) or on nothing
+(`expired`). `completed` and `expired` come once per window, so their
+ratio is the share of pushes, counting repeated pushes to a ref inside
+one window as one, that produced a sync.
 
 | Field | Type | Stored as | Meaning |
 | --- | --- | --- | --- |
@@ -621,8 +677,8 @@ Counting `outcome` over a day says how often a push is caught
 | `project` | string or null | tag | Project slug, which is also its LTD product slug; always set on this event. |
 | `github_ref` | string | field | The pushed branch or tag, normalized: `main` or `v1.2.0`, not `refs/heads/main`. A field, not a tag; see the [cardinality rule](#cardinality-rule). |
 | `outcome` | enum | tag | What the visit found: `new_edition`, `rebuilt`, `unchanged`, `expired`, `not_found`, `error`, or `completed`. |
-| `enqueued` | boolean | field | Whether the visit enqueued the project's `keeper_sync_project` for this ref, and so cleared its stamp. |
-| `push_lag` | duration or null | field | Time from the push, as Docverse stamped it on receiving the delivery, to the enqueue this visit made: the repository's CI run, its upload to LTD, and the wait for the tick. Set exactly when `enqueued` is true. |
+| `enqueued` | boolean | field | Whether the visit enqueued the project's `keeper_sync_project` for this ref. The ref keeps its stamp either way, so it can report `true` on more than one tick of its window. |
+| `push_lag` | duration or null | field | Time from the ref's latest push, as Docverse stamped it on receiving the delivery, to the enqueue this visit made: the repository's CI run, its upload to LTD, and the wait for the tick. Each enqueue in a window is measured from the latest push, so a second enqueue with no push in between (a build-less `new_edition` followed by its `rebuilt`) is longer than the first by the time between them. Set exactly when `enqueued` is true. |
 
 ### `lifecycle_action`
 
@@ -819,8 +875,13 @@ GROUP BY "outcome"
 
 Only the enqueueing visits carry `push_lag`, so the percentile reads
 from the `rebuilt` and `new_edition` groups alone, and is the time from
-a contributor's push to Docverse starting its sync. `COUNT("enqueued")`
-counts every visit, since every point carries `enqueued`.
+a contributor's latest push to each sync Docverse started for it. A ref
+that enqueues twice in its window contributes both, and when no push
+came in between, the second is measured from the same push, so a long
+tail there can be a new branch's build-less `new_edition` followed by
+its `rebuilt` rather than one slow catch. `COUNT("enqueued")` counts
+every visit, since every point carries `enqueued`; in the `completed`
+and `expired` groups it counts closed windows.
 
 ## Changing the catalog
 
@@ -836,7 +897,8 @@ counts every visit, since every point carries `enqueued`.
   event's registered Avro schema, so renaming, retyping, or removing a
   field breaks them.
 - **A new enum value** is appended to its enum, as `WebhookOutcome`
-  gained `malformed`. Adding a symbol is a backward-compatible Avro
+  gained `malformed` and `KeeperSyncPushCheckOutcome` gained `completed`
+  (PRD #888). Adding a symbol is a backward-compatible Avro
   change, and every message names the registered schema it was written
   with, so a consumer decodes the new value without needing an enum
   default. Appending rather than inserting keeps every existing symbol
@@ -873,8 +935,11 @@ hand.
 ## Related
 
 - [SQR-112](https://sqr-112.lsst.io), the design of Docverse's
-  metrics, and PRD #713, which added `ltd_lag`, `ltd_lag_seconds`,
-  `api_request`, and `github_webhook_received`.
+  metrics, PRD #713, which added `ltd_lag`, `ltd_lag_seconds`,
+  `api_request`, and `github_webhook_received`, and PRD #888, which
+  kept a pushed ref's `keeper_sync_push_check` visits going for its
+  whole window, added the `completed` outcome, and measured `ltd_lag`
+  on first imports of editions newer than the project.
 - `src/docverse_server/metrics/`: the payloads, their enums, the
   `DocverseEvents` registry, and `build_event_manager`.
 - `src/docverse_server/middleware/api_request.py`: the middleware that

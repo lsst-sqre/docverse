@@ -329,11 +329,26 @@ slice already synced, or a new edition LTD lists ahead of the cursor,
 waits for the tier crons, which pick changes up whatever a chain did:
 
 - `keeper_sync_tier_main` (every 5 minutes) re-syncs a project whose
-  `main` edition LTD has rebuilt since it was last seen.
+  `main` edition LTD has rebuilt since it was last seen. While the
+  [push hot path](github-integration.md#the-keeper-sync-push-hot-path)
+  is on, it also re-syncs a project with a ref pushed inside its push
+  window whose edition LTD has rebuilt, or created, since keeper-sync
+  last synced it. The ref is checked on every tick until its window
+  closes, even after a tick has enqueued its sync, so one push can
+  re-sync its project more than once and costs up to one window of
+  checks: 12 at the default one-hour `keeper_sync_push_window_seconds`,
+  each of one or two LTD calls for the ref, plus the project's edition
+  listing and at most three fetches of unseen editions, shared by the
+  project's refs, while the ref has no synced edition.
 - `keeper_sync_tier_discovery` (every 30 minutes) re-syncs a project
   with an edition that has no state row yet.
 - `keeper_sync_tier_other` (hourly) re-syncs a project with a stale
-  non-`main` edition.
+  non-`main` edition: one last synced 30 minutes or more ago
+  (`TIER_OTHER_REFRESH_THRESHOLD`, half the hourly interval). An
+  edition synced in the first half of an hour is refreshed on the next
+  tick and one synced in the second half on the tick after, so a
+  rebuild that no push window watches waits about 1.5 hours at worst,
+  when it lands just after the edition's last sync.
 
 Each of those starts a new chain from the top once the current chain
 has ended and freed the project's slot. Until then, it skips the
