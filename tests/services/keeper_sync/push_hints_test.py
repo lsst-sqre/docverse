@@ -582,41 +582,45 @@ def test_settle_prunes_an_enqueue_with_its_stamp() -> None:
     }
 
 
-def test_settle_caps_the_enqueue_map_keeping_the_latest() -> None:
-    """The enqueue map holds at most the cap's worth of refs.
+def test_settle_keeps_an_enqueue_for_every_ref_still_stamped() -> None:
+    """The enqueue map is bounded by the stamps, not cut on its own.
 
     The push processor caps the stamps, but a row can carry more (a
-    hand-edited one, say); the enqueue map keeps the latest enqueues.
+    hand-edited one, say), and settling writes every live stamp back.
+    Each of those refs keeps its enqueue too: cutting the enqueue map
+    alone would leave a still-stamped ref that did enqueue with no
+    record, so it would later be reported ``expired``.
     """
     count = PUSHED_REFS_CAP + 5
     pushed = _NOW - timedelta(minutes=50)
+    refs = [f"ref-{index:02d}" for index in range(count)]
     state = _project_state(
         annotations={
             ANNOTATION_GITHUB_PUSHED_REFS: {
-                f"ref-{index:02d}": pushed.isoformat()
-                for index in range(count)
+                ref: pushed.isoformat() for ref in refs
             },
             ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
-                f"ref-{index:02d}": _enqueue_json(
-                    pushed + timedelta(minutes=index)
-                )
-                for index in range(count - 1)
+                ref: _enqueue_json(pushed + timedelta(minutes=index))
+                for index, ref in enumerate(refs[:-1])
             },
         }
     )
 
     settled = settle_pushed_refs(
         state,
-        enqueued={f"ref-{count - 1:02d}": _enqueue(_NOW, rebuilt=None)},
+        enqueued={refs[-1]: _enqueue(_NOW, rebuilt=None)},
         now=_NOW,
         window=_WINDOW,
     )
 
-    enqueues = settled[ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED]
-    assert len(enqueues) == PUSHED_REFS_CAP
-    assert enqueues[f"ref-{count - 1:02d}"] == _enqueue_json(_NOW)
-    assert "ref-04" not in enqueues
-    assert "ref-05" in enqueues
+    assert set(settled[ANNOTATION_GITHUB_PUSHED_REFS]) == set(refs)
+    assert settled[ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED] == {
+        **{
+            ref: _enqueue_json(pushed + timedelta(minutes=index))
+            for index, ref in enumerate(refs[:-1])
+        },
+        refs[-1]: _enqueue_json(_NOW),
+    }
 
 
 def test_settle_preserves_other_annotation_keys() -> None:

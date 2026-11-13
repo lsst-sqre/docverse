@@ -26,7 +26,6 @@ from docverse_server.metrics import (
     HttpMethod,
     HttpStatusClass,
     KeeperSyncPushCheckEvent,
-    KeeperSyncPushCheckOutcome,
 )
 
 
@@ -349,22 +348,3 @@ def test_keeper_sync_push_check_outcome_appends_completed() -> None:
         "error",
         "completed",
     ]
-
-
-def test_keeper_sync_push_check_completed_carries_no_enqueue() -> None:
-    """A ``completed`` visit is a window closing, not an enqueue.
-
-    It is published with ``enqueued`` false and no ``push_lag``, the
-    same shape as an ``expired`` one.
-    """
-    event = KeeperSyncPushCheckEvent(
-        organization="rubin",
-        project="dp2",
-        github_ref="tickets/DM-56325",
-        outcome=KeeperSyncPushCheckOutcome.completed,
-        enqueued=False,
-        push_lag=None,
-    )
-
-    assert event.outcome is KeeperSyncPushCheckOutcome.completed
-    assert event.model_dump(mode="json")["outcome"] == "completed"

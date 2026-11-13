@@ -649,8 +649,10 @@ ever enqueued, so there is nothing to migrate:
 ```
 
 An entry is written on every enqueue for the ref, overwriting the last,
-and is pruned with the ref's stamp; the map is capped at 20 refs like
-the stamps, keeping the latest enqueues. A malformed map or entry reads
+and is pruned with the ref's stamp. The map has no cap of its own: it
+holds at most one entry per stamped ref, so the stamps' 20-ref cap
+bounds it, and every ref still stamped keeps its entry until its window
+closes. A malformed map or entry reads
 as no enqueue rather than failing the tick. An entry holding only a
 time, a bare ISO-8601 string as the map first held, or an object
 without `date_rebuilt`, reads as an enqueue whose rebuild is unknown,
@@ -947,7 +949,10 @@ redelivery's time.
   fast path, when each `tier_status` entry reads `"cohort": "hot"`. Each
   entry gives the `git_ref`, its `date_pushed`, and `in_window`, false
   for a stamp whose window has passed but that `tier_main` has not
-  pruned yet. A project no push has stamped, or with no state row,
+  pruned yet. A ref stays listed, and `in_window`, for its whole
+  window, also after `tier_main` has enqueued its sync, so a ref still
+  listed after a successful sync is waiting for its window to close,
+  not stuck. A project no push has stamped, or with no state row,
   reads `"pushed_refs": []` and `"in_push_window": false`. With the hot
   path off, the stamps are still listed, as they are still on the row,
   but none is `in_window`. Each entry of the listing at

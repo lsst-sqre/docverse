@@ -377,3 +377,36 @@ async def test_keeper_sync_project_status_documents_push_fields(
     assert pushed["properties"]["date_pushed"]["format"] == "date-time"
     for name, field in pushed["properties"].items():
         assert field.get("description"), name
+
+
+@pytest.mark.asyncio
+async def test_keeper_sync_project_status_documents_stamp_retention(
+    client: AsyncClient,
+) -> None:
+    """The served spec says a stamp lasts its whole push window (#897).
+
+    A ref stays stamped, ``in_window``, until its window closes, however
+    many syncs ``tier_main`` enqueued for it, so an operator reading the
+    spec must not take a ref still listed after a successful sync for a
+    stuck stamp. The state row's ``annotations`` description names both
+    push annotations it carries.
+    """
+    spec = (await client.get("/docverse/openapi.json")).json()
+    schemas = spec["components"]["schemas"]
+
+    pushed = " ".join(schemas["KeeperSyncPushedRef"]["description"].split())
+    assert "until its push window closes" in pushed
+    assert "until LTD has rebuilt" not in pushed
+
+    listed = " ".join(
+        schemas["KeeperSyncProjectStatus"]["properties"]["pushed_refs"][
+            "description"
+        ].split()
+    )
+    assert "until its push window closes" in listed
+
+    annotations = schemas["KeeperSyncProjectStateSummary"]["properties"][
+        "annotations"
+    ]["description"]
+    assert "``github_pushed_refs``" in annotations
+    assert "``github_pushed_refs_enqueued``" in annotations

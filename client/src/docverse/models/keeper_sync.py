@@ -900,8 +900,11 @@ class KeeperSyncProjectStateSummary(BaseModel):
         default=None,
         description=(
             "Raw ``annotations`` JSONB from the state row. Includes"
-            " per-tier last-polled timestamps and the cached"
-            " ``main_edition_*`` pointer."
+            " per-tier last-polled timestamps, the cached"
+            " ``main_edition_*`` pointer, and the push hot path's two"
+            " maps: ``github_pushed_refs``, each pushed ref's latest"
+            " push time, and ``github_pushed_refs_enqueued``, the last"
+            " sync ``tier_main`` enqueued for each of those refs."
         ),
     )
 
@@ -911,9 +914,14 @@ class KeeperSyncPushedRef(BaseModel):
 
     A ``push`` to the project's repository stamps the pushed branch or
     tag, with the time Docverse received it, on the project's
-    keeper-sync state row, and the tier crons poll the project on their
-    fast path until LTD has rebuilt the ref's edition or the push window
-    passes. Each stamp still on the row is reported here.
+    keeper-sync state row. The stamp is kept until its push window
+    closes, however many times LTD rebuilds the ref's edition in the
+    meantime: ``tier_main`` checks the ref on every tick of the window
+    and enqueues the project's sync for each new rebuild, so a ref still
+    listed ``in_window`` after a successful sync is waiting for the
+    window to close, not stuck. Once the window has closed, the next
+    ``tier_main`` tick prunes the stamp. Each stamp still on the row is
+    reported here.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -1154,11 +1162,12 @@ class KeeperSyncProjectStatus(BaseModel):
         default_factory=list,
         description=(
             "The refs GitHub pushes have stamped on the project's"
-            " keeper-sync state row, newest push first. A ref leaves"
-            " the list once ``tier_main`` enqueues the project's sync"
-            " for it, or prunes it after its window. Empty for a"
-            " project no push has stamped, and for one with no state"
-            " row."
+            " keeper-sync state row, newest push first. A ref stays in"
+            " the list until its push window closes, including after"
+            " ``tier_main`` has enqueued the project's sync for it, and"
+            " leaves it when ``tier_main`` prunes it after the window."
+            " Empty for a project no push has stamped, and for one with"
+            " no state row."
         ),
     )
 

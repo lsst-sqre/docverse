@@ -31,12 +31,13 @@ one shape, and so the rules can be unit-tested on in-memory
   (:func:`settle_pushed_refs`);
 - ``tier_main`` records each ref's last enqueue beside its stamp, in the
   ``github_pushed_refs_enqueued`` annotation, which is pruned with the
-  stamp and capped like it: the time of the enqueue, and the LTD
-  ``date_rebuilt`` it was for (:class:`PushedRefEnqueue`). A ref whose
-  window has passed is reported as ``completed`` when ``tier_main``
-  enqueued its sync at or after its latest push and as ``expired`` when
-  it never did (:func:`closed_window_outcome`). Both say what
-  ``tier_main`` did for the ref, not whether a given upload was synced;
+  stamp and so bounded by the stamps' cap: the time of the enqueue, and
+  the LTD ``date_rebuilt`` it was for (:class:`PushedRefEnqueue`). A ref
+  whose window has passed is reported as ``completed`` when
+  ``tier_main`` enqueued its sync at or after its latest push and as
+  ``expired`` when it never did (:func:`closed_window_outcome`). Both
+  say what ``tier_main`` did for the ref, not whether a given upload was
+  synced;
 - a ref that reads ``rebuilt`` or ``new_edition`` again for the rebuild
   its last enqueue was for — a sync that completed or failed without
   recording that rebuild — is enqueued again only once
@@ -386,11 +387,13 @@ def settle_pushed_refs(
     ref's earlier entry, with the rebuild it was for. The map is pruned
     with the stamps, so it keeps an entry only for a ref still stamped
     once the expired refs are gone (a ref the push processor's cap
-    dropped loses its entry here too), and is capped at
-    :data:`PUSHED_REFS_CAP`, keeping the latest enqueues. An entry the
-    visit left alone is written back as read, one whose rebuild is
-    unknown without ``date_rebuilt``. Every other annotation key on the
-    row is carried over unchanged.
+    dropped loses its entry here too). It has no cap of its own: holding
+    at most one entry per stamp written back, it is bounded by the
+    stamps, and every ref still stamped keeps its entry, so a ref that
+    did enqueue is reported ``completed`` when its window passes. An
+    entry the visit left alone is written back as read, one whose
+    rebuild is unknown without ``date_rebuilt``. Every other annotation
+    key on the row is carried over unchanged.
 
     Parameters
     ----------
@@ -413,22 +416,17 @@ def settle_pushed_refs(
     """
     kept = prune_pushed_refs(read_pushed_refs(state), now=now, window=window)
     enqueues = {
-        ref: enqueue
-        for ref, enqueue in {
-            **read_pushed_refs_enqueued(state),
-            **enqueued,
-        }.items()
-        if ref in kept
+        **read_pushed_refs_enqueued(state),
+        **enqueued,
     }
-    latest = _newest(
-        {ref: enqueue.date_enqueued for ref, enqueue in enqueues.items()}
-    )
     prior = state.annotations or {}
     return {
         **prior,
         ANNOTATION_GITHUB_PUSHED_REFS: _as_iso(kept),
         ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
-            ref: _enqueue_as_json(enqueues[ref]) for ref in latest
+            ref: _enqueue_as_json(enqueue)
+            for ref, enqueue in enqueues.items()
+            if ref in kept
         },
     }
 
