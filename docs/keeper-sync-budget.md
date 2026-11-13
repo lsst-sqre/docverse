@@ -339,7 +339,14 @@ waits for the tier crons, which pick changes up whatever a chain did:
   checks: 12 at the default one-hour `keeper_sync_push_window_seconds`,
   each of one or two LTD calls for the ref, plus the project's edition
   listing and at most three fetches of unseen editions, shared by the
-  project's refs, while the ref has no synced edition.
+  project's refs, while the ref has no synced edition. Each re-sync
+  starts a new chain of the whole project. A new LTD rebuild of the ref
+  enqueues one at once; the same rebuild enqueues again only 15 minutes
+  after the last enqueue for it (`PUSHED_REF_REENQUEUE_BACKOFF`), so a
+  sync that does not record the rebuild, its build copy failing or its
+  review of a lifecycle tombstone unable to read GitHub, re-runs at most
+  four times per rebuild in the default window rather than on every
+  tick.
 - `keeper_sync_tier_discovery` (every 30 minutes) re-syncs a project
   with an edition that has no state row yet.
 - `keeper_sync_tier_other` (hourly) re-syncs a project with a stale

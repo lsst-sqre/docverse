@@ -347,14 +347,14 @@ async def _stamps(org_id: int) -> dict[str, str]:
     return stamps
 
 
-async def _enqueues(org_id: int) -> dict[str, str] | None:
+async def _enqueues(org_id: int) -> dict[str, dict[str, str | None]] | None:
     """Return the project's ``github_pushed_refs_enqueued`` map as stored.
 
     ``None`` when the row carries no such key: nothing has written it.
     """
-    enqueues: dict[str, str] | None = (await _project_annotations(org_id)).get(
-        ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED
-    )
+    enqueues: dict[str, dict[str, str | None]] | None = (
+        await _project_annotations(org_id)
+    ).get(ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED)
     return enqueues
 
 
@@ -365,7 +365,20 @@ async def _let_window_pass(org_id: int) -> None:
     every recorded enqueue moves back together, so their order is kept,
     and the next tick finds each stamp now on the row past its window.
     """
-    age = config.keeper_sync_push_window_seconds + 60
+    await _advance_clock(
+        org_id, by=timedelta(seconds=config.keeper_sync_push_window_seconds)
+    )
+    await _advance_clock(org_id, by=timedelta(minutes=1))
+
+
+async def _advance_clock(org_id: int, *, by: timedelta) -> None:
+    """Age the project's push stamps and recorded enqueues by ``by``.
+
+    Stands in for ``by`` of wall-clock time passing between two ticks:
+    every push and every enqueue moves back together, so their order is
+    kept. The LTD rebuild an enqueue was for is LTD's time, compared
+    only with LTD's, so it is left as it is.
+    """
     async for session in db_session_dependency():
         async with session.begin():
             store = KeeperSyncStateStore(session=session, logger=_logger())
@@ -378,17 +391,25 @@ async def _let_window_pass(org_id: int) -> None:
             assert state is not None
             assert state.annotations is not None
             annotations = dict(state.annotations)
-            for key in (
-                ANNOTATION_GITHUB_PUSHED_REFS,
-                ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED,
-            ):
-                if key in annotations:
-                    annotations[key] = {
-                        ref: (
-                            datetime.fromisoformat(at) - timedelta(seconds=age)
-                        ).isoformat()
-                        for ref, at in annotations[key].items()
+            if ANNOTATION_GITHUB_PUSHED_REFS in annotations:
+                annotations[ANNOTATION_GITHUB_PUSHED_REFS] = {
+                    ref: (datetime.fromisoformat(at) - by).isoformat()
+                    for ref, at in annotations[
+                        ANNOTATION_GITHUB_PUSHED_REFS
+                    ].items()
+                }
+            if ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED in annotations:
+                annotations[ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED] = {
+                    ref: {
+                        **entry,
+                        "date_enqueued": (
+                            datetime.fromisoformat(entry["date_enqueued"]) - by
+                        ).isoformat(),
                     }
+                    for ref, entry in annotations[
+                        ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED
+                    ].items()
+                }
             await store.upsert(
                 org_id=org_id,
                 resource_type=ResourceType.project,
@@ -557,6 +578,9 @@ async def test_buildless_new_edition_is_watched_until_its_rebuild(
     )
     assert checks["tickets/DM-2"].enqueued is True
     assert await _stamps(org_id) == {"tickets/DM-2": pushed_at.isoformat()}
+    assert ((await _enqueues(org_id)) or {})["tickets/DM-2"][
+        "date_rebuilt"
+    ] is None
 
     await _sync_ltd_edition(org_id, ltd_id=3)
     await _finish_project_sync(org_id)
@@ -572,12 +596,13 @@ async def test_buildless_new_edition_is_watched_until_its_rebuild(
     assert _ltd_paths(mock_discovery) == [_MAIN_PATH, "/editions/3"]
     assert await _stamps(org_id) == {"tickets/DM-2": pushed_at.isoformat()}
 
+    uploaded_at = _now()
     _stub_edition(
         mock_discovery,
         ltd_id=3,
         slug="tickets-DM-2",
         tracked_ref="tickets/DM-2",
-        date_rebuilt=_now(),
+        date_rebuilt=uploaded_at,
     )
     before = _now()
 
@@ -590,6 +615,9 @@ async def test_buildless_new_edition_is_watched_until_its_rebuild(
     assert rebuilt.push_lag is not None
     assert before - pushed_at <= rebuilt.push_lag <= _now() - pushed_at
     assert await _stamps(org_id) == {"tickets/DM-2": pushed_at.isoformat()}
+    recorded = ((await _enqueues(org_id)) or {})["tickets/DM-2"]
+    assert recorded["date_rebuilt"] is not None
+    assert datetime.fromisoformat(recorded["date_rebuilt"]) == uploaded_at
 
 
 @pytest.mark.asyncio
@@ -904,6 +932,227 @@ async def test_pruned_enqueue_does_not_complete_a_later_push(
 
 
 @pytest.mark.asyncio
+async def test_unrecorded_rebuild_is_enqueued_once_per_backoff(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    mock_events: DocverseEvents,
+) -> None:
+    """A sync that never records the rebuild re-runs once per backoff.
+
+    Each enqueued sync completes without recording LTD's rebuild on the
+    edition's state row, as one does when a lifecycle tombstone's review
+    cannot read the repository's live refs from GitHub, or when the
+    build copy keeps failing, so the ref reads ``rebuilt`` on every tick
+    of its window. The tick that first sees the rebuild enqueues the
+    project's sync. The ticks inside the 15-minute backoff report
+    ``rebuilt`` with ``enqueued`` false and no lag and leave the
+    recorded enqueue as it was; the first tick after it enqueues again.
+    Five-minute ticks over the one-hour window enqueue four times, not
+    twelve, and the window still closes ``completed``.
+    """
+    pushed_at = _now() - timedelta(minutes=1)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-backoff")
+        project_id = await _seed_pushed_project(
+            db_session, org_id=org_id, pushed_refs={"tickets/DM-1": pushed_at}
+        )
+        await _seed_synced_edition(
+            db_session,
+            org_id=org_id,
+            project_id=project_id,
+            slug="tickets-DM-1",
+            git_ref="tickets/DM-1",
+            ltd_id=2,
+        )
+    _stub_ltd(mock_discovery)
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="tickets-DM-1",
+        tracked_ref="tickets/DM-1",
+        date_rebuilt=_now() - timedelta(seconds=30),
+    )
+    tick_interval = timedelta(minutes=5)
+    window = timedelta(seconds=config.keeper_sync_push_window_seconds)
+    enqueued_on: list[int] = []
+
+    for tick in range(window // tick_interval):
+        recorded = ((await _enqueues(org_id)) or {}).get("tickets/DM-1")
+        jobs, checks = await _tick(mock_events)
+        check = checks["tickets/DM-1"]
+        assert check.outcome is KeeperSyncPushCheckOutcome.rebuilt
+        if jobs:
+            enqueued_on.append(tick)
+            assert check.enqueued is True
+            assert check.push_lag is not None
+            await _finish_project_sync(org_id)
+        else:
+            assert check.enqueued is False
+            assert check.push_lag is None
+            assert (await _enqueues(org_id) or {})["tickets/DM-1"] == recorded
+        await _advance_clock(org_id, by=tick_interval)
+
+    assert enqueued_on == [0, 3, 6, 9]
+
+    jobs, checks = await _tick(mock_events)
+
+    assert jobs == []
+    assert set(checks) == {"tickets/DM-1"}
+    assert checks["tickets/DM-1"].outcome is (
+        KeeperSyncPushCheckOutcome.completed
+    )
+    assert await _stamps(org_id) == {}
+    assert await _enqueues(org_id) == {}
+
+
+@pytest.mark.asyncio
+async def test_new_rebuild_inside_the_backoff_enqueues_at_once(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    mock_events: DocverseEvents,
+) -> None:
+    """A second LTD rebuild of the ref is not held to the first's backoff.
+
+    The first rebuild's sync completes without recording it, so the next
+    tick reads ``rebuilt`` for that same rebuild and is held back. LTD
+    then rebuilds the edition again, for a later CI run; the tick after,
+    well inside the backoff, enqueues the project's sync for the new
+    rebuild and records it.
+    """
+    pushed_at = _now() - timedelta(minutes=10)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-backoff-rebuild")
+        project_id = await _seed_pushed_project(
+            db_session, org_id=org_id, pushed_refs={"tickets/DM-1": pushed_at}
+        )
+        await _seed_synced_edition(
+            db_session,
+            org_id=org_id,
+            project_id=project_id,
+            slug="tickets-DM-1",
+            git_ref="tickets/DM-1",
+            ltd_id=2,
+        )
+    _stub_ltd(mock_discovery)
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="tickets-DM-1",
+        tracked_ref="tickets/DM-1",
+        date_rebuilt=_now() - timedelta(minutes=2),
+    )
+
+    jobs, checks = await _tick(mock_events)
+
+    assert len(jobs) == 1
+    assert checks["tickets/DM-1"].enqueued is True
+    await _finish_project_sync(org_id)
+    await _advance_clock(org_id, by=timedelta(minutes=5))
+
+    jobs, checks = await _tick(mock_events)
+
+    assert jobs == []
+    assert checks["tickets/DM-1"].outcome is (
+        KeeperSyncPushCheckOutcome.rebuilt
+    )
+    assert checks["tickets/DM-1"].enqueued is False
+
+    second_rebuild = _now()
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="tickets-DM-1",
+        tracked_ref="tickets/DM-1",
+        date_rebuilt=second_rebuild,
+    )
+
+    jobs, checks = await _tick(mock_events)
+
+    assert len(jobs) == 1
+    assert checks["tickets/DM-1"].outcome is (
+        KeeperSyncPushCheckOutcome.rebuilt
+    )
+    assert checks["tickets/DM-1"].enqueued is True
+    recorded = ((await _enqueues(org_id)) or {})["tickets/DM-1"]
+    assert recorded["date_rebuilt"] is not None
+    assert datetime.fromisoformat(recorded["date_rebuilt"]) == second_rebuild
+
+
+@pytest.mark.asyncio
+async def test_held_back_ref_records_nothing_when_its_project_syncs(
+    app: None,
+    db_session: AsyncSession,
+    mock_discovery: respx.Router,
+    mock_events: DocverseEvents,
+) -> None:
+    """A held-back ref keeps its record when the project syncs anyway.
+
+    The ref's first rebuild enqueues the project's sync, which completes
+    without recording it. On the next tick LTD's ``main`` has rebuilt,
+    so the ``main`` check enqueues the project's sync; the ref reads
+    ``rebuilt`` for the rebuild its last enqueue was for and is held
+    back. It reports ``enqueued`` false with no lag, its log line says
+    it was held back, and its recorded enqueue stays as it was, so its
+    backoff still runs from that enqueue.
+    """
+    pushed_at = _now() - timedelta(minutes=10)
+    async with db_session.begin():
+        org_id = await _seed_org(db_session, "ks-push-backoff-main")
+        project_id = await _seed_pushed_project(
+            db_session, org_id=org_id, pushed_refs={"tickets/DM-1": pushed_at}
+        )
+        await _seed_synced_edition(
+            db_session,
+            org_id=org_id,
+            project_id=project_id,
+            slug="tickets-DM-1",
+            git_ref="tickets/DM-1",
+            ltd_id=2,
+        )
+    _stub_ltd(mock_discovery)
+    _stub_edition(
+        mock_discovery,
+        ltd_id=2,
+        slug="tickets-DM-1",
+        tracked_ref="tickets/DM-1",
+        date_rebuilt=_now() - timedelta(minutes=2),
+    )
+
+    jobs, _ = await _tick(mock_events)
+
+    assert len(jobs) == 1
+    await _finish_project_sync(org_id)
+    recorded = ((await _enqueues(org_id)) or {})["tickets/DM-1"]
+    _stub_edition(
+        mock_discovery,
+        ltd_id=_MAIN_LTD_ID,
+        slug="main",
+        tracked_ref="main",
+        date_rebuilt=_now(),
+    )
+
+    with capture_logs() as captured:
+        jobs, checks = await _tick(mock_events)
+
+    assert len(jobs) == 1
+    held = checks["tickets/DM-1"]
+    assert held.outcome is KeeperSyncPushCheckOutcome.rebuilt
+    assert held.enqueued is False
+    assert held.push_lag is None
+    assert ((await _enqueues(org_id)) or {})["tickets/DM-1"] == recorded
+    visits = [
+        entry
+        for entry in captured
+        if entry["event"] == "Tier-main: checked pushed ref"
+    ]
+    assert len(visits) == 1
+    assert visits[0]["enqueued"] is False
+    assert visits[0]["held_back"] is True
+
+
+@pytest.mark.asyncio
 async def test_rebuilt_pushed_ref_enqueues_and_keeps_its_stamp(
     app: None, db_session: AsyncSession, mock_discovery: respx.Router
 ) -> None:
@@ -950,12 +1199,14 @@ async def test_rebuilt_pushed_ref_enqueues_and_keeps_its_stamp(
 async def test_enqueue_is_recorded_beside_the_stamp(
     app: None, db_session: AsyncSession, mock_discovery: respx.Router
 ) -> None:
-    """A visit that enqueues the ref's sync records when, per ref.
+    """A visit that enqueues the ref's sync records when, and for what.
 
     The enqueue lands in ``github_pushed_refs_enqueued``, keyed like the
-    stamp; a ref whose visit enqueued nothing gets no entry.
+    stamp, with the LTD rebuild the visit found; a ref whose visit
+    enqueued nothing gets no entry.
     """
     pushed_at = _now() - timedelta(minutes=10)
+    rebuilt_at = _now() - timedelta(minutes=1)
     async with db_session.begin():
         org_id = await _seed_org(db_session, "ks-push-enqueue-record")
         project_id = await _seed_pushed_project(
@@ -978,7 +1229,7 @@ async def test_enqueue_is_recorded_beside_the_stamp(
         ltd_id=2,
         slug="tickets-DM-1",
         tracked_ref="tickets/DM-1",
-        date_rebuilt=_now() - timedelta(minutes=1),
+        date_rebuilt=rebuilt_at,
     )
     _stub_edition(
         mock_discovery,
@@ -995,8 +1246,12 @@ async def test_enqueue_is_recorded_beside_the_stamp(
     enqueues = await _enqueues(org_id)
     assert enqueues is not None
     assert set(enqueues) == {"tickets/DM-1"}
-    recorded = datetime.fromisoformat(enqueues["tickets/DM-1"])
-    assert before <= recorded <= _now()
+    entry = enqueues["tickets/DM-1"]
+    assert set(entry) == {"date_enqueued", "date_rebuilt"}
+    assert entry["date_enqueued"] is not None
+    assert before <= datetime.fromisoformat(entry["date_enqueued"]) <= _now()
+    assert entry["date_rebuilt"] is not None
+    assert datetime.fromisoformat(entry["date_rebuilt"]) == rebuilt_at
     assert await _stamps(org_id) == {
         "tickets/DM-1": pushed_at.isoformat(),
         "tickets/DM-3": pushed_at.isoformat(),
@@ -1948,8 +2203,10 @@ async def test_visit_and_enqueue_are_logged(
     assert set(visits) == {"tickets/DM-1", "old"}
     assert visits["old"]["outcome"] == "expired"
     assert visits["old"]["enqueued"] is False
+    assert visits["old"]["held_back"] is False
     assert visits["tickets/DM-1"]["outcome"] == "rebuilt"
     assert visits["tickets/DM-1"]["enqueued"] is True
+    assert visits["tickets/DM-1"]["held_back"] is False
     assert visits["tickets/DM-1"]["org"] == "ks-push-logs"
     assert visits["tickets/DM-1"]["project"] == _SLUG
     assert visits["tickets/DM-1"]["pushed_at"] == pushed_at.isoformat()

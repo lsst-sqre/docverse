@@ -87,9 +87,11 @@ from docverse_server.services.keeper_sync.mappers import (
 )
 from docverse_server.services.keeper_sync.push_hints import (
     PushCheckOutcome,
+    PushedRefEnqueue,
     closed_window_outcome,
     ltd_rebuilt_since_sync,
     prune_pushed_refs,
+    pushed_ref_enqueue_due,
     read_pushed_refs,
     read_pushed_refs_enqueued,
     settle_pushed_refs,
@@ -3015,13 +3017,16 @@ async def _tier_main_for_org(
     for a later push's CI run or after creating its edition build-less;
     a ref whose window has passed is pruned even once the project is
     dormant again, reported ``completed`` if it enqueued in its window
-    and ``expired`` if it never did. A
-    ref whose sync keeps failing may therefore enqueue on every tick of
-    its window; the project's active-job slot holds it to one sync at a
-    time. The ``main`` check and the pushed refs
-    share one enqueue per project, and the stamps are settled afterwards
-    (:func:`_settle_pushed_refs`), which publishes one
-    ``keeper_sync_push_check`` metrics event per visited ref. With the hot
+    and ``expired`` if it never did. A ref whose sync completes or fails
+    without recording its LTD rebuild reads ``rebuilt`` again on the
+    next tick; it is enqueued again for that same rebuild only once
+    :data:`~docverse_server.services.keeper_sync.push_hints.PUSHED_REF_REENQUEUE_BACKOFF`
+    has passed since its last enqueue, while a new rebuild enqueues at
+    once (:func:`pushed_ref_enqueue_due`), and the project's active-job
+    slot holds it to one sync at a time. The ``main`` check and the
+    pushed refs share one enqueue per project, and the stamps are
+    settled afterwards (:func:`_settle_pushed_refs`), which publishes
+    one ``keeper_sync_push_check`` metrics event per visited ref. With the hot
     path off, the stamps are neither read nor written, and count for
     nothing in the gate.
     """
@@ -3093,7 +3098,7 @@ async def _tier_main_for_org(
                 window=push_window,
             )
         wants_enqueue = main_check.wants_enqueue or any(
-            check.outcome.enqueues for check in push_checks
+            check.calls_for_enqueue for check in push_checks
         )
         enqueued_at: datetime | None = None
         if wants_enqueue and await _enqueue_tier_project_sync(
@@ -3217,6 +3222,22 @@ async def _check_main_edition(
 
 
 @dataclass(frozen=True, slots=True)
+class _PushedRefFinding:
+    """What LTD says about the edition one pushed ref feeds."""
+
+    outcome: PushCheckOutcome
+    """What the check found."""
+
+    ltd_date_rebuilt: datetime | None = None
+    """The LTD ``date_rebuilt`` the check compared.
+
+    The tracked edition's for ``rebuilt`` and ``unchanged``, and ``None``
+    for every other outcome, ``new_edition`` included: its check reads
+    which ref an unseen edition tracks, not when LTD rebuilt it.
+    """
+
+
+@dataclass(frozen=True, slots=True)
 class _PushedRefCheck:
     """``tier_main``'s visit to one stamped ref of a project."""
 
@@ -3228,6 +3249,21 @@ class _PushedRefCheck:
 
     outcome: PushCheckOutcome
     """What the visit found."""
+
+    ltd_date_rebuilt: datetime | None = None
+    """The LTD ``date_rebuilt`` the visit compared, recorded with an
+    enqueue for the ref (:attr:`_PushedRefFinding.ltd_date_rebuilt`)."""
+
+    held_back: bool = False
+    """Whether the outcome called for the project's sync, but the ref's
+    last enqueue was for the same rebuild and less than
+    :data:`~docverse_server.services.keeper_sync.push_hints.PUSHED_REF_REENQUEUE_BACKOFF`
+    ago (:func:`pushed_ref_enqueue_due`)."""
+
+    @property
+    def calls_for_enqueue(self) -> bool:
+        """Whether the visit asks for the project's sync this tick."""
+        return self.outcome.enqueues and not self.held_back
 
 
 @dataclass(frozen=True, slots=True)
@@ -3279,28 +3315,35 @@ class _PushedRefChecker:
     )
     _unseen: list[LtdEdition] | None = field(default=None, init=False)
 
-    async def check(self, ref: str) -> PushCheckOutcome:
+    async def check(self, ref: str) -> _PushedRefFinding:
         """Return what LTD says about the edition a pushed ref feeds.
 
         ``rebuilt`` or ``unchanged`` when an edition keeper-sync has seen
         tracks the ref and LTD still has it (:func:`ltd_rebuilt_since_sync`)
         — a synced edition, or one a lifecycle rule tombstoned, which a
-        rebuild can bring back (PRD #830); otherwise ``new_edition`` when
-        LTD lists an edition keeper-sync has not seen that tracks the
-        ref, and ``not_found`` when it lists none. An LTD failure is
-        logged, sent to Sentry, and reported as ``error``.
+        rebuild can bring back (PRD #830) — with the LTD ``date_rebuilt``
+        compared; otherwise ``new_edition`` when LTD lists an edition
+        keeper-sync has not seen that tracks the ref, and ``not_found``
+        when it lists none. An LTD failure is logged, sent to Sentry, and
+        reported as ``error``.
         """
         try:
             tracked = await self._tracked_edition(ref)
             if tracked is not None:
                 state, ltd_edition = tracked
-                if ltd_rebuilt_since_sync(
+                rebuilt = ltd_rebuilt_since_sync(
                     state, ltd_date_rebuilt=ltd_edition.date_rebuilt
-                ):
-                    return PushCheckOutcome.rebuilt
-                return PushCheckOutcome.unchanged
+                )
+                return _PushedRefFinding(
+                    outcome=(
+                        PushCheckOutcome.rebuilt
+                        if rebuilt
+                        else PushCheckOutcome.unchanged
+                    ),
+                    ltd_date_rebuilt=ltd_edition.date_rebuilt,
+                )
             if await self._lists_unseen_edition_of(ref):
-                return PushCheckOutcome.new_edition
+                return _PushedRefFinding(outcome=PushCheckOutcome.new_edition)
         except LtdClientError as exc:
             sentry_sdk.capture_exception(exc)
             self.logger.exception(
@@ -3309,8 +3352,8 @@ class _PushedRefChecker:
                 project=self.ltd_slug,
                 github_ref=ref,
             )
-            return PushCheckOutcome.error
-        return PushCheckOutcome.not_found
+            return _PushedRefFinding(outcome=PushCheckOutcome.error)
+        return _PushedRefFinding(outcome=PushCheckOutcome.not_found)
 
     async def _tracked_edition(
         self, ref: str
@@ -3502,7 +3545,10 @@ async def _visit_pushed_refs(
     push first (:meth:`_PushedRefChecker.check`); after an LTD failure
     the rest of the project's live refs wait for the next tick
     unvisited, since the failure has already ridden out the LTD client's
-    retries and the next call would most likely do the same.
+    retries and the next call would most likely do the same. A live ref
+    whose outcome calls for the project's sync is held back when its
+    last enqueue was for the same LTD rebuild and the backoff has not
+    passed since (:func:`pushed_ref_enqueue_due`).
     """
     stamped = read_pushed_refs(project_state)
     enqueued = read_pushed_refs_enqueued(project_state)
@@ -3511,16 +3557,30 @@ async def _visit_pushed_refs(
     for ref, pushed_at in sorted(
         stamped.items(), key=lambda item: (item[0] in live, item[1], item[0])
     ):
+        last = enqueued.get(ref)
         if ref in live:
-            outcome = await checker.check(ref)
-        else:
-            outcome = closed_window_outcome(
-                pushed_at=pushed_at, enqueued_at=enqueued.get(ref)
+            finding = await checker.check(ref)
+            due = pushed_ref_enqueue_due(
+                last, date_rebuilt=finding.ltd_date_rebuilt, now=now
             )
-        checks.append(
-            _PushedRefCheck(ref=ref, pushed_at=pushed_at, outcome=outcome)
-        )
-        if outcome is PushCheckOutcome.error:
+            check = _PushedRefCheck(
+                ref=ref,
+                pushed_at=pushed_at,
+                outcome=finding.outcome,
+                ltd_date_rebuilt=finding.ltd_date_rebuilt,
+                held_back=finding.outcome.enqueues and not due,
+            )
+        else:
+            check = _PushedRefCheck(
+                ref=ref,
+                pushed_at=pushed_at,
+                outcome=closed_window_outcome(
+                    pushed_at=pushed_at,
+                    enqueued_at=last.date_enqueued if last else None,
+                ),
+            )
+        checks.append(check)
+        if check.outcome is PushCheckOutcome.error:
             break
     return checks
 
@@ -3541,18 +3601,22 @@ async def _settle_pushed_refs(
     """Write a project's pushed-ref visit back to its state row and report it.
 
     Once the project's sync is enqueued (at ``enqueued_at``), every ref
-    whose outcome called for it is reported as enqueued, with its lag
-    from its latest push to this enqueue, and the enqueue is recorded
-    against it in ``github_pushed_refs_enqueued``; when the enqueue was
-    skipped (``enqueued_at`` is ``None``: an active job for the project
-    already holds its slot) none is. Either way each ref keeps its stamp
-    until its window passes, so the next tick checks it again: a ref may
-    enqueue the project's sync more than once in its window, as LTD
-    rebuilds it for each of several pushes, or first creates its edition
-    with no build and then rebuilds it. Only the refs whose window has
-    passed (``completed`` or ``expired``) are pruned, each with its
-    recorded enqueue, so the row is written only when the visit enqueued
-    or pruned a ref: it is re-read ``FOR UPDATE`` and settled by
+    whose visit called for it is reported as enqueued, with its lag from
+    its latest push to this enqueue, and the enqueue is recorded against
+    it in ``github_pushed_refs_enqueued`` with the LTD rebuild the visit
+    compared; when the enqueue was skipped (``enqueued_at`` is ``None``:
+    an active job for the project already holds its slot) none is. A ref
+    the backoff held back did not call for the sync, so it is reported
+    as not enqueued and its recorded enqueue is left as it was, even
+    when the ``main`` check or another ref enqueued the project's sync
+    this tick. Either way each ref keeps its stamp until its window
+    passes, so the next tick checks it again: a ref may enqueue the
+    project's sync more than once in its window, as LTD rebuilds it for
+    each of several pushes, or first creates its edition with no build
+    and then rebuilds it. Only the refs whose window has passed
+    (``completed`` or ``expired``) are pruned, each with its recorded
+    enqueue, so the row is written only when the visit enqueued or
+    pruned a ref: it is re-read ``FOR UPDATE`` and settled by
     :func:`settle_pushed_refs`, so a push stamped since the visit read
     the row keeps its stamp.
 
@@ -3561,9 +3625,11 @@ async def _settle_pushed_refs(
     the write, so the event reports what the tick settled.
     """
     enqueued_refs = {
-        check.ref: enqueued_at
+        check.ref: PushedRefEnqueue(
+            date_enqueued=enqueued_at, date_rebuilt=check.ltd_date_rebuilt
+        )
         for check in checks
-        if enqueued_at is not None and check.outcome.enqueues
+        if enqueued_at is not None and check.calls_for_enqueue
     }
     if enqueued_refs or any(check.outcome.prunes for check in checks):
         async with session.begin():
@@ -3585,7 +3651,7 @@ async def _settle_pushed_refs(
     for check in checks:
         push_lag = (
             enqueued_at - check.pushed_at
-            if enqueued_at is not None and check.outcome.enqueues
+            if enqueued_at is not None and check.calls_for_enqueue
             else None
         )
         enqueued = push_lag is not None
@@ -3597,6 +3663,7 @@ async def _settle_pushed_refs(
             outcome=check.outcome.value,
             pushed_at=check.pushed_at.isoformat(),
             enqueued=enqueued,
+            held_back=check.held_back,
         )
         if push_lag is not None:
             logger.info(

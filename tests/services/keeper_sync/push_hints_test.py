@@ -18,12 +18,15 @@ from typing import Any
 from docverse_server.services.keeper_sync.push_hints import (
     ANNOTATION_GITHUB_PUSHED_REFS,
     ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED,
+    PUSHED_REF_REENQUEUE_BACKOFF,
     PUSHED_REFS_CAP,
     PushCheckOutcome,
+    PushedRefEnqueue,
     closed_window_outcome,
     is_in_push_window,
     ltd_rebuilt_since_sync,
     prune_pushed_refs,
+    pushed_ref_enqueue_due,
     read_pushed_refs,
     read_pushed_refs_enqueued,
     settle_pushed_refs,
@@ -33,6 +36,7 @@ from docverse_server.storage.keeper_sync import KeeperSyncState
 
 _NOW = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 _WINDOW = timedelta(hours=1)
+_SECOND = timedelta(seconds=1)
 
 
 def _project_state(
@@ -74,6 +78,21 @@ def _edition_state(
         date_tombstoned=date_tombstoned,
         tombstone_reason=tombstone_reason,
     )
+
+
+def _enqueue(at: datetime, *, rebuilt: datetime | None) -> PushedRefEnqueue:
+    """Build ``tier_main``'s record of one enqueue, for ``rebuilt``."""
+    return PushedRefEnqueue(date_enqueued=at, date_rebuilt=rebuilt)
+
+
+def _enqueue_json(
+    at: datetime, *, rebuilt: datetime | None = None
+) -> dict[str, str | None]:
+    """Return one enqueue as the enqueue map stores it."""
+    return {
+        "date_enqueued": at.isoformat(),
+        "date_rebuilt": rebuilt.isoformat() if rebuilt is not None else None,
+    }
 
 
 def test_stamp_records_ref_with_iso_push_time() -> None:
@@ -187,7 +206,7 @@ def test_stamp_carries_the_enqueue_map_over() -> None:
     than the push, no longer counts for it (see
     :func:`closed_window_outcome`).
     """
-    enqueues = {"main": (_NOW - timedelta(minutes=5)).isoformat()}
+    enqueues = {"main": _enqueue_json(_NOW - timedelta(minutes=5))}
     state = _project_state(
         annotations={
             ANNOTATION_GITHUB_PUSHED_REFS: {
@@ -249,21 +268,69 @@ def test_read_pushed_refs_without_a_row_or_map_is_empty() -> None:
     assert read_pushed_refs(_project_state(annotations={"x": 1})) == {}
 
 
-def test_read_pushed_refs_enqueued_parses_times() -> None:
-    """The enqueue map reads back as aware datetimes, like the stamps."""
+def test_read_pushed_refs_enqueued_parses_entries() -> None:
+    """Each entry reads back as its enqueue time and the rebuild it was for.
+
+    Both times read as aware datetimes, a naive one as UTC like the
+    stamps; a null ``date_rebuilt`` is an enqueue for no rebuild (a
+    ``new_edition``, or an edition LTD has never rebuilt).
+    """
     enqueued = _NOW - timedelta(minutes=2)
+    rebuilt = _NOW - timedelta(minutes=4)
     state = _project_state(
         annotations={
             ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
-                "main": enqueued.isoformat(),
-                "naive": "2026-10-09T11:00:00",
+                "main": {
+                    "date_enqueued": enqueued.isoformat(),
+                    "date_rebuilt": rebuilt.isoformat(),
+                },
+                "tickets/DM-2": {
+                    "date_enqueued": enqueued.isoformat(),
+                    "date_rebuilt": None,
+                },
+                "naive": {
+                    "date_enqueued": "2026-10-09T11:00:00",
+                    "date_rebuilt": "2026-10-09T10:58:00",
+                },
             }
         }
     )
 
     assert read_pushed_refs_enqueued(state) == {
-        "main": enqueued,
-        "naive": datetime(2026, 10, 9, 11, 0, tzinfo=UTC),
+        "main": PushedRefEnqueue(date_enqueued=enqueued, date_rebuilt=rebuilt),
+        "tickets/DM-2": PushedRefEnqueue(
+            date_enqueued=enqueued, date_rebuilt=None
+        ),
+        "naive": PushedRefEnqueue(
+            date_enqueued=datetime(2026, 10, 9, 11, 0, tzinfo=UTC),
+            date_rebuilt=datetime(2026, 10, 9, 10, 58, tzinfo=UTC),
+        ),
+    }
+
+
+def test_read_enqueue_without_a_rebuild_as_unknown() -> None:
+    """An entry with no rebuild on record reads as an enqueue time alone.
+
+    A bare ISO-8601 string, as the map held before it recorded the
+    rebuild, and an object without ``date_rebuilt`` both read as an
+    enqueue whose rebuild is unknown, which is not the same as one for no
+    rebuild.
+    """
+    state = _project_state(
+        annotations={
+            ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
+                "bare": _NOW.isoformat(),
+                "no-rebuild-key": {"date_enqueued": _NOW.isoformat()},
+            }
+        }
+    )
+
+    unknown = PushedRefEnqueue(
+        date_enqueued=_NOW, date_rebuilt=None, rebuild_known=False
+    )
+    assert read_pushed_refs_enqueued(state) == {
+        "bare": unknown,
+        "no-rebuild-key": unknown,
     }
 
 
@@ -272,7 +339,8 @@ def test_read_pushed_refs_enqueued_is_defensive() -> None:
 
     Rows written before the map existed carry no key, and the map
     round-trips through JSONB, so a non-object map or a bad entry is
-    skipped rather than raised on.
+    skipped rather than raised on: an entry whose enqueue time or rebuild
+    does not parse is no enqueue at all.
     """
     assert read_pushed_refs_enqueued(None) == {}
     assert read_pushed_refs_enqueued(_project_state()) == {}
@@ -287,11 +355,27 @@ def test_read_pushed_refs_enqueued_is_defensive() -> None:
                 "garbled": "not a time",
                 "number": 12,
                 "": _NOW.isoformat(),
-                "main": _NOW.isoformat(),
+                "list": [_NOW.isoformat()],
+                "no-time": {"date_rebuilt": _NOW.isoformat()},
+                "bad-time": {"date_enqueued": "soon", "date_rebuilt": None},
+                "bad-rebuild": {
+                    "date_enqueued": _NOW.isoformat(),
+                    "date_rebuilt": "not a time",
+                },
+                "number-rebuild": {
+                    "date_enqueued": _NOW.isoformat(),
+                    "date_rebuilt": 12,
+                },
+                "main": {
+                    "date_enqueued": _NOW.isoformat(),
+                    "date_rebuilt": None,
+                },
             }
         }
     )
-    assert read_pushed_refs_enqueued(bad_entries) == {"main": _NOW}
+    assert read_pushed_refs_enqueued(bad_entries) == {
+        "main": PushedRefEnqueue(date_enqueued=_NOW, date_rebuilt=None)
+    }
 
 
 def test_prune_pushed_refs_keeps_only_the_window() -> None:
@@ -346,7 +430,10 @@ def test_settle_keeps_an_enqueued_ref_until_its_window_passes() -> None:
     )
 
     inside = settle_pushed_refs(
-        state, enqueued={"tickets/DM-1": _NOW}, now=_NOW, window=_WINDOW
+        state,
+        enqueued={"tickets/DM-1": _enqueue(_NOW, rebuilt=None)},
+        now=_NOW,
+        window=_WINDOW,
     )
     after = settle_pushed_refs(
         state, enqueued={}, now=pushed + _WINDOW, window=_WINDOW
@@ -396,14 +483,17 @@ def test_settle_prunes_expired_refs() -> None:
 
 
 def test_settle_records_each_enqueued_ref() -> None:
-    """A ref whose sync the visit enqueued records that enqueue's time.
+    """A ref whose sync the visit enqueued records the enqueue and rebuild.
 
-    Written as an ISO-8601 string beside the ref's stamp, overwriting an
-    earlier enqueue of the same ref, so the map holds the ref's last
-    enqueue; a ref the visit did not enqueue keeps what it had.
+    Written beside the ref's stamp as an object of two ISO-8601 times,
+    ``date_enqueued`` and ``date_rebuilt`` (null for an enqueue for no
+    rebuild), overwriting an earlier enqueue of the same ref, so the map
+    holds the ref's last enqueue; a ref the visit did not enqueue keeps
+    what it had, an entry whose rebuild is unknown included.
     """
     pushed = _NOW - timedelta(minutes=20)
     earlier = _NOW - timedelta(minutes=10)
+    rebuilt = _NOW - timedelta(minutes=3)
     enqueued_at = _NOW + timedelta(seconds=2)
     state = _project_state(
         annotations={
@@ -411,30 +501,52 @@ def test_settle_records_each_enqueued_ref() -> None:
                 "tickets/DM-1": pushed.isoformat(),
                 "tickets/DM-2": pushed.isoformat(),
                 "tickets/DM-3": pushed.isoformat(),
+                "tickets/DM-4": pushed.isoformat(),
             },
             ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
-                "tickets/DM-1": earlier.isoformat(),
-                "tickets/DM-3": earlier.isoformat(),
+                "tickets/DM-1": {
+                    "date_enqueued": earlier.isoformat(),
+                    "date_rebuilt": None,
+                },
+                "tickets/DM-3": {
+                    "date_enqueued": earlier.isoformat(),
+                    "date_rebuilt": pushed.isoformat(),
+                },
+                "tickets/DM-4": earlier.isoformat(),
             },
         }
     )
 
     settled = settle_pushed_refs(
         state,
-        enqueued={"tickets/DM-1": enqueued_at, "tickets/DM-2": enqueued_at},
+        enqueued={
+            "tickets/DM-1": _enqueue(enqueued_at, rebuilt=rebuilt),
+            "tickets/DM-2": _enqueue(enqueued_at, rebuilt=None),
+        },
         now=_NOW,
         window=_WINDOW,
     )
 
     assert settled[ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED] == {
-        "tickets/DM-1": enqueued_at.isoformat(),
-        "tickets/DM-2": enqueued_at.isoformat(),
-        "tickets/DM-3": earlier.isoformat(),
+        "tickets/DM-1": {
+            "date_enqueued": enqueued_at.isoformat(),
+            "date_rebuilt": rebuilt.isoformat(),
+        },
+        "tickets/DM-2": {
+            "date_enqueued": enqueued_at.isoformat(),
+            "date_rebuilt": None,
+        },
+        "tickets/DM-3": {
+            "date_enqueued": earlier.isoformat(),
+            "date_rebuilt": pushed.isoformat(),
+        },
+        "tickets/DM-4": {"date_enqueued": earlier.isoformat()},
     }
     assert settled[ANNOTATION_GITHUB_PUSHED_REFS] == {
         "tickets/DM-1": pushed.isoformat(),
         "tickets/DM-2": pushed.isoformat(),
         "tickets/DM-3": pushed.isoformat(),
+        "tickets/DM-4": pushed.isoformat(),
     }
 
 
@@ -455,9 +567,9 @@ def test_settle_prunes_an_enqueue_with_its_stamp() -> None:
                 "live": live.isoformat(),
             },
             ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
-                "expired": (expired + timedelta(minutes=5)).isoformat(),
-                "live": (live + timedelta(minutes=1)).isoformat(),
-                "unstamped": live.isoformat(),
+                "expired": _enqueue_json(expired + timedelta(minutes=5)),
+                "live": _enqueue_json(live + timedelta(minutes=1)),
+                "unstamped": _enqueue_json(live),
             },
         }
     )
@@ -466,7 +578,7 @@ def test_settle_prunes_an_enqueue_with_its_stamp() -> None:
 
     assert settled[ANNOTATION_GITHUB_PUSHED_REFS] == {"live": live.isoformat()}
     assert settled[ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED] == {
-        "live": (live + timedelta(minutes=1)).isoformat()
+        "live": _enqueue_json(live + timedelta(minutes=1))
     }
 
 
@@ -485,9 +597,9 @@ def test_settle_caps_the_enqueue_map_keeping_the_latest() -> None:
                 for index in range(count)
             },
             ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
-                f"ref-{index:02d}": (
+                f"ref-{index:02d}": _enqueue_json(
                     pushed + timedelta(minutes=index)
-                ).isoformat()
+                )
                 for index in range(count - 1)
             },
         }
@@ -495,14 +607,14 @@ def test_settle_caps_the_enqueue_map_keeping_the_latest() -> None:
 
     settled = settle_pushed_refs(
         state,
-        enqueued={f"ref-{count - 1:02d}": _NOW},
+        enqueued={f"ref-{count - 1:02d}": _enqueue(_NOW, rebuilt=None)},
         now=_NOW,
         window=_WINDOW,
     )
 
     enqueues = settled[ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED]
     assert len(enqueues) == PUSHED_REFS_CAP
-    assert enqueues[f"ref-{count - 1:02d}"] == _NOW.isoformat()
+    assert enqueues[f"ref-{count - 1:02d}"] == _enqueue_json(_NOW)
     assert "ref-04" not in enqueues
     assert "ref-05" in enqueues
 
@@ -565,6 +677,89 @@ def test_closed_window_ignores_an_enqueue_before_the_push() -> None:
     )
 
     assert outcome is PushCheckOutcome.expired
+
+
+def test_enqueue_due_with_no_enqueue_on_record() -> None:
+    """A ref with no recorded enqueue enqueues at once, rebuild or not."""
+    for rebuilt in (_NOW - timedelta(minutes=1), None):
+        assert pushed_ref_enqueue_due(None, date_rebuilt=rebuilt, now=_NOW)
+
+
+def test_enqueue_due_at_once_on_a_new_rebuild() -> None:
+    """A rebuild other than the last enqueue's enqueues with no backoff.
+
+    LTD rebuilt the edition again since the last enqueue (a later push's
+    upload), or the last enqueue was for no rebuild (a build-less
+    ``new_edition``) and LTD has rebuilt the edition since: either way
+    the sync is enqueued on the very next tick.
+    """
+    just_now = _NOW - timedelta(minutes=1)
+    first = _NOW - timedelta(minutes=8)
+    second = _NOW - timedelta(minutes=2)
+
+    assert pushed_ref_enqueue_due(
+        _enqueue(just_now, rebuilt=first), date_rebuilt=second, now=_NOW
+    )
+    assert pushed_ref_enqueue_due(
+        _enqueue(just_now, rebuilt=None), date_rebuilt=second, now=_NOW
+    )
+    assert pushed_ref_enqueue_due(
+        _enqueue(just_now, rebuilt=first), date_rebuilt=None, now=_NOW
+    )
+
+
+def test_same_rebuild_waits_out_the_backoff() -> None:
+    """The rebuild the last enqueue was for enqueues again only after it.
+
+    A sync that completes or fails without recording the rebuild leaves
+    the ref reading ``rebuilt`` on every tick; inside the backoff no
+    tick enqueues it again, and from the moment the backoff has passed
+    the next one does.
+    """
+    rebuilt = _NOW - timedelta(minutes=30)
+    last = _enqueue(_NOW, rebuilt=rebuilt)
+    backoff = PUSHED_REF_REENQUEUE_BACKOFF
+
+    assert backoff == timedelta(minutes=15)
+    for elapsed in (timedelta(0), timedelta(minutes=5), backoff - _SECOND):
+        assert not pushed_ref_enqueue_due(
+            last, date_rebuilt=rebuilt, now=_NOW + elapsed
+        )
+    for elapsed in (backoff, backoff + timedelta(minutes=5)):
+        assert pushed_ref_enqueue_due(
+            last, date_rebuilt=rebuilt, now=_NOW + elapsed
+        )
+
+
+def test_repeated_enqueue_for_no_rebuild_waits_out_the_backoff() -> None:
+    """A ``new_edition`` again, with no rebuild to compare, is held too.
+
+    The last enqueue was for no rebuild and the ref still reads as one
+    with no rebuild, so it counts as the same rebuild.
+    """
+    last = _enqueue(_NOW, rebuilt=None)
+    backoff = PUSHED_REF_REENQUEUE_BACKOFF
+
+    assert not pushed_ref_enqueue_due(
+        last, date_rebuilt=None, now=_NOW + backoff - _SECOND
+    )
+    assert pushed_ref_enqueue_due(last, date_rebuilt=None, now=_NOW + backoff)
+
+
+def test_unknown_rebuild_enqueues_at_once() -> None:
+    """An enqueue whose rebuild is not on record never holds a ref back.
+
+    A bare enqueue time, as the map held before it recorded the rebuild,
+    gives nothing to compare, so the ref is enqueued as if none were
+    recorded, and the enqueue it then records carries its rebuild.
+    """
+    legacy = _project_state(
+        annotations={ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {"main": _NOW}}
+    )
+    last = read_pushed_refs_enqueued(legacy)["main"]
+
+    for rebuilt in (_NOW - timedelta(minutes=1), None):
+        assert pushed_ref_enqueue_due(last, date_rebuilt=rebuilt, now=_NOW)
 
 
 def test_completed_neither_enqueues_nor_keeps_the_stamp() -> None:

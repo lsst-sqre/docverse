@@ -393,9 +393,12 @@ class KeeperSyncPushCheckEvent(DocverseEventBase):
     """Whether the visit enqueued the project's sync for this ref.
 
     ``True`` only for ``rebuilt`` and ``new_edition``, and not even then
-    when a sync for the project already held its slot; the ref then
-    keeps its stamp and is checked again next tick. Always ``False`` on
-    ``completed``, which reports a window closing, not an enqueue.
+    when a sync for the project already held its slot, or when the
+    ref's last enqueue was for the same LTD rebuild less than
+    :data:`~docverse_server.services.keeper_sync.push_hints.PUSHED_REF_REENQUEUE_BACKOFF`
+    before; the ref then keeps its stamp and is checked again next
+    tick. Always ``False`` on ``completed``, which reports a window
+    closing, not an enqueue.
     """
 
     push_lag: timedelta | None

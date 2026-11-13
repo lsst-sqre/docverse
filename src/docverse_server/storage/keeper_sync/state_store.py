@@ -126,13 +126,18 @@ class KeeperSyncState(BaseModel):
         :mod:`docverse_server.services.keeper_sync.push_hints`.
 
         ``github_pushed_refs_enqueued`` — a map from each stamped ref to
-        the ISO-8601 time of the last project sync ``tier_main``
-        enqueued for it, written by ``tier_main`` when it settles a
-        visit and pruned with the ref's stamp. Read when the ref's
-        window passes to report it ``completed`` (it enqueued in that
-        window) rather than ``expired``. A missing or malformed map
-        reads as no ref ever enqueued. Its rules live beside the
-        stamps' in :mod:`docverse_server.services.keeper_sync.push_hints`.
+        the last project sync ``tier_main`` enqueued for it: an object
+        of ``date_enqueued``, the ISO-8601 time of the enqueue, and
+        ``date_rebuilt``, the LTD ``date_rebuilt`` it was for (null for
+        a ``new_edition`` or an edition LTD never rebuilt). Written by
+        ``tier_main`` when it settles a visit and pruned with the ref's
+        stamp. Read on each visit to hold a repeated enqueue for the
+        same rebuild to a 15-minute backoff, and when the ref's window
+        passes to report it ``completed`` (it enqueued in that window)
+        rather than ``expired``. A missing or malformed map or entry
+        reads as no enqueue, and a bare ISO-8601 time as an enqueue
+        whose rebuild is unknown. Its rules live beside the stamps' in
+        :mod:`docverse_server.services.keeper_sync.push_hints`.
     Edition-resource rows
         ``ltd_mode`` / ``ltd_tracked_refs`` — the LTD-side edition
         mode / refs preserved for reversibility (used by the ``manual``

@@ -31,11 +31,18 @@ one shape, and so the rules can be unit-tested on in-memory
   (:func:`settle_pushed_refs`);
 - ``tier_main`` records each ref's last enqueue beside its stamp, in the
   ``github_pushed_refs_enqueued`` annotation, which is pruned with the
-  stamp and capped like it. A ref whose window has passed is reported
-  as ``completed`` when ``tier_main`` enqueued its sync at or after its
-  latest push and as ``expired`` when it never did
-  (:func:`closed_window_outcome`). Both say what ``tier_main`` did for
-  the ref, not whether a given upload was synced.
+  stamp and capped like it: the time of the enqueue, and the LTD
+  ``date_rebuilt`` it was for (:class:`PushedRefEnqueue`). A ref whose
+  window has passed is reported as ``completed`` when ``tier_main``
+  enqueued its sync at or after its latest push and as ``expired`` when
+  it never did (:func:`closed_window_outcome`). Both say what
+  ``tier_main`` did for the ref, not whether a given upload was synced;
+- a ref that reads ``rebuilt`` or ``new_edition`` again for the rebuild
+  its last enqueue was for — a sync that completed or failed without
+  recording that rebuild — is enqueued again only once
+  :data:`PUSHED_REF_REENQUEUE_BACKOFF` has passed since that enqueue,
+  while a new rebuild of the ref is enqueued at once
+  (:func:`pushed_ref_enqueue_due`).
 
 Nothing here does I/O: the callers read and write the row.
 """
@@ -43,6 +50,7 @@ Nothing here does I/O: the callers read and write the row.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
@@ -53,11 +61,14 @@ __all__ = [
     "ANNOTATION_GITHUB_PUSHED_REFS",
     "ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED",
     "PUSHED_REFS_CAP",
+    "PUSHED_REF_REENQUEUE_BACKOFF",
     "PushCheckOutcome",
+    "PushedRefEnqueue",
     "closed_window_outcome",
     "is_in_push_window",
     "ltd_rebuilt_since_sync",
     "prune_pushed_refs",
+    "pushed_ref_enqueue_due",
     "read_pushed_refs",
     "read_pushed_refs_enqueued",
     "settle_pushed_refs",
@@ -72,13 +83,68 @@ __all__ = [
 ANNOTATION_GITHUB_PUSHED_REFS = "github_pushed_refs"
 
 #: ``keeper_sync_state.annotations`` key on a project-resource state row
-#: recording, for each stamped ref, the ISO-8601 time of the last sync
-#: ``tier_main`` enqueued for it. Written and pruned with the ref's stamp
-#: by :func:`settle_pushed_refs`, and read when the ref's window passes
-#: to tell a window in which ``tier_main`` enqueued the ref's sync
+#: recording, for each stamped ref, the last sync ``tier_main`` enqueued
+#: for it: a JSON object mapping the ref to ``date_enqueued``, the
+#: ISO-8601 time of the enqueue, and ``date_rebuilt``, the LTD
+#: ``date_rebuilt`` the enqueue was for, or null when it was for none
+#: (:class:`PushedRefEnqueue`). Written and pruned with the ref's stamp by
+#: :func:`settle_pushed_refs`. Read on each visit to hold a repeated
+#: enqueue for the same rebuild to :data:`PUSHED_REF_REENQUEUE_BACKOFF`
+#: (:func:`pushed_ref_enqueue_due`), and when the ref's window passes to
+#: tell a window in which ``tier_main`` enqueued the ref's sync
 #: (``completed``) from one in which it never did (``expired``). A row
 #: without the key has never enqueued.
 ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED = "github_pushed_refs_enqueued"
+
+#: How long ``tier_main`` waits after enqueueing a pushed ref's sync
+#: before it enqueues it again for the same LTD rebuild. A sync that
+#: completes or fails without recording the rebuild on the edition's
+#: state row — its build copy failing, or the live-refs read of a
+#: lifecycle tombstone's review failing on GitHub — leaves the ref
+#: reading ``rebuilt`` on every tick; without the backoff each tick of
+#: the window would enqueue the project's whole sync again for it. A new
+#: rebuild of the ref is not held back. Fifteen minutes is three
+#: ``tier_main`` ticks, so a rebuild enqueues at most four times in the
+#: default one-hour window. A tick compares its own start time with the
+#: enqueue, made a little after the start of an earlier tick, so on the
+#: five-minute cadence the tick 15 minutes on usually falls a few
+#: seconds short and the re-enqueue comes on the tick after, 20 minutes
+#: on.
+PUSHED_REF_REENQUEUE_BACKOFF = timedelta(minutes=15)
+
+_DATE_ENQUEUED = "date_enqueued"
+"""Key of an enqueue's time in one entry of the enqueue map."""
+
+_DATE_REBUILT = "date_rebuilt"
+"""Key of the LTD rebuild an enqueue was for in one entry of the map."""
+
+
+@dataclass(frozen=True, slots=True)
+class PushedRefEnqueue:
+    """``tier_main``'s last enqueue of the project's sync for one pushed ref.
+
+    One entry of :data:`ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED`.
+    """
+
+    date_enqueued: datetime
+    """When ``tier_main`` enqueued the sync."""
+
+    date_rebuilt: datetime | None
+    """The LTD ``date_rebuilt`` of the ref's edition the enqueue was for.
+
+    ``None`` for an enqueue for no rebuild: a ``new_edition``, whose
+    check compares no rebuild, or a ``rebuilt`` edition LTD has never
+    rebuilt. Also ``None`` when :attr:`rebuild_known` is false.
+    """
+
+    rebuild_known: bool = True
+    """Whether the entry records the rebuild the enqueue was for.
+
+    False for an entry holding only an enqueue time — a bare ISO-8601
+    string, as the map held before it recorded rebuilds, or an object
+    without ``date_rebuilt`` — which :func:`pushed_ref_enqueue_due`
+    never holds back, having nothing to compare.
+    """
 
 
 class PushCheckOutcome(StrEnum):
@@ -86,7 +152,9 @@ class PushCheckOutcome(StrEnum):
 
     Logged as ``outcome`` on each visit. :attr:`new_edition` and
     :attr:`rebuilt` are the outcomes that enqueue the project's sync
-    (:attr:`enqueues`). Every outcome but :attr:`completed` and
+    (:attr:`enqueues`), unless the ref's last enqueue was for the same
+    rebuild too recently (:func:`pushed_ref_enqueue_due`). Every
+    outcome but :attr:`completed` and
     :attr:`expired` leaves the ref's stamp for the next tick, including
     one whose sync was enqueued: the ref is checked on every tick until
     its window passes, and a later rebuild inside the window enqueues
@@ -174,13 +242,18 @@ def read_pushed_refs(state: KeeperSyncState | None) -> dict[str, datetime]:
 
 def read_pushed_refs_enqueued(
     state: KeeperSyncState | None,
-) -> dict[str, datetime]:
-    """Return when ``tier_main`` last enqueued each stamped ref's sync.
+) -> dict[str, PushedRefEnqueue]:
+    """Return ``tier_main``'s last enqueue of each stamped ref's sync.
 
     Read as defensively as :func:`read_pushed_refs`: a missing or
     non-object map reads as empty, so a row written before the map
-    existed reads as no ref ever enqueued, and a malformed entry is
-    skipped rather than raised on.
+    existed reads as no ref ever enqueued, and a malformed entry — one
+    whose ``date_enqueued`` is missing or does not parse, or whose
+    ``date_rebuilt`` is neither null nor a time — is skipped rather than
+    raised on, reading as never enqueued. An entry holding only an
+    enqueue time, a bare ISO-8601 string or an object without
+    ``date_rebuilt``, reads as an enqueue whose rebuild is unknown
+    (:attr:`PushedRefEnqueue.rebuild_known`).
 
     Parameters
     ----------
@@ -190,12 +263,19 @@ def read_pushed_refs_enqueued(
 
     Returns
     -------
-    dict of str to datetime
+    dict of str to PushedRefEnqueue
         Every well-formed entry of
         :data:`ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED`, keyed by
         normalized ref.
     """
-    return _read_ref_times(state, ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED)
+    enqueues: dict[str, PushedRefEnqueue] = {}
+    for ref, value in _read_ref_map(
+        state, ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED
+    ).items():
+        enqueue = _parse_enqueue(value)
+        if enqueue is not None:
+            enqueues[ref] = enqueue
+    return enqueues
 
 
 def prune_pushed_refs(
@@ -287,7 +367,7 @@ def is_in_push_window(
 def settle_pushed_refs(
     state: KeeperSyncState,
     *,
-    enqueued: Mapping[str, datetime],
+    enqueued: Mapping[str, PushedRefEnqueue],
     now: datetime,
     window: timedelta,
 ) -> dict[str, Any]:
@@ -303,20 +383,22 @@ def settle_pushed_refs(
 
     The enqueues the visit made are recorded in
     :data:`ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED`, each overwriting the
-    ref's earlier entry. The map is pruned with the stamps, so it keeps
-    an entry only for a ref still stamped once the expired refs are gone
-    (a ref the push processor's cap dropped loses its entry here too),
-    and is capped at :data:`PUSHED_REFS_CAP`, keeping the latest
-    enqueues. Every other annotation key on the row is carried over
-    unchanged.
+    ref's earlier entry, with the rebuild it was for. The map is pruned
+    with the stamps, so it keeps an entry only for a ref still stamped
+    once the expired refs are gone (a ref the push processor's cap
+    dropped loses its entry here too), and is capped at
+    :data:`PUSHED_REFS_CAP`, keeping the latest enqueues. An entry the
+    visit left alone is written back as read, one whose rebuild is
+    unknown without ``date_rebuilt``. Every other annotation key on the
+    row is carried over unchanged.
 
     Parameters
     ----------
     state
         The project's ``keeper_sync_state`` row, freshly read.
     enqueued
-        The refs whose sync the visit enqueued, each with the time of
-        that enqueue; empty when it enqueued none.
+        The refs whose sync the visit enqueued, each with that enqueue;
+        empty when it enqueued none.
     now
         The time of the visit.
     window
@@ -330,22 +412,63 @@ def settle_pushed_refs(
         :data:`ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED` replaced.
     """
     kept = prune_pushed_refs(read_pushed_refs(state), now=now, window=window)
-    enqueue_times = {
-        ref: enqueued_at
-        for ref, enqueued_at in {
+    enqueues = {
+        ref: enqueue
+        for ref, enqueue in {
             **read_pushed_refs_enqueued(state),
             **enqueued,
         }.items()
         if ref in kept
     }
+    latest = _newest(
+        {ref: enqueue.date_enqueued for ref, enqueue in enqueues.items()}
+    )
     prior = state.annotations or {}
     return {
         **prior,
         ANNOTATION_GITHUB_PUSHED_REFS: _as_iso(kept),
-        ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: _as_iso(
-            _newest(enqueue_times)
-        ),
+        ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED: {
+            ref: _enqueue_as_json(enqueues[ref]) for ref in latest
+        },
     }
+
+
+def pushed_ref_enqueue_due(
+    last: PushedRefEnqueue | None,
+    *,
+    date_rebuilt: datetime | None,
+    now: datetime,
+) -> bool:
+    """Report whether a ref that calls for its sync may enqueue it now.
+
+    The rule ``tier_main`` applies to a ref whose visit found
+    ``rebuilt`` or ``new_edition``. It is enqueued at once when it has
+    no enqueue on record, when the one on record does not say which
+    rebuild it was for, or when LTD's ``date_rebuilt`` now differs from
+    the rebuild that enqueue was for: LTD rebuilt the edition again, or
+    the last enqueue was for a build-less ``new_edition`` and the
+    edition now has a rebuild. When it is the same rebuild — a null one
+    included, as for a ``new_edition`` found again — the ref is enqueued
+    again only once :data:`PUSHED_REF_REENQUEUE_BACKOFF` has passed since
+    the last enqueue, so a sync that completes or fails without
+    recording the rebuild is not re-run on every tick.
+
+    Parameters
+    ----------
+    last
+        The ref's last enqueue, from :func:`read_pushed_refs_enqueued`,
+        or ``None`` when none is on record.
+    date_rebuilt
+        The LTD ``date_rebuilt`` the visit compared: the ref's edition's
+        for ``rebuilt``, and ``None`` for ``new_edition``.
+    now
+        The time of the visit.
+    """
+    if last is None or not last.rebuild_known:
+        return True
+    if last.date_rebuilt != date_rebuilt:
+        return True
+    return now - last.date_enqueued >= PUSHED_REF_REENQUEUE_BACKOFF
 
 
 def closed_window_outcome(
@@ -437,6 +560,43 @@ def _as_iso(times: Mapping[str, datetime]) -> dict[str, str]:
     return {ref: at.isoformat() for ref, at in times.items()}
 
 
+def _enqueue_as_json(enqueue: PushedRefEnqueue) -> dict[str, str | None]:
+    """Return one enqueue as the enqueue map stores it.
+
+    An enqueue whose rebuild is unknown is written without
+    ``date_rebuilt``, so it reads back as unknown rather than as an
+    enqueue for no rebuild.
+    """
+    stored: dict[str, str | None] = {
+        _DATE_ENQUEUED: enqueue.date_enqueued.isoformat()
+    }
+    if enqueue.rebuild_known:
+        stored[_DATE_REBUILT] = (
+            enqueue.date_rebuilt.isoformat()
+            if enqueue.date_rebuilt is not None
+            else None
+        )
+    return stored
+
+
+def _read_ref_map(state: KeeperSyncState | None, key: str) -> dict[str, Any]:
+    """Return the ref-keyed map under annotation ``key``, read defensively.
+
+    A missing or non-object map reads as empty, and an entry whose ref is
+    not a non-empty string is skipped; the values are left to the caller.
+    """
+    if state is None or state.annotations is None:
+        return {}
+    raw = state.annotations.get(key)
+    if not isinstance(raw, Mapping):
+        return {}
+    return {
+        ref: value
+        for ref, value in raw.items()
+        if isinstance(ref, str) and ref
+    }
+
+
 def _read_ref_times(
     state: KeeperSyncState | None, key: str
 ) -> dict[str, datetime]:
@@ -445,17 +605,44 @@ def _read_ref_times(
     A missing or non-object map reads as empty, and an entry whose ref is
     not a non-empty string or whose time does not parse is skipped.
     """
-    if state is None or state.annotations is None:
-        return {}
-    raw = state.annotations.get(key)
-    if not isinstance(raw, Mapping):
-        return {}
     times: dict[str, datetime] = {}
-    for ref, value in raw.items():
+    for ref, value in _read_ref_map(state, key).items():
         parsed = _parse_push_time(value)
-        if isinstance(ref, str) and ref and parsed is not None:
+        if parsed is not None:
             times[ref] = parsed
     return times
+
+
+def _parse_enqueue(value: object) -> PushedRefEnqueue | None:
+    """Return one entry of the enqueue map, or ``None`` if it is malformed.
+
+    A bare time is an enqueue whose rebuild is unknown; an object needs a
+    ``date_enqueued`` time, and a ``date_rebuilt`` that is null or a
+    time, or none at all for an unknown rebuild.
+    """
+    if not isinstance(value, Mapping):
+        date_enqueued = _parse_push_time(value)
+        if date_enqueued is None:
+            return None
+        return PushedRefEnqueue(
+            date_enqueued=date_enqueued, date_rebuilt=None, rebuild_known=False
+        )
+    date_enqueued = _parse_push_time(value.get(_DATE_ENQUEUED))
+    if date_enqueued is None:
+        return None
+    if _DATE_REBUILT not in value:
+        return PushedRefEnqueue(
+            date_enqueued=date_enqueued, date_rebuilt=None, rebuild_known=False
+        )
+    raw_rebuilt = value[_DATE_REBUILT]
+    if raw_rebuilt is None:
+        return PushedRefEnqueue(date_enqueued=date_enqueued, date_rebuilt=None)
+    date_rebuilt = _parse_push_time(raw_rebuilt)
+    if date_rebuilt is None:
+        return None
+    return PushedRefEnqueue(
+        date_enqueued=date_enqueued, date_rebuilt=date_rebuilt
+    )
 
 
 def _parse_push_time(value: object) -> datetime | None:

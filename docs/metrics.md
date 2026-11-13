@@ -658,6 +658,15 @@ inside the window enqueues the sync again. So a ref can report
 - **A push whose CI never uploads** usually ends with one `expired`;
   it ends `completed` instead when a tick after it enqueued the sync
   for an earlier push's upload (see below).
+- **A sync that does not record the rebuild** — one whose build copy
+  keeps failing, or whose review of a lifecycle tombstone could not read
+  the repository's live refs from GitHub — leaves the ref reporting
+  `rebuilt` on every tick for the same LTD rebuild. Only the first of
+  those visits and then one at least 15 minutes after the last enqueue
+  for that rebuild are `enqueued` true, at most four in the default
+  one-hour window; the visits in between report `rebuilt` with
+  `enqueued` false and no `push_lag`. A new LTD rebuild of the ref is
+  enqueued on the next tick, whatever the backoff.
 
 With `keeper_sync_push_hot_path_enabled` off, `tier_main` visits no
 stamps and publishes none. Publishing is best-effort: a failed publish
@@ -701,11 +710,17 @@ enqueues nothing: a rebuild after the window waits for the project's
 ordinary cadence.
 
 A `rebuilt` or `new_edition` ref is not enqueued when a sync of the
-project already holds its slot: it then reports `enqueued` false with no
-`push_lag`, records no enqueue, and is checked again on the next tick.
-Counting `outcome` over a day says how often a visit catches a rebuild
-(`rebuilt`, `new_edition`), which can be several times for one push,
-and how each window ends: with `tier_main` having enqueued the ref's
+project already holds its slot, nor when its last enqueue was for the
+same LTD rebuild less than 15 minutes before (a `new_edition` found
+again, with no rebuild to compare, counts as the same): it then reports
+`enqueued` false with no `push_lag`, leaves its recorded enqueue as it
+was, and is checked again on the next tick. The `Tier-main: checked
+pushed ref` log line's `held_back` tells the two apart; the event does
+not. Counting `outcome` over a day says how often a visit catches a
+rebuild (`rebuilt`, `new_edition`), which can be several times for one
+push and includes the held-back visits, so count `enqueued` true for
+the syncs started. It also says how each window ends: with `tier_main`
+having enqueued the ref's
 sync (`completed`) or not (`expired`). `completed` and `expired` come
 once per window, so their ratio is the share of windows, counting
 repeated pushes to a ref inside one window as one, in which the push
@@ -720,7 +735,7 @@ and `completed` can rest on an earlier push's upload.
 | `project` | string or null | tag | Project slug, which is also its LTD product slug; always set on this event. |
 | `github_ref` | string | field | The pushed branch or tag, normalized: `main` or `v1.2.0`, not `refs/heads/main`. A field, not a tag; see the [cardinality rule](#cardinality-rule). |
 | `outcome` | enum | tag | What the visit found: `new_edition`, `rebuilt`, `unchanged`, `expired`, `not_found`, `error`, or `completed`. |
-| `enqueued` | boolean | field | Whether the visit enqueued the project's `keeper_sync_project` for this ref. The ref keeps its stamp either way, so it can report `true` on more than one tick of its window. |
+| `enqueued` | boolean | field | Whether the visit enqueued the project's `keeper_sync_project` for this ref. The ref keeps its stamp either way, so it can report `true` on more than one tick of its window: once per new LTD rebuild, and at most every 15 minutes for the same one. |
 | `push_lag` | duration or null | field | Time from the ref's latest push, as Docverse stamped it on receiving the delivery, to the enqueue this visit made: the repository's CI run, its upload to LTD, and the wait for the tick. Each enqueue in a window is measured from the latest push, so a second enqueue with no push in between (a build-less `new_edition` followed by its `rebuilt`) is longer than the first by the time between them. Set exactly when `enqueued` is true. |
 
 ### `lifecycle_action`
@@ -922,7 +937,9 @@ a contributor's latest push to each sync Docverse started for it. A ref
 that enqueues twice in its window contributes both, and when no push
 came in between, the second is measured from the same push, so a long
 tail there can be a new branch's build-less `new_edition` followed by
-its `rebuilt` rather than one slow catch. `COUNT("enqueued")` counts
+its `rebuilt` rather than one slow catch, or a sync that keeps failing
+and is enqueued again for the same rebuild every 15 minutes or so.
+`COUNT("enqueued")` counts
 every visit, since every point carries `enqueued`; in the `completed`
 and `expired` groups it counts closed windows.
 
@@ -981,8 +998,9 @@ hand.
   metrics, PRD #713, which added `ltd_lag`, `ltd_lag_seconds`,
   `api_request`, and `github_webhook_received`, and PRD #888, which
   kept a pushed ref's `keeper_sync_push_check` visits going for its
-  whole window, added the `completed` outcome, and measured `ltd_lag`
-  on first imports of editions newer than the project.
+  whole window, held its repeated enqueues for one LTD rebuild to a
+  15-minute backoff, added the `completed` outcome, and measured
+  `ltd_lag` on first imports of editions newer than the project.
 - `src/docverse_server/metrics/`: the payloads, their enums, the
   `DocverseEvents` registry, and `build_event_manager`.
 - `src/docverse_server/middleware/api_request.py`: the middleware that

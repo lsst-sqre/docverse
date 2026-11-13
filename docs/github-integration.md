@@ -627,9 +627,12 @@ to for a truncated push.
 
 Beside the stamps, `tier_main` keeps a second map on the same row,
 `github_pushed_refs_enqueued`: each stamped ref, keyed the same way, to
-the ISO-8601 time of the last project sync it enqueued for that ref.
-The push processor never writes it, and a row without it reads as no
-ref ever enqueued, so there is nothing to migrate:
+the last project sync it enqueued for that ref. `date_enqueued` is the
+ISO-8601 time of the enqueue, and `date_rebuilt` the LTD `date_rebuilt`
+of the ref's edition that the enqueue was for, or null when it was for
+no rebuild: a `new_edition`, or an edition LTD has never rebuilt. The
+push processor never writes it, and a row without it reads as no ref
+ever enqueued, so there is nothing to migrate:
 
 ```json
 {
@@ -637,7 +640,10 @@ ref ever enqueued, so there is nothing to migrate:
     "tickets/DM-56619": "2026-10-09T14:02:11.204518+00:00"
   },
   "github_pushed_refs_enqueued": {
-    "tickets/DM-56619": "2026-10-09T14:10:03.551207+00:00"
+    "tickets/DM-56619": {
+      "date_enqueued": "2026-10-09T14:10:03.551207+00:00",
+      "date_rebuilt": "2026-10-09T14:08:47.120000+00:00"
+    }
   }
 }
 ```
@@ -645,8 +651,12 @@ ref ever enqueued, so there is nothing to migrate:
 An entry is written on every enqueue for the ref, overwriting the last,
 and is pruned with the ref's stamp; the map is capped at 20 refs like
 the stamps, keeping the latest enqueues. A malformed map or entry reads
-as empty rather than failing the tick. When the ref's window passes,
-the map is what tells a window in which `tier_main` enqueued the ref's
+as no enqueue rather than failing the tick. An entry holding only a
+time, a bare ISO-8601 string as the map first held, or an object
+without `date_rebuilt`, reads as an enqueue whose rebuild is unknown,
+which never holds the ref back. The map does two jobs: it holds a
+repeated enqueue for the same rebuild to a backoff, and when the ref's
+window passes it tells a window in which `tier_main` enqueued the ref's
 sync (`completed`) from one in which it never did (`expired`): see
 [The `tier_main` check](#the-tier_main-check).
 
@@ -797,9 +807,31 @@ after an earlier run's upload was synced, or the first upload to an
 edition LTD created, and keeper-sync synced, before any build had
 landed: the synced edition reads `unchanged` until LTD rebuilds it, and
 `rebuilt` after. Each enqueue is recorded against every ref that called
-for it, in `github_pushed_refs_enqueued`. When the slot was taken, the
-refs that called for the job record nothing and are simply checked
-again next tick.
+for it, in `github_pushed_refs_enqueued`, with the LTD rebuild it was
+for. When the slot was taken, the refs that called for the job record
+nothing and are simply checked again next tick.
+
+A sync can also complete, or fail, without recording the rebuild on
+the edition's state row: a lifecycle tombstone's review that could not
+read the repository's live refs from GitHub (a `403`, `429` or `5xx`)
+keeps the tombstone with nothing stamped, and a build copy that keeps
+failing leaves the edition as it was. The ref then reads `rebuilt` on
+every tick for the same rebuild. So a `rebuilt` or `new_edition` ref is
+enqueued at once only when the rebuild differs from the one its last
+enqueue was for, or no enqueue is on record: LTD rebuilt the edition
+again for a later CI run, or the last enqueue was for a build-less
+`new_edition` and the edition now has a rebuild. For the same rebuild
+(a `new_edition` found again, with no rebuild to compare, included) the
+ref is enqueued again only once 15 minutes have passed since its last
+enqueue (`PUSHED_REF_REENQUEUE_BACKOFF`, a module constant), so a
+rebuild enqueues at most four times in the default one-hour window
+rather than on all 12 ticks. On the five-minute cadence the re-enqueue
+usually comes on the tick 20 minutes after the last enqueue, since the
+tick 15 minutes after it starts a few seconds short of the backoff. A
+visit the backoff holds back reports its outcome with `enqueued` false,
+as one whose project's slot was taken does, and leaves the ref's
+recorded enqueue untouched, even when the `main` check or another ref
+enqueued the project's sync on that tick.
 
 `completed` does not enqueue anything: the window has closed, and any
 rebuild after it waits for the project's ordinary cadence.
@@ -826,7 +858,9 @@ points to), plus the listing and at most three fetches of the unseen
 editions it shows, the listing and those fetches shared by the
 project's refs, and at most 20 refs per project. A ref is checked on
 every tick of its window, at most 12 at the default one-hour window,
-whether or not an earlier tick enqueued its sync. A dormant project the
+whether or not an earlier tick enqueued its sync, and enqueues the
+project's whole sync at most four times per LTD rebuild of its edition
+in that window, once per new rebuild otherwise. A dormant project the
 push woke adds its `main` check, usually one more call per tick for the
 window, which a push to `main` itself shares. Editions that follow a
 ref by a version rule rather than by name (`lsst_doc`,
@@ -842,7 +876,7 @@ a second, with the time from its push to the enqueue.
 
 | Message | Level | Fields |
 | --- | --- | --- |
-| `Tier-main: checked pushed ref` | info | `org`, `project`, `github_ref`, `outcome`, `pushed_at`, `enqueued` |
+| `Tier-main: checked pushed ref` | info | `org`, `project`, `github_ref`, `outcome`, `pushed_at`, `enqueued`, `held_back` |
 | `Tier-main: enqueued project sync for pushed ref` | info | `org`, `project`, `github_ref`, `outcome`, `push_lag_seconds` |
 | `Tier-main: failed to check pushed ref` | error | `org`, `project`, `github_ref`, `exception` |
 | `Tier-main: failed to publish pushed ref check` | error | `org`, `project`, `github_ref`, `exception` |
@@ -851,7 +885,11 @@ a second, with the time from its push to the enqueue.
 `pushed_at` is the push time the visit read from the stamp; `enqueued`
 is whether the ref's sync was enqueued this tick. A ref can be
 `enqueued` on more than one tick of its window, and each enqueue's
-`push_lag_seconds` is measured from its latest push.
+`push_lag_seconds` is measured from its latest push. `held_back` is
+true on a `rebuilt` or `new_edition` visit that the backoff kept from
+enqueueing, because its last enqueue was for the same rebuild less than
+15 minutes before; it tells such a visit from one whose project's slot
+was taken, which also reads `enqueued` false.
 
 ### The metrics event
 
