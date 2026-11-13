@@ -3455,7 +3455,7 @@ async def test_tier_other_leaves_a_kept_lifecycle_tombstone_dormant(
             state_id=state.id,
             note="ref_deleted",
             date_rebuilt_seen=now - timedelta(minutes=20),
-            date_last_synced=now - timedelta(minutes=10),
+            date_last_synced=now - timedelta(minutes=5),
         )
 
     assert await _tier_other_enqueued_slugs(mock_discovery) == []

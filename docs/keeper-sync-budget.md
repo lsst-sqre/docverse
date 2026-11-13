@@ -343,12 +343,14 @@ waits for the tier crons, which pick changes up whatever a chain did:
 - `keeper_sync_tier_discovery` (every 30 minutes) re-syncs a project
   with an edition that has no state row yet.
 - `keeper_sync_tier_other` (hourly) re-syncs a project with a stale
-  non-`main` edition: one last synced 30 minutes or more ago
-  (`TIER_OTHER_REFRESH_THRESHOLD`, half the hourly interval). An
-  edition synced in the first half of an hour is refreshed on the next
-  tick and one synced in the second half on the tick after, so a
-  rebuild that no push window watches waits about 1.5 hours at worst,
-  when it lands just after the edition's last sync.
+  non-`main` edition: one last synced 10 minutes or more ago
+  (`TIER_OTHER_REFRESH_THRESHOLD`, well below the hourly interval). A
+  push hot-path sync re-syncs the whole project, so it stamps every
+  edition, including those it found unchanged. Only an edition synced
+  in the last 10 minutes before a tick waits for the tick after; every
+  other edition is refreshed on the next tick. A rebuild that no push
+  window watches therefore waits about 1 h 10 min at worst, when it
+  lands just after the edition's last sync.
 
 Each of those starts a new chain from the top once the current chain
 has ended and freed the project's slot. Until then, it skips the

@@ -2755,7 +2755,7 @@ class KeeperSyncService:
         Left alone, the row would read stale on every poll, and a
         project whose only non-``main`` editions are such tombstones
         would be re-synced on every one. Stamped, it comes due on a
-        synced edition's cadence instead, which at the 30-minute
+        synced edition's cadence instead, which at the 10-minute
         ``TIER_OTHER_REFRESH_THRESHOLD`` is still nearly every hourly
         poll of a hot project. Only ``date_last_synced`` is
         written: the tombstone, its note, and the rebuild baseline the

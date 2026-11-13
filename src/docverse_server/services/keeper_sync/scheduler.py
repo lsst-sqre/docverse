@@ -68,21 +68,24 @@ __all__ = [
 TierCohort = Literal["hot", "dormant", "unseen"]
 
 #: How long a non-``main`` edition's local state may lag LTD before
-#: ``keeper_sync_tier_other`` re-enqueues a refresh. Half of
-#: :data:`TIER_OTHER_CRON_INTERVAL`, and strictly below it on purpose:
-#: with the two equal, an edition synced any time after tick T is still
-#: under one threshold old at the next tick and waits for the tick
-#: after, so a branch rebuilt in LTD just after a sync took up to two
-#: hours to reach Docverse (PRD #888, root cause 3). At 30 minutes, an
-#: edition synced in the first half of an interval is refreshed on the
-#: next tick and one synced in the second half on the tick after, about
-#: 1.5 hours after its sync at the worst. A hot project whose non-``main``
-#: editions only ``tier_other`` syncs is therefore refreshed every tick
-#: rather than every other one. This is the fallback for a rebuild the
-#: push hot path does not watch; it stays a module constant, not a
-#: configuration setting, so the worker function and the unit tests
-#: pull from the same source of truth.
-TIER_OTHER_REFRESH_THRESHOLD = timedelta(minutes=30)
+#: ``keeper_sync_tier_other`` re-enqueues a refresh. Well below
+#: :data:`TIER_OTHER_CRON_INTERVAL` on purpose: with the two equal, an
+#: edition synced any time after tick T is still under one threshold old
+#: at the next tick and waits for the tick after, so a branch rebuilt in
+#: LTD just after a sync took up to two hours to reach Docverse (PRD
+#: #888, root cause 3). A push hot-path sync is a whole-project sync, so
+#: it re-stamps every edition of the project, and the incidents behind
+#: that root cause synced 20 to 25 minutes before a tick (``rubin/dp2``:
+#: 04:40 before 05:00 on 2026-11-05, 21:35 before 22:00 on 2026-11-12).
+#: At 10 minutes, only an edition synced in the last 10 minutes before a
+#: tick waits for the tick after, about 1 h 10 min after its sync at the
+#: worst; every other edition is refreshed on the next tick. A hot
+#: project with a non-``main`` edition is already re-synced on nearly
+#: every tick, so the shorter threshold adds little load. This is the
+#: fallback for a rebuild the push hot path does not watch; it stays a
+#: module constant, not a configuration setting, so the worker function
+#: and the unit tests pull from the same source of truth.
+TIER_OTHER_REFRESH_THRESHOLD = timedelta(minutes=10)
 
 #: Wall-clock cadence at which ``keeper_sync_tier_main`` fires. Matches
 #: PRD #275 user story 10's ~5-minute SLO for the user-visible ``main``
@@ -99,11 +102,12 @@ TIER_DISCOVERY_CRON_INTERVAL = timedelta(minutes=30)
 
 #: Wall-clock cadence at which ``keeper_sync_tier_other`` fires. Hourly
 #: catches non-``main`` editions whose state has aged past
-#: :data:`TIER_OTHER_REFRESH_THRESHOLD`, which is deliberately shorter
-#: than this interval: a threshold equal to it skips a tick for any
-#: edition synced after the previous one (see that constant). The
-#: cadence itself is unchanged, so ``tier_other``'s LTD listing load is
-#: too.
+#: :data:`TIER_OTHER_REFRESH_THRESHOLD`, which is deliberately much
+#: shorter than this interval: a threshold equal to it skips a tick for
+#: any edition synced after the previous one, and at 10 minutes only an
+#: edition synced in the last 10 minutes before a tick does (see that
+#: constant). The cadence itself is unchanged, so ``tier_other``'s LTD
+#: listing load is too.
 TIER_OTHER_CRON_INTERVAL = timedelta(hours=1)
 
 #: A tier cron's arq timeout holds back this fraction (one part in
@@ -551,10 +555,10 @@ def should_refresh_other_edition(
     sync visited without a newer LTD rebuild to judge, which ages from
     that visit like any synced row rather than from a tombstoning that
     only grows older, so it comes due on the same cadence as a synced
-    edition. At the default 30-minute ``threshold`` and the hourly
+    edition. At the default 10-minute ``threshold`` and the hourly
     :data:`TIER_OTHER_CRON_INTERVAL`, that cadence is nearly every poll
-    of a hot project: a row stamped by one tick's sync is 30 minutes old
-    by the next tick unless that sync visited it more than 30 minutes
+    of a hot project: a row stamped by one tick's sync is 10 minutes old
+    by the next tick unless that sync visited it more than 50 minutes
     after its tick. A hot project with any non-``main`` edition,
     tombstoned ones included, is therefore re-synced on nearly every
     ``tier_other`` tick (see :data:`TIER_OTHER_REFRESH_THRESHOLD`).
