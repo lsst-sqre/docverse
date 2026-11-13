@@ -68,11 +68,21 @@ __all__ = [
 TierCohort = Literal["hot", "dormant", "unseen"]
 
 #: How long a non-``main`` edition's local state may lag LTD before
-#: ``keeper_sync_tier_other`` re-enqueues a refresh. One hour matches
-#: PRD #275 user story 10's branch-edition staleness SLO. Exposed as a
-#: module constant so the worker function and the unit tests pull from
-#: the same source of truth.
-TIER_OTHER_REFRESH_THRESHOLD = timedelta(hours=1)
+#: ``keeper_sync_tier_other`` re-enqueues a refresh. Half of
+#: :data:`TIER_OTHER_CRON_INTERVAL`, and strictly below it on purpose:
+#: with the two equal, an edition synced any time after tick T is still
+#: under one threshold old at the next tick and waits for the tick
+#: after, so a branch rebuilt in LTD just after a sync took up to two
+#: hours to reach Docverse (PRD #888, root cause 3). At 30 minutes, an
+#: edition synced in the first half of an interval is refreshed on the
+#: next tick and one synced in the second half on the tick after, about
+#: 1.5 hours after its sync at the worst. A hot project whose non-``main``
+#: editions only ``tier_other`` syncs is therefore refreshed every tick
+#: rather than every other one. This is the fallback for a rebuild the
+#: push hot path does not watch; it stays a module constant, not a
+#: configuration setting, so the worker function and the unit tests
+#: pull from the same source of truth.
+TIER_OTHER_REFRESH_THRESHOLD = timedelta(minutes=30)
 
 #: Wall-clock cadence at which ``keeper_sync_tier_main`` fires. Matches
 #: PRD #275 user story 10's ~5-minute SLO for the user-visible ``main``
@@ -89,8 +99,11 @@ TIER_DISCOVERY_CRON_INTERVAL = timedelta(minutes=30)
 
 #: Wall-clock cadence at which ``keeper_sync_tier_other`` fires. Hourly
 #: catches non-``main`` editions whose state has aged past
-#: :data:`TIER_OTHER_REFRESH_THRESHOLD`; the SLO is also hourly so the
-#: cron and the threshold are intentionally identical.
+#: :data:`TIER_OTHER_REFRESH_THRESHOLD`, which is deliberately shorter
+#: than this interval: a threshold equal to it skips a tick for any
+#: edition synced after the previous one (see that constant). The
+#: cadence itself is unchanged, so ``tier_other``'s LTD listing load is
+#: too.
 TIER_OTHER_CRON_INTERVAL = timedelta(hours=1)
 
 #: A tier cron's arq timeout holds back this fraction (one part in

@@ -681,11 +681,11 @@ a project dormant for months:
 - `keeper_sync_tier_discovery` lists its LTD editions every 30 minutes,
   and enqueues its sync for any it has not seen.
 - `keeper_sync_tier_other` lists them every hour, and enqueues its sync
-  for any non-`main` edition last synced an hour or more ago. An edition
-  a lifecycle rule tombstoned counts too, aging from its tombstoning
-  when keeper-sync never synced it, so the sync can judge the tombstone
-  again should LTD have rebuilt the edition; an edition an operator
-  deleted does not.
+  for any non-`main` edition last synced 30 minutes or more ago. An
+  edition a lifecycle rule tombstoned counts too, aging from its
+  tombstoning when keeper-sync never synced it, so the sync can judge
+  the tombstone again should LTD have rebuilt the edition; an edition
+  an operator deleted does not.
 
 When the window closes, the project drops back to its cohort and nothing
 else has to change: the stamp left on the row counts for nothing once

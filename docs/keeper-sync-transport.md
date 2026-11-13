@@ -534,9 +534,10 @@ that next sync depends on the project:
 - **A project with at least one non-`main` edition** (one a lifecycle
   rule tombstoned counts; one an operator deleted does not) is
   re-synced whole by `keeper_sync_tier_other` once any non-`main`
-  edition's state is an hour old: hourly while the project is hot, and
-  at the dormant cadence (about daily) otherwise. That re-sync covers
-  every edition, including a failed `main`.
+  edition's state is 30 minutes old: on the first hourly tick to find
+  it so while the project is hot, and at the dormant cadence (about
+  daily) otherwise. That re-sync covers every edition, including a
+  failed `main`.
 - **A project whose only edition is `main`** is not re-driven by the
   tier crons until LTD rebuilds `main`. `sync_edition` records LTD's
   `date_rebuilt` on the edition's state before it copies, so
