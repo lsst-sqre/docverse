@@ -257,31 +257,37 @@ def test_is_in_push_window() -> None:
     assert not is_in_push_window(None, now=_NOW, window=_WINDOW)
 
 
-def test_settle_clears_a_ref_whose_stamp_has_not_moved() -> None:
-    """A ref cleared at the push time the visit read is dropped."""
+def test_settle_keeps_an_enqueued_ref_until_its_window_passes() -> None:
+    """A ref whose sync was enqueued keeps its stamp for the whole window.
+
+    ``tier_main`` settles the row after each visit, including the one
+    that enqueued the ref's sync. The ref stays stamped, so later ticks
+    check it again and catch a second LTD rebuild inside the window; the
+    first settle after the window has passed prunes it.
+    """
     pushed = _NOW - timedelta(minutes=20)
-    other = _NOW - timedelta(minutes=5)
     state = _project_state(
         annotations={
-            ANNOTATION_GITHUB_PUSHED_REFS: {
-                "tickets/DM-1": pushed.isoformat(),
-                "main": other.isoformat(),
-            }
+            ANNOTATION_GITHUB_PUSHED_REFS: {"tickets/DM-1": pushed.isoformat()}
         }
     )
 
-    settled = settle_pushed_refs(
-        state, cleared={"tickets/DM-1": pushed}, now=_NOW, window=_WINDOW
-    )
+    inside = settle_pushed_refs(state, now=_NOW, window=_WINDOW)
+    after = settle_pushed_refs(state, now=pushed + _WINDOW, window=_WINDOW)
 
-    assert settled[ANNOTATION_GITHUB_PUSHED_REFS] == {
-        "main": other.isoformat()
+    assert inside[ANNOTATION_GITHUB_PUSHED_REFS] == {
+        "tickets/DM-1": pushed.isoformat()
     }
+    assert after[ANNOTATION_GITHUB_PUSHED_REFS] == {}
 
 
-def test_settle_keeps_a_ref_pushed_again_since_the_visit() -> None:
-    """A ref re-stamped after the visit read it keeps its newer stamp."""
-    seen = _NOW - timedelta(minutes=20)
+def test_settle_judges_a_ref_by_its_fresh_stamp() -> None:
+    """A ref pushed again since the visit read it restarts its window.
+
+    The visit read a stamp whose window had passed, but a push stamped
+    the ref again before the settling write re-read the row: the newer
+    push is what counts, so the ref is kept rather than pruned.
+    """
     again = _NOW - timedelta(seconds=10)
     state = _project_state(
         annotations={
@@ -289,9 +295,7 @@ def test_settle_keeps_a_ref_pushed_again_since_the_visit() -> None:
         }
     )
 
-    settled = settle_pushed_refs(
-        state, cleared={"tickets/DM-1": seen}, now=_NOW, window=_WINDOW
-    )
+    settled = settle_pushed_refs(state, now=_NOW, window=_WINDOW)
 
     assert settled[ANNOTATION_GITHUB_PUSHED_REFS] == {
         "tickets/DM-1": again.isoformat()
@@ -309,7 +313,7 @@ def test_settle_prunes_expired_refs() -> None:
         }
     )
 
-    settled = settle_pushed_refs(state, cleared={}, now=_NOW, window=_WINDOW)
+    settled = settle_pushed_refs(state, now=_NOW, window=_WINDOW)
 
     assert set(settled[ANNOTATION_GITHUB_PUSHED_REFS]) == {"live"}
 
@@ -325,7 +329,7 @@ def test_settle_preserves_other_annotation_keys() -> None:
         }
     )
 
-    settled = settle_pushed_refs(state, cleared={}, now=_NOW, window=_WINDOW)
+    settled = settle_pushed_refs(state, now=_NOW, window=_WINDOW)
 
     assert settled == {
         "date_main_last_polled": "2026-10-09T11:55:00+00:00",

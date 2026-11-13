@@ -359,12 +359,13 @@ class KeeperSyncPushCheckEvent(DocverseEventBase):
 
     A ``push`` stamps the pushed ref onto each LTD-synced project bound
     to the repository, and every five-minute ``keeper_sync_tier_main``
-    tick visits each stamped ref until LTD has rebuilt its edition or
-    its window passes (PRD #803). One event per ref per visit, published
-    once the visit's stamps are settled, so the stream counts how often
-    a push is caught (``rebuilt``, ``new_edition``) or missed
-    (``expired``), and ``push_lag`` times how long a contributor's push
-    takes to reach a sync.
+    tick visits each stamped ref until its window passes (PRD #803),
+    including after a visit that enqueued the ref's sync (PRD #888), so
+    a ref LTD rebuilds more than once in its window is caught each time.
+    One event per ref per visit, published once the visit's stamps are
+    settled, so the stream counts how often a push is caught
+    (``rebuilt``, ``new_edition``), and ``push_lag`` times how long a
+    contributor's push takes to reach a sync.
 
     ``project`` is the project's slug, which is also its LTD product
     slug. Never ``None``: the hot path is per project.
@@ -390,13 +391,14 @@ class KeeperSyncPushCheckEvent(DocverseEventBase):
     """
 
     push_lag: timedelta | None
-    """Time from the ref's push to the enqueue of the project's sync.
+    """Time from the ref's latest push to the enqueue of the project's sync.
 
-    The push time is when Docverse processed the ``push`` delivery, and
-    the enqueue is the one this visit made, so the lag spans the
-    repository's CI run, its upload to LTD, and the wait for the next
-    ``tier_main`` tick. Set exactly when ``enqueued`` is, and ``None``
-    for every other visit.
+    The push time is when Docverse processed the ref's latest ``push``
+    delivery, and the enqueue is the one this visit made, so the lag
+    spans the repository's CI run, its upload to LTD, and the wait for
+    the next ``tier_main`` tick. A ref that enqueues more than once in
+    its window measures each enqueue from its latest push. Set exactly
+    when ``enqueued`` is, and ``None`` for every other visit.
     """
 
 

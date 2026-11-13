@@ -478,7 +478,7 @@ class KeeperSyncPushCheckOutcome(StrEnum):
     """The ref's edition is as keeper-sync last synced it."""
 
     expired = "expired"
-    """The ref's window passed without a sync; its stamp is pruned."""
+    """The ref's window passed; its stamp is pruned."""
 
     not_found = "not_found"
     """No synced edition tracks the ref, and LTD lists nothing new."""

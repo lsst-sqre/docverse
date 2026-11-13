@@ -22,10 +22,13 @@ one shape, and so the rules can be unit-tested on in-memory
 - the map holds at most :data:`PUSHED_REFS_CAP` refs, dropping the
   oldest pushes first, so a repository that pushes many refs at once
   cannot grow the row without bound;
-- ``tier_main`` visits each stamped ref, and settles the map afterwards:
-  a ref whose sync it enqueued is cleared, unless a newer push has
-  stamped it again since, and the refs whose window has passed are
-  pruned (:func:`settle_pushed_refs`), each reported as ``expired``.
+- ``tier_main`` visits each stamped ref on every tick until its window
+  passes, including after a visit that enqueued the ref's sync, so a ref
+  can enqueue more than once in its window: LTD can rebuild it once per
+  CI run of several pushes, or create its edition before the first
+  upload lands and rebuild it after. ``tier_main`` settles the map after
+  each visit, pruning only the refs whose window has passed
+  (:func:`settle_pushed_refs`), each reported as ``expired``.
 
 Nothing here does I/O: the callers read and write the row.
 """
@@ -64,9 +67,10 @@ class PushCheckOutcome(StrEnum):
 
     Logged as ``outcome`` on each visit. :attr:`new_edition` and
     :attr:`rebuilt` are the outcomes that enqueue the project's sync
-    (:attr:`enqueues`); a ref whose sync was enqueued is cleared from
-    the map, and every other outcome but :attr:`expired` leaves its
-    stamp for the next tick.
+    (:attr:`enqueues`). Every outcome but :attr:`expired` leaves the
+    ref's stamp for the next tick, including one whose sync was
+    enqueued: the ref is checked on every tick until its window passes,
+    and a later rebuild inside the window enqueues the sync again.
     """
 
     new_edition = "new_edition"
@@ -83,7 +87,7 @@ class PushCheckOutcome(StrEnum):
     push's CI has not uploaded yet."""
 
     expired = "expired"
-    """The ref's window passed without a sync; its stamp is pruned."""
+    """The ref's window passed; its stamp is pruned."""
 
     not_found = "not_found"
     """No synced edition tracks the ref, and LTD lists no edition
@@ -234,7 +238,6 @@ def is_in_push_window(
 def settle_pushed_refs(
     state: KeeperSyncState,
     *,
-    cleared: Mapping[str, datetime],
     now: datetime,
     window: timedelta,
 ) -> dict[str, Any]:
@@ -242,19 +245,17 @@ def settle_pushed_refs(
 
     ``tier_main`` reads the stamps, visits each ref, and then writes the
     map back from a fresh read of the row, which a push may have stamped
-    again in between. A ref in ``cleared`` is dropped only while its
-    stamp is still the push time the visit read: a newer push to it is
-    a newer hint, and keeps its stamp for the next tick. Refs whose
-    window has passed are pruned. Every other annotation key on the row
-    is carried over unchanged.
+    again in between. Only the refs whose window has passed by the fresh
+    read are pruned: a ref keeps its stamp until then whatever its visit
+    found, including a visit that enqueued its sync, so a later LTD
+    rebuild of the ref inside the window is caught too. A newer push to a
+    ref is judged by its newer stamp, which restarts the window. Every
+    other annotation key on the row is carried over unchanged.
 
     Parameters
     ----------
     state
         The project's ``keeper_sync_state`` row, freshly read.
-    cleared
-        The refs whose sync the visit enqueued, each with the push time
-        the visit read for it.
     now
         The time of the visit.
     window
@@ -266,12 +267,7 @@ def settle_pushed_refs(
         The row's annotations to write back, with
         :data:`ANNOTATION_GITHUB_PUSHED_REFS` replaced.
     """
-    refs = {
-        ref: pushed_at
-        for ref, pushed_at in read_pushed_refs(state).items()
-        if cleared.get(ref) != pushed_at
-    }
-    kept = prune_pushed_refs(refs, now=now, window=window)
+    kept = prune_pushed_refs(read_pushed_refs(state), now=now, window=window)
     prior = state.annotations or {}
     return {
         **prior,

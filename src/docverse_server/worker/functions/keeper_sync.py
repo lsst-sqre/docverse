@@ -3007,9 +3007,13 @@ async def _tier_main_for_org(
     project row. The project's stamps are then visited after its
     ``main`` check, whatever that check's gate decided
     (:func:`_visit_pushed_refs`): a push says LTD is about to change, so
-    each live ref is checked on every tick until its sync is enqueued or
-    its window passes, and an expired ref is pruned even once the
-    project is dormant again. The ``main`` check and the pushed refs
+    each live ref is checked on every tick until its window passes, even
+    after a visit has enqueued its sync, since LTD can rebuild it again
+    for a later push's CI run or after creating its edition build-less;
+    an expired ref is pruned even once the project is dormant again. A
+    ref whose sync keeps failing may therefore enqueue on every tick of
+    its window; the project's active-job slot holds it to one sync at a
+    time. The ``main`` check and the pushed refs
     share one enqueue per project, and the stamps are settled afterwards
     (:func:`_settle_pushed_refs`), which publishes one
     ``keeper_sync_push_check`` metrics event per visited ref. With the hot
@@ -3527,27 +3531,23 @@ async def _settle_pushed_refs(
     """Write a project's pushed-ref visit back to its state row and report it.
 
     Once the project's sync is enqueued (at ``enqueued_at``), every ref
-    whose outcome called for it is cleared, and its push-to-enqueue lag
-    logged; when the enqueue was skipped (``enqueued_at`` is ``None``:
-    an active job for the project already holds its slot) those refs
-    keep their stamps and are checked again next tick. Expired refs are
-    pruned. The row is re-read ``FOR UPDATE`` and settled by
-    :func:`settle_pushed_refs`, so a push stamped since the visit read
-    the row keeps its stamp, and the write is skipped when nothing is
-    cleared or pruned.
+    whose outcome called for it is reported as enqueued, with its lag
+    from its latest push to this enqueue; when the enqueue was skipped
+    (``enqueued_at`` is ``None``: an active job for the project already
+    holds its slot) none is. Either way each ref keeps its stamp until
+    its window passes, so the next tick checks it again: a ref may
+    enqueue the project's sync more than once in its window, as LTD
+    rebuilds it for each of several pushes, or first creates its edition
+    with no build and then rebuilds it. Only the expired refs are pruned,
+    so the row is written only when the visit found one: it is re-read
+    ``FOR UPDATE`` and settled by :func:`settle_pushed_refs`, so a push
+    stamped since the visit read the row keeps its stamp.
 
     Each visited ref is then logged and published as one
     ``keeper_sync_push_check`` event (:func:`_publish_push_check`), after
     the write, so the event reports what the tick settled.
     """
-    cleared = {
-        check.ref: check.pushed_at
-        for check in checks
-        if enqueued_at is not None and check.outcome.enqueues
-    }
-    if cleared or any(
-        check.outcome is PushCheckOutcome.expired for check in checks
-    ):
+    if any(check.outcome is PushCheckOutcome.expired for check in checks):
         async with session.begin():
             state = await state_store.get(
                 org_id=org.id,
@@ -3561,16 +3561,16 @@ async def _settle_pushed_refs(
                     resource_type=ResourceType.project,
                     ltd_slug=ltd_slug,
                     annotations=settle_pushed_refs(
-                        state, cleared=cleared, now=now, window=window
+                        state, now=now, window=window
                     ),
                 )
     for check in checks:
-        enqueued = check.ref in cleared
         push_lag = (
             enqueued_at - check.pushed_at
-            if enqueued_at is not None and enqueued
+            if enqueued_at is not None and check.outcome.enqueues
             else None
         )
+        enqueued = push_lag is not None
         logger.info(
             "Tier-main: checked pushed ref",
             org=org.slug,

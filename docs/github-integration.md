@@ -630,11 +630,13 @@ to for a truncated push.
 A ref is inside the window while less than
 `keeper_sync_push_window_seconds` (default `3600`, one hour) has passed
 since its latest push. The window has to cover the repository's CI run
-and its upload to LTD; a ref whose window closes without LTD rebuilding
-it drops back to its project's ordinary cadence, and nothing retries
-it: `tier_main`'s next visit prunes it from the map with the outcome
-`expired`. Raising the window keeps a slow CI on the fast path longer,
-at the price of more LTD polling per push.
+and its upload to LTD. Throughout it, `tier_main` checks the ref on
+every tick, including after it has enqueued the ref's sync, so every
+LTD rebuild of the ref inside the window is synced on the fast path.
+Once the window closes the ref drops back to its project's ordinary
+cadence: `tier_main`'s next visit prunes it from the map with the
+outcome `expired`. Raising the window keeps a slow CI on the fast path
+longer, at the price of more LTD polling per push.
 
 ### A push counts as hot
 
@@ -662,9 +664,9 @@ When the window closes, the project drops back to its cohort and nothing
 else has to change: the stamp left on the row counts for nothing once
 its push is a window old, and each tier's own last-poll time, which its
 visits kept fresh, holds the project to the dormant cadence from there.
-A ref cleared by an enqueue (see below) stops counting at once, so a
-project whose every pushed ref has had its sync enqueued is back in its
-cohort on the next tick.
+A ref keeps counting for its whole window, even after `tier_main` has
+enqueued its sync (see below), so the project stays hot on every tier
+until its latest push is a window old.
 
 `GET /orgs/{org}/keeper-sync/projects/{ltd_slug}`, and the listing at
 `GET /orgs/{org}/keeper-sync/projects`, report the same: while a ref is
@@ -733,8 +735,8 @@ call, and is pruned. Then each live ref, oldest push first:
 
 | Outcome | What the visit found | The stamp |
 | --- | --- | --- |
-| `rebuilt` | LTD rebuilt the ref's edition since its last sync, or since a lifecycle rule tombstoned it | Cleared once the sync is enqueued |
-| `new_edition` | No edition keeper-sync has seen tracks the ref, and LTD lists one keeper-sync has not seen that tracks it | Cleared once the sync is enqueued |
+| `rebuilt` | LTD rebuilt the ref's edition since its last sync, or since a lifecycle rule tombstoned it | Kept |
+| `new_edition` | No edition keeper-sync has seen tracks the ref, and LTD lists one keeper-sync has not seen that tracks it | Kept |
 | `unchanged` | The ref's edition is as keeper-sync last synced or tombstoned it | Kept |
 | `not_found` | No edition keeper-sync has seen tracks the ref, and LTD lists nothing new that tracks it | Kept |
 | `error` | LTD failed to answer | Kept |
@@ -744,11 +746,16 @@ A `rebuilt` or `new_edition` ref enqueues the project's whole
 `keeper_sync_project`, with the tier label `main`, through the same
 per-project slot as every tier: one job per project per tick, shared
 with the `main` check and with the project's other refs, and none when
-a sync for the project is already queued or running. The refs that
-called for an enqueued job are cleared from the map; when the slot was
-taken they keep their stamps, and the next tick checks them again
-against what that job synced. An `unchanged` or `not_found` ref keeps
-its stamp until LTD rebuilds it or its window passes.
+a sync for the project is already queued or running. Every ref keeps
+its stamp until its window passes, whatever its visit found: the next
+tick checks it again against what the job synced, so a ref can enqueue
+the project's sync more than once in its window. That catches a second
+rebuild of the same ref, such as the upload of a later push's CI run
+after an earlier run's upload was synced, or the first upload to an
+edition LTD created, and keeper-sync synced, before any build had
+landed: the synced edition reads `unchanged` until LTD rebuilds it, and
+`rebuilt` after. When the slot was taken, the refs that called for the
+job are simply checked again next tick.
 
 An LTD failure, after the client's own retries, is logged as
 `Tier-main: failed to check pushed ref` and sent to Sentry, as the
@@ -757,10 +764,9 @@ remaining live refs wait for the next tick rather than spend more LTD
 calls on an LTD that is failing. When the `main` check itself failed on
 LTD, the project's refs wait for the next tick too.
 
-The visit writes the map back only when it cleared or pruned a ref,
-reading the row `FOR UPDATE` first: a ref pushed again while the tick
-ran keeps its newer stamp, since the enqueued job may have missed what
-that push uploads. The three tier crons' own writes to the row, which
+The visit writes the map back only when it pruned a ref, reading the
+row `FOR UPDATE` first: a ref pushed again while the tick ran keeps its
+newer stamp, which restarts its window. The three tier crons' own writes to the row, which
 record when they polled the project, read it `FOR UPDATE` for the same
 reason, so none of them can write back a map that predates a stamp.
 
@@ -768,7 +774,9 @@ The check's cost is bounded: at most two LTD calls per stamped ref per
 tick (its edition, then the edition of the lifecycle tombstone its name
 points to), plus the listing and at most three fetches of the unseen
 editions it shows, the listing and those fetches shared by the
-project's refs, and at most 20 refs per project. A dormant project the
+project's refs, and at most 20 refs per project. A ref is checked on
+every tick of its window, at most 12 at the default one-hour window,
+whether or not an earlier tick enqueued its sync. A dormant project the
 push woke adds its `main` check, usually one more call per tick for the
 window, which a push to `main` itself shares. Editions that follow a
 ref by a version rule rather than by name (`lsst_doc`,
@@ -791,8 +799,9 @@ a second, with the time from its push to the enqueue.
 
 `project` is the project's slug, which is also its LTD product slug;
 `pushed_at` is the push time the visit read from the stamp; `enqueued`
-is whether the ref's sync was enqueued, and so its stamp cleared, this
-tick.
+is whether the ref's sync was enqueued this tick. A ref can be
+`enqueued` on more than one tick of its window, and each enqueue's
+`push_lag_seconds` is measured from its latest push.
 
 ### The metrics event
 
