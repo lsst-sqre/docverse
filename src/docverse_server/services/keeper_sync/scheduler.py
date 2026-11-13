@@ -549,8 +549,15 @@ def should_refresh_other_edition(
     (:meth:`~docverse_server.services.keeper_sync_tombstone.KeeperSyncTombstoneService.keep`),
     which ages it from that judgement like any synced row. So is one a
     sync visited without a newer LTD rebuild to judge, which ages from
-    that visit, so a project whose only non-``main`` editions are such
-    tombstones is not re-synced on every poll.
+    that visit like any synced row rather than from a tombstoning that
+    only grows older, so it comes due on the same cadence as a synced
+    edition. At the default 30-minute ``threshold`` and the hourly
+    :data:`TIER_OTHER_CRON_INTERVAL`, that cadence is nearly every poll
+    of a hot project: a row stamped by one tick's sync is 30 minutes old
+    by the next tick unless that sync visited it more than 30 minutes
+    after its tick. A hot project with any non-``main`` edition,
+    tombstoned ones included, is therefore re-synced on nearly every
+    ``tier_other`` tick (see :data:`TIER_OTHER_REFRESH_THRESHOLD`).
 
     Callers pass ``now`` explicitly so tests can fix the wall clock.
     """

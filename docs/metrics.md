@@ -240,6 +240,23 @@ new branch's first build was never measured, so a percentile taken
 across that change rises by the new branches it now counts, not because
 syncs got slower.
 
+**Known limitation: a gap in mirroring.** The first-import rule takes
+the project's `date_created` as the start of an unbroken mirror, and
+keeper-sync never moves it, so the rule cannot see a later stretch when
+Docverse was not following the project: a project tombstoned and later
+restored, one that left the sync scope and came back, an organization
+whose keeper-sync was paused, or a `lifecycle_preemptive` tombstone an
+operator cleared without a new LTD rebuild (its state row has no
+current build, so its import is judged as a first one). An edition LTD
+created after the project still passes the rule when its first import
+comes only after such a gap, so that import sets `ltd_lag` and
+`ltd_lag_seconds` from its `date_rebuilt`; when LTD last rebuilt it
+during the gap, the value spans the gap: days or weeks, an unclamped
+outlier in the percentiles rather than a slow sync. Nothing filters
+these out. When a high percentile jumps right after a project
+comes back into the mirror, look at that project's first imports before
+reading it as a slowdown.
+
 **When it is null.** Whenever there is no rebuild Docverse could have
 followed to measure from:
 
@@ -625,19 +642,22 @@ inside the window enqueues the sync again. So a ref can report
 
 - **A push whose CI uploads to LTD** reports `unchanged` or `not_found`
   on the ticks while the CI runs, then `rebuilt` or `new_edition` with
-  the push lag, then `unchanged` until the window passes, and ends with
-  one `completed`.
+  the push lag, then `unchanged` until the window passes, and usually
+  ends with one `completed` (see below for when it ends `expired`).
 - **Several pushes to one ref** each restart the window, and LTD
   rebuilds the edition for each CI run that uploads. Each rebuild the
   ticks catch reports `rebuilt`, enqueued again, so the last push's
   upload is synced on the fast path even after an earlier run's upload
-  was. The ref ends with one `completed`, a window after its last push.
+  was. The ref usually ends with one `completed`, a window after its
+  last push.
 - **A new branch** can report `new_edition` before its first build has
   landed, since LTD creates the edition when the CI registers the
   build. The sync it enqueues imports the edition with no build, the
   ticks after report `unchanged` until the upload lands, and then
   `rebuilt`, enqueued again, imports the build.
-- **A push whose CI never uploads** ends with one `expired`.
+- **A push whose CI never uploads** usually ends with one `expired`;
+  it ends `completed` instead when a tick after it enqueued the sync
+  for an earlier push's upload (see below).
 
 With `keeper_sync_push_hot_path_enabled` off, `tier_main` visits no
 stamps and publishes none. Publishing is best-effort: a failed publish
@@ -650,13 +670,32 @@ is logged and never stops the tick.
 | `unchanged` | The ref's edition is as keeper-sync last synced it | `false`, null |
 | `not_found` | No synced edition tracks the ref, and LTD lists nothing new that tracks it | `false`, null |
 | `error` | LTD failed to answer; the stamp is kept for the next tick | `false`, null |
-| `completed` | The ref's window passed after it enqueued the project's sync at least once in that window; the stamp is pruned | `false`, null |
-| `expired` | The ref's window passed without it enqueueing the project's sync: the push never produced a sync; the stamp is pruned | `false`, null |
+| `completed` | The ref's window passed, and `tier_main` enqueued the project's sync for the ref at least once at or after its latest push; the stamp is pruned | `false`, null |
+| `expired` | The ref's window passed, and `tier_main` never enqueued the project's sync for the ref in that window; the stamp is pruned | `false`, null |
 
-A window ends `completed` only on an enqueue made at or after the push
-its stamp records. An enqueue made for an earlier push, whose window a
-later push to the same ref restarted, does not count for the later
-one, so `expired` always means the latest push never produced a sync.
+`completed` and `expired` report what `tier_main` did for the ref, not
+whether a particular push's upload reached Docverse. The window ends
+`completed` when `github_pushed_refs_enqueued` records an enqueue for
+the ref at or after the push its stamp records, and `expired` when it
+records none. An enqueue made before the latest push to the ref, which
+restarted its window, does not count for it. Neither outcome is tied to
+one upload:
+
+- **`completed` does not prove the latest push's upload was synced.**
+  It counts any enqueue for the ref after that push, including one for
+  an earlier push's upload that a tick caught only after the later push
+  was stamped. If the later push's CI then never uploads, its window
+  still ends `completed`.
+- **`expired` does not prove the upload was never synced.** `tier_main`
+  records an enqueue only when its own visit to the ref found `rebuilt`
+  or `new_edition` and enqueued the project's sync. A sync that already
+  held the project's slot when a visit found `rebuilt`, one enqueued for
+  another ref or by the `main` check, or `keeper_sync_tier_other` can
+  import the upload first; the ref's later visits then read `unchanged`
+  and, unless LTD rebuilds it again inside the window, its window ends
+  `expired` although the upload was synced. That is most likely on a
+  busy project with a long sync chain.
+
 The visit that reports `completed` or `expired` makes no LTD call and
 enqueues nothing: a rebuild after the window waits for the project's
 ordinary cadence.
@@ -666,10 +705,14 @@ project already holds its slot: it then reports `enqueued` false with no
 `push_lag`, records no enqueue, and is checked again on the next tick.
 Counting `outcome` over a day says how often a visit catches a rebuild
 (`rebuilt`, `new_edition`), which can be several times for one push,
-and how each window ends: with a sync (`completed`) or on nothing
-(`expired`). `completed` and `expired` come once per window, so their
-ratio is the share of pushes, counting repeated pushes to a ref inside
-one window as one, that produced a sync.
+and how each window ends: with `tier_main` having enqueued the ref's
+sync (`completed`) or not (`expired`). `completed` and `expired` come
+once per window, so their ratio is the share of windows, counting
+repeated pushes to a ref inside one window as one, in which the push
+hot path itself enqueued the ref's sync. It is the hot path's own catch
+rate, not the share of pushes whose upload Docverse synced: per the
+caveats above, `expired` includes uploads another sync imported first,
+and `completed` can rest on an earlier push's upload.
 
 | Field | Type | Stored as | Meaning |
 | --- | --- | --- | --- |

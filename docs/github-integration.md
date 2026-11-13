@@ -646,8 +646,8 @@ An entry is written on every enqueue for the ref, overwriting the last,
 and is pruned with the ref's stamp; the map is capped at 20 refs like
 the stamps, keeping the latest enqueues. A malformed map or entry reads
 as empty rather than failing the tick. When the ref's window passes,
-the map is what tells a push that produced a sync (`completed`) from one
-that never did (`expired`): see
+the map is what tells a window in which `tier_main` enqueued the ref's
+sync (`completed`) from one in which it never did (`expired`): see
 [The `tier_main` check](#the-tier_main-check).
 
 ### The window
@@ -660,8 +660,9 @@ every tick, including after it has enqueued the ref's sync, so every
 LTD rebuild of the ref inside the window is synced on the fast path.
 Once the window closes the ref drops back to its project's ordinary
 cadence: `tier_main`'s next visit prunes it from both maps with the
-outcome `completed` when it enqueued the project's sync at least once
-in the window, and `expired` when it never did. Raising the window
+outcome `completed` when `tier_main` enqueued the project's sync for
+the ref at least once since its latest push, and `expired` when it
+never did. Raising the window
 keeps a slow CI on the fast path longer, at the price of more LTD
 polling per push.
 
@@ -712,10 +713,19 @@ that is dormant again.
 
 Refs whose window has passed come first. Each costs no LTD call and is
 pruned. It is `completed` when `github_pushed_refs_enqueued` records an
-enqueue for it at or after the push its stamp holds, so a sync was
-enqueued in this window, and `expired` otherwise: an enqueue made before
-a later push to the same ref restarted its window does not count for
-that push. Then each live ref, oldest push first:
+enqueue for it at or after the push its stamp holds, so `tier_main`
+enqueued the ref's sync in this window, and `expired` otherwise: an
+enqueue made before a later push to the same ref restarted its window
+does not count for that push. Both report what `tier_main` did for the
+ref, not whether a given upload was synced. An enqueue after the latest
+push counts even when it was for an earlier push's upload that a tick
+caught late, so a later push whose CI never uploads can still end
+`completed`. And a ref whose upload another sync imported first (one
+that already held the project's slot, one enqueued for another ref or
+by the `main` check, or `tier_other`'s) reads `unchanged` from then on
+and, unless LTD rebuilds it again inside the window, ends `expired`,
+since `tier_main` never enqueued for it. Then each live ref, oldest
+push first:
 
 1. **Find the edition the ref feeds.** The Docverse editions of the
    project that track the ref (`git_ref` tracking mode, any kind: the
@@ -771,8 +781,8 @@ that push. Then each live ref, oldest push first:
 | `unchanged` | The ref's edition is as keeper-sync last synced or tombstoned it | Kept |
 | `not_found` | No edition keeper-sync has seen tracks the ref, and LTD lists nothing new that tracks it | Kept |
 | `error` | LTD failed to answer | Kept |
-| `completed` | The ref's window passed after it enqueued the project's sync at least once in that window | Pruned, with its enqueue |
-| `expired` | The ref's window passed without it enqueueing the project's sync: the push never produced a sync | Pruned, with any enqueue on record |
+| `completed` | The ref's window passed, and `tier_main` enqueued the project's sync for it at least once at or after its latest push | Pruned, with its enqueue |
+| `expired` | The ref's window passed, and `tier_main` never enqueued the project's sync for it in that window (another sync may still have imported its upload) | Pruned, with any enqueue on record |
 
 A `rebuilt` or `new_edition` ref enqueues the project's whole
 `keeper_sync_project`, with the tier label `main`, through the same

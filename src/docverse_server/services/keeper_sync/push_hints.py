@@ -32,8 +32,10 @@ one shape, and so the rules can be unit-tested on in-memory
 - ``tier_main`` records each ref's last enqueue beside its stamp, in the
   ``github_pushed_refs_enqueued`` annotation, which is pruned with the
   stamp and capped like it. A ref whose window has passed is reported
-  as ``completed`` when it enqueued in that window and as ``expired``
-  when it never did (:func:`closed_window_outcome`).
+  as ``completed`` when ``tier_main`` enqueued its sync at or after its
+  latest push and as ``expired`` when it never did
+  (:func:`closed_window_outcome`). Both say what ``tier_main`` did for
+  the ref, not whether a given upload was synced.
 
 Nothing here does I/O: the callers read and write the row.
 """
@@ -73,8 +75,9 @@ ANNOTATION_GITHUB_PUSHED_REFS = "github_pushed_refs"
 #: recording, for each stamped ref, the ISO-8601 time of the last sync
 #: ``tier_main`` enqueued for it. Written and pruned with the ref's stamp
 #: by :func:`settle_pushed_refs`, and read when the ref's window passes
-#: to tell a push that produced a sync (``completed``) from one that
-#: never did (``expired``). A row without the key has never enqueued.
+#: to tell a window in which ``tier_main`` enqueued the ref's sync
+#: (``completed``) from one in which it never did (``expired``). A row
+#: without the key has never enqueued.
 ANNOTATION_GITHUB_PUSHED_REFS_ENQUEUED = "github_pushed_refs_enqueued"
 
 
@@ -88,9 +91,9 @@ class PushCheckOutcome(StrEnum):
     one whose sync was enqueued: the ref is checked on every tick until
     its window passes, and a later rebuild inside the window enqueues
     the sync again. Once the window has passed the ref is pruned
-    (:attr:`prunes`), as :attr:`completed` when it enqueued in that
-    window and :attr:`expired` when it never did
-    (:func:`closed_window_outcome`).
+    (:attr:`prunes`), as :attr:`completed` when ``tier_main`` enqueued
+    its sync at or after its latest push and :attr:`expired` when it
+    never did (:func:`closed_window_outcome`).
     """
 
     new_edition = "new_edition"
@@ -107,12 +110,17 @@ class PushCheckOutcome(StrEnum):
     push's CI has not uploaded yet."""
 
     completed = "completed"
-    """The ref's window passed after it enqueued the project's sync at
-    least once in that window; its stamp is pruned."""
+    """The ref's window passed, and ``tier_main`` enqueued the project's
+    sync for it at least once at or after its latest push; its stamp is
+    pruned. The enqueue may have been for an earlier push's upload that
+    a tick caught only after the latest push."""
 
     expired = "expired"
-    """The ref's window passed without it enqueueing the project's sync:
-    the push never produced a sync. Its stamp is pruned."""
+    """The ref's window passed, and ``tier_main`` never enqueued the
+    project's sync for it in that window; its stamp is pruned. Another
+    sync may still have imported the push's upload: one that already
+    held the project's slot, one enqueued for another ref or by the
+    ``main`` check, or ``tier_other``'s."""
 
     not_found = "not_found"
     """No synced edition tracks the ref, and LTD lists no edition
@@ -348,9 +356,19 @@ def closed_window_outcome(
     :attr:`~PushCheckOutcome.completed` when ``tier_main`` enqueued the
     ref's sync in the window of the push its stamp records, that is at
     or after that push, and :attr:`~PushCheckOutcome.expired` otherwise.
-    An enqueue from before the push was made for an earlier push's
+    An enqueue from before the push was made in an earlier push's
     window, which a later push to the ref restarted, so it does not
     count for this one.
+
+    Only the times are compared, so the outcome says what ``tier_main``
+    did for the ref, not which upload it synced: an enqueue at or after
+    the push counts even when it was for an earlier push's upload that a
+    tick caught late, so a push whose own CI never uploads can still be
+    ``completed``. And ``tier_main`` records only the enqueues its own
+    visits made, so a ref whose upload another sync imported first —
+    one that already held the project's slot, one enqueued for another
+    ref or by the ``main`` check, or ``tier_other``'s — is ``expired``
+    unless a later rebuild in the window was enqueued for it.
 
     Parameters
     ----------

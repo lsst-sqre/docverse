@@ -478,8 +478,9 @@ class KeeperSyncPushCheckOutcome(StrEnum):
     """The ref's edition is as keeper-sync last synced it."""
 
     expired = "expired"
-    """The ref's window passed without it enqueueing the project's sync;
-    its stamp is pruned."""
+    """The ref's window passed, and ``tier_main`` never enqueued the
+    project's sync for it in that window; its stamp is pruned. Another
+    sync may still have imported the push's upload."""
 
     not_found = "not_found"
     """No synced edition tracks the ref, and LTD lists nothing new."""
@@ -488,8 +489,10 @@ class KeeperSyncPushCheckOutcome(StrEnum):
     """LTD failed to answer; the stamp is kept for the next tick."""
 
     completed = "completed"
-    """The ref's window passed after it enqueued the project's sync at
-    least once in that window; its stamp is pruned (PRD #888).
+    """The ref's window passed, and ``tier_main`` enqueued the project's
+    sync for it at least once at or after its latest push; its stamp is
+    pruned (PRD #888). The enqueue may have been for an earlier push's
+    upload that a tick caught only after the latest push.
 
     Appended after :attr:`error` so every earlier symbol keeps its index
     in the Avro enum.

@@ -367,9 +367,12 @@ class KeeperSyncPushCheckEvent(DocverseEventBase):
     a ref LTD rebuilds more than once in its window is caught each time.
     One event per ref per visit, published once the visit's stamps are
     settled, so the stream counts how often a push is caught
-    (``rebuilt``, ``new_edition``) and how its window ends, with a sync
-    (``completed``) or without one (``expired``), and ``push_lag`` times
-    how long a contributor's push takes to reach a sync.
+    (``rebuilt``, ``new_edition``) and how its window ends, with
+    ``tier_main`` having enqueued the ref's sync (``completed``) or not
+    (``expired``), and ``push_lag`` times how long a contributor's push
+    takes to reach a sync. The closing outcomes report what ``tier_main``
+    did, not whether a given upload was synced: see
+    :func:`~docverse_server.services.keeper_sync.push_hints.closed_window_outcome`.
 
     ``project`` is the project's slug, which is also its LTD product
     slug. Never ``None``: the hot path is per project.

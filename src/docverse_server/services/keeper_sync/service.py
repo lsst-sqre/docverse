@@ -748,6 +748,21 @@ def _measures_sync_lag(
     ``date_rebuilt`` is whenever LTD last rebuilt it — years ago,
     perhaps — and measures nothing Docverse did.
 
+    **Known limitation: a gap in mirroring.** The project's
+    ``date_created`` stands for the start of an unbroken mirror, and
+    keeper-sync never moves it, so this cannot see a later stretch when
+    Docverse was not following the project: a project tombstoned and
+    later restored, one that left the sync scope and came back, an
+    organization whose keeper-sync was paused, or a
+    ``lifecycle_preemptive`` tombstone an operator cleared without a new
+    LTD rebuild (its state row has no current build, so it falls through
+    to the date comparison). An edition LTD created after the project but
+    first imported only after such a gap still measures a lag, and when
+    LTD last rebuilt it during the gap the lag spans the gap: an
+    unclamped outlier of days or weeks in the ``ltd_lag`` and
+    ``ltd_lag_seconds`` percentiles. No guard filters these out;
+    ``docs/metrics.md`` documents the limitation.
+
     Whether LTD reports a ``date_rebuilt`` at all is the caller's to
     read: this decides only whether one would measure a lag.
 
@@ -2739,7 +2754,10 @@ class KeeperSyncService:
         (:func:`~docverse_server.services.keeper_sync.scheduler.should_refresh_other_edition`).
         Left alone, the row would read stale on every poll, and a
         project whose only non-``main`` editions are such tombstones
-        would be re-synced on every one. Only ``date_last_synced`` is
+        would be re-synced on every one. Stamped, it comes due on a
+        synced edition's cadence instead, which at the 30-minute
+        ``TIER_OTHER_REFRESH_THRESHOLD`` is still nearly every hourly
+        poll of a hot project. Only ``date_last_synced`` is
         written: the tombstone, its note, and the rebuild baseline the
         review compares against stay as recorded.
         """
